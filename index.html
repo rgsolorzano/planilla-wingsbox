@@ -220,13 +220,35 @@ function loadConsiderarHE(){
 }
 function saveConsiderarHE(map){ localStorage.setItem(K.considerarHE, JSON.stringify(map)); }
 let CONSIDERAR_HE = loadConsiderarHE();
+let calcPendingHE = {}; // cambios pendientes de guardar en Cálculo quincenal
 function heKey(empId, fecha){ return empId+'|'+fecha; }
 function getConsiderarHoraExtra(empId, fecha){
-  return CONSIDERAR_HE[heKey(empId, fecha)] !== false;
+  const k = heKey(empId, fecha);
+  if(Object.prototype.hasOwnProperty.call(calcPendingHE, k)) return calcPendingHE[k];
+  return CONSIDERAR_HE[k] !== false;
 }
-function setConsiderarHoraExtra(empId, fecha, valor){
-  CONSIDERAR_HE[heKey(empId, fecha)] = !!valor;
+function hasPendingConsiderarHE(){ return Object.keys(calcPendingHE).length > 0; }
+function excelTimestamp(){
+  const d = new Date();
+  const p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+function considerarHEToRows(){
+  return Object.entries(CONSIDERAR_HE).map(([k, v])=>{
+    const sep = k.indexOf('|');
+    return { empleadoId: k.slice(0, sep), fecha: k.slice(sep + 1), considerar: v ? 1 : 0 };
+  });
+}
+function loadConsiderarHEFromRows(rows){
+  CONSIDERAR_HE = {};
+  (rows || []).forEach(r=>{
+    if(!r.empleadoId || !r.fecha) return;
+    const considerar = !(r.considerar === 0 || r.considerar === '0' || r.considerar === false || String(r.considerar).toLowerCase() === 'false');
+    const k = heKey(String(r.empleadoId), String(r.fecha));
+    if(!considerar) CONSIDERAR_HE[k] = false;
+  });
   saveConsiderarHE(CONSIDERAR_HE);
+  calcPendingHE = {};
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
@@ -575,6 +597,7 @@ window.empDel = function(id){
   S.pago=S.pago.filter(p=>p.empleadoId!==id);
   S.libre=S.libre.filter(l=>l.empleadoId!==id);
   Object.keys(CONSIDERAR_HE).forEach(k=>{ if(k.startsWith(id+'|')) delete CONSIDERAR_HE[k]; });
+  Object.keys(calcPendingHE).forEach(k=>{ if(k.startsWith(id+'|')) delete calcPendingHE[k]; });
   saveConsiderarHE(CONSIDERAR_HE);
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);
   toast('Empleado eliminado','warn'); RENDERERS.empleados();
@@ -1047,19 +1070,48 @@ RENDERERS.calculo = function(){
   const el=document.getElementById('page-calculo');
   if(calcEmpSel && !S.emp.find(e=>e.id===calcEmpSel)) calcEmpSel='';
   el.innerHTML=`
-    <div class="page-head"><div><h1>🧮 Cálculo quincenal</h1><p>Selecciona el periodo y el empleado para generar el reporte detallado.</p></div></div>
+    <div class="page-head"><div><h1>🧮 Cálculo quincenal</h1><p>Selecciona el periodo y el empleado. Marca o desmarca horas extra y pulsa <b>Guardar horas extra</b> para conservar los cambios (también se exportan en Excel).</p></div></div>
     <div class="card">
       <div class="toolbar">
         ${periodSelector('c')}
         <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados</option>${S.emp.map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
         <button class="btn btn-primary" id="cGen">Generar reporte</button>
+        <button class="btn btn-green" id="cSaveHE" ${hasPendingConsiderarHE() ? '' : 'disabled'}>💾 Guardar horas extra</button>
       </div>
     </div>
     <div id="calcOut"></div>`;
   document.getElementById('cGen').onclick=()=>{ readPeriod('c'); calcEmpSel=document.getElementById('cEmp').value; renderCalculo(); };
   document.getElementById('cEmp').onchange=(e)=>{ readPeriod('c'); calcEmpSel=e.target.value; renderCalculo(); };
+  document.getElementById('cSaveHE').onclick=calcGuardarConsiderarHE;
   renderCalculo();
 };
+function calcGuardarConsiderarHE(){
+  if(!hasPendingConsiderarHE()){ toast('No hay cambios pendientes','info'); return; }
+  Object.entries(calcPendingHE).forEach(([k, v])=>{
+    if(v) delete CONSIDERAR_HE[k];
+    else CONSIDERAR_HE[k] = false;
+  });
+  calcPendingHE = {};
+  saveConsiderarHE(CONSIDERAR_HE);
+  toast('Preferencias de horas extra guardadas','success');
+  renderCalculo();
+}
+function updateCalcSaveHEUI(){
+  const btn = document.getElementById('cSaveHE');
+  const card = btn ? btn.closest('.card') : null;
+  if(!btn || !card) return;
+  btn.disabled = !hasPendingConsiderarHE();
+  let hint = card.querySelector('.calc-he-hint');
+  if(hasPendingConsiderarHE()){
+    if(!hint){
+      hint = document.createElement('p');
+      hint.className = 'hint calc-he-hint';
+      hint.style.margin = '0';
+      card.appendChild(hint);
+    }
+    hint.textContent = 'Hay cambios sin guardar en las casillas de horas extra.';
+  } else if(hint) hint.remove();
+}
 function renderCalculo(){
   const out=document.getElementById('calcOut');
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
@@ -1083,6 +1135,8 @@ function renderCalculo(){
       else if(d.esFalta) estado='<span class="badge b-miss">⛔ Falta</span>';
       else if(d.faltaMarc) estado='<span class="badge b-miss">⚠ Falta marcación</span>';
       else if(d.hTard>0||d.hSal>0) estado='<span class="badge b-late">Tardanza/Salida</span>';
+      const heChecked = getConsiderarHoraExtra(emp.id, d.fecha);
+      const hePending = Object.prototype.hasOwnProperty.call(calcPendingHE, heKey(emp.id, d.fecha));
       return `<tr class="${cls}">
         <td>${fmtFecha(d.fecha)}<br><small style="color:var(--c-muted)">${DIAS[diaSemana(d.fecha)]}</small></td>
         <td>${d.entradaReal||'<span class="badge b-miss">—</span>'}</td>
@@ -1092,8 +1146,8 @@ function renderCalculo(){
         <td class="num">${d.horasExtra?('+'+d.horasExtra):'0'}</td>
         <td style="text-align:center;white-space:normal">
           <label title="Incluir pago por horas extra en la quincena">
-            <input type="checkbox" ${d.considerarHoraExtra?'checked':''} onchange="calcSetConsiderarHE('${emp.id}','${d.fecha}', this.checked)">
-            Considerar hora extra
+            <input type="checkbox" ${heChecked?'checked':''} onchange="calcSetConsiderarHE('${emp.id}','${d.fecha}', this.checked)">
+            Considerar hora extra${hePending ? ' <span class="badge b-late">sin guardar</span>' : ''}
           </label>
         </td>
         <td class="num">${d.descAuto>0?money(d.descAuto):'—'}<br><small style="color:var(--c-muted)">${d.esFalta?('Falta '+d.horasProg+'h'):(d.horasDescAuto>0?(d.horasDescAuto+'h'+(d.horasFaltaMarc>0?' (incl. falta marc.)':'')):'')}</small></td>
@@ -1128,9 +1182,13 @@ function renderCalculo(){
     </div>`;
   });
   out.innerHTML=html;
+  updateCalcSaveHEUI();
 }
 window.calcSetConsiderarHE = function(empId, fecha, checked){
-  setConsiderarHoraExtra(empId, fecha, checked);
+  const k = heKey(empId, fecha);
+  const saved = CONSIDERAR_HE[k] !== false;
+  if(checked === saved) delete calcPendingHE[k];
+  else calcPendingHE[k] = checked;
   renderCalculo();
 };
 
@@ -1308,7 +1366,7 @@ function renderBoleta(){
 
 /* ================================================================
    MÓDULO 11: ADMINISTRACIÓN GENERAL (exportar / importar Excel)
-   Exporta Empleados, Horarios, Descuentos, Pagos extra y Días libres
+   Exporta Empleados, Horarios, Descuentos, Pagos extra, Días libres y ConsiderarHoraExtra
    en un Excel multi-hoja que la propia app puede reimportar.
    ================================================================ */
 RENDERERS.admin = function(){
@@ -1317,12 +1375,12 @@ RENDERERS.admin = function(){
     <div class="page-head"><div><h1>⚙️ Administración general</h1><p>Exporta toda la configuración a Excel o cárgala para precargar la aplicación.</p></div></div>
     <div class="card">
       <h2>Descargar información</h2>
-      <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados, Horarios, Descuentos, PagosExtra y DiasLibres. El mismo archivo sirve como input para volver a cargarlo.</p>
+      <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados, Horarios, Descuentos, PagosExtra, DiasLibres y ConsiderarHoraExtra. El mismo archivo sirve como input para volver a cargarlo.</p>
       <div class="actions"><button class="btn btn-green" id="admExport">⬇ Descargar Excel</button></div>
     </div>
     <div class="card danger-zone">
       <h2>Cargar información</h2>
-      <p class="hint" style="margin-top:0">Reemplaza Empleados, Horarios, Descuentos, Pagos extra y Días libres/Vacaciones con el contenido del Excel. Las marcaciones no se modifican.</p>
+      <p class="hint" style="margin-top:0">Reemplaza Empleados, Horarios, Descuentos, Pagos extra, Días libres/Vacaciones y ConsiderarHoraExtra con el contenido del Excel. Las marcaciones no se modifican.</p>
       <div class="toolbar">
         <div class="field"><label>Archivo Excel (.xlsx)</label><input type="file" id="admFile" accept=".xlsx,.xls"></div>
         <button class="btn btn-primary" id="admImport">⬆ Cargar Excel</button>
@@ -1341,27 +1399,28 @@ function adminExport(){
     Horarios:  S.hor.map(h=>({empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||''})),
     Descuentos:S.desc.map(d=>({id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||''})),
     PagosExtra:S.pago.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||''})),
-    DiasLibres:S.libre.map(l=>({id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||''}))
+    DiasLibres:S.libre.map(l=>({id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||''})),
+    ConsiderarHoraExtra: considerarHEToRows()
   };
   Object.entries(sheets).forEach(([name,data])=>{
     const ws=XLSX.utils.json_to_sheet(data.length?data:[{}]);
     XLSX.utils.book_append_sheet(wb, ws, name);
   });
-  XLSX.writeFile(wb, `planilla_datos_${new Date().toISOString().slice(0,10)}.xlsx`);
+  XLSX.writeFile(wb, `planilla_datos_${excelTimestamp()}.xlsx`);
   toast('Excel de datos descargado','success');
 }
 
 function adminImport(){
   const f=document.getElementById('admFile').files[0];
   if(!f){ toast('Selecciona un archivo .xlsx','error'); return; }
-  if(!confirm('Esto reemplazará Empleados, Horarios, Descuentos, Pagos extra y Días libres/Vacaciones con el contenido del Excel. ¿Continuar?')) return;
+  if(!confirm('Esto reemplazará Empleados, Horarios, Descuentos, Pagos extra, Días libres/Vacaciones y ConsiderarHoraExtra con el contenido del Excel. ¿Continuar?')) return;
   const reader=new FileReader();
   reader.onload=(e)=>{
     try{
       const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
       const sheet=(name)=>{ const ws=wb.Sheets[name]; return ws? XLSX.utils.sheet_to_json(ws,{defval:null}) : null; };
 
-      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres');
+      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres'), considerarHE=sheet('ConsiderarHoraExtra');
       if(!emp){ toast('El Excel no tiene la hoja "Empleados"','error'); return; }
 
       S.emp = emp.map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
@@ -1372,10 +1431,12 @@ function adminImport(){
       S.desc = (desc||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (pago||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.libre = (libre||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
+      const heCount = (considerarHE||[]).filter(r=>r.empleadoId && r.fecha).length;
+      loadConsiderarHEFromRows(considerarHE);
 
       save(K.emp,S.emp); save(K.hor,S.hor); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre);
       document.getElementById('admMsg').innerHTML=`<div class="card" style="background:#f0fdf4;border-color:#bbf7d0;margin-top:12px">
-        <b>✔ Carga completa.</b> Empleados: ${S.emp.length}, Horarios: ${S.hor.length}, Descuentos: ${S.desc.length}, Pagos extra: ${S.pago.length}, Días libres: ${S.libre.length}.</div>`;
+        <b>✔ Carga completa.</b> Empleados: ${S.emp.length}, Horarios: ${S.hor.length}, Descuentos: ${S.desc.length}, Pagos extra: ${S.pago.length}, Días libres: ${S.libre.length}, Considerar hora extra: ${heCount}.</div>`;
       toast('Datos cargados desde Excel','success');
     }catch(err){
       console.error(err); toast('Error al leer el Excel: '+err.message,'error');
@@ -1416,6 +1477,7 @@ function seedData(){
   S.libre.push({id:uid(),empleadoId:e2,fecha:`${y}-${m}-06`,tipo:'Vacaciones',comentario:'Vacaciones programadas'});
 
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);
+  CONSIDERAR_HE={}; calcPendingHE={}; saveConsiderarHE(CONSIDERAR_HE);
   localStorage.setItem(K.seed,'1');
 }
 
@@ -1429,6 +1491,7 @@ document.getElementById('btnWipe').onclick=()=>{
   if(confirm('Esto borrará TODOS los datos. ¿Continuar?')){
     Object.values(K).forEach(k=>localStorage.removeItem(k));
     CONSIDERAR_HE={};
+    calcPendingHE={};
     reloadState(); toast('Todos los datos fueron borrados','warn'); goto(currentPage);
   }
 };
