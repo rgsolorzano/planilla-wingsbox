@@ -1352,11 +1352,11 @@ function adminImport(){
    DATOS DE EJEMPLO  (los 10 empleados del Excel adjunto)
    ================================================================ */
 function seedData(){
-  const nombres=['Alex Carrillo','Maria Hurtado','Elena Jaimes','Piero Cueva','Alex Marconi','Luis Barreto','Noboru Tabako','César Silva','Diego Lozada','Wendy Castro'];
+  const nombres=['Alex','Maria','Elena','Pier','Marco','Luis','Naruto','Cesar','Diego','Wen'];
   S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[];
   nombres.forEach((n,i)=>{
     const id=uid();
-    const sueldoQ = 700 + (i%4)*50;          // sueldo quincenal de ejemplo
+    const sueldoQ = 2000 + (i%4)*50;          // sueldo quincenal de ejemplo
     const sueldoH = +(sueldoQ/120).toFixed(2); // ~120 h por quincena
     const sueldoP = +(sueldoQ*0.6).toFixed(2); // sueldo planilla (parte formal) de ejemplo
     S.emp.push({id, nombre:n, documento:'EMP'+String(i+1).padStart(3,'0'), sueldoQuincenal:sueldoQ, sueldoPlanilla:sueldoP, sueldoHora:sueldoH});
