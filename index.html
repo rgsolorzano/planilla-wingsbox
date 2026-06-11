@@ -201,7 +201,8 @@
 /* ---------- Claves de almacenamiento ---------- */
 const K = {
   emp:'pl_empleados', hor:'pl_horarios', mar:'pl_marcaciones',
-  desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres', seed:'pl_seedDone'
+  desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres',
+  considerarHE:'pl_considerarHE', seed:'pl_seedDone'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -212,6 +213,21 @@ const TIPOS_LIBRE = ['Día libre','Vacaciones'];
 const load = (k)=>{ try{ return JSON.parse(localStorage.getItem(k)) || []; }catch(e){ return []; } };
 const save = (k,v)=> localStorage.setItem(k, JSON.stringify(v));
 const uid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+
+/* Preferencia por día: ¿incluir pago por horas extra en la quincena? (default: sí) */
+function loadConsiderarHE(){
+  try{ return JSON.parse(localStorage.getItem(K.considerarHE)) || {}; }catch(e){ return {}; }
+}
+function saveConsiderarHE(map){ localStorage.setItem(K.considerarHE, JSON.stringify(map)); }
+let CONSIDERAR_HE = loadConsiderarHE();
+function heKey(empId, fecha){ return empId+'|'+fecha; }
+function getConsiderarHoraExtra(empId, fecha){
+  return CONSIDERAR_HE[heKey(empId, fecha)] !== false;
+}
+function setConsiderarHoraExtra(empId, fecha, valor){
+  CONSIDERAR_HE[heKey(empId, fecha)] = !!valor;
+  saveConsiderarHE(CONSIDERAR_HE);
+}
 
 /* Estado en memoria (se sincroniza con localStorage) */
 let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[] };
@@ -429,7 +445,15 @@ function calcDia(emp, fecha){
 
 /* Resumen quincenal de un empleado (suma de días + sueldo base) */
 function calcQuincenaEmpleado(emp, year, month, q){
-  const dias = rangoQuincena(year, month, q).map(f=>calcDia(emp, f));
+  const dias = rangoQuincena(year, month, q).map(f=>{
+    const d = calcDia(emp, f);
+    d.considerarHoraExtra = getConsiderarHoraExtra(emp.id, f);
+    if(!d.considerarHoraExtra && d.pagoExtraHoras > 0){
+      d.totalDia -= d.pagoExtraHoras;
+      d.pagoExtraHoras = 0;
+    }
+    return d;
+  });
 
   // Descuento por FALTA DE MARCACIÓN (una sola marcación faltante, no ausencia total):
   // solo aplica si ocurre MÁS DE UNA VEZ en la quincena y se contabiliza desde la
@@ -550,6 +574,8 @@ window.empDel = function(id){
   S.desc=S.desc.filter(d=>d.empleadoId!==id);
   S.pago=S.pago.filter(p=>p.empleadoId!==id);
   S.libre=S.libre.filter(l=>l.empleadoId!==id);
+  Object.keys(CONSIDERAR_HE).forEach(k=>{ if(k.startsWith(id+'|')) delete CONSIDERAR_HE[k]; });
+  saveConsiderarHE(CONSIDERAR_HE);
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);
   toast('Empleado eliminado','warn'); RENDERERS.empleados();
 };
@@ -1064,6 +1090,12 @@ function renderCalculo(){
         <td class="num">${d.horasEf}</td>
         <td class="num">${d.horasProg}</td>
         <td class="num">${d.horasExtra?('+'+d.horasExtra):'0'}</td>
+        <td style="text-align:center;white-space:normal">
+          <label title="Incluir pago por horas extra en la quincena">
+            <input type="checkbox" ${d.considerarHoraExtra?'checked':''} onchange="calcSetConsiderarHE('${emp.id}','${d.fecha}', this.checked)">
+            Considerar hora extra
+          </label>
+        </td>
         <td class="num">${d.descAuto>0?money(d.descAuto):'—'}<br><small style="color:var(--c-muted)">${d.esFalta?('Falta '+d.horasProg+'h'):(d.horasDescAuto>0?(d.horasDescAuto+'h'+(d.horasFaltaMarc>0?' (incl. falta marc.)':'')):'')}</small></td>
         <td class="num">${d.descManual>0?money(d.descManual):'—'}</td>
         <td class="num">${(d.pagoManual+d.pagoExtraHoras)>0?money(d.pagoManual+d.pagoExtraHoras):'—'}</td>
@@ -1079,7 +1111,7 @@ function renderCalculo(){
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Fecha</th><th>Ent. real</th><th>Sal. real</th><th class="num">H. efectivas</th>
-          <th class="num">H. programadas</th><th class="num">H. extra</th><th class="num">Desc. auto</th>
+          <th class="num">H. programadas</th><th class="num">H. extra</th><th>Considerar hora extra</th><th class="num">Desc. auto</th>
           <th class="num">Desc. manual</th><th class="num">Pagos extra</th><th>Detalle descuento</th>
           <th>Detalle pago</th><th class="num">Total día</th><th>Estado</th>
         </tr></thead>
@@ -1097,6 +1129,10 @@ function renderCalculo(){
   });
   out.innerHTML=html;
 }
+window.calcSetConsiderarHE = function(empId, fecha, checked){
+  setConsiderarHoraExtra(empId, fecha, checked);
+  renderCalculo();
+};
 
 /* ================================================================
    MÓDULO 9: CONSOLIDADO GENERAL  (+ exportación CSV)
@@ -1222,7 +1258,7 @@ function renderBoleta(){
   const pagosRows=[];
   pagosRows.push(['Sueldo quincenal base', r.base]);
   // Detalle de horas extra POR DÍA (cuando hay pago por horas extra)
-  r.dias.forEach(d=>{ if(d.horasExtra>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
+  r.dias.forEach(d=>{ if(d.pagoExtraHoras>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
   r.dias.forEach(d=> d.pagoExtraList.forEach(p=> pagosRows.push([`${fmtFecha(d.fecha)} · ${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, Number(p.monto)||0])));
   const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual;
 
@@ -1392,6 +1428,7 @@ document.getElementById('btnSeed').onclick=()=>{
 document.getElementById('btnWipe').onclick=()=>{
   if(confirm('Esto borrará TODOS los datos. ¿Continuar?')){
     Object.values(K).forEach(k=>localStorage.removeItem(k));
+    CONSIDERAR_HE={};
     reloadState(); toast('Todos los datos fueron borrados','warn'); goto(currentPage);
   }
 };
