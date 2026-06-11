@@ -6,6 +6,10 @@
 <title>Sistema de Planilla Quincenal</title>
 <!-- SheetJS para leer archivos .xlsx -->
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<!-- Google Identity Services (OAuth2 PKCE) -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<!-- Google API client -->
+<script src="https://apis.google.com/js/api.js" async defer></script>
 <style>
   /* Paleta WingsBox: índigo/morado profundo + acento coral, texto blanco */
   :root{
@@ -128,6 +132,22 @@
 
   .hint{font-size:12px;color:var(--c-muted);margin-top:8px}
   .danger-zone{border:1px dashed #fca5a5;background:#fef2f2}
+
+  /* ---------- Google Drive sync bar ---------- */
+  .gd-bar{padding:10px 14px;background:var(--panel-2);border-radius:10px;display:flex;flex-direction:column;gap:6px;font-size:12px}
+  .gd-bar .gd-title{font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px;font-size:13px}
+  .gd-bar .gd-status{color:var(--muted);font-size:11px;line-height:1.4}
+  .gd-bar .gd-status.ok{color:#86efac}
+  .gd-bar .gd-status.err{color:#fca5a5}
+  .gd-bar .gd-btns{display:flex;gap:6px;flex-wrap:wrap}
+  .btn-drive{background:#4285f4;color:#fff;border:0;border-radius:7px;padding:6px 10px;font-size:11px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:.15s}
+  .btn-drive:hover{background:#2b6fd4}
+  .btn-drive:disabled{background:#4a4270;color:var(--muted);cursor:not-allowed}
+  .btn-drive.red{background:#ef4444}
+  .btn-drive.red:hover{background:#dc2626}
+  .btn-drive.green{background:#22c55e}
+  .btn-drive.green:hover{background:#16a34a}
+  .sidebar.collapsed .gd-bar{display:none}
   .sidebar-toggle{display:none}
 
   /* ---------- Responsive ---------- */
@@ -171,6 +191,16 @@
       <button data-page="admin"><span class="ico">⚙️</span> Administración</button>
     </nav>
     <div class="foot">
+      <div class="gd-bar" id="gdBar">
+        <div class="gd-title">☁️ Google Drive</div>
+        <div class="gd-status" id="gdStatus">No conectado</div>
+        <div class="gd-btns">
+          <button class="btn-drive" id="gdConnect">🔑 Conectar</button>
+          <button class="btn-drive green" id="gdSave" disabled>⬆ Guardar</button>
+          <button class="btn-drive" id="gdLoad" disabled>⬇ Cargar</button>
+          <button class="btn-drive red" id="gdDisconnect" style="display:none">Desconectar</button>
+        </div>
+      </div>
       <button class="btn btn-ghost btn-sm" id="btnSeed">Recargar datos de ejemplo</button>
       <button class="btn btn-red btn-sm" id="btnWipe">Borrar todos los datos</button>
     </div>
@@ -1371,15 +1401,32 @@ function renderBoleta(){
    ================================================================ */
 RENDERERS.admin = function(){
   const el=document.getElementById('page-admin');
+  const hasFileId = !!localStorage.getItem(GD_FILE_KEY);
+  const sheetUrl  = hasFileId ? `https://docs.google.com/spreadsheets/d/${localStorage.getItem(GD_FILE_KEY)}/edit` : null;
   el.innerHTML=`
     <div class="page-head"><div><h1>⚙️ Administración general</h1><p>Exporta toda la configuración a Excel o cárgala para precargar la aplicación.</p></div></div>
+
+    <div class="card" style="border-color:#4285f4;background:#eff6ff">
+      <h2>☁️ Google Drive / Sheets (sincronización en la nube)</h2>
+      <p class="hint" style="margin-top:0;margin-bottom:10px">Guarda y carga todos los datos directamente en un Google Spreadsheet sin necesidad de archivos Excel. Usa los botones del menú lateral o los de aquí.</p>
+      <div class="actions">
+        <button class="btn" style="background:#4285f4;color:#fff" onclick="gdConnect()" id="admGdConnect">🔑 Conectar Google</button>
+        <button class="btn btn-green" onclick="gdSave()">⬆ Guardar en Drive</button>
+        <button class="btn btn-ghost" onclick="gdLoad()">⬇ Cargar desde Drive</button>
+        ${sheetUrl ? `<a href="${sheetUrl}" target="_blank" class="btn btn-ghost">📄 Ver Google Sheet</a>` : ''}
+      </div>
+      <p class="hint" style="margin-top:10px"><b>Primer uso:</b> haz clic en "Conectar Google", autoriza los permisos, luego "Guardar en Drive". Se creará automáticamente un archivo llamado <em>Planilla Quincenal – Datos</em> en tu Drive.</p>
+      <p class="hint"><b>Usos siguientes:</b> al abrir la app, conecta y usa "Cargar desde Drive" para recuperar tus datos. La sesión se guarda ~1 hora.</p>
+      <p class="hint"><b>Requisito:</b> debes configurar tu <code>GD_CLIENT_ID</code> en el código y servir el HTML desde HTTPS (GitHub Pages, Netlify, etc.).</p>
+    </div>
+
     <div class="card">
-      <h2>Descargar información</h2>
+      <h2>Descargar información (Excel local)</h2>
       <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados, Horarios, Descuentos, PagosExtra, DiasLibres y ConsiderarHoraExtra. El mismo archivo sirve como input para volver a cargarlo.</p>
       <div class="actions"><button class="btn btn-green" id="admExport">⬇ Descargar Excel</button></div>
     </div>
     <div class="card danger-zone">
-      <h2>Cargar información</h2>
+      <h2>Cargar información (Excel local)</h2>
       <p class="hint" style="margin-top:0">Reemplaza Empleados, Horarios, Descuentos, Pagos extra, Días libres/Vacaciones y ConsiderarHoraExtra con el contenido del Excel. Las marcaciones no se modifican.</p>
       <div class="toolbar">
         <div class="field"><label>Archivo Excel (.xlsx)</label><input type="file" id="admFile" accept=".xlsx,.xls"></div>
@@ -1443,6 +1490,309 @@ function adminImport(){
     }
   };
   reader.readAsArrayBuffer(f);
+}
+
+/* ================================================================
+   INTEGRACIÓN GOOGLE DRIVE / SHEETS
+   ----------------------------------------------------------------
+   Configuración:
+     1. Crea un proyecto en https://console.cloud.google.com
+     2. Habilita "Google Sheets API" y "Google Drive API"
+     3. Crea credenciales → OAuth 2.0 → Aplicación web
+        · Origen autorizado: tu dominio (ej. https://tuusuario.github.io)
+        · URI de redirección: mismo dominio
+     4. Pega tu Client ID en GD_CLIENT_ID (abajo).
+     5. En "Pantalla de consentimiento OAuth" agrega tu correo como
+        usuario de prueba si la app sigue en modo "Testing".
+   ================================================================ */
+const GD_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.googleusercontent.com'; // ← reemplaza esto
+const GD_SCOPES    = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
+const GD_FILE_KEY  = 'pl_gdrive_file_id';   // key localStorage donde se guarda el ID del sheet
+const GD_TOKEN_KEY = 'pl_gdrive_token';
+
+let gdToken = null;      // access_token activo
+let gdFileId = localStorage.getItem(GD_FILE_KEY) || null;
+let gdReady  = false;    // true cuando gapi.client está cargado
+
+/* --- Helpers de UI del bar de Drive --- */
+function gdSetStatus(msg, type=''){
+  const el = document.getElementById('gdStatus');
+  if(!el) return;
+  el.textContent = msg;
+  el.className = 'gd-status' + (type ? ' '+type : '');
+}
+function gdUpdateButtons(){
+  const connected = !!gdToken;
+  const btnC = document.getElementById('gdConnect');
+  const btnS = document.getElementById('gdSave');
+  const btnL = document.getElementById('gdLoad');
+  const btnD = document.getElementById('gdDisconnect');
+  if(!btnC) return;
+  btnC.style.display   = connected ? 'none' : '';
+  btnD.style.display   = connected ? '' : 'none';
+  btnS.disabled = !connected;
+  btnL.disabled = !connected;
+}
+
+/* --- Carga de gapi.client (una sola vez) --- */
+function gdLoadGapi(){
+  return new Promise((resolve)=>{
+    if(typeof gapi === 'undefined'){ setTimeout(()=>gdLoadGapi().then(resolve), 400); return; }
+    if(gdReady){ resolve(); return; }
+    gapi.load('client', async ()=>{
+      await gapi.client.init({});
+      await gapi.client.load('https://sheets.googleapis.com/$discovery/rest?version=v4');
+      gdReady = true;
+      resolve();
+    });
+  });
+}
+
+/* --- OAuth con token popup (Google Identity Services) --- */
+let gdTokenClient = null;
+function gdGetTokenClient(){
+  if(gdTokenClient) return gdTokenClient;
+  if(typeof google === 'undefined') return null;
+  gdTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GD_CLIENT_ID,
+    scope: GD_SCOPES,
+    callback: (resp)=>{
+      if(resp.error){ gdSetStatus('Error: '+resp.error,'err'); return; }
+      gdToken = resp.access_token;
+      // Guardar token con expiración (1 hora)
+      const exp = Date.now() + (resp.expires_in||3600)*1000 - 60000;
+      localStorage.setItem(GD_TOKEN_KEY, JSON.stringify({token:gdToken, exp}));
+      gapi.client.setToken({access_token:gdToken});
+      gdSetStatus('Conectado ✓','ok');
+      gdUpdateButtons();
+      toast('Google Drive conectado','success');
+    },
+  });
+  return gdTokenClient;
+}
+
+/* Intenta recuperar token guardado al iniciar */
+function gdTryRestoreToken(){
+  try{
+    const raw = localStorage.getItem(GD_TOKEN_KEY);
+    if(!raw) return;
+    const {token, exp} = JSON.parse(raw);
+    if(Date.now() < exp && token){
+      gdToken = token;
+      gdLoadGapi().then(()=>{
+        gapi.client.setToken({access_token:gdToken});
+        gdSetStatus('Conectado ✓','ok');
+        gdUpdateButtons();
+      });
+    }else{
+      localStorage.removeItem(GD_TOKEN_KEY);
+    }
+  }catch(e){}
+}
+
+/* --- Conectar / Desconectar --- */
+async function gdConnect(){
+  gdSetStatus('Iniciando autenticación…');
+  await gdLoadGapi();
+  const tc = gdGetTokenClient();
+  if(!tc){ gdSetStatus('Error: librería Google no cargada. Revisa que el CLIENT_ID esté configurado.','err'); return; }
+  if(GD_CLIENT_ID === 'TU_CLIENT_ID_AQUI.apps.googleusercontent.com'){
+    toast('⚠ Configura tu GD_CLIENT_ID en el código primero','error'); return;
+  }
+  tc.requestAccessToken({prompt:'consent'});
+}
+function gdDisconnect(){
+  if(gdToken) google.accounts.oauth2.revoke(gdToken, ()=>{});
+  gdToken = null;
+  localStorage.removeItem(GD_TOKEN_KEY);
+  gapi.client.setToken(null);
+  gdSetStatus('Desconectado');
+  gdUpdateButtons();
+  toast('Sesión de Google cerrada','warn');
+}
+
+/* --- Crear o abrir el Spreadsheet de datos --- */
+async function gdEnsureFile(){
+  if(gdFileId){
+    // Verificar que aún existe
+    try{
+      const check = await fetch(`https://www.googleapis.com/drive/v3/files/${gdFileId}?fields=id,name,trashed`,
+        {headers:{Authorization:'Bearer '+gdToken}});
+      const data = await check.json();
+      if(data.id && !data.trashed) return gdFileId;
+    }catch(e){}
+    // No existe, crear uno nuevo
+    gdFileId = null;
+    localStorage.removeItem(GD_FILE_KEY);
+  }
+  // Crear nuevo spreadsheet con 6 hojas
+  const body = {
+    properties:{ title:'Planilla Quincenal – Datos' },
+    sheets:[
+      {properties:{title:'Empleados'}},
+      {properties:{title:'Horarios'}},
+      {properties:{title:'Descuentos'}},
+      {properties:{title:'PagosExtra'}},
+      {properties:{title:'DiasLibres'}},
+      {properties:{title:'ConsiderarHoraExtra'}},
+      {properties:{title:'Marcaciones'}}
+    ]
+  };
+  const resp = await gapi.client.sheets.spreadsheets.create({resource:body});
+  gdFileId = resp.result.spreadsheetId;
+  localStorage.setItem(GD_FILE_KEY, gdFileId);
+  return gdFileId;
+}
+
+/* --- Convertir array de objetos a filas 2D --- */
+function toRows(arr, cols){
+  if(!arr.length) return [cols];
+  return [cols, ...arr.map(obj=>cols.map(c=>{ const v=obj[c]; return v==null?'':v; }))];
+}
+
+/* --- Guardar todos los datos en el Sheet --- */
+async function gdSave(){
+  if(!gdToken){ toast('Conecta Drive primero','error'); return; }
+  gdSetStatus('Guardando…');
+  document.getElementById('gdSave').disabled = true;
+  try{
+    await gdLoadGapi();
+    const fid = await gdEnsureFile();
+
+    const heRows = toRows(considerarHEToRows(), ['empleadoId','fecha','considerar']);
+    const marCols = ['id','empleadoId','fecha','entradaReal','salidaReal'];
+
+    const dataMap = {
+      'Empleados':             toRows(S.emp,  ['id','nombre','documento','sueldoQuincenal','sueldoPlanilla','sueldoHora']),
+      'Horarios':              toRows(S.hor,  ['empleadoId','dia','libre','entrada','salida']),
+      'Descuentos':            toRows(S.desc, ['id','empleadoId','fecha','tipo','monto','detalle']),
+      'PagosExtra':            toRows(S.pago, ['id','empleadoId','fecha','tipo','monto','detalle']),
+      'DiasLibres':            toRows(S.libre,['id','empleadoId','fecha','tipo','comentario']),
+      'ConsiderarHoraExtra':   heRows,
+      'Marcaciones':           toRows(S.mar,  marCols)
+    };
+
+    // Limpiar y escribir cada hoja
+    const clearRanges = Object.keys(dataMap).map(s=>s+'!A:Z');
+    await gapi.client.sheets.spreadsheets.values.batchClear({spreadsheetId:fid, resource:{ranges:clearRanges}});
+
+    const valueRanges = Object.entries(dataMap).map(([sheet, rows])=>({
+      range: sheet+'!A1', majorDimension:'ROWS', values: rows.map(r=>r.map(String))
+    }));
+    await gapi.client.sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId:fid,
+      resource:{ valueInputOption:'RAW', data: valueRanges }
+    });
+
+    const now = new Date().toLocaleTimeString('es-PE');
+    gdSetStatus(`Guardado ✓ a las ${now}`,'ok');
+    toast('Datos guardados en Google Sheets','success');
+
+    // Link al sheet
+    localStorage.setItem('pl_gd_last_save', now);
+    const linkId = 'gdSheetLink';
+    let link = document.getElementById(linkId);
+    if(!link){
+      link = document.createElement('a');
+      link.id = linkId;
+      link.target = '_blank';
+      link.style.cssText = 'font-size:11px;color:#93c5fd;display:block;margin-top:4px;word-break:break-all';
+      document.getElementById('gdBar').appendChild(link);
+    }
+    link.href = `https://docs.google.com/spreadsheets/d/${fid}/edit`;
+    link.textContent = '📄 Abrir Google Sheet';
+
+  }catch(err){
+    console.error('gdSave error:', err);
+    gdSetStatus('Error al guardar: '+(err.message||err),'err');
+    toast('Error al guardar en Drive: '+(err.result?.error?.message||err.message||'desconocido'),'error');
+    // Si fue error de auth, limpiar token
+    if(err.status===401){ gdToken=null; localStorage.removeItem(GD_TOKEN_KEY); gdUpdateButtons(); }
+  }finally{
+    document.getElementById('gdSave').disabled = false;
+  }
+}
+
+/* --- Cargar todos los datos desde el Sheet --- */
+async function gdLoad(){
+  if(!gdToken){ toast('Conecta Drive primero','error'); return; }
+  if(!gdFileId){ toast('Aún no hay datos guardados en Drive. Guarda primero.','error'); return; }
+  if(!confirm('Esto reemplazará TODOS los datos locales con los del Google Sheet. ¿Continuar?')) return;
+  gdSetStatus('Cargando…');
+  document.getElementById('gdLoad').disabled = true;
+  try{
+    await gdLoadGapi();
+    const sheets = ['Empleados','Horarios','Descuentos','PagosExtra','DiasLibres','ConsiderarHoraExtra','Marcaciones'];
+    const resp = await gapi.client.sheets.spreadsheets.values.batchGet({
+      spreadsheetId: gdFileId,
+      ranges: sheets.map(s=>s+'!A:Z'),
+      majorDimension:'ROWS'
+    });
+
+    function parseSheet(valueRange){
+      const rows = (valueRange && valueRange.values) ? valueRange.values : [];
+      if(rows.length < 1) return [];
+      const headers = rows[0];
+      return rows.slice(1).filter(r=>r.some(c=>c!=='')).map(r=>{
+        const obj={};
+        headers.forEach((h,i)=>{ obj[h]=r[i]??''; });
+        return obj;
+      });
+    }
+
+    const [emp, hor, desc, pago, libre, considerarHE, mar] = resp.result.valueRanges.map(parseSheet);
+
+    if(!emp.length){ toast('El Sheet está vacío o sin datos de Empleados','error'); return; }
+
+    S.emp = emp.map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
+      sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
+    S.hor = hor.map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
+      libre:(r.libre==='1'||r.libre==='true'||r.libre===true),
+      entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
+    S.desc = desc.map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+    S.pago = pago.map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+    S.libre = libre.map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
+    S.mar = mar.map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), entradaReal:r.entradaReal||null, salidaReal:r.salidaReal||null }));
+
+    loadConsiderarHEFromRows(considerarHE.map(r=>({
+      empleadoId:String(r.empleadoId), fecha:String(r.fecha),
+      considerar: !(r.considerar==='0'||r.considerar===false||r.considerar==='false')
+    })));
+
+    save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar);
+    save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre);
+
+    const now = new Date().toLocaleTimeString('es-PE');
+    gdSetStatus(`Cargado ✓ a las ${now}`,'ok');
+    toast(`Datos cargados desde Google Sheets. Empleados: ${S.emp.length}, Marcaciones: ${S.mar.length}`, 'success');
+    reloadState(); goto(currentPage);
+
+  }catch(err){
+    console.error('gdLoad error:', err);
+    gdSetStatus('Error al cargar: '+(err.message||err),'err');
+    toast('Error al cargar desde Drive: '+(err.result?.error?.message||err.message||'desconocido'),'error');
+    if(err.status===401){ gdToken=null; localStorage.removeItem(GD_TOKEN_KEY); gdUpdateButtons(); }
+  }finally{
+    document.getElementById('gdLoad').disabled = false;
+  }
+}
+
+/* --- Inicializar botones y restaurar sesión --- */
+document.getElementById('gdConnect').onclick    = gdConnect;
+document.getElementById('gdSave').onclick       = gdSave;
+document.getElementById('gdLoad').onclick       = gdLoad;
+document.getElementById('gdDisconnect').onclick = gdDisconnect;
+// Intentar recuperar token guardado al cargar la página
+setTimeout(gdTryRestoreToken, 800); // esperar a que google GIS cargue
+
+// Mostrar link si ya tenemos un file guardado
+if(gdFileId){
+  const link = document.createElement('a');
+  link.id='gdSheetLink'; link.target='_blank';
+  link.style.cssText='font-size:11px;color:#93c5fd;display:block;margin-top:4px;word-break:break-all';
+  link.href=`https://docs.google.com/spreadsheets/d/${gdFileId}/edit`;
+  link.textContent='📄 Abrir Google Sheet';
+  document.getElementById('gdBar').appendChild(link);
 }
 
 /* ================================================================
