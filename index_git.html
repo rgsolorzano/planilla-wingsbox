@@ -20,9 +20,21 @@
   .layout{display:flex;min-height:100vh}
 
   /* ---------- Menu lateral ---------- */
-  .sidebar{width:250px;background:var(--bg);color:var(--text);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto;flex-shrink:0}
+  .sidebar{width:250px;background:var(--bg);color:var(--text);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto;flex-shrink:0;transition:width .2s ease}
   .sidebar .brand{padding:20px 18px;font-size:18px;font-weight:700;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .sidebar .brand .logo{font-size:22px;line-height:1}
+  .sidebar .brand .brand-text{display:flex;flex-direction:column}
   .sidebar .brand small{display:block;font-size:11px;font-weight:400;color:var(--muted)}
+  .collapse-btn{margin-left:auto;background:var(--panel);color:#fff;border:0;border-radius:8px;padding:4px 10px;cursor:pointer;font-size:14px;line-height:1}
+  .collapse-btn:hover{background:var(--panel-2)}
+  /* ---- Estado colapsado (solo iconos) ---- */
+  .sidebar.collapsed{width:66px}
+  .sidebar.collapsed .brand{justify-content:center;padding:18px 0}
+  .sidebar.collapsed .brand-text{display:none}
+  .sidebar.collapsed .collapse-btn{margin-left:6px;padding:4px 8px}
+  .sidebar.collapsed .nav button{justify-content:center;font-size:0;padding:14px 0;border-left-width:3px}
+  .sidebar.collapsed .nav button .ico{font-size:19px}
+  .sidebar.collapsed .foot{display:none}
   .nav{padding:10px 0;flex:1}
   .nav button{width:100%;text-align:left;background:none;border:0;color:var(--text);padding:12px 18px;cursor:pointer;font-size:14px;display:flex;align-items:center;gap:10px;border-left:3px solid transparent;transition:.15s}
   .nav button:hover{background:var(--panel)}
@@ -127,6 +139,10 @@
     .nav button{border-left:0;border-bottom:1px solid var(--line)}
     .sidebar .foot{flex-direction:row}
     .sidebar-toggle{display:inline-flex;position:absolute;right:14px;top:16px;background:var(--panel);color:#fff;border:0;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .collapse-btn{display:none}
+    .sidebar.collapsed{width:100%}
+    .sidebar.collapsed .brand-text{display:flex}
+    .sidebar.collapsed .nav button{justify-content:flex-start;font-size:14px;padding:12px 18px}
     .main{padding:16px}
   }
 </style>
@@ -137,9 +153,10 @@
   <!-- ===================== MENU LATERAL ===================== -->
   <aside class="sidebar">
     <div class="brand">
-      <span>💼 Planilla</span>
+      <span class="logo">💼</span>
+      <span class="brand-text">Planilla<small>Cálculo quincenal de personal</small></span>
+      <button class="collapse-btn" id="collapseBtn" title="Colapsar menú">«</button>
       <button class="sidebar-toggle" id="navToggle">☰</button>
-      <small style="width:100%">Cálculo quincenal de personal</small>
     </div>
     <nav class="nav" id="nav">
       <button data-page="empleados" class="active"><span class="ico">👥</span> Empleados</button>
@@ -267,15 +284,40 @@ document.getElementById('nav').addEventListener('click', e=>{
 });
 document.getElementById('navToggle').addEventListener('click', ()=> document.getElementById('nav').classList.toggle('open'));
 
+/* ---------- Colapsar / expandir el panel lateral ---------- */
+const sidebarEl = document.querySelector('.sidebar');
+const collapseBtn = document.getElementById('collapseBtn');
+if(localStorage.getItem('pl_collapsed')==='1') sidebarEl.classList.add('collapsed');
+collapseBtn.textContent = sidebarEl.classList.contains('collapsed') ? '»' : '«';
+collapseBtn.addEventListener('click', ()=>{
+  const colapsado = sidebarEl.classList.toggle('collapsed');
+  collapseBtn.textContent = colapsado ? '»' : '«';
+  collapseBtn.title = colapsado ? 'Expandir menú' : 'Colapsar menú';
+  localStorage.setItem('pl_collapsed', colapsado ? '1' : '0');
+});
+
 /* ================================================================
    REGLAS DE CÁLCULO (funciones puras)
    ================================================================ */
 
-// Horas efectivas trabajadas: diferencia entrada/salida real, redondeada a
-// horas completas. Si falta una marcación => 0.
+// Horas efectivas trabajadas (en horas completas), con redondeo por reglas:
+//  - ENTRADA: si el ingreso pasa de los :30 min, esa hora NO cuenta como
+//    trabajada (se redondea la entrada hacia la hora siguiente).
+//    Ej.: ingreso 13:31 -> empieza a contar desde las 14:00.
+//  - SALIDA: si la salida es antes de los :30 min, esa hora NO cuenta
+//    (se redondea la salida hacia la hora anterior).
+//    Ej.: salida 22:27 -> cuenta hasta las 22:00.
+// Si falta la entrada o la salida => 0.
 function calcHorasEfectivas(entradaReal, salidaReal){
   if(!entradaReal || !salidaReal) return 0;
-  return round0(diffHoras(entradaReal, salidaReal));
+  const inMin = hmToMin(entradaReal), outMin = hmToMin(salidaReal);
+  const inRem = inMin % 60;
+  const inEff  = (inMin - inRem) + (inRem > 30 ? 60 : 0);  // entrada: >:30 sube a la hora siguiente
+  const outRem = outMin % 60;
+  const outEff = (outMin - outRem) + (outRem < 30 ? 0 : 60); // salida: <:30 baja a la hora anterior
+  let diff = outEff - inEff;
+  if(diff < 0) diff += 24*60; // por si cruza medianoche
+  return diff/60; // ya queda en horas completas
 }
 
 // Horas que debería trabajar según el horario del día. 0 si día libre/vacación.
@@ -325,26 +367,46 @@ function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId==
 function calcDia(emp, fecha){
   const mar = getMarcacion(emp.id, fecha);
   const entradaReal = mar? mar.entradaReal : null;
-  const salidaReal  = mar? mar.salidaReal  : null;
+  let salidaReal    = mar? mar.salidaReal  : null;
   const libre = esDiaLibre(emp.id, fecha);
   const tipoLibre = tipoDiaLibre(emp.id, fecha);
   const hor = getHorario(emp.id, diaSemana(fecha));
 
-  const horasEf = calcHorasEfectivas(entradaReal, salidaReal);
   const horasProg = calcHorasProgramadas(emp.id, fecha);
 
-  // ¿hay día laboral configurado? (para saber si una marcación faltante es alerta)
+  // ¿hay día laboral configurado?
   const debeTrabajar = !libre && hor && !hor.libre && hor.entrada && hor.salida;
-  const faltaMarc = debeTrabajar && (!entradaReal || !salidaReal);
 
-  // En días libres/vacaciones NO se aplica descuento por tardanza ni por falta de marcación.
+  // REGLAS ESPECIALES SOLO para el día 15 y el último día del mes (días de pago):
+  //  - Si NO hay marcación de ENTRADA (y no es libre/vacaciones) => se asume FALTA.
+  //  - Si hay entrada pero falta la SALIDA => se asume que salió a la hora de su horario.
+  const [pY,pM,pD] = fecha.split('-').map(Number);
+  const esPayday = (pD === 15) || (pD === ultimoDia(pY, pM));
+  let salidaAsumida = false;
+  if(esPayday && debeTrabajar && entradaReal && !salidaReal){
+    salidaReal = hor.salida; salidaAsumida = true;
+  }
+
+  // FALTA (ausencia): día normal => sin entrada NI salida. Día de pago => basta que falte la ENTRADA.
+  //   El descuento es: horas programadas del día x sueldo por hora.
+  //   Nunca cuenta como falta si el día es libre o vacaciones (debeTrabajar lo contempla).
+  const esFalta = debeTrabajar && (esPayday ? !entradaReal : (!entradaReal && !salidaReal));
+  // FALTA DE MARCACIÓN: falta UNA sola marcación (entrada o salida, no ambas) y no es falta total.
+  //   Su descuento (1h) se aplica desde la 2da omisión de la quincena (ver calcQuincenaEmpleado).
+  const faltaMarc = debeTrabajar && !esFalta && ((!!entradaReal) !== (!!salidaReal));
+
+  const horasEf = esFalta ? 0 : calcHorasEfectivas(entradaReal, salidaReal);
+
+  // En días libres/vacaciones NO se aplica descuento por tardanza ni por falta.
   let hTard=0, hSal=0;
-  if(!libre && debeTrabajar){
+  if(!libre && debeTrabajar && !esFalta){
     if(entradaReal) hTard = calcHorasTardanza(entradaReal, hor.entrada);
     if(salidaReal)  hSal  = calcHorasSalidaAnt(salidaReal, hor.salida);
   }
+  // Descuento por falta (ausencia) = horas programadas x sueldo/hora
+  const descFalta = esFalta ? horasProg * (emp.sueldoHora||0) : 0;
   const horasDescAuto = hTard + hSal;
-  const descAuto = horasDescAuto * (emp.sueldoHora||0);
+  const descAuto = horasDescAuto * (emp.sueldoHora||0) + descFalta;
 
   const horasExtra = calcHorasExtra(horasEf, horasProg);
   const pagoExtraHoras = horasExtra * (emp.sueldoHora||0);
@@ -360,8 +422,8 @@ function calcDia(emp, fecha){
 
   return {
     fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra,
-    hTard, hSal, horasDescAuto, descAuto, descManual, pagoManual, pagoExtraHoras,
-    descManualList, pagoExtraList, faltaMarc, libre, tipoLibre, debeTrabajar, totalDia
+    hTard, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
+    descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia
   };
 }
 
@@ -369,15 +431,15 @@ function calcDia(emp, fecha){
 function calcQuincenaEmpleado(emp, year, month, q){
   const dias = rangoQuincena(year, month, q).map(f=>calcDia(emp, f));
 
-  // Descuento automático por falta de marcación (regla a nivel de quincena):
-  // 1 hora del sueldo/hora por cada DÍA con falta de marcación, PERO el primer
-  // día con falta de la quincena NO se descuenta (aplica desde el 2º día).
+  // Descuento por FALTA DE MARCACIÓN (una sola marcación faltante, no ausencia total):
+  // solo aplica si ocurre MÁS DE UNA VEZ en la quincena y se contabiliza desde la
+  // 2da omisión (la 1ra no se descuenta). Cada omisión a partir de la 2da = 1 hora.
   let faltasVistas = 0;
   dias.forEach(d=>{               // 'dias' va en orden cronológico
     d.horasFaltaMarc = 0; d.descFaltaMarc = 0;
     if(d.faltaMarc){
       faltasVistas++;
-      if(faltasVistas > 1){       // a partir del 2º día con falta
+      if(faltasVistas > 1){       // a partir de la 2da omisión
         d.horasFaltaMarc = 1;
         d.descFaltaMarc = emp.sueldoHora || 0;
         d.horasDescAuto += d.horasFaltaMarc;
@@ -719,15 +781,34 @@ function importarExcel(){
   reader.readAsArrayBuffer(f);
 }
 
+/* ---------- Filtro por empleado y rango de fecha (Descuentos / Pagos extra) ---------- */
+function filtroToolbar(prefix, f){
+  return `
+    <div class="toolbar" style="margin-bottom:12px">
+      <div class="field"><label>Filtrar empleado</label><select id="${prefix}FEmp"><option value="">Todos</option>${S.emp.map(e=>`<option value="${e.id}" ${f.emp===e.id?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
+      <div class="field"><label>Desde</label><input type="date" id="${prefix}FDesde" value="${f.desde||''}"></div>
+      <div class="field"><label>Hasta</label><input type="date" id="${prefix}FHasta" value="${f.hasta||''}"></div>
+      <button class="btn btn-ghost btn-sm" id="${prefix}FClear">Limpiar filtro</button>
+    </div>`;
+}
+function aplicaFiltro(arr, f){
+  return arr.filter(x=>
+    (!f.emp || x.empleadoId===f.emp) &&
+    (!f.desde || x.fecha>=f.desde) &&
+    (!f.hasta || x.fecha<=f.hasta)
+  );
+}
+
 /* ================================================================
    MÓDULO 4: DESCUENTOS
    ================================================================ */
 let editDescId=null;
+let descFilter={emp:'',desde:'',hasta:''};
 RENDERERS.descuentos = function(){
   const el=document.getElementById('page-descuentos');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>➖ Descuentos</h1></div></div>`+noEmpWarning(); return; }
   const hoy=new Date().toISOString().slice(0,10);
-  const list=[...S.desc].sort((a,b)=>b.fecha.localeCompare(a.fecha));
+  const list=aplicaFiltro([...S.desc].sort((a,b)=>b.fecha.localeCompare(a.fecha)), descFilter);
   const ed = editDescId? S.desc.find(x=>x.id===editDescId) : null;
   el.innerHTML=`
     <div class="page-head"><div><h1>➖ Descuentos</h1><p>Registra descuentos manuales por empleado y fecha.</p></div></div>
@@ -746,7 +827,8 @@ RENDERERS.descuentos = function(){
       </div>
     </div>
     <div class="card">
-      <h2>Descuentos registrados (${S.desc.length})</h2>
+      <h2>Descuentos registrados (${list.length} de ${S.desc.length})</h2>
+      ${filtroToolbar('d', descFilter)}
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Empleado</th><th>Tipo</th><th class="num">Monto</th><th>Detalle</th><th>Acciones</th></tr></thead>
         <tbody>${list.length? list.map(d=>`
@@ -754,9 +836,12 @@ RENDERERS.descuentos = function(){
           <td><span class="badge b-disc">${d.tipo}</span></td><td class="num">${money(d.monto)}</td>
           <td>${d.detalle||'—'}</td>
           <td><button class="btn-icon" onclick="descEdit('${d.id}')">✏️</button> <button class="btn-icon del" onclick="descDel('${d.id}')">🗑️</button></td></tr>`).join('')
-          : `<tr><td colspan="6" class="empty">Sin descuentos.</td></tr>`}</tbody>
+          : `<tr><td colspan="6" class="empty">Sin descuentos para el filtro aplicado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
+  const dApplyF=()=>{ descFilter={emp:document.getElementById('dFEmp').value, desde:document.getElementById('dFDesde').value, hasta:document.getElementById('dFHasta').value}; RENDERERS.descuentos(); };
+  ['dFEmp','dFDesde','dFHasta'].forEach(id=> document.getElementById(id).onchange=dApplyF);
+  document.getElementById('dFClear').onclick=()=>{ descFilter={emp:'',desde:'',hasta:''}; RENDERERS.descuentos(); };
   document.getElementById('dSave').onclick=()=>{
     const monto=parseFloat(dMonto.value);
     if(isNaN(monto)||monto<0){ dMonto.classList.add('invalid'); toast('Ingresa un monto válido','error'); return; }
@@ -779,11 +864,12 @@ window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.
    MÓDULO 5: PAGOS EXTRA
    ================================================================ */
 let editPagoId=null;
+let pagoFilter={emp:'',desde:'',hasta:''};
 RENDERERS.pagos = function(){
   const el=document.getElementById('page-pagos');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>➕ Pagos extra</h1></div></div>`+noEmpWarning(); return; }
   const hoy=new Date().toISOString().slice(0,10);
-  const list=[...S.pago].sort((a,b)=>b.fecha.localeCompare(a.fecha));
+  const list=aplicaFiltro([...S.pago].sort((a,b)=>b.fecha.localeCompare(a.fecha)), pagoFilter);
   const ed = editPagoId? S.pago.find(x=>x.id===editPagoId) : null;
   el.innerHTML=`
     <div class="page-head"><div><h1>➕ Pagos extra</h1><p>Registra bonos, feriados, bono de caja y otros por empleado y fecha.</p></div></div>
@@ -802,7 +888,8 @@ RENDERERS.pagos = function(){
       </div>
     </div>
     <div class="card">
-      <h2>Pagos extra registrados (${S.pago.length})</h2>
+      <h2>Pagos extra registrados (${list.length} de ${S.pago.length})</h2>
+      ${filtroToolbar('p', pagoFilter)}
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Empleado</th><th>Tipo</th><th class="num">Monto</th><th>Detalle</th><th>Acciones</th></tr></thead>
         <tbody>${list.length? list.map(p=>`
@@ -810,9 +897,12 @@ RENDERERS.pagos = function(){
           <td><span class="badge b-extra">${p.tipo}</span></td><td class="num">${money(p.monto)}</td>
           <td>${p.detalle||'—'}</td>
           <td><button class="btn-icon" onclick="pagoEdit('${p.id}')">✏️</button> <button class="btn-icon del" onclick="pagoDel('${p.id}')">🗑️</button></td></tr>`).join('')
-          : `<tr><td colspan="6" class="empty">Sin pagos extra.</td></tr>`}</tbody>
+          : `<tr><td colspan="6" class="empty">Sin pagos extra para el filtro aplicado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
+  const pApplyF=()=>{ pagoFilter={emp:document.getElementById('pFEmp').value, desde:document.getElementById('pFDesde').value, hasta:document.getElementById('pFHasta').value}; RENDERERS.pagos(); };
+  ['pFEmp','pFDesde','pFHasta'].forEach(id=> document.getElementById(id).onchange=pApplyF);
+  document.getElementById('pFClear').onclick=()=>{ pagoFilter={emp:'',desde:'',hasta:''}; RENDERERS.pagos(); };
   document.getElementById('pSave').onclick=()=>{
     const monto=parseFloat(pMonto.value);
     if(isNaN(monto)||monto<0){ pMonto.classList.add('invalid'); toast('Ingresa un monto válido','error'); return; }
@@ -835,6 +925,13 @@ window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.
    MÓDULO 6: DÍAS LIBRES Y VACACIONES
    (en estos días no se aplica descuento por tardanza ni por falta de marcación)
    ================================================================ */
+// Devuelve un array de fechas "YYYY-MM-DD" entre ini y fin (inclusive)
+function rangoFechas(ini, fin){
+  const out=[]; const [y,m,d]=ini.split('-').map(Number); const cur=new Date(y,m-1,d);
+  const [y2,m2,d2]=fin.split('-').map(Number); const end=new Date(y2,m2-1,d2);
+  while(cur<=end){ out.push(`${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`); cur.setDate(cur.getDate()+1); }
+  return out;
+}
 let editLibreId=null;
 RENDERERS.libres = function(){
   const el=document.getElementById('page-libres');
@@ -848,10 +945,12 @@ RENDERERS.libres = function(){
       <h2>${ed?'Editar registro':'Nuevo registro'}</h2>
       <div class="form-grid">
         <div class="field"><label>Empleado *</label><select id="lEmp">${empOptions(ed?ed.empleadoId:undefined)}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="lFecha" value="${ed?ed.fecha:hoy}"></div>
+        <div class="field"><label>${ed?'Fecha *':'Fecha inicio *'}</label><input type="date" id="lFecha" value="${ed?ed.fecha:hoy}"></div>
+        ${ed?'':`<div class="field"><label>Fecha fin (opcional)</label><input type="date" id="lFechaFin" placeholder="Para rangos"></div>`}
         <div class="field"><label>Tipo *</label><select id="lTipo">${TIPOS_LIBRE.map(t=>`<option ${ed&&ed.tipo===t?'selected':''}>${t}</option>`).join('')}</select></div>
         <div class="field" style="grid-column:1/-1"><label>Comentario</label><input id="lDet" placeholder="Opcional" value="${ed?(ed.comentario||''):''}"></div>
       </div>
+      ${ed?'':`<p class="hint" style="margin-top:0">Deja "Fecha fin" vacía para un solo día, o indícala para registrar un rango completo (vacaciones).</p>`}
       <div class="actions">
         <button class="btn btn-primary" id="lSave">${ed?'Actualizar':'Guardar'}</button>
         ${ed?`<button class="btn btn-ghost" id="lCancel">Cancelar</button>`:''}
@@ -876,8 +975,19 @@ RENDERERS.libres = function(){
       Object.assign(l,{empleadoId:lEmp.value, fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
       editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success');
     }else{
-      S.libre.push({id:uid(), empleadoId:lEmp.value, fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
-      save(K.libre,S.libre); toast('Registro guardado','success');
+      const ini=lFecha.value, fin=document.getElementById('lFechaFin').value;
+      if(fin && fin<ini){ toast('La fecha fin no puede ser anterior a la de inicio','error'); return; }
+      // Rango de fechas: se crea un registro por cada día (evitando duplicados existentes)
+      const fechas = fin ? rangoFechas(ini, fin) : [ini];
+      let creados=0;
+      fechas.forEach(f=>{
+        if(!S.libre.some(x=>x.empleadoId===lEmp.value && x.fecha===f)){
+          S.libre.push({id:uid(), empleadoId:lEmp.value, fecha:f, tipo:lTipo.value, comentario:lDet.value.trim()});
+          creados++;
+        }
+      });
+      save(K.libre,S.libre);
+      toast(creados>1?`${creados} días registrados`:'Registro guardado','success');
     }
     RENDERERS.libres();
   };
@@ -906,18 +1016,22 @@ function readPeriod(prefix){
 /* ================================================================
    MÓDULO 7: CÁLCULO QUINCENAL (reporte por empleado, una fila por día)
    ================================================================ */
+let calcEmpSel=''; // '' = todos los empleados
 RENDERERS.calculo = function(){
   const el=document.getElementById('page-calculo');
+  if(calcEmpSel && !S.emp.find(e=>e.id===calcEmpSel)) calcEmpSel='';
   el.innerHTML=`
-    <div class="page-head"><div><h1>🧮 Cálculo quincenal</h1><p>Selecciona el periodo para generar el reporte detallado por empleado.</p></div></div>
+    <div class="page-head"><div><h1>🧮 Cálculo quincenal</h1><p>Selecciona el periodo y el empleado para generar el reporte detallado.</p></div></div>
     <div class="card">
       <div class="toolbar">
         ${periodSelector('c')}
+        <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados</option>${S.emp.map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
         <button class="btn btn-primary" id="cGen">Generar reporte</button>
       </div>
     </div>
     <div id="calcOut"></div>`;
-  document.getElementById('cGen').onclick=()=>{ readPeriod('c'); renderCalculo(); };
+  document.getElementById('cGen').onclick=()=>{ readPeriod('c'); calcEmpSel=document.getElementById('cEmp').value; renderCalculo(); };
+  document.getElementById('cEmp').onchange=(e)=>{ readPeriod('c'); calcEmpSel=e.target.value; renderCalculo(); };
   renderCalculo();
 };
 function renderCalculo(){
@@ -926,11 +1040,13 @@ function renderCalculo(){
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena (1-15)':'2ª quincena (16-fin)'}`;
   let html=`<div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Periodo:</b> ${titulo}</div>`;
 
-  S.emp.forEach(emp=>{
+  const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp;
+  emps.forEach(emp=>{
     const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
     const filas=r.dias.map(d=>{
-      let cls=''; if(d.libre)cls='row-vac'; else if(d.faltaMarc)cls='row-miss';
+      let cls=''; if(d.libre)cls='row-vac'; else if(d.esFalta||d.faltaMarc)cls='row-miss';
       const detDescAuto=[];
+      if(d.esFalta) detDescAuto.push(`Falta - ausencia (${d.horasProg}h prog.)`);
       if(d.hTard>0) detDescAuto.push(`Tardanza (${d.hTard}h)`);
       if(d.hSal>0) detDescAuto.push(`Salida anticipada (${d.hSal}h)`);
       if(d.horasFaltaMarc>0) detDescAuto.push(`Falta marcación (${d.horasFaltaMarc}h)`);
@@ -938,16 +1054,17 @@ function renderCalculo(){
       const detPago=d.pagoExtraList.map(x=>`${x.tipo}: ${money(x.monto)}`).join('<br>') || '';
       let estado='';
       if(d.libre) estado=`<span class="badge ${d.tipoLibre==='Vacaciones'?'b-vac':'b-free'}">${d.tipoLibre}</span>`;
+      else if(d.esFalta) estado='<span class="badge b-miss">⛔ Falta</span>';
       else if(d.faltaMarc) estado='<span class="badge b-miss">⚠ Falta marcación</span>';
       else if(d.hTard>0||d.hSal>0) estado='<span class="badge b-late">Tardanza/Salida</span>';
       return `<tr class="${cls}">
         <td>${fmtFecha(d.fecha)}<br><small style="color:var(--c-muted)">${DIAS[diaSemana(d.fecha)]}</small></td>
         <td>${d.entradaReal||'<span class="badge b-miss">—</span>'}</td>
-        <td>${d.salidaReal||'<span class="badge b-miss">—</span>'}</td>
+        <td>${d.salidaReal? (d.salidaReal+(d.salidaAsumida?' <span class="badge b-free">horario</span>':'')) : '<span class="badge b-miss">—</span>'}</td>
         <td class="num">${d.horasEf}</td>
         <td class="num">${d.horasProg}</td>
         <td class="num">${d.horasExtra?('+'+d.horasExtra):'0'}</td>
-        <td class="num">${d.descAuto>0?money(d.descAuto):'—'}<br><small style="color:var(--c-muted)">${d.horasDescAuto>0?(d.horasDescAuto+'h'+(d.horasFaltaMarc>0?' (incl. falta marc.)':'')):''}</small></td>
+        <td class="num">${d.descAuto>0?money(d.descAuto):'—'}<br><small style="color:var(--c-muted)">${d.esFalta?('Falta '+d.horasProg+'h'):(d.horasDescAuto>0?(d.horasDescAuto+'h'+(d.horasFaltaMarc>0?' (incl. falta marc.)':'')):'')}</small></td>
         <td class="num">${d.descManual>0?money(d.descManual):'—'}</td>
         <td class="num">${(d.pagoManual+d.pagoExtraHoras)>0?money(d.pagoManual+d.pagoExtraHoras):'—'}</td>
         <td style="white-space:normal;max-width:160px">${detDesc||'—'}</td>
@@ -1104,7 +1221,8 @@ function renderBoleta(){
   // ----- Detalle de pagos -----
   const pagosRows=[];
   pagosRows.push(['Sueldo quincenal base', r.base]);
-  if(r.tot.horasExtra>0) pagosRows.push([`Pago por horas extra (${r.tot.horasExtra}h)`, r.tot.pagoExtraHoras]);
+  // Detalle de horas extra POR DÍA (cuando hay pago por horas extra)
+  r.dias.forEach(d=>{ if(d.horasExtra>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
   r.dias.forEach(d=> d.pagoExtraList.forEach(p=> pagosRows.push([`${fmtFecha(d.fecha)} · ${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, Number(p.monto)||0])));
   const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual;
 
@@ -1112,6 +1230,7 @@ function renderBoleta(){
   const descRows=[];
   r.dias.forEach(d=>{
     const motivos=[];
+    if(d.esFalta) motivos.push(`Falta - ausencia (${d.horasProg}h)`);
     if(d.hTard>0) motivos.push(`Tardanza ${d.hTard}h`);
     if(d.hSal>0) motivos.push(`Salida anticipada ${d.hSal}h`);
     if(d.horasFaltaMarc>0) motivos.push(`Falta de marcación ${d.horasFaltaMarc}h`);
@@ -1233,11 +1352,11 @@ function adminImport(){
    DATOS DE EJEMPLO  (los 10 empleados del Excel adjunto)
    ================================================================ */
 function seedData(){
-  const nombres=['Pepe','Maria','Elena','Pier','Marco','Luis','Naruto','Cesar','Diego','Wendy'];
+  const nombres=['Alex Carrillo','Maria Hurtado','Elena Jaimes','Piero Cueva','Alex Marconi','Luis Barreto','Noboru Tabako','César Silva','Diego Lozada','Wendy Castro'];
   S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[];
   nombres.forEach((n,i)=>{
     const id=uid();
-    const sueldoQ = 7000 + (i%4)*50;          // sueldo quincenal de ejemplo
+    const sueldoQ = 700 + (i%4)*50;          // sueldo quincenal de ejemplo
     const sueldoH = +(sueldoQ/120).toFixed(2); // ~120 h por quincena
     const sueldoP = +(sueldoQ*0.6).toFixed(2); // sueldo planilla (parte formal) de ejemplo
     S.emp.push({id, nombre:n, documento:'EMP'+String(i+1).padStart(3,'0'), sueldoQuincenal:sueldoQ, sueldoPlanilla:sueldoP, sueldoHora:sueldoH});
