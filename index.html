@@ -2202,7 +2202,9 @@ async function gsLoadFromSheets(){
     if(!id){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
     const ranges = GS_SHEETS.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
-    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges);
+    // UNFORMATTED_VALUE: devuelve los números como números reales (sin separadores de
+    // miles ni moneda del locale), evitando que Number() falle y los sueldos queden en 0.
+    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
     if(!r.ok) throw new Error('No se pudieron leer los datos');
     const j = await r.json();
     const byName = {};
