@@ -6,6 +6,8 @@
 <title>Sistema de Planilla Quincenal</title>
 <!-- SheetJS para leer archivos .xlsx -->
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<!-- Google Identity Services (login con Google para sincronizar con Google Sheets) -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   /* Paleta WingsBox: índigo/morado profundo + acento coral, texto blanco */
   :root{
@@ -130,6 +132,19 @@
   .danger-zone{border:1px dashed #fca5a5;background:#fef2f2}
   .sidebar-toggle{display:none}
 
+  /* ---------- Pantalla de acceso (login con Google) ---------- */
+  #authGate{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--bg),var(--panel-2));padding:20px}
+  body.authed #authGate{display:none}          /* autenticado: ocultar login */
+  body:not(.authed) .layout{display:none}      /* no autenticado: ocultar la app */
+  .auth-card{background:#fff;border-radius:16px;padding:34px 30px;max-width:420px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+  .auth-card .auth-logo{font-size:44px;line-height:1}
+  .auth-card h1{font-size:22px;margin:12px 0 6px;color:var(--c-text)}
+  .auth-card p{color:var(--c-muted);font-size:13px;margin-bottom:18px}
+  .auth-card .btn{width:100%;justify-content:center;padding:12px}
+  .auth-msg{margin-top:14px;font-size:13px;font-weight:600;min-height:18px}
+  .auth-msg.error{color:var(--red)} .auth-msg.success{color:var(--green)} .auth-msg.info{color:var(--c-muted)}
+  .auth-foot{font-size:11px;color:var(--c-muted);margin-top:20px;line-height:1.5}
+
   /* ---------- Responsive ---------- */
   @media(max-width:880px){
     .layout{flex-direction:column}
@@ -149,6 +164,19 @@
 </head>
 <body>
 <div id="toasts"></div>
+
+<!-- ===================== PANTALLA DE ACCESO (login con Google) ===================== -->
+<div id="authGate">
+  <div class="auth-card">
+    <div class="auth-logo">🔒</div>
+    <h1>Acceso restringido</h1>
+    <p>Inicia sesión con la cuenta autorizada para usar la aplicación.</p>
+    <button class="btn btn-primary" id="authLoginBtn">🔐 Iniciar sesión con Google</button>
+    <div id="authMsg" class="auth-msg"></div>
+    <p class="auth-foot">Solo la cuenta de Google autorizada puede acceder. La seguridad real de los datos también depende de compartir el Google Spreadsheet únicamente con ese correo.</p>
+  </div>
+</div>
+
 <div class="layout">
   <!-- ===================== MENU LATERAL ===================== -->
   <aside class="sidebar">
@@ -162,6 +190,8 @@
       <button data-page="empleados" class="active"><span class="ico">👥</span> Empleados</button>
       <button data-page="horarios"><span class="ico">🕒</span> Horarios</button>
       <button data-page="marcaciones"><span class="ico">📥</span> Carga de horas</button>
+      <button data-page="propinas"><span class="ico">💵</span> Propinas</button>
+      <button data-page="propinasConsolidado"><span class="ico">🧮</span> Consolidado propinas</button>
       <button data-page="descuentos"><span class="ico">➖</span> Descuentos</button>
       <button data-page="pagos"><span class="ico">➕</span> Pagos extra</button>
       <button data-page="libres"><span class="ico">🌴</span> Días libres / Vacaciones</button>
@@ -171,6 +201,8 @@
       <button data-page="admin"><span class="ico">⚙️</span> Administración</button>
     </nav>
     <div class="foot">
+      <div id="gsSideStatus" style="font-size:11px;color:var(--muted);padding:2px 0">⚪ Google: sin sesión</div>
+      <button class="btn btn-ghost btn-sm" id="authLogoutBtn">🔒 Cerrar sesión</button>
       <button class="btn btn-ghost btn-sm" id="btnSeed">Recargar datos de ejemplo</button>
       <button class="btn btn-red btn-sm" id="btnWipe">Borrar todos los datos</button>
     </div>
@@ -182,6 +214,8 @@
     <section class="page active" id="page-empleados"></section>
     <section class="page" id="page-horarios"></section>
     <section class="page" id="page-marcaciones"></section>
+    <section class="page" id="page-propinas"></section>
+    <section class="page" id="page-propinasConsolidado"></section>
     <section class="page" id="page-descuentos"></section>
     <section class="page" id="page-pagos"></section>
     <section class="page" id="page-libres"></section>
@@ -202,12 +236,14 @@
 const K = {
   emp:'pl_empleados', hor:'pl_horarios', mar:'pl_marcaciones',
   desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres',
-  considerarHE:'pl_considerarHE', seed:'pl_seedDone'
+  considerarHE:'pl_considerarHE', seed:'pl_seedDone',
+  prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
 const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
 const TIPOS_LIBRE = ['Día libre','Vacaciones'];
+const TIPOS_EMP = ['Mesero','Cocina'];
 
 /* ---------- Helpers de localStorage ---------- */
 const load = (k)=>{ try{ return JSON.parse(localStorage.getItem(k)) || []; }catch(e){ return []; } };
@@ -252,10 +288,60 @@ function loadConsiderarHEFromRows(rows){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
+  S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
+}
+
+/* ---------- Helpers de propinas (tipo de empleado y cálculos) ---------- */
+// Tipo de empleado con compatibilidad: si no tiene tipo, se asume "Mesero".
+function empTipo(e){ return (e && e.tipo) ? e.tipo : 'Mesero'; }
+function esMesero(e){ return empTipo(e)==='Mesero'; }
+function esCocina(e){ return empTipo(e)==='Cocina'; }
+// Normaliza un monto de propina: vacío/no numérico/negativo => 0.
+function numProp(v){ const n=Number(v); return (isNaN(n)||n<0) ? 0 : n; }
+// Redondeo SIEMPRE hacia abajo a 1 decimal.
+function redondearAMenos1Decimal(v){ return Math.floor((Number(v)||0)*10)/10; }
+// Total base de propinas: solo la tarjeta se multiplica por 0.98.
+function calcularTotalBasePropinas({efectivo,yape,plin,tarjeta}){
+  return numProp(efectivo)+numProp(yape)+numProp(plin)+(numProp(tarjeta)*0.98);
+}
+// Mesero: 60% del total base (redondeado hacia abajo a 1 decimal).
+function calcularPropinaMesero(totalBaseMesero){ return redondearAMenos1Decimal(totalBaseMesero*0.60); }
+// Cocina: 40% del total base del día dividido entre los cocineros que trabajaron.
+function calcularPropinaCocina(totalBaseDia, cantidadCocineros){
+  if(cantidadCocineros<=0) return 0;
+  return redondearAMenos1Decimal((totalBaseDia*0.40)/cantidadCocineros);
+}
+// Validación de tarjeta: Niubiz debe igualar Caja + propinas de tarjeta del día.
+function calcularDiferenciaTarjeta(montoNiubiz, montoCaja, propinasTarjetaDia){
+  return numProp(montoNiubiz)-(numProp(montoCaja)+(Number(propinasTarjetaDia)||0));
+}
+// Diferencia total: base del periodo menos lo efectivamente pagado.
+function calcularDiferenciaTotal(totalBaseDia, totalPagadoEmpleados){
+  return (Number(totalBaseDia)||0)-(Number(totalPagadoEmpleados)||0);
+}
+// Lunes (YYYY-MM-DD) de la semana que contiene a "fecha".
+function inicioSemana(fecha){
+  const [y,m,d]=fecha.split('-').map(Number);
+  const dt=new Date(y,m-1,d);
+  const dow=dt.getDay();            // 0=Dom..6=Sab
+  const diff=(dow===0?-6:1-dow);    // mover hasta el lunes
+  dt.setDate(dt.getDate()+diff);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
+// ¿El empleado tiene marcación de entrada ese día? (trabajó)
+function trabajoEseDia(empleadoId, fecha){
+  const m=getMarcacion(empleadoId, fecha);
+  return !!(m && m.entradaReal);
+}
+// Suma las propinas (por campo) de un mesero en una fecha concreta.
+function propinasMeseroFecha(empleadoId, fecha){
+  return S.prop.filter(p=>p.empleadoId===empleadoId && p.fecha===fecha)
+    .reduce((a,p)=>({ efectivo:a.efectivo+numProp(p.efectivo), yape:a.yape+numProp(p.yape), plin:a.plin+numProp(p.plin), tarjeta:a.tarjeta+numProp(p.tarjeta) }),
+      {efectivo:0,yape:0,plin:0,tarjeta:0});
 }
 
 /* ---------- Utilidades de tiempo y fecha ---------- */
@@ -522,6 +608,7 @@ RENDERERS.empleados = function(){
       <div class="form-grid">
         <div class="field"><label>Nombre *</label><input id="empNombre" placeholder="Nombre completo"></div>
         <div class="field"><label>Documento / Código *</label><input id="empDoc" placeholder="DNI o código interno"></div>
+        <div class="field"><label>Tipo de empleado *</label><select id="empTipo">${TIPOS_EMP.map(t=>`<option>${t}</option>`).join('')}</select></div>
         <div class="field"><label>Sueldo quincenal *</label><input id="empSueldoQ" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Sueldo planilla *</label><input id="empSueldoP" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Sueldo por hora *</label><input id="empSueldoH" type="number" min="0" step="0.01" placeholder="0.00"></div>
@@ -535,11 +622,12 @@ RENDERERS.empleados = function(){
       <h2>Lista de empleados (${S.emp.length})</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Nombre</th><th>Documento</th><th class="num">Sueldo quincenal</th><th class="num">Sueldo planilla</th><th class="num">Sueldo/hora</th><th>Acciones</th></tr></thead>
+          <thead><tr><th>Nombre</th><th>Documento</th><th>Tipo</th><th class="num">Sueldo quincenal</th><th class="num">Sueldo planilla</th><th class="num">Sueldo/hora</th><th>Acciones</th></tr></thead>
           <tbody>
             ${S.emp.length? S.emp.map(e=>`
               <tr>
                 <td>${e.nombre}</td><td>${e.documento}</td>
+                <td><span class="badge ${esCocina(e)?'b-vac':'b-extra'}">${empTipo(e)}</span></td>
                 <td class="num">${money(e.sueldoQuincenal)}</td>
                 <td class="num">${money(e.sueldoPlanilla)}</td>
                 <td class="num">${money(e.sueldoHora)}</td>
@@ -547,7 +635,7 @@ RENDERERS.empleados = function(){
                   <button class="btn-icon" onclick="empEdit('${e.id}')">✏️ Editar</button>
                   <button class="btn-icon del" onclick="empDel('${e.id}')">🗑️ Eliminar</button>
                 </td>
-              </tr>`).join('') : `<tr><td colspan="6" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
+              </tr>`).join('') : `<tr><td colspan="7" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -560,6 +648,7 @@ RENDERERS.empleados = function(){
     if(e){
       document.getElementById('empFormTitle').textContent='Editar empleado';
       empNombre.value=e.nombre; empDoc.value=e.documento;
+      document.getElementById('empTipo').value=empTipo(e);
       empSueldoQ.value=e.sueldoQuincenal; empSueldoP.value=e.sueldoPlanilla; empSueldoH.value=e.sueldoHora;
     }
   }
@@ -567,6 +656,7 @@ RENDERERS.empleados = function(){
 function empClearForm(){ editEmpId=null; RENDERERS.empleados(); }
 function empSave(){
   const nombre=empNombre.value.trim(), doc=empDoc.value.trim();
+  const tipo=document.getElementById('empTipo').value;
   const sq=parseFloat(empSueldoQ.value), sp=parseFloat(empSueldoP.value), sh=parseFloat(empSueldoH.value);
   // validación de campos obligatorios
   let ok=true;
@@ -576,11 +666,11 @@ function empSave(){
 
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
-    Object.assign(e,{nombre,documento:doc,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    Object.assign(e,{nombre,documento:doc,tipo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
   }else{
     const id=uid();
-    S.emp.push({id,nombre,documento:doc,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    S.emp.push({id,nombre,documento:doc,tipo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
@@ -596,10 +686,11 @@ window.empDel = function(id){
   S.desc=S.desc.filter(d=>d.empleadoId!==id);
   S.pago=S.pago.filter(p=>p.empleadoId!==id);
   S.libre=S.libre.filter(l=>l.empleadoId!==id);
+  S.prop=S.prop.filter(p=>p.empleadoId!==id);
   Object.keys(CONSIDERAR_HE).forEach(k=>{ if(k.startsWith(id+'|')) delete CONSIDERAR_HE[k]; });
   Object.keys(calcPendingHE).forEach(k=>{ if(k.startsWith(id+'|')) delete calcPendingHE[k]; });
   saveConsiderarHE(CONSIDERAR_HE);
-  save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);
+  save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);save(K.prop,S.prop);
   toast('Empleado eliminado','warn'); RENDERERS.empleados();
 };
 // genera horario base (Lun-Vie laboral, Sab/Dom libre) para un empleado
@@ -614,6 +705,10 @@ function crearHorarioDefault(empId){
 /* Helper: <option> de empleados */
 function empOptions(selected){
   return S.emp.map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
+}
+/* Helper: <option> solo de empleados tipo Mesero (para propinas) */
+function meseroOptions(selected){
+  return S.emp.filter(esMesero).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
 }
 function noEmpWarning(){
   return `<div class="card"><div class="empty">Primero registra empleados en el módulo <b>Empleados</b>.</div></div>`;
@@ -1045,6 +1140,278 @@ RENDERERS.libres = function(){
 window.libreEdit=function(id){ editLibreId=id; RENDERERS.libres(); window.scrollTo({top:0,behavior:'smooth'}); };
 window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); };
 
+/* ================================================================
+   MÓDULO 6B: INGRESO DE PROPINAS (por mesero y por día)
+   Cada registro: efectivo, yape, plin, tarjeta. Solo meseros.
+   ================================================================ */
+let editPropId=null;
+let propFilter={emp:'',desde:'',hasta:''};
+RENDERERS.propinas = function(){
+  const el=document.getElementById('page-propinas');
+  const meseros=S.emp.filter(esMesero);
+  if(!meseros.length){
+    el.innerHTML=`<div class="page-head"><div><h1>💵 Propinas</h1></div></div>
+      <div class="card"><div class="empty">No hay empleados de tipo <b>Mesero</b>. Crea o asigna el tipo "Mesero" en el módulo <b>Empleados</b>.</div></div>`;
+    return;
+  }
+  const hoy=new Date().toISOString().slice(0,10);
+  const list=aplicaFiltro([...S.prop].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter);
+  const ed = editPropId? S.prop.find(x=>x.id===editPropId) : null;
+  el.innerHTML=`
+    <div class="page-head"><div><h1>💵 Propinas</h1><p>Registra las propinas por mesero y por día. Solo se permiten meseros. Los campos vacíos se toman como 0.</p></div></div>
+    <div class="card">
+      <h2>${ed?'Editar propina':'Nueva propina'}</h2>
+      <div class="form-grid">
+        <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(ed?ed.empleadoId:undefined)}</select></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${ed?ed.fecha:hoy}"></div>
+        <div class="field"><label>Efectivo</label><input type="number" id="prEfectivo" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.efectivo??''):''}"></div>
+        <div class="field"><label>Yape</label><input type="number" id="prYape" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.yape??''):''}"></div>
+        <div class="field"><label>Plin</label><input type="number" id="prPlin" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.plin??''):''}"></div>
+        <div class="field"><label>Tarjeta</label><input type="number" id="prTarjeta" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.tarjeta??''):''}"></div>
+      </div>
+      <p class="hint" style="margin-top:8px">Total base de esta propina = efectivo + yape + plin + (tarjeta × 0.98).</p>
+      <div class="actions">
+        <button class="btn btn-primary" id="prSave">${ed?'Actualizar':'Guardar propina'}</button>
+        ${ed?`<button class="btn btn-ghost" id="prCancel">Cancelar</button>`:''}
+      </div>
+    </div>
+    <div class="card">
+      <h2>Propinas registradas (${list.length} de ${S.prop.length})</h2>
+      ${filtroToolbar('pr', propFilter)}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Mesero</th><th class="num">Efectivo</th><th class="num">Yape</th><th class="num">Plin</th><th class="num">Tarjeta</th><th class="num">Total base</th><th>Acciones</th></tr></thead>
+        <tbody>${list.length? list.map(p=>{
+          const base=calcularTotalBasePropinas(p);
+          return `<tr><td>${fmtFecha(p.fecha)}</td><td>${nombreEmp(p.empleadoId)}</td>
+            <td class="num">${money(numProp(p.efectivo))}</td><td class="num">${money(numProp(p.yape))}</td>
+            <td class="num">${money(numProp(p.plin))}</td><td class="num">${money(numProp(p.tarjeta))}</td>
+            <td class="num"><b>${money(base)}</b></td>
+            <td><button class="btn-icon" onclick="propEdit('${p.id}')">✏️</button> <button class="btn-icon del" onclick="propDel('${p.id}')">🗑️</button></td></tr>`;
+        }).join('') : `<tr><td colspan="8" class="empty">Sin propinas para el filtro aplicado.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+  const prApplyF=()=>{ propFilter={emp:document.getElementById('prFEmp').value, desde:document.getElementById('prFDesde').value, hasta:document.getElementById('prFHasta').value}; RENDERERS.propinas(); };
+  ['prFEmp','prFDesde','prFHasta'].forEach(id=> document.getElementById(id).onchange=prApplyF);
+  document.getElementById('prFClear').onclick=()=>{ propFilter={emp:'',desde:'',hasta:''}; RENDERERS.propinas(); };
+  document.getElementById('prSave').onclick=propGuardar;
+  if(ed) document.getElementById('prCancel').onclick=()=>{ editPropId=null; RENDERERS.propinas(); };
+};
+function propGuardar(){
+  const empleadoId=document.getElementById('prEmp').value;
+  const fecha=document.getElementById('prFecha').value;
+  if(!empleadoId){ toast('Selecciona un mesero','error'); return; }
+  if(!fecha){ document.getElementById('prFecha').classList.add('invalid'); toast('Selecciona una fecha','error'); return; }
+  // Validación: montos numéricos y no negativos
+  const campos=['prEfectivo','prYape','prPlin','prTarjeta'];
+  let ok=true;
+  campos.forEach(id=>{ const f=document.getElementById(id); const v=f.value.trim(); const bad=v!=='' && (isNaN(Number(v))||Number(v)<0); f.classList.toggle('invalid',bad); if(bad)ok=false; });
+  if(!ok){ toast('Los montos deben ser numéricos y no negativos','error'); return; }
+  const datos={
+    empleadoId, fecha,
+    efectivo:numProp(document.getElementById('prEfectivo').value),
+    yape:numProp(document.getElementById('prYape').value),
+    plin:numProp(document.getElementById('prPlin').value),
+    tarjeta:numProp(document.getElementById('prTarjeta').value)
+  };
+  if(editPropId){
+    const p=S.prop.find(x=>x.id===editPropId);
+    Object.assign(p, datos); editPropId=null; save(K.prop,S.prop); toast('Propina actualizada','success');
+  }else{
+    S.prop.push(Object.assign({id:uid()}, datos)); save(K.prop,S.prop); toast('Propina registrada','success');
+  }
+  RENDERERS.propinas();
+}
+window.propEdit=function(id){ editPropId=id; RENDERERS.propinas(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.propDel=function(id){ if(editPropId===id) editPropId=null; S.prop=S.prop.filter(p=>p.id!==id); save(K.prop,S.prop); toast('Propina eliminada','warn'); RENDERERS.propinas(); };
+
+/* ================================================================
+   MÓDULO 6C: CONSOLIDADO SEMANAL DE PROPINAS (lunes a domingo)
+   - Meseros: 60% del total base de SUS propinas de la semana.
+   - Cocina: 40% del total base de meseros POR DÍA, dividido entre
+     los cocineros con marcación ese día, y sumado en la semana.
+   - Validación de tarjeta (Niubiz vs Caja) por día.
+   - Diferencia total de la semana.
+   ================================================================ */
+let propSemana = inicioSemana(new Date().toISOString().slice(0,10));
+
+// Calcula todo el consolidado de la semana que empieza en "lunes" (YYYY-MM-DD).
+function calcularConsolidadoPropinas(lunes){
+  const [y,m,d]=lunes.split('-').map(Number);
+  const finDt=new Date(y,m-1,d); finDt.setDate(finDt.getDate()+6);
+  const domingo=`${finDt.getFullYear()}-${String(finDt.getMonth()+1).padStart(2,'0')}-${String(finDt.getDate()).padStart(2,'0')}`;
+  const dias=rangoFechas(lunes, domingo);
+
+  // --- Meseros: acumulado semanal de sus propias propinas ---
+  const meseroAcc={}; // empleadoId -> {efectivo,yape,plin,tarjeta}
+  dias.forEach(f=>{
+    S.prop.filter(p=>p.fecha===f).forEach(p=>{
+      const e=S.emp.find(x=>x.id===p.empleadoId); if(!e||!esMesero(e)) return;
+      if(!meseroAcc[p.empleadoId]) meseroAcc[p.empleadoId]={efectivo:0,yape:0,plin:0,tarjeta:0};
+      meseroAcc[p.empleadoId].efectivo+=numProp(p.efectivo);
+      meseroAcc[p.empleadoId].yape+=numProp(p.yape);
+      meseroAcc[p.empleadoId].plin+=numProp(p.plin);
+      meseroAcc[p.empleadoId].tarjeta+=numProp(p.tarjeta);
+    });
+  });
+  const meseros=Object.entries(meseroAcc).map(([id,t])=>{
+    const base=calcularTotalBasePropinas(t);
+    return { empleadoId:id, nombre:nombreEmp(id), tipo:'Mesero', tot:t, base, pago:calcularPropinaMesero(base) };
+  }).sort((a,b)=>a.nombre.localeCompare(b.nombre));
+
+  // --- Cocina: reparto por día y suma semanal ---
+  const cocinaAcc={};   // empleadoId -> monto acumulado
+  const cocinaDias={};  // empleadoId -> nº de días trabajados
+  const avisosCocina=[]; // días con propinas pero sin cocineros
+  dias.forEach(f=>{
+    // base de meseros ese día
+    let baseDia=0; let hayPropDia=false;
+    S.prop.filter(p=>p.fecha===f).forEach(p=>{
+      const e=S.emp.find(x=>x.id===p.empleadoId); if(!e||!esMesero(e)) return;
+      baseDia+=calcularTotalBasePropinas(p); hayPropDia=true;
+    });
+    // cocineros que trabajaron ese día (marcación de entrada)
+    const cocinerosDia=S.emp.filter(e=>esCocina(e) && trabajoEseDia(e.id, f));
+    if(baseDia>0 && cocinerosDia.length===0){ avisosCocina.push(f); return; }
+    if(cocinerosDia.length===0) return;
+    const porCocinero=calcularPropinaCocina(baseDia, cocinerosDia.length);
+    cocinerosDia.forEach(c=>{
+      cocinaAcc[c.id]=(cocinaAcc[c.id]||0)+porCocinero;
+      cocinaDias[c.id]=(cocinaDias[c.id]||0)+1;
+    });
+  });
+  const cocina=Object.entries(cocinaAcc).map(([id,monto])=>({
+    empleadoId:id, nombre:nombreEmp(id), tipo:'Cocina', pago:redondearAMenos1Decimal(monto), dias:cocinaDias[id]||0
+  })).sort((a,b)=>a.nombre.localeCompare(b.nombre));
+
+  // --- Totales y diferencia ---
+  const baseSemana=meseros.reduce((s,m)=>s+m.base,0);
+  const pagadoMeseros=meseros.reduce((s,m)=>s+m.pago,0);
+  const pagadoCocina=cocina.reduce((s,c)=>s+c.pago,0);
+  const pagadoTotal=pagadoMeseros+pagadoCocina;
+  const diferenciaTotal=calcularDiferenciaTotal(baseSemana, pagadoTotal);
+
+  // --- Tarjeta por día (suma de propinas tarjeta de meseros) ---
+  const tarjetaPorDia=dias.map(f=>{
+    let sum=0;
+    S.prop.filter(p=>p.fecha===f).forEach(p=>{ const e=S.emp.find(x=>x.id===p.empleadoId); if(e&&esMesero(e)) sum+=numProp(p.tarjeta); });
+    return { fecha:f, propTarjeta:sum };
+  });
+
+  return { lunes, domingo, dias, meseros, cocina, avisosCocina, baseSemana, pagadoMeseros, pagadoCocina, pagadoTotal, diferenciaTotal, tarjetaPorDia };
+}
+
+RENDERERS.propinasConsolidado = function(){
+  const el=document.getElementById('page-propinasConsolidado');
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🧮 Consolidado de propinas</h1><p>Cálculo semanal (lunes a domingo). Meseros reciben 60% de sus propinas; cocina recibe 40% del total de meseros, repartido por día entre quienes marcaron.</p></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Semana (elige cualquier día)</label><input type="date" id="psFecha" value="${propSemana}"></div>
+        <button class="btn btn-primary" id="psGen">Generar consolidado</button>
+      </div>
+      <p class="hint" style="margin:0">La semana se calcula automáticamente de lunes a domingo según la fecha elegida.</p>
+    </div>
+    <div id="propConsOut"></div>`;
+  document.getElementById('psGen').onclick=()=>{ propSemana=inicioSemana(document.getElementById('psFecha').value||new Date().toISOString().slice(0,10)); renderPropinasConsolidado(); };
+  document.getElementById('psFecha').onchange=(e)=>{ propSemana=inicioSemana(e.target.value||new Date().toISOString().slice(0,10)); };
+  renderPropinasConsolidado();
+};
+
+function renderPropinasConsolidado(){
+  const out=document.getElementById('propConsOut');
+  const r=calcularConsolidadoPropinas(propSemana);
+  const titulo=`${fmtFecha(r.lunes)} al ${fmtFecha(r.domingo)}`;
+  const filas=[...r.meseros, ...r.cocina];
+
+  if(!r.meseros.length && !r.cocina.length){
+    out.innerHTML=`<div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Semana:</b> ${titulo}</div>
+      <div class="card"><div class="empty">No hay propinas registradas para esta semana.</div></div>`;
+    return;
+  }
+
+  // Tabla principal por empleado
+  const filasHtml=filas.map(x=>{
+    const obs = x.tipo==='Cocina'
+      ? `${x.dias} día(s) trabajado(s)`
+      : '';
+    const baseUsado = x.tipo==='Mesero' ? money(x.base) : '—';
+    const pct = x.tipo==='Mesero' ? '60%' : '40% (repartido)';
+    return `<tr class="${x.tipo==='Cocina'?'row-vac':''}">
+      <td>${titulo}</td>
+      <td>${x.nombre}</td>
+      <td><span class="badge ${x.tipo==='Cocina'?'b-vac':'b-extra'}">${x.tipo}</span></td>
+      <td class="num">${baseUsado}</td>
+      <td class="num">${pct}</td>
+      <td class="num"><b>${money(x.pago)}</b></td>
+      <td style="white-space:normal">${obs||'—'}</td>
+    </tr>`;
+  }).join('');
+
+  let avisoCocinaHtml='';
+  if(r.avisosCocina.length){
+    avisoCocinaHtml=`<div class="card" style="background:#fffbeb;border-color:#fde68a">
+      <b>⚠ Cocina:</b> No hay cocineros con marcación de entrada para: ${r.avisosCocina.map(fmtFecha).join(', ')}. Esas propinas de cocina (40%) no se repartieron. Registra la marcación de los cocineros en <b>Carga de horas</b>.</div>`;
+  }
+
+  // Validación de tarjeta por día
+  const valRows=r.tarjetaPorDia.map(t=>{
+    const v=S.tarjetaVal.find(x=>x.fecha===t.fecha) || {niubiz:'',caja:''};
+    const dif=calcularDiferenciaTarjeta(v.niubiz, v.caja, t.propTarjeta);
+    const tieneDatos=(v.niubiz!=='' && v.niubiz!=null) || (v.caja!=='' && v.caja!=null);
+    const cuadrado=Math.abs(dif)<0.0001;
+    const estado= !tieneDatos ? '<span class="badge b-free">—</span>'
+      : (cuadrado? '<span class="badge b-ok">Cuadrado</span>' : `<span class="badge b-miss">No cuadra (${money(dif)})</span>`);
+    return `<tr>
+      <td>${fmtFecha(t.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(t.fecha)].slice(0,3)}</small></td>
+      <td><input type="number" step="0.01" style="min-width:110px" value="${v.niubiz??''}" onchange="tarjetaValSet('${t.fecha}','niubiz',this.value)"></td>
+      <td><input type="number" step="0.01" style="min-width:110px" value="${v.caja??''}" onchange="tarjetaValSet('${t.fecha}','caja',this.value)"></td>
+      <td class="num">${money(t.propTarjeta)}</td>
+      <td>${estado}</td>
+    </tr>`;
+  }).join('');
+  const totalTarjetaSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.propTarjeta,0);
+
+  out.innerHTML=`
+    <div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Semana:</b> ${titulo}</div>
+    ${avisoCocinaHtml}
+    <div class="card">
+      <h2>Cálculo por empleado</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Periodo (semana)</th><th>Empleado</th><th>Tipo</th><th class="num">Total base usado</th><th class="num">% aplicado</th><th class="num">Monto a pagar</th><th>Observaciones</th></tr></thead>
+        <tbody>${filasHtml || `<tr><td colspan="7" class="empty">Sin empleados con cálculo esta semana.</td></tr>`}</tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <h2>Validación de tarjeta (Niubiz vs Caja)</h2>
+      <p class="hint" style="margin-top:0">Regla: <b>Niubiz = Caja + propinas por tarjeta del día</b>. Ingresa los montos por día.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Monto Niubiz</th><th>Monto Caja</th><th class="num">Propinas tarjeta del día</th><th>Validación</th></tr></thead>
+        <tbody>${valRows}</tbody>
+        <tfoot><tr><td>Total semana</td><td>—</td><td>—</td><td class="num">${money(totalTarjetaSemana)}</td><td></td></tr></tfoot>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <h2>Diferencia total de propinas</h2>
+      <div class="summary">
+        <div class="item"><div class="l">Monto total base (semana)</div><div class="v">${money(r.baseSemana)}</div></div>
+        <div class="item"><div class="l">Total pagado a meseros</div><div class="v" style="color:var(--green)">${money(r.pagadoMeseros)}</div></div>
+        <div class="item"><div class="l">Total pagado a cocina</div><div class="v" style="color:var(--green)">${money(r.pagadoCocina)}</div></div>
+        <div class="item"><div class="l">Monto total pagado</div><div class="v">${money(r.pagadoTotal)}</div></div>
+        <div class="item total"><div class="l">Diferencia total</div><div class="v">${money(r.diferenciaTotal)}</div></div>
+      </div>
+      <p class="hint">${Math.abs(r.diferenciaTotal)<0.0001 ? 'El monto total pagado coincide con el total base de propinas.' : 'El monto total pagado no coincide con el total base de propinas (diferencia por redondeo hacia abajo a favor del negocio).'}</p>
+    </div>`;
+}
+window.tarjetaValSet=function(fecha, campo, valor){
+  let v=S.tarjetaVal.find(x=>x.fecha===fecha);
+  if(!v){ v={fecha, niubiz:'', caja:''}; S.tarjetaVal.push(v); }
+  v[campo] = (valor===''? '' : numProp(valor));
+  save(K.tarjetaVal, S.tarjetaVal);
+  renderPropinasConsolidado();
+};
+
 /* ---------- Estado del periodo (compartido por Cálculo y Consolidado) ---------- */
 const _now = new Date();
 let PER = { year:_now.getFullYear(), month:_now.getMonth()+1, q:(_now.getDate()<=15?1:2) };
@@ -1375,31 +1742,35 @@ RENDERERS.admin = function(){
     <div class="page-head"><div><h1>⚙️ Administración general</h1><p>Exporta toda la configuración a Excel o cárgala para precargar la aplicación.</p></div></div>
     <div class="card">
       <h2>Descargar información</h2>
-      <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados, Horarios, Descuentos, PagosExtra, DiasLibres y ConsiderarHoraExtra. El mismo archivo sirve como input para volver a cargarlo.</p>
+      <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados (con tipo), Horarios, Descuentos, PagosExtra, DiasLibres, Propinas, ValidacionTarjeta y ConsiderarHoraExtra. El mismo archivo sirve como input para volver a cargarlo.</p>
       <div class="actions"><button class="btn btn-green" id="admExport">⬇ Descargar Excel</button></div>
     </div>
     <div class="card danger-zone">
       <h2>Cargar información</h2>
-      <p class="hint" style="margin-top:0">Reemplaza Empleados, Horarios, Descuentos, Pagos extra, Días libres/Vacaciones y ConsiderarHoraExtra con el contenido del Excel. Las marcaciones no se modifican.</p>
+      <p class="hint" style="margin-top:0">Reemplaza Empleados, Horarios, Descuentos, Pagos extra, Días libres/Vacaciones, Propinas, Validación de tarjeta y ConsiderarHoraExtra con el contenido del Excel. Las marcaciones no se modifican.</p>
       <div class="toolbar">
         <div class="field"><label>Archivo Excel (.xlsx)</label><input type="file" id="admFile" accept=".xlsx,.xls"></div>
         <button class="btn btn-primary" id="admImport">⬆ Cargar Excel</button>
       </div>
       <div id="admMsg"></div>
-    </div>`;
+    </div>
+    ${gsControlsHTML()}`;
   document.getElementById('admExport').onclick=adminExport;
   document.getElementById('admImport').onclick=adminImport;
+  gsBindControls();
 };
 
 function adminExport(){
   const wb=XLSX.utils.book_new();
   // Cada hoja conserva id/empleadoId para preservar las relaciones al reimportar.
   const sheets={
-    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora})),
+    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora})),
     Horarios:  S.hor.map(h=>({empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||''})),
     Descuentos:S.desc.map(d=>({id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||''})),
     PagosExtra:S.pago.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||''})),
     DiasLibres:S.libre.map(l=>({id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||''})),
+    Propinas:  S.prop.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, efectivo:numProp(p.efectivo), yape:numProp(p.yape), plin:numProp(p.plin), tarjeta:numProp(p.tarjeta)})),
+    ValidacionTarjeta: S.tarjetaVal.map(v=>({fecha:v.fecha, niubiz:(v.niubiz===''||v.niubiz==null)?'':numProp(v.niubiz), caja:(v.caja===''||v.caja==null)?'':numProp(v.caja)})),
     ConsiderarHoraExtra: considerarHEToRows()
   };
   Object.entries(sheets).forEach(([name,data])=>{
@@ -1420,10 +1791,11 @@ function adminImport(){
       const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
       const sheet=(name)=>{ const ws=wb.Sheets[name]; return ws? XLSX.utils.sheet_to_json(ws,{defval:null}) : null; };
 
-      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres'), considerarHE=sheet('ConsiderarHoraExtra');
+      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres'), considerarHE=sheet('ConsiderarHoraExtra'), prop=sheet('Propinas'), tarjetaVal=sheet('ValidacionTarjeta');
       if(!emp){ toast('El Excel no tiene la hoja "Empleados"','error'); return; }
 
       S.emp = emp.map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
+        tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
         sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
       S.hor = (hor||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
@@ -1431,12 +1803,15 @@ function adminImport(){
       S.desc = (desc||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (pago||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.libre = (libre||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
+      // Propinas y validación de tarjeta: solo se reemplazan si la hoja existe (compatibilidad con Excel antiguos).
+      if(prop) S.prop = prop.map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta) }));
+      if(tarjetaVal) S.tarjetaVal = tarjetaVal.filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
       const heCount = (considerarHE||[]).filter(r=>r.empleadoId && r.fecha).length;
       loadConsiderarHEFromRows(considerarHE);
 
-      save(K.emp,S.emp); save(K.hor,S.hor); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre);
+      save(K.emp,S.emp); save(K.hor,S.hor); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
       document.getElementById('admMsg').innerHTML=`<div class="card" style="background:#f0fdf4;border-color:#bbf7d0;margin-top:12px">
-        <b>✔ Carga completa.</b> Empleados: ${S.emp.length}, Horarios: ${S.hor.length}, Descuentos: ${S.desc.length}, Pagos extra: ${S.pago.length}, Días libres: ${S.libre.length}, Considerar hora extra: ${heCount}.</div>`;
+        <b>✔ Carga completa.</b> Empleados: ${S.emp.length}, Horarios: ${S.hor.length}, Descuentos: ${S.desc.length}, Pagos extra: ${S.pago.length}, Días libres: ${S.libre.length}, Propinas: ${S.prop.length}, Considerar hora extra: ${heCount}.</div>`;
       toast('Datos cargados desde Excel','success');
     }catch(err){
       console.error(err); toast('Error al leer el Excel: '+err.message,'error');
@@ -1450,13 +1825,14 @@ function adminImport(){
    ================================================================ */
 function seedData(){
   const nombres=['Alex','Maria','Elena','Pier','Marco','Luis','Naruto','Cesar','Diego','Wen'];
-  S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[];
+  S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.prop=[]; S.tarjetaVal=[];
   nombres.forEach((n,i)=>{
     const id=uid();
     const sueldoQ = 2000 + (i%4)*50;          // sueldo quincenal de ejemplo
     const sueldoH = +(sueldoQ/120).toFixed(2); // ~120 h por quincena
     const sueldoP = +(sueldoQ*0.6).toFixed(2); // sueldo planilla (parte formal) de ejemplo
-    S.emp.push({id, nombre:n, documento:'EMP'+String(i+1).padStart(3,'0'), sueldoQuincenal:sueldoQ, sueldoPlanilla:sueldoP, sueldoHora:sueldoH});
+    const tipo = (i>=7) ? 'Cocina' : 'Mesero'; // últimos 3 de ejemplo son Cocina
+    S.emp.push({id, nombre:n, documento:'EMP'+String(i+1).padStart(3,'0'), tipo, sueldoQuincenal:sueldoQ, sueldoPlanilla:sueldoP, sueldoHora:sueldoH});
     // horario: Lun-Vie 09:00-18:00, fin de semana variable
     for(let d=0; d<7; d++){
       const libre=(d===0); // domingo libre
@@ -1476,7 +1852,24 @@ function seedData(){
   S.pago.push({id:uid(),empleadoId:e1,fecha:`${y}-${m}-05`,tipo:'Bono',monto:40,detalle:'Bono de productividad'});
   S.libre.push({id:uid(),empleadoId:e2,fecha:`${y}-${m}-06`,tipo:'Vacaciones',comentario:'Vacaciones programadas'});
 
-  save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);
+  // Propinas de ejemplo (semana actual) + marcaciones de cocineros esos días
+  const lunes = inicioSemana(new Date().toISOString().slice(0,10));
+  const [ly,lm,ld] = lunes.split('-').map(Number);
+  const diaSem = (offset)=>{ const dt=new Date(ly,lm-1,ld+offset); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`; };
+  const cocineros = S.emp.filter(esCocina);
+  [0,1,2].forEach(off=>{ // lunes, martes, miércoles
+    const f = diaSem(off);
+    // propinas de 3 meseros
+    S.prop.push({id:uid(),empleadoId:e0,fecha:f,efectivo:30+off*5,yape:20,plin:10,tarjeta:40});
+    S.prop.push({id:uid(),empleadoId:e1,fecha:f,efectivo:25,yape:15,plin:5,tarjeta:30});
+    S.prop.push({id:uid(),empleadoId:S.emp[3].id,fecha:f,efectivo:20,yape:10,plin:0,tarjeta:25});
+    // los cocineros marcan entrada ese día
+    cocineros.forEach(c=> S.mar.push({id:uid(),empleadoId:c.id,fecha:f,entradaReal:'10:00',salidaReal:'19:00'}));
+    // validación de tarjeta de ejemplo: Niubiz = Caja + tarjetas del día (40+30+25=95)
+    S.tarjetaVal.push({fecha:f, niubiz:95, caja:0});
+  });
+
+  save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);save(K.prop,S.prop);save(K.tarjetaVal,S.tarjetaVal);
   CONSIDERAR_HE={}; calcPendingHE={}; saveConsiderarHE(CONSIDERAR_HE);
   localStorage.setItem(K.seed,'1');
 }
@@ -1497,12 +1890,522 @@ document.getElementById('btnWipe').onclick=()=>{
 };
 
 /* ================================================================
+   MÓDULO 12: SINCRONIZACIÓN CON GOOGLE SHEETS
+   ----------------------------------------------------------------
+   CONFIGURACIÓN (ver Nat/README.md para el paso a paso):
+   1) En Google Cloud Console habilita: "Google Sheets API" y
+      "Google Drive API".
+   2) Crea credenciales -> "ID de cliente de OAuth" -> tipo
+      "Aplicación web".
+   3) En "Orígenes autorizados de JavaScript" agrega el dominio de
+      despliegue:  https://rgsolorzano.github.io
+      (para pruebas locales agrega también  http://localhost:PUERTO ).
+   4) Configura la pantalla de consentimiento de OAuth y agrega el
+      scope ".../auth/drive.file" (acceso solo a archivos creados por
+      esta app). Si la app está en modo "Testing", agrega tu cuenta
+      como usuario de prueba.
+   5) Pega tu Client ID abajo (GOOGLE_CLIENT_ID). El Client ID NO es
+      secreto; puede estar en el frontend. NUNCA pongas el client
+      secret aquí.
+   ================================================================ */
+const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.googleusercontent.com';
+// Correo de Google AUTORIZADO para usar la aplicación (control de acceso).
+// Solo esta cuenta podrá iniciar sesión y operar con el spreadsheet.
+const AUTHORIZED_EMAIL = 'multiboxes.peru@gmail.com';
+// Scopes: openid/email/profile para identificar al usuario (login) +
+// drive.file (mínimo) para acceder solo a los archivos creados por esta app.
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file';
+// Nombre fijo del spreadsheet de almacenamiento (se busca/crea por nombre).
+const GS_FILE_NAME = 'WingsBox Planilla - Datos';
+// Clave en localStorage para recordar el spreadsheet de esta cuenta.
+K.gsheetId = 'pl_gsheetId';
+
+// Estado de sesión Google (solo en memoria; el token nunca se persiste).
+let gsState = { tokenClient:null, accessToken:null, email:null, spreadsheetId:null, lastSync:null };
+
+/* ---------- Carga de Google Identity Services ---------- */
+function gsReady(){ return typeof google !== 'undefined' && google.accounts && google.accounts.oauth2; }
+function gsWaitForLib(maxMs=8000){
+  return new Promise((resolve, reject)=>{
+    if(gsReady()) return resolve();
+    const t0 = Date.now();
+    const iv = setInterval(()=>{
+      if(gsReady()){ clearInterval(iv); resolve(); }
+      else if(Date.now()-t0 > maxMs){ clearInterval(iv); reject(new Error('No se pudo cargar Google Identity Services')); }
+    }, 150);
+  });
+}
+
+/* ---------- Inicializa el token client de OAuth ---------- */
+function gsInitTokenClient(){
+  if(gsState.tokenClient) return gsState.tokenClient;
+  gsState.tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: GS_SCOPE,
+    callback: ()=>{} // se reemplaza dinámicamente en cada solicitud de token
+  });
+  return gsState.tokenClient;
+}
+
+/* Solicita un access token (muestra el consentimiento si hace falta) */
+function gsRequestToken(interactive=true){
+  return new Promise((resolve, reject)=>{
+    let tc;
+    try{ tc = gsInitTokenClient(); }catch(e){ return reject(e); }
+    tc.callback = (resp)=>{
+      if(resp && resp.error){ reject(new Error(resp.error)); return; }
+      gsState.accessToken = resp.access_token;
+      resolve(resp.access_token);
+    };
+    try{ tc.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
+    catch(e){ reject(e); }
+  });
+}
+
+/* ---------- Iniciar / cerrar sesión ---------- */
+async function gsSignIn(){
+  try{
+    gsUpdateSyncStatus('Conectando con Google…','info');
+    await gsWaitForLib();
+    await gsRequestToken(true);
+    await gsFetchUserEmail();
+    toast('Sesión de Google iniciada','success');
+    gsUpdateSyncStatus('Sesión iniciada. Detectando hoja…','info');
+    try{
+      await gsEnsureSpreadsheet();
+      gsUpdateSyncStatus('Listo para guardar / cargar.','success');
+    }catch(e){
+      console.error(e);
+      gsUpdateSyncStatus('Sesión iniciada (la hoja se creará al guardar).','warn');
+    }
+  }catch(err){
+    console.error(err);
+    toast('No se pudo iniciar sesión con Google','error');
+    gsUpdateSyncStatus('No se pudo iniciar sesión.','error');
+  }
+  gsRenderControls();
+}
+
+function gsSignOut(){
+  const tok = gsState.accessToken;
+  if(tok && gsReady() && google.accounts.oauth2.revoke){
+    try{ google.accounts.oauth2.revoke(tok, ()=>{}); }catch(e){ /* noop */ }
+  }
+  gsState.accessToken = null;
+  gsState.email = null;
+  toast('Sesión de Google cerrada','warn');
+  gsUpdateSyncStatus('Sin sesión.','info');
+  gsRenderControls();
+}
+
+function gsIsSignedIn(){ return !!gsState.accessToken; }
+
+/* Obtiene el email de la cuenta conectada (informativo) */
+async function gsFetchUserEmail(){
+  try{
+    const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers:{ 'Authorization':'Bearer '+gsState.accessToken }
+    });
+    if(r.ok){ const j = await r.json(); gsState.email = j.email || j.name || 'cuenta de Google'; }
+  }catch(e){ /* el scope drive.file puede no exponer email; no es crítico */ }
+}
+
+/* ---------- Wrapper de fetch con manejo de token expirado (401) ---------- */
+async function gsApiFetch(url, options={}){
+  if(!gsState.accessToken) throw new Error('NO_SESSION');
+  const opt = Object.assign({}, options);
+  opt.headers = Object.assign({}, options.headers, { 'Authorization':'Bearer '+gsState.accessToken });
+  let r = await fetch(url, opt);
+  if(r.status === 401){
+    // token expirado: intentar renovar silenciosamente una vez
+    try{
+      await gsRequestToken(false);
+      opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
+      r = await fetch(url, opt);
+    }catch(e){
+      gsState.accessToken = null;
+      throw new Error('SESSION_EXPIRED');
+    }
+    if(r.status === 401){ gsState.accessToken = null; throw new Error('SESSION_EXPIRED'); }
+  }
+  return r;
+}
+
+/* ================================================================
+   SPREADSHEET: detectar, buscar por nombre o crear
+   ================================================================ */
+const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','Propinas','ValidacionTarjeta','ConsiderarHoraExtra','Meta'];
+
+async function gsEnsureSpreadsheet(){
+  // 1) Reutilizar el id guardado para esta cuenta/dispositivo
+  const saved = localStorage.getItem(K.gsheetId);
+  if(saved){
+    const ok = await gsVerifySpreadsheet(saved);
+    if(ok){ gsState.spreadsheetId = saved; return saved; }
+    localStorage.removeItem(K.gsheetId);
+  }
+  // 2) Buscar por nombre en Drive (archivos creados por esta app, también desde otros dispositivos)
+  const found = await gsFindSpreadsheetByName();
+  if(found){ gsState.spreadsheetId = found; localStorage.setItem(K.gsheetId, found); return found; }
+  // 3) Crear uno nuevo
+  const created = await gsCreateSpreadsheet();
+  gsState.spreadsheetId = created;
+  localStorage.setItem(K.gsheetId, created);
+  return created;
+}
+
+async function gsVerifySpreadsheet(id){
+  try{
+    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'?fields=spreadsheetId');
+    return r.ok;
+  }catch(e){ if(e.message==='SESSION_EXPIRED') throw e; return false; }
+}
+
+async function gsFindSpreadsheetByName(){
+  const q = encodeURIComponent(`name='${GS_FILE_NAME.replace(/'/g,"\\'")}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
+  const url = 'https://www.googleapis.com/drive/v3/files?q='+q+'&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=10&spaces=drive';
+  const r = await gsApiFetch(url);
+  if(!r.ok) return null;
+  const j = await r.json();
+  return (j.files && j.files.length) ? j.files[0].id : null;
+}
+
+async function gsCreateSpreadsheet(){
+  const body = {
+    properties:{ title: GS_FILE_NAME },
+    sheets: GS_SHEETS.map(name=>({ properties:{ title:name } }))
+  };
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error('No se pudo crear el spreadsheet');
+  const j = await r.json();
+  return j.spreadsheetId;
+}
+
+/* Asegura que todas las hojas existan (por si el spreadsheet es antiguo) */
+async function gsEnsureSheetsExist(){
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+'?fields=sheets.properties.title');
+  if(!r.ok) throw new Error('No se pudo leer el spreadsheet');
+  const j = await r.json();
+  const existing = new Set((j.sheets||[]).map(s=>s.properties.title));
+  const missing = GS_SHEETS.filter(n=>!existing.has(n));
+  if(!missing.length) return;
+  const requests = missing.map(name=>({ addSheet:{ properties:{ title:name } } }));
+  const br = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+':batchUpdate', {
+    method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ requests })
+  });
+  if(!br.ok) throw new Error('No se pudieron crear las hojas faltantes');
+}
+
+/* ================================================================
+   SERIALIZACIÓN: estado interno <-> matrices (encabezado + filas)
+   Reutiliza el mismo formato de columnas que adminExport/adminImport
+   y agrega Marcaciones para una sincronización completa.
+   ================================================================ */
+function gsRowsToMatrix(headers, objects){
+  const m = [headers.slice()];
+  (objects||[]).forEach(o=>{ m.push(headers.map(h=> (o[h]===undefined || o[h]===null) ? '' : o[h])); });
+  return m;
+}
+// Convierte la respuesta values.get (matriz) en array de objetos por encabezado
+function gsMatrixToObjects(values){
+  if(!values || !values.length) return [];
+  const headers = values[0].map(h=>String(h).trim());
+  const out = [];
+  for(let i=1;i<values.length;i++){
+    const row = values[i]; if(!row) continue;
+    if(row.every(c=>c===null || c==='' || c===undefined)) continue;
+    const o = {};
+    headers.forEach((h,idx)=>{ o[h] = (idx < row.length) ? row[idx] : ''; });
+    out.push(o);
+  }
+  return out;
+}
+
+function gsSerializeAll(){
+  return {
+    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','sueldoQuincenal','sueldoPlanilla','sueldoHora'],
+      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora }))),
+    Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
+      S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
+    Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal'],
+      S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'' }))),
+    Descuentos: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
+      S.desc.map(d=>({ id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||'' }))),
+    PagosExtra: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
+      S.pago.map(p=>({ id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||'' }))),
+    DiasLibres: gsRowsToMatrix(['id','empleadoId','fecha','tipo','comentario'],
+      S.libre.map(l=>({ id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||'' }))),
+    Propinas: gsRowsToMatrix(['id','empleadoId','fecha','efectivo','yape','plin','tarjeta'],
+      S.prop.map(p=>({ id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, efectivo:numProp(p.efectivo), yape:numProp(p.yape), plin:numProp(p.plin), tarjeta:numProp(p.tarjeta) }))),
+    ValidacionTarjeta: gsRowsToMatrix(['fecha','niubiz','caja'],
+      S.tarjetaVal.map(v=>({ fecha:v.fecha, niubiz:(v.niubiz===''||v.niubiz==null)?'':numProp(v.niubiz), caja:(v.caja===''||v.caja==null)?'':numProp(v.caja) }))),
+    ConsiderarHoraExtra: gsRowsToMatrix(['empleadoId','fecha','considerar'], considerarHEToRows()),
+    Meta: gsRowsToMatrix(['clave','valor'], [
+      { clave:'app', valor:'WingsBox Planilla' },
+      { clave:'lastSync', valor:new Date().toISOString() }
+    ])
+  };
+}
+
+/* ================================================================
+   GUARDAR en Google Sheets
+   ================================================================ */
+async function gsSaveToSheets(){
+  if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
+  try{
+    gsUpdateSyncStatus('Guardando en Google Sheets…','info');
+    toast('Guardando en Google Sheets…','info');
+    await gsEnsureSpreadsheet();
+    await gsEnsureSheetsExist();
+    const data = gsSerializeAll();
+    const id = encodeURIComponent(gsState.spreadsheetId);
+
+    // 1) Limpiar todas las hojas
+    const clearRanges = GS_SHEETS.map(n=>n+'!A:Z');
+    const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchClear', {
+      method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ ranges: clearRanges })
+    });
+    if(!cr.ok) throw new Error('No se pudieron limpiar las hojas');
+
+    // 2) Escribir cada hoja
+    const valueRanges = Object.entries(data).map(([name, matrix])=>({ range: name+'!A1', majorDimension:'ROWS', values: matrix }));
+    const ur = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchUpdate', {
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ valueInputOption:'RAW', data: valueRanges })
+    });
+    if(!ur.ok) throw new Error('No se pudieron escribir los datos');
+
+    gsState.lastSync = new Date();
+    toast('Datos guardados correctamente.','success');
+    gsUpdateSyncStatus('Datos guardados ('+gsState.email+').','success');
+  }catch(err){
+    console.error(err);
+    gsHandleError(err, 'guardar');
+  }
+  gsRenderControls();
+}
+
+/* ================================================================
+   CARGAR desde Google Sheets
+   ================================================================ */
+async function gsLoadFromSheets(){
+  if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
+  if(!confirm('Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?')) return;
+  try{
+    gsUpdateSyncStatus('Cargando últimos datos…','info');
+    toast('Cargando últimos datos…','info');
+    const id = await gsEnsureSpreadsheet();
+    if(!id){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
+
+    const ranges = GS_SHEETS.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
+    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges);
+    if(!r.ok) throw new Error('No se pudieron leer los datos');
+    const j = await r.json();
+    const byName = {};
+    (j.valueRanges||[]).forEach(vr=>{
+      const name = (vr.range||'').split('!')[0].replace(/^'|'$/g,'');
+      byName[name] = gsMatrixToObjects(vr.values);
+    });
+
+    if(!byName['Empleados'] || !byName['Empleados'].length){
+      toast('No se encontró una hoja asociada.','error');
+      gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn');
+      return;
+    }
+
+    // Reconstruir el estado (misma lógica de tipos que adminImport)
+    S.emp = byName['Empleados'].map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
+      tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
+      sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
+    S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
+      libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
+      entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
+    S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
+      entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null }));
+    S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+    S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+    S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
+    S.prop = (byName['Propinas']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta) }));
+    S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
+    loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
+
+    save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
+    reloadState();
+    gsState.lastSync = new Date();
+    toast('Datos cargados desde Google Sheets','success');
+    gsUpdateSyncStatus('Datos cargados ('+gsState.email+').','success');
+    goto(currentPage);
+  }catch(err){
+    console.error(err);
+    gsHandleError(err, 'cargar');
+  }
+  gsRenderControls();
+}
+
+function gsHandleError(err, accion){
+  if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
+    gsState.accessToken = null;
+    toast('Error de permisos o sesión expirada. Vuelve a iniciar sesión.','error');
+    gsUpdateSyncStatus('Sesión expirada. Inicia sesión de nuevo.','error');
+  }else{
+    toast('Error al '+accion+' en Google Sheets: '+(err.message||err),'error');
+    gsUpdateSyncStatus('Error al '+accion+'.','error');
+  }
+}
+
+/* ================================================================
+   UI de sincronización (botones + estado)
+   ================================================================ */
+function gsUpdateSyncStatus(msg, type){
+  const el = document.getElementById('gsSyncStatus');
+  if(el){
+    el.textContent = msg;
+    el.dataset.type = type || 'info';
+  }
+  const side = document.getElementById('gsSideStatus');
+  if(side){
+    side.textContent = gsIsSignedIn() ? ('🟢 '+(gsState.email||'Conectado')) : '⚪ Google: sin sesión';
+  }
+}
+
+// Re-renderiza los controles (si la página de Administración está montada)
+function gsRenderControls(){
+  if(currentPage==='admin' && RENDERERS.admin) RENDERERS.admin();
+  else gsUpdateSyncStatus(gsIsSignedIn() ? ('Sesión iniciada ('+(gsState.email||'cuenta de Google')+').') : 'Sin sesión.', gsIsSignedIn()?'success':'info');
+}
+
+function gsControlsHTML(){
+  const signed = gsIsSignedIn();
+  const lastTxt = gsState.lastSync ? ('Última sincronización: '+gsState.lastSync.toLocaleString('es-PE')) : '';
+  const cuenta = signed ? ('Conectado como <b>'+(gsState.email||'cuenta de Google')+'</b>') : 'No has iniciado sesión con Google.';
+  return `
+    <div class="card">
+      <h2>☁️ Sincronización con Google Sheets</h2>
+      <p class="hint" style="margin-top:0">Inicia sesión con Google para guardar y cargar tus datos online y poder usarlos desde otro dispositivo. Esto es una alternativa al Excel local; el Excel sigue funcionando igual.</p>
+      <div class="actions">
+        ${signed
+          ? `<button class="btn btn-ghost" id="gsBtnSignOut">🔓 Cerrar sesión</button>
+             <button class="btn btn-green" id="gsBtnSave">⬆ Guardar en Google Sheets</button>
+             <button class="btn btn-primary" id="gsBtnLoad">⬇ Cargar desde Google Sheets</button>`
+          : `<button class="btn btn-primary" id="gsBtnSignIn">🔐 Iniciar sesión con Google</button>`}
+      </div>
+      <div class="summary" style="margin-top:14px">
+        <div class="item"><div class="l">Cuenta</div><div class="v" style="font-size:13px">${cuenta}</div></div>
+        <div class="item"><div class="l">Estado</div><div class="v" style="font-size:13px"><span id="gsSyncStatus" data-type="info">${signed?'Listo para guardar / cargar.':'Sin sesión.'}</span></div></div>
+        ${lastTxt?`<div class="item"><div class="l">Sincronización</div><div class="v" style="font-size:13px">${lastTxt}</div></div>`:''}
+      </div>
+    </div>`;
+}
+
+function gsBindControls(){
+  const bind = (id, fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; };
+  bind('gsBtnSignIn', authSignIn);   // iniciar sesión = mismo flujo de acceso autorizado
+  bind('gsBtnSignOut', authLogout);  // cerrar sesión bloquea de nuevo la app
+  bind('gsBtnSave', gsSaveToSheets);
+  bind('gsBtnLoad', gsLoadFromSheets);
+  gsUpdateSyncStatus(document.getElementById('gsSyncStatus')?document.getElementById('gsSyncStatus').textContent:'', 'info');
+}
+
+/* ================================================================
+   MÓDULO 13: CONTROL DE ACCESO (login con Google restringido)
+   ----------------------------------------------------------------
+   Solo la cuenta AUTHORIZED_EMAIL puede usar la app. La validación
+   del correo se hace en el frontend (control de la interfaz). La
+   seguridad REAL de los datos se refuerza compartiendo el Google
+   Spreadsheet únicamente con ese correo (ver Nat/README.md).
+   ================================================================ */
+// ¿La sesión actual de Google corresponde al correo autorizado?
+function isAuthorized(){
+  return gsIsSignedIn() && (gsState.email||'').trim().toLowerCase() === AUTHORIZED_EMAIL.toLowerCase();
+}
+function authSetMsg(msg, type){
+  const el=document.getElementById('authMsg');
+  if(el){ el.textContent=msg||''; el.className='auth-msg '+(type||'info'); }
+}
+
+// Inicia sesión con Google y valida que el correo sea el autorizado.
+async function authSignIn(){
+  try{
+    authSetMsg('Conectando con Google…','info');
+    await gsWaitForLib();
+    await gsRequestToken(true);
+    await gsFetchUserEmail();
+    if(isAuthorized()) authGrant();
+    else authDeny(gsState.email);
+  }catch(err){
+    console.error(err);
+    authSetMsg('No se pudo iniciar sesión con Google. Inténtalo de nuevo.','error');
+  }
+}
+
+// Reintento silencioso al cargar (mantiene la sesión si Google la conserva).
+async function authTrySilent(){
+  if(!localStorage.getItem('pl_auth_email')) return; // sin sesión previa: mostrar login
+  try{
+    await gsWaitForLib();
+    await gsRequestToken(false); // sin prompt
+    await gsFetchUserEmail();
+    if(isAuthorized()) authGrant();
+    else authDeny(gsState.email);
+  }catch(e){ /* se requiere login manual */ }
+}
+
+// Concede acceso: muestra la app y habilita Google Sheets.
+function authGrant(){
+  document.body.classList.add('authed');
+  localStorage.setItem('pl_auth_email', gsState.email); // solo un hint no sensible
+  authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
+  toast('Bienvenido, '+gsState.email,'success');
+  gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
+  // Intentar detectar/crear el spreadsheet asociado (no bloquea el acceso).
+  gsEnsureSpreadsheet().catch(()=>{});
+  gsRenderControls();
+}
+
+// Deniega acceso: revoca el token y mantiene la app oculta.
+function authDeny(email){
+  gsRevokeToken();
+  gsState.accessToken=null; gsState.email=null;
+  document.body.classList.remove('authed');
+  localStorage.removeItem('pl_auth_email');
+  authSetMsg('Acceso denegado. Esta aplicación solo está habilitada para el correo autorizado.'+(email?(' (intento: '+email+')'):''),'error');
+}
+
+// Cierra sesión: bloquea la app y vuelve al login.
+function authLogout(){
+  gsRevokeToken();
+  gsState.accessToken=null; gsState.email=null;
+  localStorage.removeItem('pl_auth_email');
+  document.body.classList.remove('authed');
+  gsUpdateSyncStatus('Sin sesión.','info');
+  authSetMsg('Sesión cerrada. Inicia sesión para continuar.','info');
+  toast('Sesión cerrada','warn');
+}
+
+// Revoca el token de Google si existe.
+function gsRevokeToken(){
+  const tok = gsState.accessToken;
+  if(tok && gsReady() && google.accounts.oauth2.revoke){
+    try{ google.accounts.oauth2.revoke(tok, ()=>{}); }catch(e){ /* noop */ }
+  }
+}
+
+/* ================================================================
    INICIALIZACIÓN
    ================================================================ */
 (function init(){
   if(!localStorage.getItem(K.seed)) seedData(); // carga inicial de ejemplo
   reloadState();
   goto('empleados');
+  gsUpdateSyncStatus('', 'info');
+  // Control de acceso: la app queda oculta tras la pantalla de login.
+  document.getElementById('authLoginBtn').onclick = authSignIn;
+  document.getElementById('authLogoutBtn').onclick = authLogout;
+  authTrySilent();
 })();
 
 </script>
