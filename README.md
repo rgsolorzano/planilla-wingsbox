@@ -128,7 +128,7 @@ Cada colección va en su propia hoja del spreadsheet:
 
 | Hoja | Contenido |
 |------|-----------|
-| `Empleados` | Personal, tipo (Mesero/Cocina) y sueldos |
+| `Empleados` | Personal, tipo (Mesero/Cocina), esLibre y sueldos |
 | `Horarios` | Horario por día de cada empleado |
 | `Marcaciones` | Horas trabajadas (entrada/salida reales) |
 | `Descuentos` | Descuentos manuales |
