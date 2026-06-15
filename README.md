@@ -137,7 +137,14 @@ Cada colección va en su propia hoja del spreadsheet:
 | `Propinas` | Propinas por mesero y día (efectivo, yape, plin, tarjeta) |
 | `ValidacionTarjeta` | Montos Niubiz/Caja por día para la validación |
 | `ConsiderarHoraExtra` | Preferencias de horas extra por día |
+| `ExoneracionTardanza` | Exoneraciones de tardanza por empleado y día (activa, horas) |
 | `Meta` | Metadatos (última sincronización) |
+
+### Tardanzas, exoneración y bono de puntualidad
+
+- En **Cálculo quincenal**, cada día con tardanza muestra un checkbox **"Exoneración de tardanza"** y un campo **"Horas de tardanza a exonerar"**. La tardanza neta es `max(0, tardanzaOriginal − horasExoneradas)` (nunca negativa y nunca mayor a la original). La exoneración aplica solo a ese empleado y día, afecta el descuento del día y el acumulado mensual, y se guarda automáticamente.
+- **Bono de puntualidad (S/ 25):** se otorga solo en la **2ª quincena** si el retraso mensual neto (suma de tardanzas netas de ambas quincenas, en minutos = horas × 60) es **≤ 15 min**. Se muestra en una columna del Consolidado (con los minutos acumulados del mes) y se suma al total a pagar.
+- **Descuentos:** al crear nuevos descuentos ya no aparecen los tipos "Falta" ni "No marcación"; los registros históricos con esos tipos se siguen mostrando y editando sin cambios.
 
 ---
 

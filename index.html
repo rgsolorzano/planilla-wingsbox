@@ -237,10 +237,15 @@ const K = {
   emp:'pl_empleados', hor:'pl_horarios', mar:'pl_marcaciones',
   desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres',
   considerarHE:'pl_considerarHE', seed:'pl_seedDone',
-  prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal'
+  prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
+// Tipos permitidos al CREAR nuevos descuentos (se quitan "Falta" y "No marcación").
+// Los históricos con esos tipos siguen mostrándose y editándose sin cambiar su tipo.
+const TIPOS_DESC_NUEVOS = TIPOS_DESC.filter(t=> t!=='Falta' && t!=='No marcación');
+const BONO_PUNTUALIDAD = 25;            // S/ por puntualidad mensual (2ª quincena)
+const BONO_PUNT_MAX_MINUTOS = 15;       // máximo de retraso mensual neto para calificar
 const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
 const TIPOS_LIBRE = ['Día libre','Vacaciones'];
 const TIPOS_EMP = ['Mesero','Cocina'];
@@ -285,6 +290,51 @@ function loadConsiderarHEFromRows(rows){
   });
   saveConsiderarHE(CONSIDERAR_HE);
   calcPendingHE = {};
+}
+
+/* ---------- Exoneración de tardanza por empleado y día ----------
+   Mapa key = empleadoId|fecha -> { activa:true, horas:Number }.
+   Solo se guardan las entradas activas; ausencia = no exonerado (0). */
+function loadExoTard(){ try{ return JSON.parse(localStorage.getItem(K.exoTard)) || {}; }catch(e){ return {}; } }
+function saveExoTard(){ localStorage.setItem(K.exoTard, JSON.stringify(EXO_TARD)); }
+let EXO_TARD = loadExoTard();
+function getExoneracionTardanza(empId, fecha){
+  const v = EXO_TARD[heKey(empId, fecha)];
+  return v ? { activa: !!v.activa, horas: Number(v.horas)||0 } : { activa:false, horas:0 };
+}
+function setExoneracionTardanza(empId, fecha, activa, horas){
+  const k = heKey(empId, fecha);
+  if(activa) EXO_TARD[k] = { activa:true, horas: Number(horas)||0 };
+  else delete EXO_TARD[k];
+  saveExoTard();
+}
+function exoTardToRows(){
+  return Object.entries(EXO_TARD).map(([k, v])=>{
+    const sep = k.indexOf('|');
+    return { empleadoId:k.slice(0, sep), fecha:k.slice(sep+1), activa: v.activa?1:0, horas: Number(v.horas)||0 };
+  });
+}
+function loadExoTardFromRows(rows){
+  EXO_TARD = {};
+  (rows || []).forEach(r=>{
+    if(!r.empleadoId || !r.fecha) return;
+    const activa = (r.activa===1 || r.activa==='1' || r.activa===true || String(r.activa).toLowerCase()==='true');
+    if(activa) EXO_TARD[heKey(String(r.empleadoId), String(r.fecha))] = { activa:true, horas: Number(r.horas)||0 };
+  });
+  saveExoTard();
+}
+
+/* ---------- Cálculos de tardanza neta y bono de puntualidad ---------- */
+// Tardanza final tras exoneración: nunca negativa, nunca exonera más de lo real.
+function calcularTardanzaNeta(tardanzaOriginalHoras, horasExoneradas){
+  const t = Number(tardanzaOriginalHoras||0), e = Number(horasExoneradas||0);
+  return Math.max(0, t - Math.min(e, t));
+}
+function convertirHorasAMinutos(horas){ return (Number(horas)||0) * 60; }
+// Bono S/25 solo en 2ª quincena si el retraso mensual neto <= 15 min.
+function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
+  if(!esSegundaQuincena) return 0;
+  return retrasoMensualMinutos <= BONO_PUNT_MAX_MINUTOS ? BONO_PUNTUALIDAD : 0;
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
@@ -493,6 +543,8 @@ function calcHorasExtra(efectivas, programadas){
 /* ---------- Accesores auxiliares ---------- */
 function getHorario(empleadoId, dia){ return S.hor.find(h=>h.empleadoId===empleadoId && h.dia===dia); }
 function getMarcacion(empleadoId, fecha){ return S.mar.find(m=>m.empleadoId===empleadoId && m.fecha===fecha); }
+// Origen de la marcación: 'manual' o 'archivo'. Registros antiguos sin campo = 'archivo'.
+function marOrigen(m){ return (m && m.origen === 'manual') ? 'manual' : 'archivo'; }
 function esDiaLibre(empleadoId, fecha){ return S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha); }
 function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha); return l? l.tipo : null; }
 
@@ -531,11 +583,15 @@ function calcDia(emp, fecha){
   const horasEf = esFalta ? 0 : calcHorasEfectivas(entradaReal, salidaReal);
 
   // En días libres/vacaciones NO se aplica descuento por tardanza ni por falta.
-  let hTard=0, hSal=0;
+  let hTardOriginal=0, hSal=0;
   if(!libre && debeTrabajar && !esFalta){
-    if(entradaReal) hTard = calcHorasTardanza(entradaReal, hor.entrada);
+    if(entradaReal) hTardOriginal = calcHorasTardanza(entradaReal, hor.entrada);
     if(salidaReal)  hSal  = calcHorasSalidaAnt(salidaReal, hor.salida);
   }
+  // Exoneración de tardanza del día (no afecta otros días/empleados).
+  const exo = getExoneracionTardanza(emp.id, fecha);
+  const horasTardExoneradas = exo.activa ? Math.min(numProp(exo.horas), hTardOriginal) : 0;
+  const hTard = calcularTardanzaNeta(hTardOriginal, horasTardExoneradas); // tardanza NETA
   // Descuento por falta (ausencia) = horas programadas x sueldo/hora
   const descFalta = esFalta ? horasProg * (emp.sueldoHora||0) : 0;
   const horasDescAuto = hTard + hSal;
@@ -555,7 +611,7 @@ function calcDia(emp, fecha){
 
   return {
     fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra,
-    hTard, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
+    hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
     descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia
   };
 }
@@ -606,9 +662,20 @@ function calcQuincenaEmpleado(emp, year, month, q){
   }
 
   const base = Number(emp.sueldoQuincenal)||0;
-  // Total = base + pagos extra + pago horas extra - desc. manuales - desc. automáticos
-  const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras - tot.descManual - tot.descAuto;
-  return { dias, tot, base, totalPagar, esLibre:false };
+  // Bono por puntualidad: solo 2ª quincena y si el retraso mensual neto <= 15 min.
+  const retrasoMin = retrasoMensualMinutos(emp, year, month);
+  const bonoPuntualidad = calcularBonoPuntualidad(q===2, retrasoMin);
+  // Total = base + pagos extra + pago horas extra + bono - desc. manuales - desc. automáticos
+  const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras + bonoPuntualidad - tot.descManual - tot.descAuto;
+  return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad, retrasoMensualMinutos:retrasoMin };
+}
+
+// Suma de tardanzas NETAS (en minutos) de todo el mes, ambas quincenas.
+// Usa calcDia directamente para evitar recursión con calcQuincenaEmpleado.
+function retrasoMensualMinutos(emp, year, month){
+  let horas = 0;
+  [1,2].forEach(q=> rangoQuincena(year, month, q).forEach(f=>{ horas += (calcDia(emp, f).hTard || 0); }));
+  return convertirHorasAMinutos(horas);
 }
 
 /* ================================================================
@@ -812,57 +879,98 @@ RENDERERS.marcaciones = function(){
   // ordenar marcaciones por fecha y empleado
   const data = [...S.mar].sort((a,b)=> a.fecha.localeCompare(b.fecha) || nombreEmp(a.empleadoId).localeCompare(nombreEmp(b.empleadoId)));
 
+  const hoy = new Date().toISOString().slice(0,10);
+  const manuales = S.mar.filter(m=>marOrigen(m)==='manual').length;
+  const empOpts = S.emp.map(e=>`<option value="${e.id}">${e.nombre}</option>`).join('');
+
   el.innerHTML = `
-    <div class="page-head"><div><h1>📥 Carga de horas trabajadas</h1><p>Importa el Excel de marcaciones. Puedes editar manualmente las horas y se alerta si falta una marcación.</p></div></div>
+    <div class="page-head"><div><h1>📥 Carga de horas trabajadas</h1><p>Importa el Excel de marcaciones o agrégalas manualmente. Puedes editar las horas y se alerta si falta una marcación.</p></div></div>
     <div class="card">
       <h2>Importar marcaciones</h2>
       <div class="toolbar">
         <div class="field"><label>Archivo Excel (.xlsx)</label><input type="file" id="fileXlsx" accept=".xlsx,.xls"></div>
         <button class="btn btn-primary" id="btnImport">Importar</button>
         <label class="pill"><input type="checkbox" id="impReemplaza"> Reemplazar marcaciones existentes</label>
+        <label class="pill"><input type="checkbox" id="impConservaManual" checked> Conservar marcaciones manuales existentes</label>
       </div>
-      <p class="hint">Estructura esperada: <b>Marca temporal</b> | <b>Escoja su nombre</b> | <b>Tipo marcación</b> (Entrada/Salida). El empleado se empareja por nombre.</p>
+      <p class="hint">Estructura esperada: <b>Marca temporal</b> | <b>Escoja su nombre</b> | <b>Tipo marcación</b> (Entrada/Salida). El empleado se empareja por nombre. Las marcaciones importadas se registran con origen <b>Archivo</b>. Si activas "Reemplazar", el flujo respeta la opción de conservar las manuales.</p>
       <div id="importMsg"></div>
     </div>
     <div class="card">
-      <h2>Marcaciones (${S.mar.length})</h2>
+      <h2>Agregar marcación manual</h2>
+      ${S.emp.length? `<div class="toolbar">
+        <div class="field"><label>Empleado *</label><select id="manEmp">${empOpts}</select></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="manFecha" value="${hoy}"></div>
+        <div class="field"><label>Entrada</label><input type="time" id="manEntrada"></div>
+        <div class="field"><label>Salida</label><input type="time" id="manSalida"></div>
+        <button class="btn btn-primary" id="btnAddMar">+ Agregar marcación</button>
+      </div>
+      <p class="hint">La fecha y al menos una hora (entrada o salida) son obligatorias. Se guarda con origen <b>Manual</b> y se conserva al reemplazar desde archivo (si la opción está activa).</p>`
+      : noEmpWarning()}
+    </div>
+    <div class="card">
+      <h2>Marcaciones (${S.mar.length}) <small style="color:var(--c-muted);font-weight:400">· ${manuales} manual(es)</small></h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Fecha</th><th>Empleado</th><th>Entrada real</th><th>Salida real</th><th>Estado</th><th>Acciones</th></tr></thead>
+          <thead><tr><th>Fecha</th><th>Empleado</th><th>Entrada real</th><th>Salida real</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
           <tbody>
             ${data.length? data.map(m=>{
               const falta = !m.entradaReal || !m.salidaReal;
+              const esManual = marOrigen(m)==='manual';
               return `<tr class="${falta?'row-miss':''}">
                 <td>${fmtFecha(m.fecha)} <span class="badge b-free">${DIAS[diaSemana(m.fecha)].slice(0,3)}</span></td>
                 <td>${nombreEmp(m.empleadoId)}</td>
                 <td><input type="time" value="${m.entradaReal||''}" onchange="marSet('${m.id}','entradaReal',this.value)"></td>
                 <td><input type="time" value="${m.salidaReal||''}" onchange="marSet('${m.id}','salidaReal',this.value)"></td>
+                <td>${esManual? '<span class="badge b-late">Manual</span>' : '<span class="badge b-free">Archivo</span>'}</td>
                 <td>${falta? '<span class="badge b-miss">⚠ Falta marcación</span>' : '<span class="badge b-ok">Completo</span>'}</td>
                 <td><button class="btn-icon del" onclick="marDel('${m.id}')">🗑️</button></td>
               </tr>`;
-            }).join('') : `<tr><td colspan="6" class="empty">No hay marcaciones. Importa un Excel o agrégalas manualmente.</td></tr>`}
+            }).join('') : `<tr><td colspan="7" class="empty">No hay marcaciones. Importa un Excel o agrégalas manualmente.</td></tr>`}
           </tbody>
         </table>
-      </div>
-      <div class="actions">
-        <button class="btn btn-ghost btn-sm" id="btnAddMar">+ Agregar marcación manual</button>
       </div>
     </div>`;
 
   document.getElementById('btnImport').onclick = importarExcel;
-  document.getElementById('btnAddMar').onclick = addMarManual;
+  const addBtn = document.getElementById('btnAddMar');
+  if(addBtn) addBtn.onclick = addMarManual;
 };
 
+// Editar una marcación (entrada/salida): toda edición manual marca el registro como "manual"
+// para que se conserve ante futuras reimportaciones desde archivo.
 window.marSet = function(id, campo, val){
   const m=S.mar.find(x=>x.id===id); if(!m) return;
-  m[campo]=val||null; save(K.mar,S.mar); RENDERERS.marcaciones();
+  m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar); RENDERERS.marcaciones();
 };
-window.marDel = function(id){ S.mar=S.mar.filter(m=>m.id!==id); save(K.mar,S.mar); toast('Marcación eliminada','warn'); RENDERERS.marcaciones(); };
+window.marDel = function(id){
+  const m=S.mar.find(x=>x.id===id);
+  const esManual = m && marOrigen(m)==='manual';
+  S.mar=S.mar.filter(x=>x.id!==id); save(K.mar,S.mar);
+  toast(esManual?'Marcación manual eliminada correctamente':'Marcación eliminada','warn');
+  RENDERERS.marcaciones();
+};
 function addMarManual(){
   if(!S.emp.length){ toast('Primero registra empleados','error'); return; }
-  const hoy=new Date().toISOString().slice(0,10);
-  S.mar.push({id:uid(), empleadoId:S.emp[0].id, fecha:hoy, entradaReal:null, salidaReal:null});
-  save(K.mar,S.mar); RENDERERS.marcaciones();
+  const empId = document.getElementById('manEmp').value;
+  const fecha = document.getElementById('manFecha').value;
+  const entrada = document.getElementById('manEntrada').value || null;
+  const salida = document.getElementById('manSalida').value || null;
+  if(!empId || !S.emp.some(e=>e.id===empId)){ toast('Selecciona un empleado válido','error'); return; }
+  if(!fecha){ toast('Ingresa una fecha y hora válidas','error'); return; }
+  if(!entrada && !salida){ toast('Ingresa una fecha y hora válidas','error'); return; }
+  // Si ya existe un registro para ese empleado y día, se actualiza (estructura: 1 registro por día).
+  let m = getMarcacion(empId, fecha);
+  if(m){
+    if(entrada) m.entradaReal = entrada;
+    if(salida)  m.salidaReal  = salida;
+    m.origen='manual';
+  }else{
+    S.mar.push({id:uid(), empleadoId:empId, fecha, entradaReal:entrada, salidaReal:salida, origen:'manual'});
+  }
+  save(K.mar,S.mar);
+  toast('Marcación manual agregada correctamente','success');
+  RENDERERS.marcaciones();
 }
 
 // Convierte un serial de Excel (o Date/string) a {fecha:'YYYY-MM-DD', hm:'HH:MM'}
@@ -892,6 +1000,7 @@ function importarExcel(){
   const f = document.getElementById('fileXlsx').files[0];
   if(!f){ toast('Selecciona un archivo .xlsx','error'); return; }
   const reemplazar = document.getElementById('impReemplaza').checked;
+  const conservarManuales = document.getElementById('impConservaManual').checked;
   const reader = new FileReader();
   reader.onload = (e)=>{
     try{
@@ -920,19 +1029,35 @@ function importarExcel(){
         else grupos[key].entradas.push(p.hm); // por defecto Entrada
       }
 
-      if(reemplazar) S.mar = [];
-      let nuevas=0, actualizadas=0;
+      // Reemplazo: si se conservan manuales, solo se eliminan las de origen "archivo".
+      let manualesConservadas = 0, manualesBorradas = 0;
+      if(reemplazar){
+        if(conservarManuales){
+          manualesConservadas = S.mar.filter(m=>marOrigen(m)==='manual').length;
+          S.mar = S.mar.filter(m=>marOrigen(m)==='manual');
+        }else{
+          manualesBorradas = S.mar.filter(m=>marOrigen(m)==='manual').length;
+          S.mar = [];
+        }
+      }
+      let nuevas=0, actualizadas=0, manualesProtegidas=0;
       Object.values(grupos).forEach(g=>{
         const entradaReal = g.entradas.length? g.entradas.sort()[0] : null;       // entrada más temprana
         const salidaReal  = g.salidas.length? g.salidas.sort().slice(-1)[0] : null; // salida más tardía
         let m = getMarcacion(g.empleadoId, g.fecha);
-        if(m){ m.entradaReal=entradaReal; m.salidaReal=salidaReal; actualizadas++; }
-        else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal}); nuevas++; }
+        if(m){
+          // No sobreescribir correcciones manuales cuando se pide conservarlas.
+          if(marOrigen(m)==='manual' && conservarManuales){ manualesProtegidas++; return; }
+          m.entradaReal=entradaReal; m.salidaReal=salidaReal; m.origen='archivo'; actualizadas++;
+        }
+        else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal, origen:'archivo'}); nuevas++; }
       });
       save(K.mar,S.mar);
 
       let msg = `<div class="card" style="background:#f0fdf4;border-color:#bbf7d0">
-        <b>✔ Importación completa.</b> Filas leídas: ${leidas}. Marcaciones nuevas: ${nuevas}, actualizadas: ${actualizadas}.`;
+        <b>✔ Nueva carga procesada correctamente.</b> Filas leídas: ${leidas}. Marcaciones nuevas: ${nuevas}, actualizadas: ${actualizadas}.`;
+      if(reemplazar && conservarManuales) msg += `<br>Las marcaciones manuales fueron conservadas (${manualesConservadas}${manualesProtegidas?`, ${manualesProtegidas} no se sobreescribieron`:''}).`;
+      if(reemplazar && !conservarManuales) msg += `<br>Todas las marcaciones anteriores fueron reemplazadas${manualesBorradas?` (incluidas ${manualesBorradas} manuales)`:''}.`;
       if(importNoRecon.length){
         msg += `<div style="margin-top:10px"><b>⚠ Nombres no reconocidos:</b> ${importNoRecon.join(', ')}.
           <br>Crea estos empleados (mismo nombre) y vuelve a importar para incluirlos.</div>`;
@@ -985,7 +1110,7 @@ RENDERERS.descuentos = function(){
       <div class="form-grid">
         <div class="field"><label>Empleado *</label><select id="dEmp">${empOptions(ed?ed.empleadoId:undefined)}</select></div>
         <div class="field"><label>Fecha *</label><input type="date" id="dFecha" value="${ed?ed.fecha:hoy}"></div>
-        <div class="field"><label>Tipo *</label><select id="dTipo">${TIPOS_DESC.map(t=>`<option ${ed&&ed.tipo===t?'selected':''}>${t}</option>`).join('')}</select></div>
+        <div class="field"><label>Tipo *</label><select id="dTipo">${(ed && !TIPOS_DESC_NUEVOS.includes(ed.tipo) ? [ed.tipo, ...TIPOS_DESC_NUEVOS] : TIPOS_DESC_NUEVOS).map(t=>`<option ${ed&&ed.tipo===t?'selected':''}>${t}</option>`).join('')}</select></div>
         <div class="field"><label>Monto *</label><input type="number" id="dMonto" min="0" step="0.01" placeholder="0.00" value="${ed?ed.monto:''}"></div>
         <div class="field" style="grid-column:1/-1"><label>Detalle / comentario</label><input id="dDet" placeholder="Opcional" value="${ed?(ed.detalle||''):''}"></div>
       </div>
@@ -1553,7 +1678,8 @@ function renderCalculo(){
       let cls=''; if(d.libre)cls='row-vac'; else if(d.esFalta||d.faltaMarc)cls='row-miss';
       const detDescAuto=[];
       if(d.esFalta) detDescAuto.push(`Falta - ausencia (${d.horasProg}h prog.)`);
-      if(d.hTard>0) detDescAuto.push(`Tardanza (${d.hTard}h)`);
+      if(d.hTard>0) detDescAuto.push(`Tardanza (${d.hTard}h${d.horasTardExoneradas>0?(' neta, exon. '+d.horasTardExoneradas+'h de '+d.hTardOriginal+'h'):''})`);
+      else if(d.horasTardExoneradas>0) detDescAuto.push(`Tardanza exonerada (${d.horasTardExoneradas}h)`);
       if(d.hSal>0) detDescAuto.push(`Salida anticipada (${d.hSal}h)`);
       if(d.horasFaltaMarc>0) detDescAuto.push(`Falta marcación (${d.horasFaltaMarc}h)`);
       const detDesc=[...detDescAuto, ...d.descManualList.map(x=>`${x.tipo}: ${money(x.monto)}`)].join('<br>');
@@ -1579,6 +1705,11 @@ function renderCalculo(){
           </label>
         </td>
         <td class="num">${d.descAuto>0?money(d.descAuto):'—'}<br><small style="color:var(--c-muted)">${d.esFalta?('Falta '+d.horasProg+'h'):(d.horasDescAuto>0?(d.horasDescAuto+'h'+(d.horasFaltaMarc>0?' (incl. falta marc.)':'')):'')}</small></td>
+        <td style="white-space:normal;text-align:center;min-width:150px">${(d.hTardOriginal>0||d.exoActiva) ? `
+          <label title="Exonerar tardanza de este día"><input type="checkbox" ${d.exoActiva?'checked':''} onchange="setExoTardUI('${emp.id}','${d.fecha}',this.checked)"> Exoneración de tardanza</label>
+          <div style="margin-top:4px"><input type="number" min="0" max="${d.hTardOriginal}" step="0.25" value="${d.exoActiva?d.horasTardExoneradas:''}" ${d.exoActiva?'':'disabled'} style="width:72px" placeholder="horas" title="Horas de tardanza a exonerar" onchange="setExoTardHorasUI('${emp.id}','${d.fecha}',this.value)"> h</div>
+          <small style="color:var(--c-muted)">orig: ${d.hTardOriginal}h${d.horasTardExoneradas>0?(' · neta: '+d.hTard+'h'):''}</small>
+        ` : '—'}</td>
         <td class="num">${d.descManual>0?money(d.descManual):'—'}</td>
         <td class="num">${(d.pagoManual+d.pagoExtraHoras)>0?money(d.pagoManual+d.pagoExtraHoras):'—'}</td>
         <td style="white-space:normal;max-width:160px">${detDesc||'—'}</td>
@@ -1594,7 +1725,7 @@ function renderCalculo(){
         <thead><tr>
           <th>Fecha</th><th>Ent. real</th><th>Sal. real</th><th class="num">H. efectivas</th>
           <th class="num">H. programadas</th><th class="num">H. extra</th><th>Considerar hora extra</th><th class="num">Desc. auto</th>
-          <th class="num">Desc. manual</th><th class="num">Pagos extra</th><th>Detalle descuento</th>
+          <th>Exon. tardanza</th><th class="num">Desc. manual</th><th class="num">Pagos extra</th><th>Detalle descuento</th>
           <th>Detalle pago</th><th class="num">Total día</th><th>Estado</th>
         </tr></thead>
         <tbody>${filas}</tbody>
@@ -1605,6 +1736,7 @@ function renderCalculo(){
         <div class="item"><div class="l">Desc. manuales</div><div class="v" style="color:var(--red)">- ${money(r.tot.descManual)}</div></div>
         <div class="item"><div class="l">Pagos extra</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoManual)}</div></div>
         <div class="item"><div class="l">Total horas extra (${r.tot.horasExtra}h)</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoExtraHoras)}</div></div>
+        <div class="item"><div class="l">Bono puntualidad ${PER.q==2?`(retraso mes: ${(r.retrasoMensualMinutos||0).toFixed(0)} min)`:'(solo 2ª quincena)'}</div><div class="v" style="color:var(--green)">+ ${money(r.bonoPuntualidad||0)}</div></div>
         <div class="item total"><div class="l">Total a pagar quincena</div><div class="v">${money(r.totalPagar)}</div></div>
       </div>
     </div>`;
@@ -1617,6 +1749,21 @@ window.calcSetConsiderarHE = function(empId, fecha, checked){
   const saved = CONSIDERAR_HE[k] !== false;
   if(checked === saved) delete calcPendingHE[k];
   else calcPendingHE[k] = checked;
+  renderCalculo();
+};
+// Exoneración de tardanza (se guarda de inmediato; afecta descuentos y bono).
+window.setExoTardUI = function(empId, fecha, checked){
+  const cur = getExoneracionTardanza(empId, fecha);
+  setExoneracionTardanza(empId, fecha, checked, checked ? (cur.horas||0) : 0);
+  renderCalculo();
+};
+window.setExoTardHorasUI = function(empId, fecha, val){
+  const emp = S.emp.find(e=>e.id===empId); if(!emp) return;
+  const orig = calcDia(emp, fecha).hTardOriginal || 0; // tardanza original (sin exonerar)
+  let h = Number(val);
+  if(isNaN(h) || h<0) h = 0;
+  if(h > orig){ h = orig; toast('Se limitó a la tardanza original ('+orig+'h)','warn'); }
+  setExoneracionTardanza(empId, fecha, true, h);
   renderCalculo();
 };
 
@@ -1650,14 +1797,16 @@ function renderConsolidado(){
     const sueldoTransfer = r.totalPagar - sueldoPlanilla;
     return {nombre:emp.nombre, esLibre:r.esLibre===true, sueldoHora:Number(emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
       horasExtra:r.tot.horasExtra, pagoExtraHoras:r.tot.pagoExtraHoras, descAuto:r.tot.descAuto,
-      descManual:r.tot.descManual, pagoManual:r.tot.pagoManual, total:r.totalPagar,
+      descManual:r.tot.descManual, pagoManual:r.tot.pagoManual,
+      bonoPuntualidad:r.bonoPuntualidad||0, retrasoMin:r.retrasoMensualMinutos||0, total:r.totalPagar,
       sueldoPlanilla, sueldoTransfer};
   });
   const T=_consolidado.reduce((a,c)=>({
     base:a.base+c.base, horasExtra:a.horasExtra+c.horasExtra, pagoExtraHoras:a.pagoExtraHoras+c.pagoExtraHoras,
-    descAuto:a.descAuto+c.descAuto, descManual:a.descManual+c.descManual, pagoManual:a.pagoManual+c.pagoManual, total:a.total+c.total,
+    descAuto:a.descAuto+c.descAuto, descManual:a.descManual+c.descManual, pagoManual:a.pagoManual+c.pagoManual,
+    bonoPuntualidad:a.bonoPuntualidad+c.bonoPuntualidad, total:a.total+c.total,
     sueldoPlanilla:a.sueldoPlanilla+c.sueldoPlanilla, sueldoTransfer:a.sueldoTransfer+c.sueldoTransfer
-  }),{base:0,horasExtra:0,pagoExtraHoras:0,descAuto:0,descManual:0,pagoManual:0,total:0,sueldoPlanilla:0,sueldoTransfer:0});
+  }),{base:0,horasExtra:0,pagoExtraHoras:0,descAuto:0,descManual:0,pagoManual:0,bonoPuntualidad:0,total:0,sueldoPlanilla:0,sueldoTransfer:0});
 
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena':'2ª quincena'}`;
   out.innerHTML=`
@@ -1676,7 +1825,7 @@ function renderConsolidado(){
         <thead><tr>
           <th>Empleado</th><th class="num">Sueldo base</th><th class="num">H. trabajadas</th><th class="num">H. programadas</th>
           <th class="num">H. extra</th><th class="num">Pago h. extra</th><th class="num">Desc. auto</th>
-          <th class="num">Desc. manual</th><th class="num">Pagos extra</th>
+          <th class="num">Desc. manual</th><th class="num">Pagos extra</th><th class="num">Bono puntualidad</th>
           <th class="num">Sueldo planilla</th><th class="num">Sueldo transferencia</th><th class="num">Total a pagar</th>
         </tr></thead>
         <tbody>${_consolidado.map(c=>`<tr>
@@ -1684,13 +1833,14 @@ function renderConsolidado(){
           <td class="num">${c.horasExtra}</td><td class="num">${money(c.pagoExtraHoras)}</td>
           <td class="num" style="color:var(--red)">${money(c.descAuto)}</td><td class="num" style="color:var(--red)">${money(c.descManual)}</td>
           <td class="num" style="color:var(--green)">${money(c.pagoManual)}</td>
+          <td class="num" style="color:var(--green)">${money(c.bonoPuntualidad)}<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min mes</small></td>
           <td class="num">${money(c.sueldoPlanilla)}</td><td class="num">${money(c.sueldoTransfer)}</td><td class="num"><b>${money(c.total)}</b></td>
         </tr>`).join('')}</tbody>
         <tfoot><tr>
           <td>TOTALES</td><td class="num">${money(T.base)}</td><td class="num">—</td><td class="num">—</td>
           <td class="num">${T.horasExtra}</td><td class="num">${money(T.pagoExtraHoras)}</td>
           <td class="num">${money(T.descAuto)}</td><td class="num">${money(T.descManual)}</td>
-          <td class="num">${money(T.pagoManual)}</td>
+          <td class="num">${money(T.pagoManual)}</td><td class="num">${money(T.bonoPuntualidad)}</td>
           <td class="num">${money(T.sueldoPlanilla)}</td><td class="num">${money(T.sueldoTransfer)}</td><td class="num">${money(T.total)}</td>
         </tr></tfoot>
       </table></div>
@@ -1699,10 +1849,10 @@ function renderConsolidado(){
 /* ---------- Exportación a CSV ---------- */
 function exportarCSV(){
   if(!_consolidado.length){ toast('Genera el consolidado primero','error'); return; }
-  const head=['Empleado','Sueldo base','Horas trabajadas','Horas programadas','Horas extra','Pago horas extra','Descuentos automaticos','Descuentos manuales','Pagos extra','Sueldo planilla','Sueldo transferencia','Total a pagar'];
-  const rows=_consolidado.map(c=>[c.nombre,c.base,c.horasEf,c.horasProg,c.horasExtra,c.pagoExtraHoras,c.descAuto,c.descManual,c.pagoManual,c.sueldoPlanilla,c.sueldoTransfer,c.total]);
-  const T=_consolidado.reduce((a,c)=>({base:a.base+c.base,he:a.he+c.horasExtra,phe:a.phe+c.pagoExtraHoras,da:a.da+c.descAuto,dm:a.dm+c.descManual,pm:a.pm+c.pagoManual,sp:a.sp+c.sueldoPlanilla,st:a.st+c.sueldoTransfer,t:a.t+c.total}),{base:0,he:0,phe:0,da:0,dm:0,pm:0,sp:0,st:0,t:0});
-  rows.push(['TOTALES',T.base,'','',T.he,T.phe,T.da,T.dm,T.pm,T.sp,T.st,T.t]);
+  const head=['Empleado','Sueldo base','Horas trabajadas','Horas programadas','Horas extra','Pago horas extra','Descuentos automaticos','Descuentos manuales','Pagos extra','Bono puntualidad','Retraso mes (min)','Sueldo planilla','Sueldo transferencia','Total a pagar'];
+  const rows=_consolidado.map(c=>[c.nombre,c.base,c.horasEf,c.horasProg,c.horasExtra,c.pagoExtraHoras,c.descAuto,c.descManual,c.pagoManual,c.bonoPuntualidad,c.retrasoMin,c.sueldoPlanilla,c.sueldoTransfer,c.total]);
+  const T=_consolidado.reduce((a,c)=>({base:a.base+c.base,he:a.he+c.horasExtra,phe:a.phe+c.pagoExtraHoras,da:a.da+c.descAuto,dm:a.dm+c.descManual,pm:a.pm+c.pagoManual,bp:a.bp+c.bonoPuntualidad,sp:a.sp+c.sueldoPlanilla,st:a.st+c.sueldoTransfer,t:a.t+c.total}),{base:0,he:0,phe:0,da:0,dm:0,pm:0,bp:0,sp:0,st:0,t:0});
+  rows.push(['TOTALES',T.base,'','',T.he,T.phe,T.da,T.dm,T.pm,T.bp,'',T.sp,T.st,T.t]);
   const csv=[head,...rows].map(r=>r.map(v=>{ const s=String(v).replace(/"/g,'""'); return /[",;\n]/.test(s)?`"${s}"`:s; }).join(';')).join('\n');
   const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'});
   const a=document.createElement('a');
@@ -1771,7 +1921,8 @@ function renderBoleta(){
   // Detalle de horas extra POR DÍA (cuando hay pago por horas extra)
   r.dias.forEach(d=>{ if(d.pagoExtraHoras>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
   r.dias.forEach(d=> d.pagoExtraList.forEach(p=> pagosRows.push([`${fmtFecha(d.fecha)} · ${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, Number(p.monto)||0])));
-  const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual;
+  if((r.bonoPuntualidad||0) > 0) pagosRows.push(['Bono puntualidad (retraso mes: '+(r.retrasoMensualMinutos||0).toFixed(0)+' min)', r.bonoPuntualidad]);
+  const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual + (r.bonoPuntualidad||0);
 
   // ----- Detalle de descuentos -----
   const descRows=[];
@@ -1857,7 +2008,8 @@ function adminExport(){
     DiasLibres:S.libre.map(l=>({id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||''})),
     Propinas:  S.prop.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, efectivo:numProp(p.efectivo), yape:numProp(p.yape), plin:numProp(p.plin), tarjeta:numProp(p.tarjeta)})),
     ValidacionTarjeta: S.tarjetaVal.map(v=>({fecha:v.fecha, niubiz:(v.niubiz===''||v.niubiz==null)?'':numProp(v.niubiz), caja:(v.caja===''||v.caja==null)?'':numProp(v.caja)})),
-    ConsiderarHoraExtra: considerarHEToRows()
+    ConsiderarHoraExtra: considerarHEToRows(),
+    ExoneracionTardanza: exoTardToRows()
   };
   Object.entries(sheets).forEach(([name,data])=>{
     const ws=XLSX.utils.json_to_sheet(data.length?data:[{}]);
@@ -1877,7 +2029,7 @@ function adminImport(){
       const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
       const sheet=(name)=>{ const ws=wb.Sheets[name]; return ws? XLSX.utils.sheet_to_json(ws,{defval:null}) : null; };
 
-      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres'), considerarHE=sheet('ConsiderarHoraExtra'), prop=sheet('Propinas'), tarjetaVal=sheet('ValidacionTarjeta');
+      const emp=sheet('Empleados'), hor=sheet('Horarios'), desc=sheet('Descuentos'), pago=sheet('PagosExtra'), libre=sheet('DiasLibres'), considerarHE=sheet('ConsiderarHoraExtra'), prop=sheet('Propinas'), tarjetaVal=sheet('ValidacionTarjeta'), exoTard=sheet('ExoneracionTardanza');
       if(!emp){ toast('El Excel no tiene la hoja "Empleados"','error'); return; }
 
       S.emp = emp.map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
@@ -1895,6 +2047,7 @@ function adminImport(){
       if(tarjetaVal) S.tarjetaVal = tarjetaVal.filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
       const heCount = (considerarHE||[]).filter(r=>r.empleadoId && r.fecha).length;
       loadConsiderarHEFromRows(considerarHE);
+      if(exoTard) loadExoTardFromRows(exoTard); // compatibilidad con Excel antiguos sin esta hoja
 
       save(K.emp,S.emp); save(K.hor,S.hor); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
       document.getElementById('admMsg').innerHTML=`<div class="card" style="background:#f0fdf4;border-color:#bbf7d0;margin-top:12px">
@@ -1958,6 +2111,7 @@ function seedData(){
 
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);save(K.prop,S.prop);save(K.tarjetaVal,S.tarjetaVal);
   CONSIDERAR_HE={}; calcPendingHE={}; saveConsiderarHE(CONSIDERAR_HE);
+  EXO_TARD={}; saveExoTard();
   localStorage.setItem(K.seed,'1');
 }
 
@@ -1972,6 +2126,7 @@ document.getElementById('btnWipe').onclick=()=>{
     Object.values(K).forEach(k=>localStorage.removeItem(k));
     CONSIDERAR_HE={};
     calcPendingHE={};
+    EXO_TARD={};
     reloadState(); toast('Todos los datos fueron borrados','warn'); goto(currentPage);
   }
 };
@@ -2007,8 +2162,35 @@ const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
 K.gsheetId = 'pl_gsheetId';
 
-// Estado de sesión Google (solo en memoria; el token nunca se persiste).
-let gsState = { tokenClient:null, accessToken:null, email:null, spreadsheetId:null, lastSync:null };
+// Estado de sesión Google. El access token se persiste (con su expiración) para
+// mantener la sesión al refrescar; los tokens de Google duran ~1 hora.
+let gsState = { tokenClient:null, accessToken:null, tokenExpiry:0, email:null, spreadsheetId:null, lastSync:null };
+
+// Claves de sesión en localStorage.
+const AUTH_KEYS = { token:'pl_auth_token', exp:'pl_auth_token_exp', email:'pl_auth_email' };
+// Guarda la sesión actual (token + expiración + correo) para sobrevivir a un refresh.
+function gsPersistSession(){
+  if(gsState.accessToken && gsState.email){
+    localStorage.setItem(AUTH_KEYS.token, gsState.accessToken);
+    localStorage.setItem(AUTH_KEYS.exp, String(gsState.tokenExpiry||0));
+    localStorage.setItem(AUTH_KEYS.email, gsState.email);
+  }
+}
+// Borra la sesión persistida.
+function gsClearSession(){
+  Object.values(AUTH_KEYS).forEach(k=>localStorage.removeItem(k));
+}
+// Restaura un token aún válido (con margen de 60s) sin contactar a Google.
+function gsRestoreSession(){
+  const tok = localStorage.getItem(AUTH_KEYS.token);
+  const exp = Number(localStorage.getItem(AUTH_KEYS.exp)||0);
+  const email = localStorage.getItem(AUTH_KEYS.email);
+  if(tok && email && exp > Date.now()+60000){
+    gsState.accessToken = tok; gsState.tokenExpiry = exp; gsState.email = email;
+    return true;
+  }
+  return false;
+}
 
 /* ---------- Carga de Google Identity Services ---------- */
 function gsReady(){ return typeof google !== 'undefined' && google.accounts && google.accounts.oauth2; }
@@ -2042,6 +2224,7 @@ function gsRequestToken(interactive=true){
     tc.callback = (resp)=>{
       if(resp && resp.error){ reject(new Error(resp.error)); return; }
       gsState.accessToken = resp.access_token;
+      gsState.tokenExpiry = Date.now() + ((Number(resp.expires_in)||3600)*1000);
       resolve(resp.access_token);
     };
     try{ tc.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
@@ -2080,6 +2263,8 @@ function gsSignOut(){
   }
   gsState.accessToken = null;
   gsState.email = null;
+  gsState.tokenExpiry = 0;
+  gsClearSession();
   toast('Sesión de Google cerrada','warn');
   gsUpdateSyncStatus('Sin sesión.','info');
   gsRenderControls();
@@ -2107,13 +2292,14 @@ async function gsApiFetch(url, options={}){
     // token expirado: intentar renovar silenciosamente una vez
     try{
       await gsRequestToken(false);
+      gsPersistSession(); // guarda el token renovado
       opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
       r = await fetch(url, opt);
     }catch(e){
-      gsState.accessToken = null;
+      gsState.accessToken = null; gsClearSession();
       throw new Error('SESSION_EXPIRED');
     }
-    if(r.status === 401){ gsState.accessToken = null; throw new Error('SESSION_EXPIRED'); }
+    if(r.status === 401){ gsState.accessToken = null; gsClearSession(); throw new Error('SESSION_EXPIRED'); }
   }
   return r;
 }
@@ -2121,7 +2307,7 @@ async function gsApiFetch(url, options={}){
 /* ================================================================
    SPREADSHEET: detectar, buscar por nombre o crear
    ================================================================ */
-const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','Propinas','ValidacionTarjeta','ConsiderarHoraExtra','Meta'];
+const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','Propinas','ValidacionTarjeta','ConsiderarHoraExtra','ExoneracionTardanza','Meta'];
 
 async function gsEnsureSpreadsheet(){
   // 1) Reutilizar el id guardado para esta cuenta/dispositivo
@@ -2218,8 +2404,8 @@ function gsSerializeAll(){
       S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora }))),
     Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
       S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
-    Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal'],
-      S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'' }))),
+    Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen'],
+      S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'', origen:marOrigen(m) }))),
     Descuentos: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
       S.desc.map(d=>({ id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||'' }))),
     PagosExtra: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
@@ -2231,6 +2417,7 @@ function gsSerializeAll(){
     ValidacionTarjeta: gsRowsToMatrix(['fecha','niubiz','caja'],
       S.tarjetaVal.map(v=>({ fecha:v.fecha, niubiz:(v.niubiz===''||v.niubiz==null)?'':numProp(v.niubiz), caja:(v.caja===''||v.caja==null)?'':numProp(v.caja) }))),
     ConsiderarHoraExtra: gsRowsToMatrix(['empleadoId','fecha','considerar'], considerarHEToRows()),
+    ExoneracionTardanza: gsRowsToMatrix(['empleadoId','fecha','activa','horas'], exoTardToRows()),
     Meta: gsRowsToMatrix(['clave','valor'], [
       { clave:'app', valor:'WingsBox Planilla' },
       { clave:'lastSync', valor:new Date().toISOString() }
@@ -2315,13 +2502,15 @@ async function gsLoadFromSheets(){
       libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
       entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
     S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
-      entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null }));
+      entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
+      origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo' }));
     S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
     S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
     S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
     S.prop = (byName['Propinas']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta) }));
     S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
     loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
+    loadExoTardFromRows(byName['ExoneracionTardanza']||[]);
 
     save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
     reloadState();
@@ -2434,7 +2623,10 @@ async function authSignIn(){
 
 // Reintento silencioso al cargar (mantiene la sesión si Google la conserva).
 async function authTrySilent(){
-  if(!localStorage.getItem('pl_auth_email')) return; // sin sesión previa: mostrar login
+  if(!localStorage.getItem(AUTH_KEYS.email)) return; // sin sesión previa: mostrar login
+  // 1) Restaurar un token aún válido sin contactar a Google (mantiene la sesión al refrescar).
+  if(gsRestoreSession() && isAuthorized()){ authGrant(); return; }
+  // 2) Renovación silenciosa si el token expiró.
   try{
     await gsWaitForLib();
     await gsRequestToken(false); // sin prompt
@@ -2447,7 +2639,7 @@ async function authTrySilent(){
 // Concede acceso: muestra la app y habilita Google Sheets.
 function authGrant(){
   document.body.classList.add('authed');
-  localStorage.setItem('pl_auth_email', gsState.email); // solo un hint no sensible
+  gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
@@ -2459,17 +2651,17 @@ function authGrant(){
 // Deniega acceso: revoca el token y mantiene la app oculta.
 function authDeny(email){
   gsRevokeToken();
-  gsState.accessToken=null; gsState.email=null;
+  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
   document.body.classList.remove('authed');
-  localStorage.removeItem('pl_auth_email');
+  gsClearSession();
   authSetMsg('Acceso denegado. Esta aplicación solo está habilitada para el correo autorizado.'+(email?(' (intento: '+email+')'):''),'error');
 }
 
 // Cierra sesión: bloquea la app y vuelve al login.
 function authLogout(){
   gsRevokeToken();
-  gsState.accessToken=null; gsState.email=null;
-  localStorage.removeItem('pl_auth_email');
+  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
+  gsClearSession();
   document.body.classList.remove('authed');
   gsUpdateSyncStatus('Sin sesión.','info');
   authSetMsg('Sesión cerrada. Inicia sesión para continuar.','info');
