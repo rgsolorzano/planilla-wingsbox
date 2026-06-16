@@ -960,6 +960,11 @@ let importNoRecon = []; // nombres del Excel que no coinciden con empleados
 // para no tener que volver a seleccionarlos tras cada alta exitosa.
 let lastMarcacion = { empleadoId: null, fecha: null };
 
+// Filtro de visualización del cuadro "Marcaciones" (rango de fechas + empleado).
+// Solo afecta qué filas se muestran; nunca modifica S.mar, cálculos, exportaciones
+// ni la sincronización con Google Sheets (se aplica únicamente al renderizar).
+let marFilter = { emp:'', desde:'', hasta:'' };
+
 // ---------------------------------------------------------------------------
 // Configuración centralizada de la sincronización de marcaciones desde un
 // Google Spreadsheet externo (p.ej. las respuestas de un Google Form). Si la
@@ -1044,11 +1049,15 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
 
 RENDERERS.marcaciones = function(){
   const el = document.getElementById('page-marcaciones');
-  // ordenar marcaciones por fecha y empleado
-  const data = [...S.mar].sort((a,b)=> a.fecha.localeCompare(b.fecha) || nombreEmp(a.empleadoId).localeCompare(nombreEmp(b.empleadoId)));
+  // ordenar marcaciones por fecha y empleado, y aplicar el filtro de visualización
+  // (rango de fechas + empleado) reutilizando el mismo helper aplicaFiltro() que
+  // ya usan Descuentos / Pagos extra / Propinas. Esto NUNCA toca S.mar: solo
+  // decide qué filas se muestran en la tabla.
+  const dataAll = [...S.mar].sort((a,b)=> a.fecha.localeCompare(b.fecha) || nombreEmp(a.empleadoId).localeCompare(nombreEmp(b.empleadoId)));
+  const data = aplicaFiltro(dataAll, marFilter);
 
   const hoy = new Date().toISOString().slice(0,10);
-  const manuales = S.mar.filter(m=>marOrigen(m)==='manual').length;
+  const manuales = data.filter(m=>marOrigen(m)==='manual').length;
   const empOpts = empOptions(lastMarcacion.empleadoId);
 
   el.innerHTML = `
@@ -1079,7 +1088,8 @@ RENDERERS.marcaciones = function(){
       : noEmpWarning()}
     </div>
     <div class="card">
-      <h2>Marcaciones (${S.mar.length}) <small style="color:var(--c-muted);font-weight:400">· ${manuales} manual(es)</small></h2>
+      <h2>Marcaciones (${data.length} de ${dataAll.length}) <small style="color:var(--c-muted);font-weight:400">· ${manuales} manual(es)</small></h2>
+      ${filtroToolbar('mar', marFilter)}
       <div class="table-wrap">
         <table>
           <thead><tr><th>Fecha</th><th>Empleado</th><th>Entrada real</th><th>Salida real</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
@@ -1096,7 +1106,7 @@ RENDERERS.marcaciones = function(){
                 <td>${falta? '<span class="badge b-miss">⚠ Falta marcación</span>' : '<span class="badge b-ok">Completo</span>'}</td>
                 <td><button class="btn-icon del" onclick="marDel('${m.id}')">🗑️</button></td>
               </tr>`;
-            }).join('') : `<tr><td colspan="7" class="empty">No hay marcaciones. Importa un Excel o agrégalas manualmente.</td></tr>`}
+            }).join('') : `<tr><td colspan="7" class="empty">${dataAll.length? 'Ningún registro coincide con el filtro aplicado.' : 'No hay marcaciones. Importa un Excel o agrégalas manualmente.'}</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -1106,6 +1116,22 @@ RENDERERS.marcaciones = function(){
   document.getElementById('btnSyncMarcacion').onclick = sincronizarMarcacionesDesdeSheet;
   const addBtn = document.getElementById('btnAddMar');
   if(addBtn) addBtn.onclick = addMarManual;
+
+  // Filtro de Marcaciones: aplica automáticamente al cambiar cualquier campo
+  // (sin botón de búsqueda) y valida que "Desde" no sea mayor que "Hasta".
+  const marApplyF=()=>{
+    const emp = document.getElementById('marFEmp').value;
+    const desde = document.getElementById('marFDesde').value;
+    const hasta = document.getElementById('marFHasta').value;
+    if(desde && hasta && desde>hasta){
+      toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error');
+      return; // no se aplica el filtro hasta que el usuario corrija el rango
+    }
+    marFilter = { emp, desde, hasta };
+    RENDERERS.marcaciones();
+  };
+  ['marFEmp','marFDesde','marFHasta'].forEach(id=> document.getElementById(id).onchange=marApplyF);
+  document.getElementById('marFClear').onclick=()=>{ marFilter={emp:'',desde:'',hasta:''}; RENDERERS.marcaciones(); };
 };
 
 // Editar una marcación (entrada/salida): toda edición manual marca el registro como "manual"
@@ -1800,11 +1826,16 @@ function calcularConsolidadoPropinas(lunes){
   const pagadoTotal=pagadoMeseros+pagadoCocina;
   const diferenciaTotal=calcularDiferenciaTotal(baseSemana, pagadoTotal);
 
-  // --- Tarjeta por día (suma de propinas tarjeta de meseros) ---
+  // --- Propinas por día y por tipo (para validación de tarjeta y el resumen
+  //     semanal por medio de pago). Se reutiliza el mismo bucle/filtro que ya
+  //     calculaba solo tarjeta, ahora acumulando también efectivo/yape/plin.
   const tarjetaPorDia=dias.map(f=>{
-    let sum=0;
-    S.prop.filter(p=>p.fecha===f).forEach(p=>{ const e=S.emp.find(x=>x.id===p.empleadoId); if(e&&esMesero(e)) sum+=propMonto(p,'tarjeta'); });
-    return { fecha:f, propTarjeta:sum };
+    let efectivo=0, yape=0, plin=0, tarjeta=0;
+    S.prop.filter(p=>p.fecha===f).forEach(p=>{
+      const e=S.emp.find(x=>x.id===p.empleadoId); if(!e||!esMesero(e)) return;
+      efectivo+=propMonto(p,'efectivo'); yape+=propMonto(p,'yape'); plin+=propMonto(p,'plin'); tarjeta+=propMonto(p,'tarjeta');
+    });
+    return { fecha:f, propTarjeta:tarjeta, efectivo, yape, plin };
   });
 
   return { lunes, domingo, dias, meseros, cocina, avisosCocina, baseSemana, pagadoMeseros, pagadoCocina, pagadoTotal, diferenciaTotal, tarjetaPorDia };
@@ -1860,6 +1891,10 @@ function renderPropinasConsolidado(){
     </tr>`;
   }).join('');
 
+  // Total de la columna "Total base usado": solo suma donde hay un valor real
+  // (filas de Mesero); las filas de Cocina muestran "—" y no se incluyen.
+  const totalBaseUsado = filas.reduce((s,x)=> s + (x.tipo==='Mesero' ? x.base : 0), 0);
+
   let avisoCocinaHtml='';
   if(r.avisosCocina.length){
     avisoCocinaHtml=`<div class="card" style="background:#fffbeb;border-color:#fde68a">
@@ -1884,13 +1919,24 @@ function renderPropinasConsolidado(){
   }).join('');
   const totalTarjetaSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.propTarjeta,0);
 
-  // Resumen semanal de propinas de tarjeta YA PAGADAS (regla existente: monto × 0.98).
-  // Reutiliza r.tarjetaPorDia (mismo cálculo usado en la validación de tarjeta) sin duplicar lógica.
-  const tarjetaPagadaRows=r.tarjetaPorDia.map(t=>{
-    const pagado=t.propTarjeta*0.98;
-    return `<tr><td>${fmtFecha(t.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(t.fecha)].slice(0,3)}</small></td><td class="num">${money(pagado)}</td></tr>`;
+  // Resumen semanal de propinas por medio de pago. Tarjeta mantiene la regla
+  // existente (monto × 0.98, solo el neto); Yape/Efectivo/Plin se muestran sin
+  // descuentos. Reutiliza r.tarjetaPorDia (mismo cálculo de la validación de
+  // tarjeta) sin duplicar lógica.
+  const resumenRows=r.tarjetaPorDia.map(t=>{
+    const tarjetaPagada=t.propTarjeta*0.98;
+    return `<tr>
+      <td>${fmtFecha(t.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(t.fecha)].slice(0,3)}</small></td>
+      <td class="num">${money(tarjetaPagada)}</td>
+      <td class="num">${money(t.yape)}</td>
+      <td class="num">${money(t.efectivo)}</td>
+      <td class="num">${money(t.plin)}</td>
+    </tr>`;
   }).join('');
   const totalTarjetaPagadaSemana=r.tarjetaPorDia.reduce((s,t)=>s+(t.propTarjeta*0.98),0);
+  const totalYapeSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.yape,0);
+  const totalEfectivoSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.efectivo,0);
+  const totalPlinSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.plin,0);
 
   out.innerHTML=`
     <div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Semana:</b> ${titulo}</div>
@@ -1900,6 +1946,7 @@ function renderPropinasConsolidado(){
       <div class="table-wrap"><table>
         <thead><tr><th>Periodo (semana)</th><th>Empleado</th><th>Tipo</th><th class="num">Total base usado</th><th class="num">% aplicado</th><th class="num">Monto a pagar</th><th>Observaciones</th></tr></thead>
         <tbody>${filasHtml || `<tr><td colspan="7" class="empty">Sin empleados con cálculo esta semana.</td></tr>`}</tbody>
+        ${filas.length? `<tfoot><tr><td>Totales</td><td>—</td><td>—</td><td class="num">${money(totalBaseUsado)}</td><td>—</td><td class="num">${money(r.pagadoTotal)}</td><td>—</td></tr></tfoot>` : ''}
       </table></div>
       <div class="actions"><button class="btn btn-ghost btn-sm" id="propConsCopiarBtn">📋 Copiar empleado y monto</button></div>
       <p class="hint" style="margin-top:8px">Copia solo Empleado y Monto a pagar (separados por tabulación), listo para pegar en Google Sheets.</p>
@@ -1916,12 +1963,12 @@ function renderPropinasConsolidado(){
     </div>
 
     <div class="card">
-      <h2>Resumen semanal de propinas de tarjeta pagadas</h2>
-      <p class="hint" style="margin-top:0">Monto neto por día (propinas de tarjeta × 0.98), agrupado por fecha. Se actualiza automáticamente al agregar, editar o eliminar propinas.</p>
+      <h2>Resumen semanal de propinas</h2>
+      <p class="hint" style="margin-top:0">Monto diario por medio de pago, agrupado por fecha. Tarjeta muestra el neto (propinas de tarjeta × 0.98); Yape, Efectivo y Plin se muestran sin descuentos. Se actualiza automáticamente al agregar, editar o eliminar propinas, y al restaurar/importar/sincronizar datos.</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th class="num">Total propinas tarjeta pagadas</th></tr></thead>
-        <tbody>${tarjetaPagadaRows || `<tr><td colspan="2" class="empty">Sin propinas de tarjeta esta semana.</td></tr>`}</tbody>
-        <tfoot><tr><td>Total semana</td><td class="num">${money(totalTarjetaPagadaSemana)}</td></tr></tfoot>
+        <thead><tr><th>Fecha</th><th class="num">Tarjeta</th><th class="num">Yape</th><th class="num">Efectivo</th><th class="num">Plin</th></tr></thead>
+        <tbody>${resumenRows || `<tr><td colspan="5" class="empty">Sin propinas esta semana.</td></tr>`}</tbody>
+        <tfoot><tr><td>Total semana</td><td class="num">${money(totalTarjetaPagadaSemana)}</td><td class="num">${money(totalYapeSemana)}</td><td class="num">${money(totalEfectivoSemana)}</td><td class="num">${money(totalPlinSemana)}</td></tr></tfoot>
       </table></div>
     </div>
 
