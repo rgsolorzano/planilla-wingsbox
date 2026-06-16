@@ -1389,14 +1389,24 @@ let editPropItem=null;       // item en edición (formato unificado), null = mod
 let propFilter={emp:'',desde:'',hasta:''};
 // Filas del formulario de "nueva propina" (no aplica en modo edición).
 let propDraftRows=[{tipo:'efectivo', monto:''}];
+// Mesero/fecha seleccionados "en vivo" en el formulario de nueva propina (no aplica en
+// edición). Se usan para no perder la selección al agregar/quitar filas antes de guardar;
+// se reinician a null tras guardar (en ese punto manda lastPropina, que ya coincide).
+let propFormEmpleadoId=null;
+let propFormFecha=null;
 
 // Recuerda el último mesero y fecha usados al registrar una propina
 // para no tener que volver a seleccionarlos tras cada guardado exitoso.
 let lastPropina = { empleadoId: null, fecha: null };
 
-// Lee del DOM los valores actuales de las filas del formulario hacia propDraftRows
-// (se usa antes de agregar/quitar una fila, para no perder lo ya escrito).
+// Lee del DOM los valores actuales del formulario (mesero, fecha y filas) hacia el
+// estado en memoria. Se usa antes de agregar/quitar una fila, para no perder lo ya
+// seleccionado/escrito y conservar mesero y fecha entre cada "Agregar otra propina".
 function propCapturarFilas(){
+  const empSel=document.getElementById('prEmp');
+  const fechaInp=document.getElementById('prFecha');
+  if(empSel) propFormEmpleadoId=empSel.value;
+  if(fechaInp) propFormFecha=fechaInp.value;
   const tipos=document.querySelectorAll('.prRowTipo');
   const montos=document.querySelectorAll('.prRowMonto');
   if(!tipos.length) return;
@@ -1433,8 +1443,8 @@ RENDERERS.propinas = function(){
     <div class="card">
       <h2>Nueva propina</h2>
       <div class="form-grid">
-        <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(lastPropina.empleadoId)}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${lastPropina.fecha||hoy}"></div>
+        <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(propFormEmpleadoId!=null?propFormEmpleadoId:lastPropina.empleadoId)}</select></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${propFormFecha!=null?propFormFecha:(lastPropina.fecha||hoy)}"></div>
       </div>
       <h3 style="margin-top:14px">Propinas a registrar</h3>
       <p class="hint" style="margin-top:0">El mesero y la fecha de arriba se aplican a todas las filas. Agrega tantas filas como necesites (no hay límite).</p>
@@ -1483,7 +1493,13 @@ RENDERERS.propinas = function(){
     document.getElementById('prCancel').onclick=()=>{ editPropItem=null; RENDERERS.propinas(); };
   }else{
     document.getElementById('prSave').onclick=propGuardarNuevo;
-    document.getElementById('prRowAdd').onclick=()=>{ propCapturarFilas(); propDraftRows.push({tipo:'efectivo', monto:''}); RENDERERS.propinas(); };
+    document.getElementById('prRowAdd').onclick=()=>{
+      propCapturarFilas();
+      propDraftRows.push({tipo:'efectivo', monto:''});
+      RENDERERS.propinas();
+      const tipos=document.querySelectorAll('.prRowTipo');
+      if(tipos.length) tipos[tipos.length-1].focus();
+    };
   }
 };
 
@@ -1520,6 +1536,11 @@ function propGuardarNuevo(){
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
 
   lastPropina = { empleadoId, fecha };
+  // Mantiene el encabezado (mesero/fecha) sincronizado con lo recién guardado,
+  // para que no se muestre un valor obsoleto si el usuario los cambió justo
+  // antes de presionar "Guardar" (sin pasar por "Agregar otra propina").
+  propFormEmpleadoId = empleadoId;
+  propFormFecha = fecha;
   propDraftRows=[{tipo:'efectivo', monto:''}];
   RENDERERS.propinas();
 }
