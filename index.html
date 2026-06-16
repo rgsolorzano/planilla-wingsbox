@@ -960,6 +960,88 @@ let importNoRecon = []; // nombres del Excel que no coinciden con empleados
 // para no tener que volver a seleccionarlos tras cada alta exitosa.
 let lastMarcacion = { empleadoId: null, fecha: null };
 
+// ---------------------------------------------------------------------------
+// Configuración centralizada de la sincronización de marcaciones desde un
+// Google Spreadsheet externo (p.ej. las respuestas de un Google Form). Si la
+// fuente cambia de spreadsheet, de pestaña o de encabezados, solo hay que
+// editar este objeto: el resto del código no asume IDs ni nombres fijos.
+const MARCACION_SYNC_CONFIG = {
+  spreadsheetId: '1CA6fpDKI9id4yyG1HcFoDR1aEDTExkwo-jYA-PSq2cU',
+  sheetName: 'Respuestas de formulario 1',
+  // Cada campo acepta varias palabras clave (sin tildes, en minúsculas) para
+  // ubicar la columna por su encabezado real en vez de asumir una posición fija.
+  columnas: {
+    timestamp: ['marca temporal', 'timestamp'],
+    nombre: ['nombre del empleado', 'escoja su nombre', 'nombre', 'empleado'],
+    tipo: ['tipo de marcacion', 'tipo marcacion', 'tipo']
+  }
+};
+
+// Ubica el índice de una columna dentro de "headers" buscando por palabras
+// clave (insensible a mayúsculas/tildes). Si no encuentra ninguna, devuelve -1
+// para que el llamador decida un valor de respaldo (posición fija).
+function indiceColumna(headers, palabrasClave){
+  const normalizar = s => (s==null?'':String(s)).normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLowerCase();
+  const hs = (headers||[]).map(normalizar);
+  for(const clave of palabrasClave){
+    const idx = hs.findIndex(h=>h.includes(clave));
+    if(idx!==-1) return idx;
+  }
+  return -1;
+}
+
+// Agrupa filas crudas {ts, nombre, tipo} (provenientes del Excel o de Google
+// Sheets) en marcaciones por empleado+fecha, igual que la importación actual:
+// toma la Entrada más temprana y la Salida más tardía del día. Se reutiliza
+// tanto en importarExcel() como en sincronizarMarcacionesDesdeSheet().
+function agruparFilasMarcacion(filasRaw){
+  const grupos = {};
+  const noReconocidos = [];
+  let leidas = 0;
+  filasRaw.forEach(({ts, nombre, tipo})=>{
+    if(ts==null || !nombre) return;
+    const emp = findEmpByName(nombre);
+    if(!emp){ if(!noReconocidos.includes(nombre)) noReconocidos.push(nombre); return; }
+    const p = parseExcelTS(ts); if(!p) return;
+    leidas++;
+    const key = emp.id+'|'+p.fecha;
+    if(!grupos[key]) grupos[key] = { empleadoId:emp.id, fecha:p.fecha, entradas:[], salidas:[] };
+    const t = (tipo||'').toString().trim().toLowerCase();
+    if(t.startsWith('sal')) grupos[key].salidas.push(p.hm);
+    else grupos[key].entradas.push(p.hm); // por defecto Entrada
+  });
+  return { grupos, noReconocidos, leidas };
+}
+
+// Aplica los grupos {empleadoId,fecha,entradas,salidas} sobre S.mar respetando
+// "reemplazar" y "conservar manuales", exactamente con la misma lógica que ya
+// usaba importarExcel(). Reutilizado por ambas fuentes (Excel y Sheets).
+function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
+  let manualesConservadas = 0, manualesBorradas = 0;
+  if(reemplazar){
+    if(conservarManuales){
+      manualesConservadas = S.mar.filter(m=>marOrigen(m)==='manual').length;
+      S.mar = S.mar.filter(m=>marOrigen(m)==='manual');
+    }else{
+      manualesBorradas = S.mar.filter(m=>marOrigen(m)==='manual').length;
+      S.mar = [];
+    }
+  }
+  let nuevas=0, actualizadas=0, manualesProtegidas=0;
+  Object.values(grupos).forEach(g=>{
+    const entradaReal = g.entradas.length? g.entradas.sort()[0] : null;       // entrada más temprana
+    const salidaReal  = g.salidas.length? g.salidas.sort().slice(-1)[0] : null; // salida más tardía
+    let m = getMarcacion(g.empleadoId, g.fecha);
+    if(m){
+      // No sobreescribir correcciones manuales cuando se pide conservarlas.
+      if(marOrigen(m)==='manual' && conservarManuales){ manualesProtegidas++; return; }
+      m.entradaReal=entradaReal; m.salidaReal=salidaReal; m.origen='archivo'; actualizadas++;
+    }
+    else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal, origen:'archivo'}); nuevas++; }
+  });
+  return { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas };
+}
+
 RENDERERS.marcaciones = function(){
   const el = document.getElementById('page-marcaciones');
   // ordenar marcaciones por fecha y empleado
@@ -976,10 +1058,12 @@ RENDERERS.marcaciones = function(){
       <div class="toolbar">
         <div class="field"><label>Archivo Excel (.xlsx)</label><input type="file" id="fileXlsx" accept=".xlsx,.xls"></div>
         <button class="btn btn-primary" id="btnImport">Importar</button>
+        <button class="btn btn-ghost" id="btnSyncMarcacion">🔄 Sincronizar marcación</button>
         <label class="pill"><input type="checkbox" id="impReemplaza"> Reemplazar marcaciones existentes</label>
         <label class="pill"><input type="checkbox" id="impConservaManual" checked> Conservar marcaciones manuales existentes</label>
       </div>
       <p class="hint">Estructura esperada: <b>Marca temporal</b> | <b>Escoja su nombre</b> | <b>Tipo marcación</b> (Entrada/Salida). El empleado se empareja por nombre. Las marcaciones importadas se registran con origen <b>Archivo</b>. Si activas "Reemplazar", el flujo respeta la opción de conservar las manuales.</p>
+      <p class="hint" style="margin-top:4px">"🔄 Sincronizar marcación" lee las mismas columnas directamente desde el Google Sheet de respuestas del formulario (requiere haber iniciado sesión con la cuenta de Google autorizada) y aplica las mismas reglas de agrupación y las opciones de arriba.</p>
       <div id="importMsg"></div>
     </div>
     <div class="card">
@@ -1019,6 +1103,7 @@ RENDERERS.marcaciones = function(){
     </div>`;
 
   document.getElementById('btnImport').onclick = importarExcel;
+  document.getElementById('btnSyncMarcacion').onclick = sincronizarMarcacionesDesdeSheet;
   const addBtn = document.getElementById('btnAddMar');
   if(addBtn) addBtn.onclick = addMarManual;
 };
@@ -1098,47 +1183,12 @@ function importarExcel(){
       let start = 0;
       if(rows.length && rows[0].some(c=> typeof c==='string' && /marca|nombre|tipo/i.test(c))) start = 1;
 
-      // agrupado: clave empleado|fecha -> {entradas:[], salidas:[]}
-      const grupos = {};
-      importNoRecon = [];
-      let leidas=0;
-      for(let i=start; i<rows.length; i++){
-        const r=rows[i]; if(!r) continue;
-        const ts=r[0], nombre=r[1], tipo=(r[2]||'').toString().trim().toLowerCase();
-        if(ts==null || !nombre) continue;
-        const emp = findEmpByName(nombre);
-        if(!emp){ if(!importNoRecon.includes(nombre)) importNoRecon.push(nombre); continue; }
-        const p = parseExcelTS(ts); if(!p) continue;
-        leidas++;
-        const key = emp.id+'|'+p.fecha;
-        if(!grupos[key]) grupos[key]={empleadoId:emp.id, fecha:p.fecha, entradas:[], salidas:[]};
-        if(tipo.startsWith('sal')) grupos[key].salidas.push(p.hm);
-        else grupos[key].entradas.push(p.hm); // por defecto Entrada
-      }
+      const filasRaw = rows.slice(start).filter(r=>r).map(r=>({ ts:r[0], nombre:r[1], tipo:r[2] }));
+      const { grupos, noReconocidos, leidas } = agruparFilasMarcacion(filasRaw);
+      importNoRecon = noReconocidos;
 
-      // Reemplazo: si se conservan manuales, solo se eliminan las de origen "archivo".
-      let manualesConservadas = 0, manualesBorradas = 0;
-      if(reemplazar){
-        if(conservarManuales){
-          manualesConservadas = S.mar.filter(m=>marOrigen(m)==='manual').length;
-          S.mar = S.mar.filter(m=>marOrigen(m)==='manual');
-        }else{
-          manualesBorradas = S.mar.filter(m=>marOrigen(m)==='manual').length;
-          S.mar = [];
-        }
-      }
-      let nuevas=0, actualizadas=0, manualesProtegidas=0;
-      Object.values(grupos).forEach(g=>{
-        const entradaReal = g.entradas.length? g.entradas.sort()[0] : null;       // entrada más temprana
-        const salidaReal  = g.salidas.length? g.salidas.sort().slice(-1)[0] : null; // salida más tardía
-        let m = getMarcacion(g.empleadoId, g.fecha);
-        if(m){
-          // No sobreescribir correcciones manuales cuando se pide conservarlas.
-          if(marOrigen(m)==='manual' && conservarManuales){ manualesProtegidas++; return; }
-          m.entradaReal=entradaReal; m.salidaReal=salidaReal; m.origen='archivo'; actualizadas++;
-        }
-        else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal, origen:'archivo'}); nuevas++; }
-      });
+      const { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas } =
+        aplicarGruposMarcacion(grupos, { reemplazar, conservarManuales });
       save(K.mar,S.mar);
 
       let msg = `<div class="card" style="background:#f0fdf4;border-color:#bbf7d0">
@@ -1159,6 +1209,103 @@ function importarExcel(){
     }
   };
   reader.readAsArrayBuffer(f);
+}
+
+// ---------------------------------------------------------------------------
+// Sincroniza marcaciones leyendo directamente la hoja de respuestas del
+// Google Form (ver MARCACION_SYNC_CONFIG), reutilizando la MISMA sesión/token
+// OAuth y el mismo helper gsApiFetch() que ya usa el resto de la app para
+// hablar con la Google Sheets API (sin mecanismos de autenticación paralelos).
+// ---------------------------------------------------------------------------
+async function sincronizarMarcacionesDesdeSheet(){
+  if(!isAuthorized()){ toast('No hay sesión activa de Google. Inicia sesión con la cuenta habilitada para sincronizar.','error'); return; }
+  const { spreadsheetId, sheetName, columnas } = MARCACION_SYNC_CONFIG;
+  const reemplazar = document.getElementById('impReemplaza').checked;
+  const conservarManuales = document.getElementById('impConservaManual').checked;
+  const btn = document.getElementById('btnSyncMarcacion');
+  if(btn){ btn.disabled=true; btn.dataset.txt = btn.textContent; btn.textContent = 'Sincronizando…'; }
+  gsUpdateSyncStatus('Sincronizando marcaciones desde Google Sheets…','info');
+  try{
+    const range = "'"+sheetName.replace(/'/g,"''")+"'!A1:Z";
+    // UNFORMATTED_VALUE + SERIAL_NUMBER: el timestamp llega como número serial
+    // de hoja de cálculo, igual que en un Excel, así reutilizamos sin cambios
+    // el mismo parseExcelTS() que ya usa la importación de Excel.
+    const r = await gsApiFetch(
+      'https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(spreadsheetId)+
+      '/values/'+encodeURIComponent(range)+'?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=SERIAL_NUMBER'
+    );
+    if(r.status===403){ throw new Error('SIN_PERMISO'); }
+    if(r.status===404){ throw new Error('NO_ENCONTRADO'); }
+    if(!r.ok){ throw new Error('Error de conexión con Google Sheets (código '+r.status+').'); }
+
+    const data = await r.json();
+    const filas = data.values;
+    if(!filas || !filas.length) throw new Error('SIN_DATOS');
+
+    const headers = filas[0];
+    const idxTs = indiceColumna(headers, columnas.timestamp);
+    const idxNombre = indiceColumna(headers, columnas.nombre);
+    const idxTipo = indiceColumna(headers, columnas.tipo);
+    // Si no se reconoce el encabezado, se cae de vuelta a las posiciones fijas
+    // A/B/C (mismo orden que usa el Excel) en lugar de fallar.
+    const tsCol = idxTs!==-1 ? idxTs : 0;
+    const nombreCol = idxNombre!==-1 ? idxNombre : 1;
+    const tipoCol = idxTipo!==-1 ? idxTipo : 2;
+
+    const filasRaw = filas.slice(1).map(row=>({ ts:row[tsCol], nombre:row[nombreCol], tipo:row[tipoCol] }));
+    const { grupos, noReconocidos, leidas } = agruparFilasMarcacion(filasRaw);
+    if(!leidas) throw new Error('SIN_REGISTROS');
+
+    const { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas } =
+      aplicarGruposMarcacion(grupos, { reemplazar, conservarManuales });
+    save(K.mar, S.mar);
+    RENDERERS.marcaciones();
+
+    const procesadas = nuevas + actualizadas;
+    toast(`Sincronización exitosa: ${procesadas} marcación(es) procesadas (${nuevas} nuevas, ${actualizadas} actualizadas).`, 'success');
+    gsUpdateSyncStatus('Marcaciones sincronizadas ('+(gsState.email||'cuenta de Google')+').', 'success');
+    if(noReconocidos.length){
+      toast(`${noReconocidos.length} nombre(s) del formulario no coinciden con ningún empleado: ${noReconocidos.slice(0,5).join(', ')}${noReconocidos.length>5?'…':''}.`, 'warn');
+    }
+
+    const msgEl = document.getElementById('importMsg');
+    if(msgEl){
+      let msg = `<div class="card" style="background:#f0fdf4;border-color:#bbf7d0">
+        <b>✔ Sincronización con Google Sheets completada.</b> Filas leídas: ${leidas}. Marcaciones nuevas: ${nuevas}, actualizadas: ${actualizadas}.`;
+      if(reemplazar && conservarManuales) msg += `<br>Las marcaciones manuales fueron conservadas (${manualesConservadas}${manualesProtegidas?`, ${manualesProtegidas} no se sobreescribieron`:''}).`;
+      if(reemplazar && !conservarManuales) msg += `<br>Todas las marcaciones anteriores fueron reemplazadas${manualesBorradas?` (incluidas ${manualesBorradas} manuales)`:''}.`;
+      if(noReconocidos.length) msg += `<div style="margin-top:10px"><b>⚠ Nombres no reconocidos:</b> ${noReconocidos.join(', ')}.<br>Crea estos empleados (mismo nombre) y vuelve a sincronizar para incluirlos.</div>`;
+      msg += `</div>`;
+      msgEl.innerHTML = msg;
+    }
+
+    // Refleja el cambio también en el spreadsheet de almacenamiento de la app,
+    // reutilizando tal cual el mecanismo de guardado ya existente (mismo botón
+    // "⬆ Guardar en Google Sheets" del módulo de Administración).
+    try{ await gsSaveToSheets(); }
+    catch(e){ console.error(e); /* gsSaveToSheets ya muestra su propio toast de error */ }
+
+  }catch(err){
+    console.error(err);
+    if(err && err.message==='SIN_PERMISO'){
+      toast('No tienes permisos suficientes para leer ese spreadsheet. La cuenta conectada necesita el permiso "Ver tus hojas de cálculo de Google" — cierra sesión y vuelve a iniciar sesión con Google para otorgarlo.','error');
+      gsUpdateSyncStatus('Sin permisos para leer el spreadsheet externo.','error');
+    }else if(err && err.message==='NO_ENCONTRADO'){
+      toast('El spreadsheet no existe o no es accesible con la cuenta conectada.','error');
+      gsUpdateSyncStatus('Spreadsheet no encontrado o sin acceso.','error');
+    }else if(err && err.message==='SIN_DATOS'){
+      toast('La pestaña "'+sheetName+'" no existe o no tiene filas para procesar.','error');
+      gsUpdateSyncStatus('La pestaña está vacía o no existe.','error');
+    }else if(err && err.message==='SIN_REGISTROS'){
+      toast('No se encontraron registros válidos (marca temporal + nombre) en la hoja.','error');
+      gsUpdateSyncStatus('Sin registros válidos.','error');
+    }else{
+      gsHandleError(err, 'sincronizar marcaciones');
+    }
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent = btn.dataset.txt || '🔄 Sincronizar marcación'; }
+    gsRenderControls();
+  }
 }
 
 /* ---------- Filtro por empleado y rango de fecha (Descuentos / Pagos extra) ---------- */
@@ -2396,9 +2543,12 @@ document.getElementById('btnWipe').onclick=()=>{
    3) En "Orígenes autorizados de JavaScript" agrega el dominio de
       despliegue:  https://rgsolorzano.github.io
       (para pruebas locales agrega también  http://localhost:PUERTO ).
-   4) Configura la pantalla de consentimiento de OAuth y agrega el
-      scope ".../auth/drive.file" (acceso solo a archivos creados por
-      esta app). Si la app está en modo "Testing", agrega tu cuenta
+   4) Configura la pantalla de consentimiento de OAuth y agrega los
+      scopes ".../auth/drive.file" (acceso solo a archivos creados por
+      esta app) y ".../auth/spreadsheets.readonly" (necesario para que
+      la app pueda LEER otros spreadsheets de la misma cuenta, como las
+      respuestas de un Google Form; ver "Sincronizar marcación" en el
+      MÓDULO 3). Si la app está en modo "Testing", agrega tu cuenta
       como usuario de prueba.
    5) Pega tu Client ID abajo (GOOGLE_CLIENT_ID). El Client ID NO es
       secreto; puede estar en el frontend. NUNCA pongas el client
@@ -2409,8 +2559,20 @@ const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.goo
 // Solo esta cuenta podrá iniciar sesión y operar con el spreadsheet.
 const AUTHORIZED_EMAIL = 'multiboxes.peru@gmail.com';
 // Scopes: openid/email/profile para identificar al usuario (login) +
-// drive.file (mínimo) para acceder solo a los archivos creados por esta app.
-const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file';
+// drive.file (mínimo) para que la app cree/lea/escriba SU PROPIO spreadsheet
+// de almacenamiento (WingsBox Planilla - Datos) +
+// spreadsheets.readonly para poder LEER otros spreadsheets que la cuenta ya
+// posee/puede ver (p.ej. las respuestas de un Google Form), algo que
+// drive.file NO permite: ese scope solo da acceso a archivos creados por
+// esta app o abiertos explícitamente con ella (vía Picker/"Abrir con"), NO a
+// cualquier archivo del usuario por más que se conozca su ID. Por eso la
+// sincronización de marcaciones (ver MÓDULO 3) necesita este scope extra.
+// IMPORTANTE: al agregar este scope, la cuenta AUTHORIZED_EMAIL debe volver a
+// iniciar sesión una vez (Google pedirá el nuevo permiso) y, si el proyecto de
+// Google Cloud está en modo "Testing", confirmar que el scope esté habilitado
+// en la pantalla de consentimiento (mismo paso ya documentado arriba para
+// drive.file).
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly';
 // Nombre fijo del spreadsheet de almacenamiento (se busca/crea por nombre).
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
