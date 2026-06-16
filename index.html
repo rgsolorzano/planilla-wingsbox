@@ -874,6 +874,10 @@ function horGuardar(silent){
    ================================================================ */
 let importNoRecon = []; // nombres del Excel que no coinciden con empleados
 
+// Recuerda el último empleado y fecha usados en "Agregar marcación manual"
+// para no tener que volver a seleccionarlos tras cada alta exitosa.
+let lastMarcacion = { empleadoId: null, fecha: null };
+
 RENDERERS.marcaciones = function(){
   const el = document.getElementById('page-marcaciones');
   // ordenar marcaciones por fecha y empleado
@@ -881,7 +885,7 @@ RENDERERS.marcaciones = function(){
 
   const hoy = new Date().toISOString().slice(0,10);
   const manuales = S.mar.filter(m=>marOrigen(m)==='manual').length;
-  const empOpts = S.emp.map(e=>`<option value="${e.id}">${e.nombre}</option>`).join('');
+  const empOpts = empOptions(lastMarcacion.empleadoId);
 
   el.innerHTML = `
     <div class="page-head"><div><h1>📥 Carga de horas trabajadas</h1><p>Importa el Excel de marcaciones o agrégalas manualmente. Puedes editar las horas y se alerta si falta una marcación.</p></div></div>
@@ -900,7 +904,7 @@ RENDERERS.marcaciones = function(){
       <h2>Agregar marcación manual</h2>
       ${S.emp.length? `<div class="toolbar">
         <div class="field"><label>Empleado *</label><select id="manEmp">${empOpts}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="manFecha" value="${hoy}"></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="manFecha" value="${lastMarcacion.fecha || hoy}"></div>
         <div class="field"><label>Entrada</label><input type="time" id="manEntrada"></div>
         <div class="field"><label>Salida</label><input type="time" id="manSalida"></div>
         <button class="btn btn-primary" id="btnAddMar">+ Agregar marcación</button>
@@ -969,6 +973,7 @@ function addMarManual(){
     S.mar.push({id:uid(), empleadoId:empId, fecha, entradaReal:entrada, salidaReal:salida, origen:'manual'});
   }
   save(K.mar,S.mar);
+  lastMarcacion = { empleadoId: empId, fecha: fecha };
   toast('Marcación manual agregada correctamente','success');
   RENDERERS.marcaciones();
 }
@@ -1295,6 +1300,11 @@ window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.l
    ================================================================ */
 let editPropId=null;
 let propFilter={emp:'',desde:'',hasta:''};
+
+// Recuerda el último mesero y fecha usados al registrar una propina
+// para no tener que volver a seleccionarlos tras cada guardado exitoso.
+let lastPropina = { empleadoId: null, fecha: null };
+
 RENDERERS.propinas = function(){
   const el=document.getElementById('page-propinas');
   const meseros=S.emp.filter(esMesero);
@@ -1311,8 +1321,8 @@ RENDERERS.propinas = function(){
     <div class="card">
       <h2>${ed?'Editar propina':'Nueva propina'}</h2>
       <div class="form-grid">
-        <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(ed?ed.empleadoId:undefined)}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${ed?ed.fecha:hoy}"></div>
+        <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(ed?ed.empleadoId:lastPropina.empleadoId)}</select></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${ed?ed.fecha:(lastPropina.fecha||hoy)}"></div>
         <div class="field"><label>Efectivo</label><input type="number" id="prEfectivo" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.efectivo??''):''}"></div>
         <div class="field"><label>Yape</label><input type="number" id="prYape" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.yape??''):''}"></div>
         <div class="field"><label>Plin</label><input type="number" id="prPlin" min="0" step="0.01" placeholder="0.00" value="${ed?(ed.plin??''):''}"></div>
@@ -1368,6 +1378,7 @@ function propGuardar(){
   }else{
     S.prop.push(Object.assign({id:uid()}, datos)); save(K.prop,S.prop); toast('Propina registrada','success');
   }
+  lastPropina = { empleadoId, fecha };
   RENDERERS.propinas();
 }
 window.propEdit=function(id){ editPropId=id; RENDERERS.propinas(); window.scrollTo({top:0,behavior:'smooth'}); };
