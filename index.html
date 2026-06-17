@@ -89,6 +89,15 @@
   tbody tr:hover{background:#faf8fe}
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   tfoot td{font-weight:700;background:#f1ecfa}
+  /* Consolidado de Inventario: alertas (mismos colores que .b-miss) */
+  .inv-insumo-alerta{color:#991b1b;font-weight:700}
+  .inv-cell-alerta{background:#fee2e2}
+  .inv-cell-alerta input{color:#991b1b;font-weight:700}
+  .inv-matrix th small{display:block}
+  .inv-del-mini{border:none;background:transparent;cursor:pointer;font-size:12px;padding:0 2px;line-height:1;opacity:.7}
+  .inv-del-mini:hover{opacity:1}
+  .inv-cell-wrap{display:flex;align-items:center;gap:4px;justify-content:flex-end}
+  .inv-cell-wrap input{min-width:64px}
   table input,table select{width:100%;min-width:80px;padding:5px 6px;border:1px solid var(--c-line);border-radius:6px;font-size:12px;background:#fff}
   .empty{padding:30px;text-align:center;color:var(--c-muted);font-size:13px}
 
@@ -2830,7 +2839,7 @@ window.insumoDel = function(id){
   RENDERERS.insumos();
 };
 
-/* ---------- Consolidado de Inventario (histórico por insumo) ---------- */
+/* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
 // Rango por defecto: últimos 7 días (incluye hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
 let invConsFilter = (function(){
@@ -2838,15 +2847,90 @@ let invConsFilter = (function(){
   const fmt = d => d.toISOString().slice(0,10);
   return { desde: fmt(hace6), hasta: fmt(hoy) };
 })();
+// Tope de columnas de fecha que genera la matriz (cada fecha = 2 columnas).
+// Evita una tabla inmanejable si el usuario deja un rango muy amplio o vacío.
+const INV_MAX_DIAS = 60;
+// Resuelve el rango efectivo (con valores por defecto si el usuario dejó algún
+// campo vacío) y la lista de fechas (ascendente) que se usará como columnas.
+function invRangoEfectivo(){
+  const hoy = new Date().toISOString().slice(0,10);
+  let desde = invConsFilter.desde || hoy;
+  let hasta = invConsFilter.hasta || hoy;
+  if(desde>hasta){ const t=desde; desde=hasta; hasta=t; }
+  let fechas = rangoFechas(desde, hasta);
+  if(fechas.length > INV_MAX_DIAS){
+    fechas = fechas.slice(-INV_MAX_DIAS);
+    desde = fechas[0];
+  }
+  return { desde, hasta, fechas };
+}
+// Fecha calendario inmediatamente anterior (string 'YYYY-MM-DD').
+function fechaMenosUnDia(fechaISO){
+  const [y,m,d] = fechaISO.split('-').map(Number);
+  const dt = new Date(y, m-1, d);
+  dt.setDate(dt.getDate()-1);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
+
 RENDERERS.inventarioConsolidado = function(){
   const el = document.getElementById('page-inventarioConsolidado');
-  const { desde, hasta } = invConsFilter;
-  const data = [...S.produccion]
-    .filter(r => (!desde || r.fecha>=desde) && (!hasta || r.fecha<=hasta))
-    .sort((a,b)=> b.fecha.localeCompare(a.fecha) || nombreInsumo(a.insumoId).localeCompare(nombreInsumo(b.insumoId)));
+  const { desde, hasta, fechas } = invRangoEfectivo();
+  const reg = (insumoId, fecha) => getProduccion(insumoId, fecha);
+
+  // ---------------------------------------------------------------------
+  // Reglas de alerta (se recalculan en cada render: al cargar, al cambiar
+  // el rango, y tras cualquier edición/alta/baja de un registro).
+  // ---------------------------------------------------------------------
+  // Regla 2 — bajo consumo (solo insumos en "ml"): se resalta el insumo si
+  // existe AL MENOS UNA ventana de 3 días calendario consecutivos (con
+  // registro en los tres) dentro del rango visualizado cuya reducción de
+  // Stock Total (Producción+Cierre) entre el primer y el último día sea
+  // menor a 100 ml.
+  function bajoConsumo(insumo){
+    if((insumo.unidad||'').trim().toLowerCase()!=='ml') return false;
+    for(let i=0;i<fechas.length-2;i++){
+      const r1=reg(insumo.id,fechas[i]), r2=reg(insumo.id,fechas[i+1]), r3=reg(insumo.id,fechas[i+2]);
+      if(!r1||!r2||!r3) continue; // ventana incompleta: no se evalúa
+      const stock1 = numProp(r1.produccion)+numProp(r1.cierre);
+      const stock3 = numProp(r3.produccion)+numProp(r3.cierre);
+      if((stock1-stock3) < 100) return true;
+    }
+    return false;
+  }
+  // Regla 3 — incremento anormal de cierre sin producción registrada: compara
+  // contra el día calendario inmediatamente anterior del MISMO insumo (en
+  // todo el historial, no solo el rango visible, para no perder el primer
+  // día mostrado). Se resalta únicamente la celda de Cierre de esa fecha.
+  function incrementoAnormal(insumoId, fecha){
+    const r = reg(insumoId, fecha); if(!r) return false;
+    if(numProp(r.produccion) !== 0) return false;
+    const ant = getProduccion(insumoId, fechaMenosUnDia(fecha)); if(!ant) return false;
+    const cierreAnt = numProp(ant.cierre); if(cierreAnt<=0) return false;
+    return numProp(r.cierre) > cierreAnt*1.02;
+  }
+
+  const hayInsumos = S.insumos.length>0;
+  const hayDatos = hayInsumos && S.insumos.some(ins=> fechas.some(f=>reg(ins.id,f)));
+
+  const theadFechas = fechas.map(f=>`<th colspan="2">${fmtFecha(f)}<small style="font-weight:400;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</small></th>`).join('');
+  const theadSub = fechas.map(()=>`<th class="num">Producción</th><th class="num">Cierre</th>`).join('');
+
+  const filasInsumos = S.insumos.map(ins=>{
+    const alerta = bajoConsumo(ins);
+    const celdas = fechas.map(f=>{
+      const r = reg(ins.id,f);
+      if(!r) return `<td class="num"></td><td class="num"></td>`;
+      const anomalo = incrementoAnormal(ins.id,f);
+      const prodCell = `<input type="number" min="0" step="0.01" value="${r.produccion}" onchange="invSetCampo('${r.id}','produccion',this.value)">`;
+      const cierreCell = `<div class="inv-cell-wrap"><input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)">
+        <button class="inv-del-mini" title="Eliminar este registro" onclick="invDel('${r.id}')">🗑️</button></div>`;
+      return `<td class="num">${prodCell}</td><td class="num ${anomalo?'inv-cell-alerta':''}">${cierreCell}</td>`;
+    }).join('');
+    return `<tr><td class="${alerta?'inv-insumo-alerta':''}">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
+  }).join('');
 
   el.innerHTML = `
-    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica de producción y cierre por insumo.</p></div></div>
+    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica de producción y cierre por insumo, en formato matricial (una fila por insumo, dos columnas por fecha).</p></div></div>
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
@@ -2854,19 +2938,19 @@ RENDERERS.inventarioConsolidado = function(){
         <button class="btn btn-ghost btn-sm" id="invFClear">Últimos 7 días</button>
         <button class="btn btn-green" id="invExport">⬇ Exportar Excel (filtrado)</button>
       </div>
-      <h2>Historial (${data.length})</h2>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th>Insumo</th><th class="num">Producción</th><th class="num">Cierre</th><th>Unidad</th><th>Acciones</th></tr></thead>
-        <tbody>${data.length? data.map(r=>`
-          <tr>
-            <td>${fmtFecha(r.fecha)}</td>
-            <td>${nombreInsumo(r.insumoId)}</td>
-            <td class="num"><input type="number" min="0" step="0.01" value="${r.produccion}" onchange="invSetCampo('${r.id}','produccion',this.value)"></td>
-            <td class="num"><input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)"></td>
-            <td>${unidadInsumo(r.insumoId)}</td>
-            <td><button class="btn-icon del" onclick="invDel('${r.id}')">🗑️</button></td>
-          </tr>`).join('') : `<tr><td colspan="6" class="empty">No hay registros en el rango seleccionado.</td></tr>`}</tbody>
-      </table></div>
+      <h2>Historial por insumo (${fechas.length} día${fechas.length===1?'':'s'}, ${S.insumos.length} insumo${S.insumos.length===1?'':'s'})</h2>
+      <p class="hint" style="margin-top:0">
+        <span class="inv-insumo-alerta">Insumo en rojo y negrita</span>: bajo consumo (insumos en ml; reducción de Stock Total &lt; 100&nbsp;ml en alguna ventana de 3 días consecutivos del rango).
+        <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: incremento de cierre &gt; 2% sin producción registrada ese día.
+      </p>
+      ${(!hayInsumos) ? `<div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div>` : (!hayDatos ? `<div class="empty">No hay registros en el rango seleccionado.</div>` : `
+      <div class="table-wrap"><table class="inv-matrix">
+        <thead>
+          <tr><th rowspan="2">Insumo</th>${theadFechas}</tr>
+          <tr>${theadSub}</tr>
+        </thead>
+        <tbody>${filasInsumos}</tbody>
+      </table></div>`)}
     </div>`;
 
   const applyF = ()=>{
@@ -2882,14 +2966,61 @@ RENDERERS.inventarioConsolidado = function(){
     invConsFilter = { desde: hace6.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10) };
     RENDERERS.inventarioConsolidado();
   };
-  document.getElementById('invExport').onclick = ()=>{
-    const datos = data.map(r=>({ fecha:r.fecha, insumo:nombreInsumo(r.insumoId), produccion:r.produccion, cierre:r.cierre, unidad:unidadInsumo(r.insumoId) }));
-    exportarExcelSimple('Inventario', datos, `inventario_${desde||'inicio'}_a_${hasta||'hoy'}_${excelTimestamp()}.xlsx`);
-    toast('Excel de inventario descargado','success');
-  };
+  document.getElementById('invExport').onclick = ()=> exportarInventarioMatrizExcel(fechas, { bajoConsumo, incrementoAnormal });
 };
-// Edición rápida (inline) de un registro de inventario: guarda en localStorage
-// y sincroniza de inmediato con Google Sheets (dominio inventario).
+
+// Exporta la matriz visible (mismas fechas/insumos del rango filtrado) a Excel,
+// con encabezados de fecha agrupados (Producción/Cierre) y, cuando la build de
+// SheetJS cargada lo soporte, el mismo resaltado condicional (rojo/negrita) que
+// se ve en pantalla. Si la librería no soporta estilos en .xlsx, el archivo se
+// genera igual, solo sin el color (no se interrumpe la exportación).
+function exportarInventarioMatrizExcel(fechas, reglas){
+  const ROJO_TEXTO = { rgb:'991B1B' };
+  const ROJO_FONDO = { rgb:'FEE2E2' };
+  const filaFechas = ['Insumo'];
+  const filaSub = [''];
+  fechas.forEach(f=>{ filaFechas.push(fmtFecha(f), ''); filaSub.push('Producción','Cierre'); });
+  const aoa = [filaFechas, filaSub];
+  const estilosCelda = []; // {r,c,style}
+
+  S.insumos.forEach(ins=>{
+    const fila = [ins.nombre+' ('+ins.unidad+')'];
+    const filaIdx = aoa.length;
+    if(reglas.bajoConsumo(ins)) estilosCelda.push({ r:filaIdx, c:0, style:{ font:{ bold:true, color:ROJO_TEXTO } } });
+    fechas.forEach((f,i)=>{
+      const r = getProduccion(ins.id, f);
+      fila.push(r? r.produccion : '', r? r.cierre : '');
+      if(r && reglas.incrementoAnormal(ins.id, f)){
+        estilosCelda.push({ r:filaIdx, c:2+i*2, style:{ fill:{ fgColor:ROJO_FONDO }, font:{ bold:true, color:ROJO_TEXTO } } });
+      }
+    });
+    aoa.push(fila);
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  // Fusiona visualmente cada par de columnas de fecha y la columna "Insumo".
+  ws['!merges'] = [{ s:{r:0,c:0}, e:{r:1,c:0} }];
+  fechas.forEach((f,i)=> ws['!merges'].push({ s:{r:0,c:1+i*2}, e:{r:0,c:2+i*2} }));
+  // Aplica estilos celda por celda (mejor esfuerzo; depende de la build de SheetJS).
+  estilosCelda.forEach(({r,c,style})=>{
+    const ref = XLSX.utils.encode_cell({r,c});
+    if(ws[ref]) ws[ref].s = style;
+  });
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Inventario');
+  try{
+    XLSX.writeFile(wb, `inventario_${invConsFilter.desde||'inicio'}_a_${invConsFilter.hasta||'hoy'}_${excelTimestamp()}.xlsx`, { cellStyles:true });
+  }catch(e){
+    // Compatibilidad: si la build de SheetJS no acepta la opción cellStyles, se reintenta sin ella.
+    XLSX.writeFile(wb, `inventario_${invConsFilter.desde||'inicio'}_a_${invConsFilter.hasta||'hoy'}_${excelTimestamp()}.xlsx`);
+  }
+  toast('Excel de inventario descargado','success');
+}
+
+// Edición rápida (inline) de un registro de inventario: guarda en localStorage,
+// re-renderiza (para recalcular alertas) y sincroniza de inmediato con Google
+// Sheets (dominio inventario).
 window.invSetCampo = async function(id, campo, valor){
   const r = S.produccion.find(x=>x.id===id); if(!r) return;
   const v = String(valor).trim();
@@ -2897,6 +3028,7 @@ window.invSetCampo = async function(id, campo, valor){
   r[campo] = (v===''? 0 : Number(v));
   save(K.produccion, S.produccion);
   toast('Registro actualizado','success');
+  RENDERERS.inventarioConsolidado();
   try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
 };
 window.invDel = async function(id){
