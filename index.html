@@ -170,10 +170,10 @@
   <div class="auth-card">
     <div class="auth-logo">🔒</div>
     <h1>Acceso restringido</h1>
-    <p>Inicia sesión con la cuenta autorizada para usar la aplicación.</p>
+    <p>Inicia sesión con una cuenta autorizada para usar la aplicación.</p>
     <button class="btn btn-primary" id="authLoginBtn">🔐 Iniciar sesión con Google</button>
     <div id="authMsg" class="auth-msg"></div>
-    <p class="auth-foot">Solo la cuenta de Google autorizada puede acceder. La seguridad real de los datos también depende de compartir el Google Spreadsheet únicamente con ese correo.</p>
+    <p class="auth-foot">Cada cuenta de Google autorizada solo ve los módulos asignados a su rol. La seguridad real de los datos también depende de que cada Google Spreadsheet se mantenga privado de su respectiva cuenta.</p>
   </div>
 </div>
 
@@ -199,6 +199,10 @@
       <button data-page="consolidado"><span class="ico">📊</span> Consolidado</button>
       <button data-page="boleta"><span class="ico">🧾</span> Boleta por empleado</button>
       <button data-page="admin"><span class="ico">⚙️</span> Administración</button>
+      <button data-page="produccion"><span class="ico">📦</span> Producción</button>
+      <button data-page="insumos"><span class="ico">🧂</span> Insumos</button>
+      <button data-page="inventarioConsolidado"><span class="ico">📈</span> Consolidado de Inventario</button>
+      <button data-page="syncInventario"><span class="ico">☁️</span> Sync. Inventario</button>
     </nav>
     <div class="foot">
       <div id="gsSideStatus" style="font-size:11px;color:var(--muted);padding:2px 0">⚪ Google: sin sesión</div>
@@ -223,6 +227,10 @@
     <section class="page" id="page-consolidado"></section>
     <section class="page" id="page-boleta"></section>
     <section class="page" id="page-admin"></section>
+    <section class="page" id="page-produccion"></section>
+    <section class="page" id="page-insumos"></section>
+    <section class="page" id="page-inventarioConsolidado"></section>
+    <section class="page" id="page-syncInventario"></section>
   </main>
 </div>
 
@@ -237,7 +245,9 @@ const K = {
   emp:'pl_empleados', hor:'pl_horarios', mar:'pl_marcaciones',
   desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres',
   considerarHE:'pl_considerarHE', seed:'pl_seedDone',
-  prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza'
+  prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza',
+  // Módulo Producción / Insumos (inventario)
+  insumos:'pl_insumos', produccion:'pl_produccion', seedInsumos:'pl_seedInsumosDone'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -342,11 +352,24 @@ function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
+  S.insumos=load(K.insumos); S.produccion=load(K.produccion);
+}
+// Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
+// corresponde al rol de la cuenta conectada. Así, durante una sesión de
+// Wingsbox (inventario) los datos de planilla de Multiboxes no quedan
+// cargados en memoria (ni accesibles vía consola), y viceversa. Los datos
+// persistidos en localStorage de ambos dominios NUNCA se borran con esto.
+function limpiarEstadoDominio(domain){
+  if(domain==='planilla'){
+    S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.prop=[]; S.tarjetaVal=[];
+  }else if(domain==='inventario'){
+    S.insumos=[]; S.produccion=[];
+  }
 }
 
 /* ---------- Helpers de propinas (tipo de empleado y cálculos) ---------- */
@@ -537,6 +560,14 @@ function toast(msg, type='info'){
 const RENDERERS = {};
 let currentPage='empleados';
 function goto(page){
+  // Refuerza en la propia función de navegación (no solo ocultando botones)
+  // la restricción de acceso por rol: una cuenta autorizada solo puede
+  // "enrutar" hacia los módulos de su rol, incluso si goto() se invoca
+  // directamente (consola, atajo, etc.) en vez de hacer clic en el menú.
+  if(isAuthorized() && !moduloPermitido(page)){
+    toast('No tienes acceso a este módulo con esta cuenta.','error');
+    page = paginaPorDefecto();
+  }
   currentPage=page;
   document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -769,6 +800,7 @@ RENDERERS.empleados = function(){
   el.innerHTML = `
     <div class="page-head">
       <div><h1>👥 Empleados</h1><p>Crea, edita y elimina al personal. Cada empleado tiene sueldo quincenal, sueldo planilla y sueldo por hora.</p></div>
+      <div class="actions"><button class="btn btn-green" id="empExport">⬇ Exportar Excel</button></div>
     </div>
     <div class="card">
       <h2 id="empFormTitle">Nuevo empleado</h2>
@@ -812,6 +844,7 @@ RENDERERS.empleados = function(){
 
   document.getElementById('empSave').onclick = empSave;
   document.getElementById('empClear').onclick = empClearForm;
+  document.getElementById('empExport').onclick = exportarEmpleadosExcel;
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
     if(e){
@@ -873,6 +906,15 @@ function crearHorarioDefault(empId){
     S.hor.push({empleadoId:empId, dia:d, libre, entrada: libre?'':'09:00', salida: libre?'':'18:00'});
   }
   save(K.hor,S.hor);
+}
+// Exporta toda la información registrada de Empleados a un Excel (.xlsx).
+function exportarEmpleadosExcel(){
+  const datos = S.emp.map(e=>({
+    id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0,
+    sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora
+  }));
+  exportarExcelSimple('Empleados', datos, `empleados_${excelTimestamp()}.xlsx`);
+  toast('Excel de empleados descargado','success');
 }
 
 /* Helper: <option> de empleados */
@@ -2563,21 +2605,325 @@ function seedData(){
   localStorage.setItem(K.seed,'1');
 }
 
-/* ---------- Botones globales de datos ---------- */
+/* ---------- Botones globales de datos ----------
+   Se limitan al dominio de datos del rol conectado: una cuenta de
+   inventario nunca borra/reemplaza datos de planilla, y viceversa
+   (ambos conjuntos de datos conviven en el mismo localStorage). */
+function dominioKeys(domain){
+  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv]);
+  return domain==='inventario' ? Array.from(invKeys) : Object.values(K).filter(k=>!invKeys.has(k));
+}
 document.getElementById('btnSeed').onclick=()=>{
-  if(confirm('Esto reemplazará TODOS los datos actuales por los datos de ejemplo. ¿Continuar?')){
-    seedData(); reloadState(); toast('Datos de ejemplo cargados','success'); goto(currentPage);
+  const role = currentRole();
+  if(role && role.domain==='inventario'){
+    if(confirm('Esto reemplazará la lista de insumos actual por la lista de insumos de ejemplo (no afecta los registros históricos de producción ya guardados). ¿Continuar?')){
+      seedInsumos(true); reloadState(); limpiarEstadoDominio('planilla'); toast('Insumos de ejemplo recargados','success'); goto(currentPage);
+    }
+  }else if(confirm('Esto reemplazará TODOS los datos actuales por los datos de ejemplo. ¿Continuar?')){
+    seedData(); reloadState(); if(role) limpiarEstadoDominio('inventario'); toast('Datos de ejemplo cargados','success'); goto(currentPage);
   }
 };
 document.getElementById('btnWipe').onclick=()=>{
-  if(confirm('Esto borrará TODOS los datos. ¿Continuar?')){
-    Object.values(K).forEach(k=>localStorage.removeItem(k));
-    CONSIDERAR_HE={};
-    calcPendingHE={};
-    EXO_TARD={};
-    reloadState(); toast('Todos los datos fueron borrados','warn'); goto(currentPage);
+  const role = currentRole();
+  const domain = role ? role.domain : 'planilla';
+  const msg = domain==='inventario'
+    ? 'Esto borrará TODOS los insumos y registros de producción del inventario. ¿Continuar?'
+    : 'Esto borrará TODOS los datos de planilla (empleados, horarios, marcaciones, propinas, etc). ¿Continuar?';
+  if(confirm(msg)){
+    dominioKeys(domain).forEach(k=>localStorage.removeItem(k));
+    if(domain==='planilla'){ CONSIDERAR_HE={}; calcPendingHE={}; EXO_TARD={}; }
+    reloadState();
+    if(domain==='inventario') limpiarEstadoDominio('planilla'); else if(role) limpiarEstadoDominio('inventario');
+    toast('Datos borrados','warn'); goto(currentPage);
   }
 };
+// Actualiza las etiquetas de los botones del pie del menú según el rol
+// conectado (mismo botón físico, distinto alcance/dato según el dominio).
+function aplicarTextosFooterPorRol(){
+  const role = currentRole();
+  const seedBtn = document.getElementById('btnSeed'), wipeBtn = document.getElementById('btnWipe');
+  if(!seedBtn || !wipeBtn) return;
+  if(role && role.domain==='inventario'){
+    seedBtn.textContent = 'Recargar insumos de ejemplo';
+    wipeBtn.textContent = 'Borrar datos de inventario';
+  }else{
+    seedBtn.textContent = 'Recargar datos de ejemplo';
+    wipeBtn.textContent = 'Borrar todos los datos';
+  }
+}
+
+/* ================================================================
+   MÓDULO 11B: PRODUCCIÓN E INVENTARIO DE INSUMOS
+   ----------------------------------------------------------------
+   - Insumo:     { id, nombre, unidad }
+   - Producción: { id, insumoId, fecha, produccion, cierre }  (un único
+     registro por insumo+fecha; "Guardar" actualiza el existente o crea
+     uno nuevo, nunca duplica ni toca registros de otras fechas).
+   ================================================================ */
+// Lista inicial de insumos (se siembra una sola vez; editable luego desde
+// el módulo de Administración de insumos).
+const INSUMOS_INICIALES = [
+  ['ACEVICHADO CLÁSICO','ml'], ['ACEVICHADO PICANTE','ml'], ['ANTICUCHERA','ml'],
+  ['AJILLO','ml'], ['BBQ CLÁSICA','ml'], ['BBQ PICANTE','ml'], ['BRASA','ml'],
+  ['BÚFALO','ml'], ['CHARAPITA','ml'], ['CHIMICHURRI','ml'], ['HONEY MUSTARD','ml'],
+  ['LEMON PEPPER','ml'], ['MANGO HABANERO','ml'], ['MARACUYÁ CLÁSICO','ml'],
+  ['MARACUYÁ PICANTE','ml'], ['PIÑA HABANERA','ml'], ['SALVAJE','ml'],
+  ['TERIYAKI DULCE','ml'], ['PREPARADO CHAUFA','ml'], ['PREPARADO SALTADO','ml'],
+  ['PREPARADO TALLARÍN','ml'], ['CHUCKY','Bolsas'], ['TIFFANY','Bolsas'],
+  ['VINAGRETA','ml'], ['PAPA CONGELADA','gr']
+];
+// Siembra la lista inicial de insumos. force=true la reemplaza aunque ya
+// se haya sembrado antes (usado por "Recargar insumos de ejemplo").
+function seedInsumos(force){
+  if(!force && localStorage.getItem(K.seedInsumos)) return;
+  S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({ id:uid(), nombre, unidad }));
+  save(K.insumos, S.insumos);
+  localStorage.setItem(K.seedInsumos,'1');
+}
+function nombreInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.nombre : '(insumo eliminado)'; }
+function unidadInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.unidad : ''; }
+function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
+// Actualiza el registro existente de (insumo, fecha) o crea uno nuevo si no
+// existe. Nunca duplica ni toca registros de otras fechas/insumos.
+function produccionUpsert(insumoId, fecha, produccion, cierre){
+  let r = getProduccion(insumoId, fecha);
+  if(r){ r.produccion = produccion; r.cierre = cierre; }
+  else { S.produccion.push({ id:uid(), insumoId, fecha, produccion, cierre }); }
+}
+
+/* ---------- Producción: registro diario por insumo ---------- */
+let prodFecha = new Date().toISOString().slice(0,10);
+RENDERERS.produccion = function(){
+  const el = document.getElementById('page-produccion');
+  if(!S.insumos.length){
+    el.innerHTML = `<div class="page-head"><div><h1>📦 Producción</h1><p>Registra diariamente la producción y el cierre de cada insumo.</p></div></div>
+      <div class="card"><div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div></div>`;
+    return;
+  }
+  const filas = S.insumos.map(ins=>{
+    const reg = getProduccion(ins.id, prodFecha);
+    return `<tr>
+      <td>${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>
+      <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="produccion" value="${reg?reg.produccion:''}" placeholder="0"></td>
+      <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="cierre" value="${reg?reg.cierre:''}" placeholder="0"></td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="page-head"><div><h1>📦 Producción</h1><p>Registra diariamente la producción y el cierre de cada insumo.</p></div></div>
+    <div class="card">
+      <div class="toolbar"><div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Insumo</th><th class="num">Producción</th><th class="num">Cierre</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>
+      <div class="actions">
+        <button class="btn btn-primary" id="btnGuardarProduccion">💾 Guardar</button>
+        <button class="btn btn-green" id="btnExportProduccion">⬇ Exportar Excel (este día)</button>
+      </div>
+      <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con Google Sheets.</p>
+    </div>`;
+  document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || new Date().toISOString().slice(0,10); RENDERERS.produccion(); };
+  document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
+  document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
+};
+async function guardarProduccion(){
+  const inputs = document.querySelectorAll('.prodInput');
+  const porInsumo = {};
+  inputs.forEach(inp=>{
+    const insumoId = inp.dataset.insumo, campo = inp.dataset.campo;
+    if(!porInsumo[insumoId]) porInsumo[insumoId] = {};
+    porInsumo[insumoId][campo] = inp.value;
+  });
+  // Validación: si se ingresó un valor, debe ser numérico y no negativo.
+  let ok = true;
+  inputs.forEach(inp=>{
+    const v = inp.value.trim();
+    const bad = v!=='' && (isNaN(Number(v)) || Number(v)<0);
+    inp.classList.toggle('invalid', bad);
+    if(bad) ok=false;
+  });
+  if(!ok){ toast('Los valores deben ser numéricos y no negativos','error'); return; }
+
+  let guardados = 0;
+  Object.entries(porInsumo).forEach(([insumoId, vals])=>{
+    const prodVacio = vals.produccion===undefined || vals.produccion==='';
+    const cierreVacio = vals.cierre===undefined || vals.cierre==='';
+    if(prodVacio && cierreVacio) return; // fila totalmente vacía: no se crea/actualiza registro
+    const produccion = prodVacio ? 0 : Number(vals.produccion);
+    const cierre = cierreVacio ? 0 : Number(vals.cierre);
+    produccionUpsert(insumoId, prodFecha, produccion, cierre);
+    guardados++;
+  });
+  if(!guardados){ toast('Ingresa al menos un valor de producción o cierre','error'); return; }
+  save(K.produccion, S.produccion);
+  toast(`Producción guardada (${guardados} insumo(s)).`,'success');
+  RENDERERS.produccion();
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+}
+function exportarProduccionDiaExcel(){
+  const datos = S.insumos.map(ins=>{
+    const r = getProduccion(ins.id, prodFecha);
+    return { fecha:prodFecha, insumo:ins.nombre, produccion:r?r.produccion:0, cierre:r?r.cierre:0, unidad:ins.unidad };
+  });
+  exportarExcelSimple('Produccion', datos, `produccion_${prodFecha}_${excelTimestamp()}.xlsx`);
+  toast('Excel de producción descargado','success');
+}
+
+/* ---------- Administración de insumos ---------- */
+let editInsumoId = null;
+RENDERERS.insumos = function(){
+  const el = document.getElementById('page-insumos');
+  el.innerHTML = `
+    <div class="page-head"><div><h1>🧂 Administración de insumos</h1><p>Crea, edita y elimina los insumos usados en el módulo Producción. Los cambios se reflejan automáticamente ahí.</p></div></div>
+    <div class="card">
+      <h2 id="insFormTitle">Nuevo insumo</h2>
+      <div class="form-grid">
+        <div class="field"><label>Nombre *</label><input id="insNombre" placeholder="Ej: ACEVICHADO CLÁSICO"></div>
+        <div class="field"><label>Unidad de medida *</label><input id="insUnidad" placeholder="Ej: ml, gr, Bolsas"></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="insSave">Guardar</button>
+        <button class="btn btn-ghost" id="insClear">Limpiar</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Lista de insumos (${S.insumos.length})</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Insumo</th><th>Unidad</th><th>Acciones</th></tr></thead>
+        <tbody>${S.insumos.length? S.insumos.map(i=>`
+          <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
+            <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
+                <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
+        `).join('') : `<tr><td colspan="3" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+  document.getElementById('insSave').onclick = insumoSave;
+  document.getElementById('insClear').onclick = ()=>{ editInsumoId=null; RENDERERS.insumos(); };
+  if(editInsumoId){
+    const i = S.insumos.find(x=>x.id===editInsumoId);
+    if(i){ document.getElementById('insFormTitle').textContent='Editar insumo'; document.getElementById('insNombre').value=i.nombre; document.getElementById('insUnidad').value=i.unidad; }
+  }
+};
+function insumoSave(){
+  const nombre = document.getElementById('insNombre').value.trim();
+  const unidad = document.getElementById('insUnidad').value.trim();
+  let ok = true;
+  [['insNombre',nombre],['insUnidad',unidad]].forEach(([id,v])=>{ const f=document.getElementById(id); f.classList.toggle('invalid', !v); if(!v) ok=false; });
+  if(!ok){ toast('Completa nombre y unidad','error'); return; }
+  if(editInsumoId){
+    const i = S.insumos.find(x=>x.id===editInsumoId);
+    Object.assign(i, { nombre, unidad });
+    save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
+  }else{
+    S.insumos.push({ id:uid(), nombre, unidad });
+    save(K.insumos, S.insumos); toast('Insumo creado','success');
+  }
+  RENDERERS.insumos();
+}
+window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.insumoDel = function(id){
+  if(!confirm('¿Eliminar este insumo? Los registros históricos de producción ya guardados no se eliminan, pero ya no podrás registrar nueva producción para él.')) return;
+  if(editInsumoId===id) editInsumoId=null;
+  S.insumos = S.insumos.filter(i=>i.id!==id);
+  save(K.insumos, S.insumos);
+  toast('Insumo eliminado','warn');
+  RENDERERS.insumos();
+};
+
+/* ---------- Consolidado de Inventario (histórico por insumo) ---------- */
+// Rango por defecto: últimos 7 días (incluye hoy). Se inicializa una sola
+// vez; cambiar de fecha en el filtro no se reinicia entre renders.
+let invConsFilter = (function(){
+  const hoy = new Date(), hace6 = new Date(hoy.getTime() - 6*86400000);
+  const fmt = d => d.toISOString().slice(0,10);
+  return { desde: fmt(hace6), hasta: fmt(hoy) };
+})();
+RENDERERS.inventarioConsolidado = function(){
+  const el = document.getElementById('page-inventarioConsolidado');
+  const { desde, hasta } = invConsFilter;
+  const data = [...S.produccion]
+    .filter(r => (!desde || r.fecha>=desde) && (!hasta || r.fecha<=hasta))
+    .sort((a,b)=> b.fecha.localeCompare(a.fecha) || nombreInsumo(a.insumoId).localeCompare(nombreInsumo(b.insumoId)));
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica de producción y cierre por insumo.</p></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="invFHasta" value="${hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="invFClear">Últimos 7 días</button>
+        <button class="btn btn-green" id="invExport">⬇ Exportar Excel (filtrado)</button>
+      </div>
+      <h2>Historial (${data.length})</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Insumo</th><th class="num">Producción</th><th class="num">Cierre</th><th>Unidad</th><th>Acciones</th></tr></thead>
+        <tbody>${data.length? data.map(r=>`
+          <tr>
+            <td>${fmtFecha(r.fecha)}</td>
+            <td>${nombreInsumo(r.insumoId)}</td>
+            <td class="num"><input type="number" min="0" step="0.01" value="${r.produccion}" onchange="invSetCampo('${r.id}','produccion',this.value)"></td>
+            <td class="num"><input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)"></td>
+            <td>${unidadInsumo(r.insumoId)}</td>
+            <td><button class="btn-icon del" onclick="invDel('${r.id}')">🗑️</button></td>
+          </tr>`).join('') : `<tr><td colspan="6" class="empty">No hay registros en el rango seleccionado.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+
+  const applyF = ()=>{
+    const d = document.getElementById('invFDesde').value, h = document.getElementById('invFHasta').value;
+    if(d && h && d>h){ toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error'); return; }
+    invConsFilter = { desde:d, hasta:h };
+    RENDERERS.inventarioConsolidado();
+  };
+  document.getElementById('invFDesde').onchange = applyF;
+  document.getElementById('invFHasta').onchange = applyF;
+  document.getElementById('invFClear').onclick = ()=>{
+    const hoy = new Date(), hace6 = new Date(hoy.getTime() - 6*86400000);
+    invConsFilter = { desde: hace6.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10) };
+    RENDERERS.inventarioConsolidado();
+  };
+  document.getElementById('invExport').onclick = ()=>{
+    const datos = data.map(r=>({ fecha:r.fecha, insumo:nombreInsumo(r.insumoId), produccion:r.produccion, cierre:r.cierre, unidad:unidadInsumo(r.insumoId) }));
+    exportarExcelSimple('Inventario', datos, `inventario_${desde||'inicio'}_a_${hasta||'hoy'}_${excelTimestamp()}.xlsx`);
+    toast('Excel de inventario descargado','success');
+  };
+};
+// Edición rápida (inline) de un registro de inventario: guarda en localStorage
+// y sincroniza de inmediato con Google Sheets (dominio inventario).
+window.invSetCampo = async function(id, campo, valor){
+  const r = S.produccion.find(x=>x.id===id); if(!r) return;
+  const v = String(valor).trim();
+  if(v!=='' && (isNaN(Number(v)) || Number(v)<0)){ toast('El valor debe ser numérico y no negativo','error'); RENDERERS.inventarioConsolidado(); return; }
+  r[campo] = (v===''? 0 : Number(v));
+  save(K.produccion, S.produccion);
+  toast('Registro actualizado','success');
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+};
+window.invDel = async function(id){
+  if(!confirm('¿Eliminar este registro de inventario? Esta acción no se puede deshacer.')) return;
+  S.produccion = S.produccion.filter(x=>x.id!==id);
+  save(K.produccion, S.produccion);
+  toast('Registro eliminado','warn');
+  RENDERERS.inventarioConsolidado();
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+};
+
+/* ---------- Administración de sincronización (Inventario) ---------- */
+RENDERERS.syncInventario = function(){
+  const el = document.getElementById('page-syncInventario');
+  el.innerHTML = `
+    <div class="page-head"><div><h1>☁️ Administración de sincronización (Inventario)</h1><p>Estado de conexión, sincronización manual y última actualización con Google Sheets para Producción e Insumos.</p></div></div>
+    ${gsControlsHTML('inventario')}`;
+  gsBindControls('inventario');
+};
+
+/* ---------- Helper genérico de exportación a Excel (una sola hoja) ---------- */
+function exportarExcelSimple(nombreHoja, datos, nombreArchivo){
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(datos.length?datos:[{}]);
+  XLSX.utils.book_append_sheet(wb, ws, nombreHoja);
+  XLSX.writeFile(wb, nombreArchivo);
+}
 
 /* ================================================================
    MÓDULO 12: SINCRONIZACIÓN CON GOOGLE SHEETS
@@ -2602,26 +2948,60 @@ document.getElementById('btnWipe').onclick=()=>{
       secret aquí.
    ================================================================ */
 const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.googleusercontent.com';
-// Correo de Google AUTORIZADO para usar la aplicación (control de acceso).
-// Solo esta cuenta podrá iniciar sesión y operar con el spreadsheet.
-const AUTHORIZED_EMAIL = 'multiboxes.peru@gmail.com';
+// ---------------------------------------------------------------------------
+// Control de acceso por cuenta de Google. Cada cuenta autorizada tiene un
+// "dominio" de datos (su propio Google Spreadsheet) y una lista cerrada y
+// excluyente de módulos visibles. Para agregar/quitar accesos o sumar una
+// nueva cuenta autorizada, basta con editar este objeto: el resto de la app
+// (navegación, rutas, sincronización) ya reacciona a estos datos.
+// IMPORTANTE: esta es una app 100% cliente (sin backend propio), por lo que
+// esto NO sustituye un control de acceso de servidor. La restricción real e
+// inviolable es la que impone la propia Google Sheets API: cada cuenta solo
+// puede leer/escribir el spreadsheet que ELLA creó (scope drive.file), nunca
+// el de la otra cuenta. Lo de aquí (ocultar menú + bloquear goto()) evita
+// que, usando la app normalmente, una cuenta vea botones o pantallas que no
+// le corresponden; no protege contra alguien editando la página con las
+// herramientas de desarrollador del navegador, algo que ninguna app 100%
+// estática puede evitar sin un backend propio.
+const ACCOUNT_ROLES = {
+  'multiboxes.peru@gmail.com': {
+    domain: 'planilla',
+    modules: ['empleados','horarios','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin']
+  },
+  'wingsbox.oficial@gmail.com': {
+    domain: 'inventario',
+    modules: ['produccion','insumos','inventarioConsolidado','syncInventario']
+  }
+};
 // Scopes: openid/email/profile para identificar al usuario (login) +
-// drive.file (mínimo) para que la app cree/lea/escriba SU PROPIO spreadsheet
-// de almacenamiento (WingsBox Planilla - Datos) +
+// drive.file (mínimo) para que cada cuenta cree/lea/escriba SU PROPIO
+// spreadsheet de almacenamiento (uno para planilla, otro para inventario) +
 // spreadsheets.readonly para poder LEER otros spreadsheets que la cuenta ya
 // posee/puede ver (p.ej. las respuestas de un Google Form), algo que
 // drive.file NO permite: ese scope solo da acceso a archivos creados por
 // esta app o abiertos explícitamente con ella (vía Picker/"Abrir con"), NO a
 // cualquier archivo del usuario por más que se conozca su ID. Por eso la
 // sincronización de marcaciones (ver MÓDULO 3) necesita este scope extra.
-// IMPORTANTE: al agregar este scope, la cuenta AUTHORIZED_EMAIL debe volver a
+// IMPORTANTE: al agregar este scope, cada cuenta autorizada debe volver a
 // iniciar sesión una vez (Google pedirá el nuevo permiso) y, si el proyecto de
 // Google Cloud está en modo "Testing", confirmar que el scope esté habilitado
 // en la pantalla de consentimiento (mismo paso ya documentado arriba para
-// drive.file).
+// drive.file), y que AMBAS cuentas estén en la lista de "usuarios de prueba".
 const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly';
-// Nombre fijo del spreadsheet de almacenamiento (se busca/crea por nombre).
+// Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
+// (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
+// inicia sesión (por eso queda en su propio Drive).
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
+// Nombre fijo del spreadsheet de almacenamiento del dominio "inventario"
+// (wingsbox.oficial@gmail.com). Mismo mecanismo: se busca/crea por nombre la
+// primera vez que esa cuenta usa el módulo Producción, así el spreadsheet
+// queda creado y es propiedad de esa cuenta (cumple el requisito de que el
+// inventario se almacene en un Spreadsheet de Wingsbox.oficial@gmail.com).
+const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
+// Hojas que debe tener el spreadsheet de inventario.
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Meta'];
+// Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
+K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
 K.gsheetId = 'pl_gsheetId';
 
@@ -2772,21 +3152,31 @@ async function gsApiFetch(url, options={}){
    ================================================================ */
 const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','Propinas','ValidacionTarjeta','ConsiderarHoraExtra','ExoneracionTardanza','Meta'];
 
-async function gsEnsureSpreadsheet(){
+// Config de cada dominio de datos (qué spreadsheet, qué hojas, qué clave de
+// localStorage). domain='planilla' es el comportamiento histórico (sin
+// cambios); domain='inventario' es el nuevo dominio del módulo Producción.
+function gsDomainCfg(domain){
+  return domain==='inventario'
+    ? { fileName: GS_FILE_NAME_INVENTARIO, sheets: GS_SHEETS_INVENTARIO, gsheetIdKey: K.gsheetIdInv }
+    : { fileName: GS_FILE_NAME, sheets: GS_SHEETS, gsheetIdKey: K.gsheetId };
+}
+
+async function gsEnsureSpreadsheet(domain='planilla'){
+  const cfg = gsDomainCfg(domain);
   // 1) Reutilizar el id guardado para esta cuenta/dispositivo
-  const saved = localStorage.getItem(K.gsheetId);
+  const saved = localStorage.getItem(cfg.gsheetIdKey);
   if(saved){
     const ok = await gsVerifySpreadsheet(saved);
     if(ok){ gsState.spreadsheetId = saved; return saved; }
-    localStorage.removeItem(K.gsheetId);
+    localStorage.removeItem(cfg.gsheetIdKey);
   }
   // 2) Buscar por nombre en Drive (archivos creados por esta app, también desde otros dispositivos)
-  const found = await gsFindSpreadsheetByName();
-  if(found){ gsState.spreadsheetId = found; localStorage.setItem(K.gsheetId, found); return found; }
-  // 3) Crear uno nuevo
-  const created = await gsCreateSpreadsheet();
+  const found = await gsFindSpreadsheetByName(domain);
+  if(found){ gsState.spreadsheetId = found; localStorage.setItem(cfg.gsheetIdKey, found); return found; }
+  // 3) Crear uno nuevo (queda como propiedad de la cuenta que inicia sesión)
+  const created = await gsCreateSpreadsheet(domain);
   gsState.spreadsheetId = created;
-  localStorage.setItem(K.gsheetId, created);
+  localStorage.setItem(cfg.gsheetIdKey, created);
   return created;
 }
 
@@ -2797,8 +3187,9 @@ async function gsVerifySpreadsheet(id){
   }catch(e){ if(e.message==='SESSION_EXPIRED') throw e; return false; }
 }
 
-async function gsFindSpreadsheetByName(){
-  const q = encodeURIComponent(`name='${GS_FILE_NAME.replace(/'/g,"\\'")}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
+async function gsFindSpreadsheetByName(domain='planilla'){
+  const cfg = gsDomainCfg(domain);
+  const q = encodeURIComponent(`name='${cfg.fileName.replace(/'/g,"\\'")}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
   const url = 'https://www.googleapis.com/drive/v3/files?q='+q+'&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=10&spaces=drive';
   const r = await gsApiFetch(url);
   if(!r.ok) return null;
@@ -2806,10 +3197,11 @@ async function gsFindSpreadsheetByName(){
   return (j.files && j.files.length) ? j.files[0].id : null;
 }
 
-async function gsCreateSpreadsheet(){
+async function gsCreateSpreadsheet(domain='planilla'){
+  const cfg = gsDomainCfg(domain);
   const body = {
-    properties:{ title: GS_FILE_NAME },
-    sheets: GS_SHEETS.map(name=>({ properties:{ title:name } }))
+    properties:{ title: cfg.fileName },
+    sheets: cfg.sheets.map(name=>({ properties:{ title:name } }))
   };
   const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method:'POST',
@@ -2822,12 +3214,13 @@ async function gsCreateSpreadsheet(){
 }
 
 /* Asegura que todas las hojas existan (por si el spreadsheet es antiguo) */
-async function gsEnsureSheetsExist(){
+async function gsEnsureSheetsExist(domain='planilla'){
+  const cfg = gsDomainCfg(domain);
   const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+'?fields=sheets.properties.title');
   if(!r.ok) throw new Error('No se pudo leer el spreadsheet');
   const j = await r.json();
   const existing = new Set((j.sheets||[]).map(s=>s.properties.title));
-  const missing = GS_SHEETS.filter(n=>!existing.has(n));
+  const missing = cfg.sheets.filter(n=>!existing.has(n));
   if(!missing.length) return;
   const requests = missing.map(name=>({ addSheet:{ properties:{ title:name } } }));
   const br = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+':batchUpdate', {
@@ -2887,21 +3280,36 @@ function gsSerializeAll(){
   };
 }
 
+// Serialización del dominio "inventario" (Insumos + Producción), análoga a
+// gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
+function gsSerializeInventario(){
+  return {
+    Insumos: gsRowsToMatrix(['id','nombre','unidad'], S.insumos),
+    Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
+    Meta: gsRowsToMatrix(['clave','valor'], [
+      { clave:'app', valor:'WingsBox Inventario' },
+      { clave:'lastSync', valor:new Date().toISOString() }
+    ])
+  };
+}
+
 /* ================================================================
    GUARDAR en Google Sheets
+   domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
    ================================================================ */
-async function gsSaveToSheets(){
+async function gsSaveToSheets(domain='planilla'){
   if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
+  const cfg = gsDomainCfg(domain);
   try{
     gsUpdateSyncStatus('Guardando en Google Sheets…','info');
     toast('Guardando en Google Sheets…','info');
-    await gsEnsureSpreadsheet();
-    await gsEnsureSheetsExist();
-    const data = gsSerializeAll();
+    await gsEnsureSpreadsheet(domain);
+    await gsEnsureSheetsExist(domain);
+    const data = domain==='inventario' ? gsSerializeInventario() : gsSerializeAll();
     const id = encodeURIComponent(gsState.spreadsheetId);
 
     // 1) Limpiar todas las hojas
-    const clearRanges = GS_SHEETS.map(n=>n+'!A:Z');
+    const clearRanges = cfg.sheets.map(n=>n+'!A:Z');
     const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchClear', {
       method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ ranges: clearRanges })
     });
@@ -2927,17 +3335,22 @@ async function gsSaveToSheets(){
 
 /* ================================================================
    CARGAR desde Google Sheets
+   domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
    ================================================================ */
-async function gsLoadFromSheets(){
+async function gsLoadFromSheets(domain='planilla'){
   if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
-  if(!confirm('Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?')) return;
+  const cfg = gsDomainCfg(domain);
+  const confirmMsg = domain==='inventario'
+    ? 'Esto reemplazará los insumos y los registros de producción actuales con los últimos datos guardados en Google Sheets. ¿Continuar?'
+    : 'Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?';
+  if(!confirm(confirmMsg)) return;
   try{
     gsUpdateSyncStatus('Cargando últimos datos…','info');
     toast('Cargando últimos datos…','info');
-    const id = await gsEnsureSpreadsheet();
+    const id = await gsEnsureSpreadsheet(domain);
     if(!id){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
-    const ranges = GS_SHEETS.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
+    const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
     // UNFORMATTED_VALUE: devuelve los números como números reales (sin separadores de
     // miles ni moneda del locale), evitando que Number() falle y los sueldos queden en 0.
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
@@ -2949,33 +3362,50 @@ async function gsLoadFromSheets(){
       byName[name] = gsMatrixToObjects(vr.values);
     });
 
-    if(!byName['Empleados'] || !byName['Empleados'].length){
-      toast('No se encontró una hoja asociada.','error');
-      gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn');
-      return;
+    if(domain==='inventario'){
+      if(!byName['Insumos']){
+        toast('No se encontró una hoja asociada.','error');
+        gsUpdateSyncStatus('La hoja no tiene datos de insumos.','warn');
+        return;
+      }
+      S.insumos = (byName['Insumos']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim() }));
+      S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion);
+    }else{
+      if(!byName['Empleados'] || !byName['Empleados'].length){
+        toast('No se encontró una hoja asociada.','error');
+        gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn');
+        return;
+      }
+
+      // Reconstruir el estado (misma lógica de tipos que adminImport)
+      S.emp = byName['Empleados'].map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
+        tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
+        esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
+        sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
+      S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
+        libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
+        entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
+      S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
+        entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
+        origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo' }));
+      S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+      S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
+      S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
+      S.prop = (byName['Propinas']||[]).map(filaPropinaAEstado);
+      S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
+      loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
+      loadExoTardFromRows(byName['ExoneracionTardanza']||[]);
+
+      save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
     }
 
-    // Reconstruir el estado (misma lógica de tipos que adminImport)
-    S.emp = byName['Empleados'].map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
-      tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
-      esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
-      sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
-    S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
-      libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
-      entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
-    S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
-      entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
-      origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo' }));
-    S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
-    S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
-    S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
-    S.prop = (byName['Propinas']||[]).map(filaPropinaAEstado);
-    S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
-    loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
-    loadExoTardFromRows(byName['ExoneracionTardanza']||[]);
-
-    save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
     reloadState();
+    // Tras recargar todo desde localStorage, se vuelve a aislar en memoria el
+    // dominio que no corresponde al rol actual (mismo criterio que authGrant).
+    const role = currentRole();
+    if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
+    else if(role) limpiarEstadoDominio('inventario');
     gsState.lastSync = new Date();
     toast('Datos cargados desde Google Sheets','success');
     gsUpdateSyncStatus('Datos cargados ('+gsState.email+').','success');
@@ -3002,73 +3432,115 @@ function gsHandleError(err, accion){
    UI de sincronización (botones + estado)
    ================================================================ */
 function gsUpdateSyncStatus(msg, type){
-  const el = document.getElementById('gsSyncStatus');
-  if(el){
-    el.textContent = msg;
-    el.dataset.type = type || 'info';
-  }
+  // Actualiza el estado de CUALQUIER dominio cuyo elemento esté presente en
+  // el DOM (en la práctica solo uno está montado a la vez, según el rol de
+  // la cuenta conectada), sin tener que indicar el dominio explícitamente.
+  ['gsSyncStatus','gsSyncStatus_inv'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el){ el.textContent = msg; el.dataset.type = type || 'info'; }
+  });
   const side = document.getElementById('gsSideStatus');
   if(side){
     side.textContent = gsIsSignedIn() ? ('🟢 '+(gsState.email||'Conectado')) : '⚪ Google: sin sesión';
   }
 }
 
-// Re-renderiza los controles (si la página de Administración está montada)
+// Re-renderiza los controles (si la página de Administración o de
+// Sincronización de Inventario está montada)
 function gsRenderControls(){
   if(currentPage==='admin' && RENDERERS.admin) RENDERERS.admin();
+  else if(currentPage==='syncInventario' && RENDERERS.syncInventario) RENDERERS.syncInventario();
   else gsUpdateSyncStatus(gsIsSignedIn() ? ('Sesión iniciada ('+(gsState.email||'cuenta de Google')+').') : 'Sin sesión.', gsIsSignedIn()?'success':'info');
 }
 
-function gsControlsHTML(){
+// domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
+// Genera ids con sufijo "_inv" para el dominio de inventario, así ambos
+// bloques de controles pueden coexistir en el DOM sin colisionar.
+function gsControlsHTML(domain='planilla'){
+  const suf = domain==='inventario' ? '_inv' : '';
+  const titulo = domain==='inventario' ? '☁️ Sincronización de Inventario con Google Sheets' : '☁️ Sincronización con Google Sheets';
+  const detalle = domain==='inventario'
+    ? 'Inicia sesión con la cuenta de Wingsbox para guardar y cargar los insumos y la producción diaria online.'
+    : 'Inicia sesión con Google para guardar y cargar tus datos online y poder usarlos desde otro dispositivo. Esto es una alternativa al Excel local; el Excel sigue funcionando igual.';
   const signed = gsIsSignedIn();
   const lastTxt = gsState.lastSync ? ('Última sincronización: '+gsState.lastSync.toLocaleString('es-PE')) : '';
   const cuenta = signed ? ('Conectado como <b>'+(gsState.email||'cuenta de Google')+'</b>') : 'No has iniciado sesión con Google.';
   return `
     <div class="card">
-      <h2>☁️ Sincronización con Google Sheets</h2>
-      <p class="hint" style="margin-top:0">Inicia sesión con Google para guardar y cargar tus datos online y poder usarlos desde otro dispositivo. Esto es una alternativa al Excel local; el Excel sigue funcionando igual.</p>
+      <h2>${titulo}</h2>
+      <p class="hint" style="margin-top:0">${detalle}</p>
       <div class="actions">
         ${signed
-          ? `<button class="btn btn-ghost" id="gsBtnSignOut">🔓 Cerrar sesión</button>
-             <button class="btn btn-green" id="gsBtnSave">⬆ Guardar en Google Sheets</button>
-             <button class="btn btn-primary" id="gsBtnLoad">⬇ Cargar desde Google Sheets</button>`
-          : `<button class="btn btn-primary" id="gsBtnSignIn">🔐 Iniciar sesión con Google</button>`}
+          ? `<button class="btn btn-ghost" id="gsBtnSignOut${suf}">🔓 Cerrar sesión</button>
+             <button class="btn btn-green" id="gsBtnSave${suf}">⬆ Guardar en Google Sheets</button>
+             <button class="btn btn-primary" id="gsBtnLoad${suf}">⬇ Cargar desde Google Sheets</button>`
+          : `<button class="btn btn-primary" id="gsBtnSignIn${suf}">🔐 Iniciar sesión con Google</button>`}
       </div>
       <div class="summary" style="margin-top:14px">
         <div class="item"><div class="l">Cuenta</div><div class="v" style="font-size:13px">${cuenta}</div></div>
-        <div class="item"><div class="l">Estado</div><div class="v" style="font-size:13px"><span id="gsSyncStatus" data-type="info">${signed?'Listo para guardar / cargar.':'Sin sesión.'}</span></div></div>
+        <div class="item"><div class="l">Estado</div><div class="v" style="font-size:13px"><span id="gsSyncStatus${suf}" data-type="info">${signed?'Listo para guardar / cargar.':'Sin sesión.'}</span></div></div>
         ${lastTxt?`<div class="item"><div class="l">Sincronización</div><div class="v" style="font-size:13px">${lastTxt}</div></div>`:''}
       </div>
     </div>`;
 }
 
-function gsBindControls(){
+function gsBindControls(domain='planilla'){
+  const suf = domain==='inventario' ? '_inv' : '';
   const bind = (id, fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; };
-  bind('gsBtnSignIn', authSignIn);   // iniciar sesión = mismo flujo de acceso autorizado
-  bind('gsBtnSignOut', authLogout);  // cerrar sesión bloquea de nuevo la app
-  bind('gsBtnSave', gsSaveToSheets);
-  bind('gsBtnLoad', gsLoadFromSheets);
-  gsUpdateSyncStatus(document.getElementById('gsSyncStatus')?document.getElementById('gsSyncStatus').textContent:'', 'info');
+  bind('gsBtnSignIn'+suf, authSignIn);   // iniciar sesión = mismo flujo de acceso autorizado
+  bind('gsBtnSignOut'+suf, authLogout);  // cerrar sesión bloquea de nuevo la app
+  bind('gsBtnSave'+suf, ()=>gsSaveToSheets(domain));
+  bind('gsBtnLoad'+suf, ()=>gsLoadFromSheets(domain));
+  const statusEl = document.getElementById('gsSyncStatus'+suf);
+  gsUpdateSyncStatus(statusEl?statusEl.textContent:'', 'info');
 }
 
 /* ================================================================
-   MÓDULO 13: CONTROL DE ACCESO (login con Google restringido)
+   MÓDULO 13: CONTROL DE ACCESO (login con Google restringido, por rol)
    ----------------------------------------------------------------
-   Solo la cuenta AUTHORIZED_EMAIL puede usar la app. La validación
-   del correo se hace en el frontend (control de la interfaz). La
-   seguridad REAL de los datos se refuerza compartiendo el Google
-   Spreadsheet únicamente con ese correo (ver Nat/README.md).
+   Cada cuenta de ACCOUNT_ROLES puede iniciar sesión y ve únicamente los
+   módulos de su rol. La validación se hace en el frontend (UI + rutas,
+   ver goto()); la seguridad REAL de los datos depende de que cada cuenta
+   solo pueda leer/escribir el Spreadsheet que ELLA creó (ver comentario
+   junto a ACCOUNT_ROLES más arriba).
    ================================================================ */
-// ¿La sesión actual de Google corresponde al correo autorizado?
+// ¿La sesión actual de Google corresponde a alguna cuenta autorizada?
 function isAuthorized(){
-  return gsIsSignedIn() && (gsState.email||'').trim().toLowerCase() === AUTHORIZED_EMAIL.toLowerCase();
+  return gsIsSignedIn() && !!currentRole();
+}
+// Rol (dominio + módulos permitidos) de la cuenta conectada, o null si no
+// hay sesión o el correo no está en ACCOUNT_ROLES.
+function currentRole(){
+  const email = (gsState.email||'').trim().toLowerCase();
+  return ACCOUNT_ROLES[email] || null;
+}
+// ¿La cuenta conectada puede ver/usar el módulo "page"?
+function moduloPermitido(page){
+  const role = currentRole();
+  return !!role && role.modules.includes(page);
+}
+// Primer módulo del rol actual (página a la que se redirige tras iniciar
+// sesión, o si se intenta ir a un módulo no permitido).
+function paginaPorDefecto(){
+  const role = currentRole();
+  return (role && role.modules.length) ? role.modules[0] : 'empleados';
+}
+// Oculta del menú lateral los módulos que no pertenecen al rol de la cuenta
+// conectada. Si todavía no hay sesión (currentRole()===null), no oculta nada:
+// el menú entero está detrás del auth gate (ver CSS body:not(.authed)).
+function aplicarPermisosNav(){
+  const role = currentRole();
+  document.querySelectorAll('.nav button[data-page]').forEach(b=>{
+    const permitido = !role || role.modules.includes(b.dataset.page);
+    b.style.display = permitido ? '' : 'none';
+  });
 }
 function authSetMsg(msg, type){
   const el=document.getElementById('authMsg');
   if(el){ el.textContent=msg||''; el.className='auth-msg '+(type||'info'); }
 }
 
-// Inicia sesión con Google y valida que el correo sea el autorizado.
+// Inicia sesión con Google y valida que el correo tenga un rol asignado.
 async function authSignIn(){
   try{
     authSetMsg('Conectando con Google…','info');
@@ -3098,15 +3570,29 @@ async function authTrySilent(){
   }catch(e){ /* se requiere login manual */ }
 }
 
-// Concede acceso: muestra la app y habilita Google Sheets.
+// Concede acceso: muestra la app (con el menú filtrado por rol) y habilita
+// Google Sheets para el dominio (spreadsheet) correspondiente.
 function authGrant(){
   document.body.classList.add('authed');
   gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
-  // Intentar detectar/crear el spreadsheet asociado (no bloquea el acceso).
-  gsEnsureSpreadsheet().catch(()=>{});
+
+  const role = currentRole();
+  // Recarga todo desde localStorage (no afecta lo persistido) y luego vacía
+  // en memoria el dominio que NO corresponde a esta cuenta, para que sus
+  // datos no queden cargados durante esta sesión (ver limpiarEstadoDominio).
+  reloadState();
+  if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
+  else limpiarEstadoDominio('inventario');
+
+  aplicarPermisosNav();
+  aplicarTextosFooterPorRol();
+  goto(moduloPermitido(currentPage) ? currentPage : paginaPorDefecto());
+
+  // Intentar detectar/crear el spreadsheet del dominio de esta cuenta (no bloquea el acceso).
+  gsEnsureSpreadsheet(role ? role.domain : 'planilla').catch(()=>{});
   gsRenderControls();
 }
 
@@ -3116,7 +3602,9 @@ function authDeny(email){
   gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
   document.body.classList.remove('authed');
   gsClearSession();
-  authSetMsg('Acceso denegado. Esta aplicación solo está habilitada para el correo autorizado.'+(email?(' (intento: '+email+')'):''),'error');
+  limpiarEstadoDominio('planilla'); limpiarEstadoDominio('inventario');
+  aplicarPermisosNav(); aplicarTextosFooterPorRol();
+  authSetMsg('Acceso denegado. Esta aplicación solo está habilitada para cuentas autorizadas.'+(email?(' (intento: '+email+')'):''),'error');
 }
 
 // Cierra sesión: bloquea la app y vuelve al login.
@@ -3125,6 +3613,8 @@ function authLogout(){
   gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
   gsClearSession();
   document.body.classList.remove('authed');
+  limpiarEstadoDominio('planilla'); limpiarEstadoDominio('inventario');
+  aplicarPermisosNav(); aplicarTextosFooterPorRol();
   gsUpdateSyncStatus('Sin sesión.','info');
   authSetMsg('Sesión cerrada. Inicia sesión para continuar.','info');
   toast('Sesión cerrada','warn');
@@ -3142,10 +3632,13 @@ function gsRevokeToken(){
    INICIALIZACIÓN
    ================================================================ */
 (function init(){
-  if(!localStorage.getItem(K.seed)) seedData(); // carga inicial de ejemplo
+  if(!localStorage.getItem(K.seed)) seedData(); // carga inicial de ejemplo (planilla)
+  seedInsumos(); // carga inicial de ejemplo (insumos), solo si nunca se sembró
   reloadState();
   goto('empleados');
   gsUpdateSyncStatus('', 'info');
+  aplicarPermisosNav();        // antes de iniciar sesión no oculta nada (ver función)
+  aplicarTextosFooterPorRol();
   // Control de acceso: la app queda oculta tras la pantalla de login.
   document.getElementById('authLoginBtn').onclick = authSignIn;
   document.getElementById('authLogoutBtn').onclick = authLogout;
