@@ -94,6 +94,8 @@
   .inv-cell-alerta{background:#fee2e2}
   .inv-cell-alerta input{color:#991b1b;font-weight:700}
   .inv-matrix th small{display:block}
+  .inv-matrix thead th{vertical-align:top}
+  .inv-del-dia-btn{margin-top:6px;font-size:11px;padding:3px 8px;white-space:nowrap}
   .inv-del-mini{border:none;background:transparent;cursor:pointer;font-size:12px;padding:0 2px;line-height:1;opacity:.7}
   .inv-del-mini:hover{opacity:1}
   .inv-cell-wrap{display:flex;align-items:center;gap:4px;justify-content:flex-end}
@@ -2802,20 +2804,24 @@ RENDERERS.insumos = function(){
     </div>
     <div class="card">
       <h2>Lista de insumos (${S.insumos.length})</h2>
-      <p class="hint" style="margin-top:0">Los dos checkboxes controlan, por insumo, las alertas del <b>Consolidado de Inventario</b>: resaltado del nombre por bajo consumo (solo insumos en ml) y resaltado de la celda de cierre por incremento anormal. Ambos vienen activados por defecto y el cambio se aplica de inmediato, sin recargar la página.</p>
+      <p class="hint" style="margin-top:0">Los dos checkboxes controlan, por insumo, las alertas del <b>Consolidado de Inventario</b>: resaltado del nombre por bajo consumo (solo insumos en ml) y resaltado de la celda de cierre por incremento anormal. Ambos vienen activados por defecto. <b>Los cambios en los checkboxes NO se guardan automáticamente</b>: marca/desmarca lo que necesites y presiona "Actualizar" para guardar y sincronizar todos los cambios en una sola acción.</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th><th class="num">Resaltado de insumo</th><th class="num">Resaltado de celda</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Insumo</th><th>Unidad</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? S.insumos.map(i=>`
           <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
-            <td class="num"><input type="checkbox" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita si el consumo de los últimos 3 días es bajo" onchange="insumoToggleConfig('${i.id}','resaltadoInsumo',this.checked)"></td>
-            <td class="num"><input type="checkbox" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada" onchange="insumoToggleConfig('${i.id}','resaltadoCelda',this.checked)"></td>
+            <td class="num"><input type="checkbox" class="insCfgInsumo" data-id="${i.id}" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita si el consumo de los últimos 3 días es bajo"></td>
+            <td class="num"><input type="checkbox" class="insCfgCelda" data-id="${i.id}" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada"></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
         `).join('') : `<tr><td colspan="5" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
+      ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
+      <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de resaltado realizados arriba.</p>` : ''}
     </div>`;
   document.getElementById('insSave').onclick = insumoSave;
   document.getElementById('insClear').onclick = ()=>{ editInsumoId=null; RENDERERS.insumos(); };
+  const actBtn = document.getElementById('insActualizar');
+  if(actBtn) actBtn.onclick = insumosActualizarResaltados;
   if(editInsumoId){
     const i = S.insumos.find(x=>x.id===editInsumoId);
     if(i){ document.getElementById('insFormTitle').textContent='Editar insumo'; document.getElementById('insNombre').value=i.nombre; document.getElementById('insUnidad').value=i.unidad; }
@@ -2838,17 +2844,31 @@ function insumoSave(){
   }
   RENDERERS.insumos();
 }
-// Activa/desactiva al instante uno de los dos checkboxes de configuración de
-// un insumo: persiste en localStorage, sincroniza con Google Sheets (dominio
-// inventario) y no requiere recargar nada — el Consolidado de Inventario ya
-// lee S.insumos en cada render, así que el próximo render ve el cambio.
-window.insumoToggleConfig = async function(id, campo, valor){
-  const ins = S.insumos.find(i=>i.id===id); if(!ins) return;
-  ins[campo] = !!valor;
-  save(K.insumos, S.insumos);
-  toast('Configuración del insumo actualizada','success');
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
-};
+// Lee TODOS los checkboxes de resaltado de la tabla (de todos los insumos),
+// aplica los cambios a S.insumos, guarda en localStorage y sincroniza con
+// Google Sheets en una sola acción — los checkboxes en sí ya no disparan
+// guardado/sincronización individual al marcarlos/desmarcarlos.
+async function insumosActualizarResaltados(){
+  const btn = document.getElementById('insActualizar');
+  if(btn){ btn.disabled=true; btn.dataset.txt=btn.textContent; btn.textContent='Actualizando…'; }
+  try{
+    document.querySelectorAll('.insCfgInsumo').forEach(cb=>{
+      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
+      if(ins) ins.resaltadoInsumo = cb.checked;
+    });
+    document.querySelectorAll('.insCfgCelda').forEach(cb=>{
+      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
+      if(ins) ins.resaltadoCelda = cb.checked;
+    });
+    save(K.insumos, S.insumos);
+    const ok = await gsSaveToSheets('inventario');
+    if(ok) toast('Cambios actualizados y sincronizados correctamente','success');
+    else toast('Los cambios se guardaron localmente, pero ocurrió un error al sincronizar con Google Sheets','error');
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent=btn.dataset.txt||'💾 Actualizar'; }
+    RENDERERS.insumos();
+  }
+}
 window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.scrollTo({top:0,behavior:'smooth'}); };
 window.insumoDel = function(id){
   if(!confirm('¿Eliminar este insumo? Los registros históricos de producción ya guardados no se eliminan, pero ya no podrás registrar nueva producción para él.')) return;
@@ -2947,7 +2967,13 @@ RENDERERS.inventarioConsolidado = function(){
   const hayInsumos = S.insumos.length>0;
   const hayDatos = hayInsumos && S.insumos.some(ins=> fechas.some(f=>reg(ins.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th colspan="2">${fmtFecha(f)}<small style="font-weight:400;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</small></th>`).join('');
+  // Cada columna de fecha incluye, en el propio encabezado, el botón
+  // "Eliminar día" (elimina TODOS los registros de TODOS los insumos para
+  // esa fecha, no un registro individual; ver invDeleteDia).
+  const theadFechas = fechas.map(f=>`<th colspan="2">
+      <div>${fmtFecha(f)}<small style="font-weight:400;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</small></div>
+      <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️ Eliminar día</button>
+    </th>`).join('');
   const theadSub = fechas.map(()=>`<th class="num">Producción</th><th class="num">Cierre</th>`).join('');
 
   const filasInsumos = S.insumos.map(ins=>{
@@ -2957,8 +2983,7 @@ RENDERERS.inventarioConsolidado = function(){
       if(!r) return `<td class="num"></td><td class="num"></td>`;
       const anomalo = incrementoAnormal(ins.id,f);
       const prodCell = `<input type="number" min="0" step="0.01" value="${r.produccion}" onchange="invSetCampo('${r.id}','produccion',this.value)">`;
-      const cierreCell = `<div class="inv-cell-wrap"><input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)">
-        <button class="inv-del-mini" title="Eliminar este registro" onclick="invDel('${r.id}')">🗑️</button></div>`;
+      const cierreCell = `<input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)">`;
       return `<td class="num">${prodCell}</td><td class="num ${anomalo?'inv-cell-alerta':''}">${cierreCell}</td>`;
     }).join('');
     return `<tr><td class="${alerta?'inv-insumo-alerta':''}">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
@@ -2971,12 +2996,12 @@ RENDERERS.inventarioConsolidado = function(){
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="invFHasta" value="${hasta}"></div>
         <button class="btn btn-ghost btn-sm" id="invFClear">Últimos 7 días</button>
-        <button class="btn btn-green" id="invExport">⬇ Exportar Excel (filtrado)</button>
       </div>
       <h2>Historial por insumo (${fechas.length} día${fechas.length===1?'':'s'}, ${S.insumos.length} insumo${S.insumos.length===1?'':'s'})</h2>
       <p class="hint" style="margin-top:0">
         <span class="inv-insumo-alerta">Insumo en rojo y negrita</span>: bajo consumo (insumos en ml con "Resaltado de insumo" activado; se evalúan únicamente los últimos 3 días registrados para ese insumo — reducción de Stock Total entre el día -2 y el día actual &lt; 100&nbsp;ml).
         <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: insumo con "Resaltado de celda" activado, incremento de cierre &gt; 2% sin producción registrada ese día. Ambos resaltados se configuran por insumo en el módulo <b>Insumos</b>.
+        El botón <b>🗑️ Eliminar día</b> de cada columna borra los registros de TODOS los insumos para esa fecha.
       </p>
       ${(!hayInsumos) ? `<div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div>` : (!hayDatos ? `<div class="empty">No hay registros en el rango seleccionado.</div>` : `
       <div class="table-wrap"><table class="inv-matrix">
@@ -3001,57 +3026,7 @@ RENDERERS.inventarioConsolidado = function(){
     invConsFilter = { desde: hace6.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10) };
     RENDERERS.inventarioConsolidado();
   };
-  document.getElementById('invExport').onclick = ()=> exportarInventarioMatrizExcel(fechas, { bajoConsumo, incrementoAnormal });
 };
-
-// Exporta la matriz visible (mismas fechas/insumos del rango filtrado) a Excel,
-// con encabezados de fecha agrupados (Producción/Cierre) y, cuando la build de
-// SheetJS cargada lo soporte, el mismo resaltado condicional (rojo/negrita) que
-// se ve en pantalla. Si la librería no soporta estilos en .xlsx, el archivo se
-// genera igual, solo sin el color (no se interrumpe la exportación).
-function exportarInventarioMatrizExcel(fechas, reglas){
-  const ROJO_TEXTO = { rgb:'991B1B' };
-  const ROJO_FONDO = { rgb:'FEE2E2' };
-  const filaFechas = ['Insumo'];
-  const filaSub = [''];
-  fechas.forEach(f=>{ filaFechas.push(fmtFecha(f), ''); filaSub.push('Producción','Cierre'); });
-  const aoa = [filaFechas, filaSub];
-  const estilosCelda = []; // {r,c,style}
-
-  S.insumos.forEach(ins=>{
-    const fila = [ins.nombre+' ('+ins.unidad+')'];
-    const filaIdx = aoa.length;
-    if(reglas.bajoConsumo(ins)) estilosCelda.push({ r:filaIdx, c:0, style:{ font:{ bold:true, color:ROJO_TEXTO } } });
-    fechas.forEach((f,i)=>{
-      const r = getProduccion(ins.id, f);
-      fila.push(r? r.produccion : '', r? r.cierre : '');
-      if(r && reglas.incrementoAnormal(ins.id, f)){
-        estilosCelda.push({ r:filaIdx, c:2+i*2, style:{ fill:{ fgColor:ROJO_FONDO }, font:{ bold:true, color:ROJO_TEXTO } } });
-      }
-    });
-    aoa.push(fila);
-  });
-
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
-  // Fusiona visualmente cada par de columnas de fecha y la columna "Insumo".
-  ws['!merges'] = [{ s:{r:0,c:0}, e:{r:1,c:0} }];
-  fechas.forEach((f,i)=> ws['!merges'].push({ s:{r:0,c:1+i*2}, e:{r:0,c:2+i*2} }));
-  // Aplica estilos celda por celda (mejor esfuerzo; depende de la build de SheetJS).
-  estilosCelda.forEach(({r,c,style})=>{
-    const ref = XLSX.utils.encode_cell({r,c});
-    if(ws[ref]) ws[ref].s = style;
-  });
-
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Inventario');
-  try{
-    XLSX.writeFile(wb, `inventario_${invConsFilter.desde||'inicio'}_a_${invConsFilter.hasta||'hoy'}_${excelTimestamp()}.xlsx`, { cellStyles:true });
-  }catch(e){
-    // Compatibilidad: si la build de SheetJS no acepta la opción cellStyles, se reintenta sin ella.
-    XLSX.writeFile(wb, `inventario_${invConsFilter.desde||'inicio'}_a_${invConsFilter.hasta||'hoy'}_${excelTimestamp()}.xlsx`);
-  }
-  toast('Excel de inventario descargado','success');
-}
 
 // Edición rápida (inline) de un registro de inventario: guarda en localStorage,
 // re-renderiza (para recalcular alertas) y sincroniza de inmediato con Google
@@ -3066,11 +3041,15 @@ window.invSetCampo = async function(id, campo, valor){
   RENDERERS.inventarioConsolidado();
   try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
 };
-window.invDel = async function(id){
-  if(!confirm('¿Eliminar este registro de inventario? Esta acción no se puede deshacer.')) return;
-  S.produccion = S.produccion.filter(x=>x.id!==id);
+// Elimina TODOS los registros de producción (de TODOS los insumos) de una
+// fecha específica. Reemplaza la eliminación por registro individual.
+window.invDeleteDia = async function(fecha){
+  const cantidad = S.produccion.filter(r=>r.fecha===fecha).length;
+  if(!cantidad){ toast('No hay registros para ese día','info'); return; }
+  if(!confirm(`¿Está seguro que desea eliminar todos los registros del día ${fmtFecha(fecha)}? Esta acción no se puede deshacer.`)) return;
+  S.produccion = S.produccion.filter(r=>r.fecha!==fecha);
   save(K.produccion, S.produccion);
-  toast('Registro eliminado','warn');
+  toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
   RENDERERS.inventarioConsolidado();
   try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
 };
@@ -3465,9 +3444,13 @@ function gsSerializeInventario(){
    GUARDAR en Google Sheets
    domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
    ================================================================ */
+// Devuelve true si se guardó correctamente, false si hubo un error (ya
+// mostrado vía toast/gsHandleError). No relanza la excepción: los llamadores
+// que necesiten saber si falló deben revisar el valor de retorno, no un catch.
 async function gsSaveToSheets(domain='planilla'){
-  if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
+  if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return false; }
   const cfg = gsDomainCfg(domain);
+  let ok = true;
   try{
     gsUpdateSyncStatus('Guardando en Google Sheets…','info');
     toast('Guardando en Google Sheets…','info');
@@ -3497,26 +3480,32 @@ async function gsSaveToSheets(domain='planilla'){
   }catch(err){
     console.error(err);
     gsHandleError(err, 'guardar');
+    ok = false;
   }
   gsRenderControls();
+  return ok;
 }
+
 
 /* ================================================================
    CARGAR desde Google Sheets
    domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
    ================================================================ */
-async function gsLoadFromSheets(domain='planilla'){
-  if(!isAuthorized()){ toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
+async function gsLoadFromSheets(domain='planilla', opts={}){
+  const auto = !!opts.auto; // true = sincronización automática al iniciar sesión (sin diálogo de confirmación)
+  if(!isAuthorized()){ if(!auto) toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
   const cfg = gsDomainCfg(domain);
-  const confirmMsg = domain==='inventario'
-    ? 'Esto reemplazará los insumos y los registros de producción actuales con los últimos datos guardados en Google Sheets. ¿Continuar?'
-    : 'Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?';
-  if(!confirm(confirmMsg)) return;
+  if(!auto){
+    const confirmMsg = domain==='inventario'
+      ? 'Esto reemplazará los insumos y los registros de producción actuales con los últimos datos guardados en Google Sheets. ¿Continuar?'
+      : 'Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?';
+    if(!confirm(confirmMsg)) return;
+  }
   try{
-    gsUpdateSyncStatus('Cargando últimos datos…','info');
-    toast('Cargando últimos datos…','info');
+    gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
+    if(!auto) toast('Cargando últimos datos…','info');
     const id = await gsEnsureSpreadsheet(domain);
-    if(!id){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
+    if(!id){ if(!auto) toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
     const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
     // UNFORMATTED_VALUE: devuelve los números como números reales (sin separadores de
@@ -3532,8 +3521,10 @@ async function gsLoadFromSheets(domain='planilla'){
 
     if(domain==='inventario'){
       if(!byName['Insumos']){
-        toast('No se encontró una hoja asociada.','error');
-        gsUpdateSyncStatus('La hoja no tiene datos de insumos.','warn');
+        // En modo automático, una hoja recién creada (sin datos todavía) no es
+        // un error: simplemente no hay nada que sincronizar todavía.
+        if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de insumos.','warn'); }
+        else gsUpdateSyncStatus('Sin datos previos en Google Sheets.','info');
         return;
       }
       // Compatibilidad: si la hoja no tiene estas columnas (o vienen en blanco),
@@ -3545,8 +3536,8 @@ async function gsLoadFromSheets(domain='planilla'){
       save(K.insumos,S.insumos); save(K.produccion,S.produccion);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
-        toast('No se encontró una hoja asociada.','error');
-        gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn');
+        if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn'); }
+        else gsUpdateSyncStatus('Sin datos previos en Google Sheets.','info');
         return;
       }
 
@@ -3579,12 +3570,13 @@ async function gsLoadFromSheets(domain='planilla'){
     if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
     else if(role) limpiarEstadoDominio('inventario');
     gsState.lastSync = new Date();
-    toast('Datos cargados desde Google Sheets','success');
+    toast(auto? 'Datos sincronizados al iniciar sesión' : 'Datos cargados desde Google Sheets','success');
     gsUpdateSyncStatus('Datos cargados ('+gsState.email+').','success');
     goto(currentPage);
   }catch(err){
     console.error(err);
-    gsHandleError(err, 'cargar');
+    if(auto) gsUpdateSyncStatus('No se pudo sincronizar automáticamente al iniciar sesión.','error');
+    else gsHandleError(err, 'cargar');
   }
   gsRenderControls();
 }
@@ -3719,7 +3711,7 @@ async function authSignIn(){
     await gsWaitForLib();
     await gsRequestToken(true);
     await gsFetchUserEmail();
-    if(isAuthorized()) authGrant();
+    if(isAuthorized()) authGrant(true);  // true = login explícito -> dispara sincronización automática
     else authDeny(gsState.email);
   }catch(err){
     console.error(err);
@@ -3728,23 +3720,32 @@ async function authSignIn(){
 }
 
 // Reintento silencioso al cargar (mantiene la sesión si Google la conserva).
+// NUNCA dispara la sincronización automática: representa una página
+// refrescada con una sesión que YA estaba activa, no un inicio de sesión.
 async function authTrySilent(){
   if(!localStorage.getItem(AUTH_KEYS.email)) return; // sin sesión previa: mostrar login
   // 1) Restaurar un token aún válido sin contactar a Google (mantiene la sesión al refrescar).
-  if(gsRestoreSession() && isAuthorized()){ authGrant(); return; }
+  if(gsRestoreSession() && isAuthorized()){ authGrant(false); return; }
   // 2) Renovación silenciosa si el token expiró.
   try{
     await gsWaitForLib();
     await gsRequestToken(false); // sin prompt
     await gsFetchUserEmail();
-    if(isAuthorized()) authGrant();
+    if(isAuthorized()) authGrant(false);
     else authDeny(gsState.email);
   }catch(e){ /* se requiere login manual */ }
 }
 
 // Concede acceso: muestra la app (con el menú filtrado por rol) y habilita
 // Google Sheets para el dominio (spreadsheet) correspondiente.
-function authGrant(){
+// viaLogin=true únicamente cuando el acceso proviene de un inicio de sesión
+// EXPLÍCITO (authSignIn, el usuario presionó "Iniciar sesión con Google").
+// Solo en ese caso se dispara la sincronización automática de todos los
+// datos desde Google Sheets (Producción/Insumos/Consolidado de Inventario o
+// Empleados y el resto del dominio "planilla", según el rol de la cuenta).
+// Al refrescar la página con una sesión ya activa (viaLogin=false/omitido)
+// NO se vuelve a sincronizar automáticamente.
+function authGrant(viaLogin){
   document.body.classList.add('authed');
   gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
@@ -3763,8 +3764,15 @@ function authGrant(){
   aplicarTextosFooterPorRol();
   goto(moduloPermitido(currentPage) ? currentPage : paginaPorDefecto());
 
+  const domain = role ? role.domain : 'planilla';
   // Intentar detectar/crear el spreadsheet del dominio de esta cuenta (no bloquea el acceso).
-  gsEnsureSpreadsheet(role ? role.domain : 'planilla').catch(()=>{});
+  const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
+  if(viaLogin){
+    // Sincronización automática SOLO al iniciar sesión explícitamente: trae
+    // todos los datos del dominio de esta cuenta desde Google Sheets, sin
+    // diálogo de confirmación (opts.auto=true) y sin bloquear el acceso si falla.
+    ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
+  }
   gsRenderControls();
 }
 
