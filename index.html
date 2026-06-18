@@ -2685,12 +2685,17 @@ const INSUMOS_INICIALES = [
 // se haya sembrado antes (usado por "Recargar insumos de ejemplo").
 function seedInsumos(force){
   if(!force && localStorage.getItem(K.seedInsumos)) return;
-  S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({ id:uid(), nombre, unidad }));
+  S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({ id:uid(), nombre, unidad, resaltadoInsumo:true, resaltadoCelda:true }));
   save(K.insumos, S.insumos);
   localStorage.setItem(K.seedInsumos,'1');
 }
 function nombreInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.nombre : '(insumo eliminado)'; }
 function unidadInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.unidad : ''; }
+// Accesores de configuración por insumo: un insumo antiguo sin estos campos
+// (undefined) se considera ACTIVADO por defecto; solo se desactiva si el
+// valor guardado es explícitamente false (checkbox destildado).
+function insumoAplicaResaltadoInsumo(ins){ return !!ins && ins.resaltadoInsumo !== false; }
+function insumoAplicaResaltadoCelda(ins){ return !!ins && ins.resaltadoCelda !== false; }
 function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
 // Actualiza el registro existente de (insumo, fecha) o crea uno nuevo si no
 // existe. Nunca duplica ni toca registros de otras fechas/insumos.
@@ -2797,13 +2802,16 @@ RENDERERS.insumos = function(){
     </div>
     <div class="card">
       <h2>Lista de insumos (${S.insumos.length})</h2>
+      <p class="hint" style="margin-top:0">Los dos checkboxes controlan, por insumo, las alertas del <b>Consolidado de Inventario</b>: resaltado del nombre por bajo consumo (solo insumos en ml) y resaltado de la celda de cierre por incremento anormal. Ambos vienen activados por defecto y el cambio se aplica de inmediato, sin recargar la página.</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Insumo</th><th>Unidad</th><th class="num">Resaltado de insumo</th><th class="num">Resaltado de celda</th><th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? S.insumos.map(i=>`
           <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
+            <td class="num"><input type="checkbox" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita si el consumo de los últimos 3 días es bajo" onchange="insumoToggleConfig('${i.id}','resaltadoInsumo',this.checked)"></td>
+            <td class="num"><input type="checkbox" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada" onchange="insumoToggleConfig('${i.id}','resaltadoCelda',this.checked)"></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="3" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="5" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
     </div>`;
   document.getElementById('insSave').onclick = insumoSave;
@@ -2824,11 +2832,23 @@ function insumoSave(){
     Object.assign(i, { nombre, unidad });
     save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
   }else{
-    S.insumos.push({ id:uid(), nombre, unidad });
+    // Nuevo insumo: ambos resaltados activados por defecto (requisito 2).
+    S.insumos.push({ id:uid(), nombre, unidad, resaltadoInsumo:true, resaltadoCelda:true });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
 }
+// Activa/desactiva al instante uno de los dos checkboxes de configuración de
+// un insumo: persiste en localStorage, sincroniza con Google Sheets (dominio
+// inventario) y no requiere recargar nada — el Consolidado de Inventario ya
+// lee S.insumos en cada render, así que el próximo render ve el cambio.
+window.insumoToggleConfig = async function(id, campo, valor){
+  const ins = S.insumos.find(i=>i.id===id); if(!ins) return;
+  ins[campo] = !!valor;
+  save(K.insumos, S.insumos);
+  toast('Configuración del insumo actualizada','success');
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+};
 window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.scrollTo({top:0,behavior:'smooth'}); };
 window.insumoDel = function(id){
   if(!confirm('¿Eliminar este insumo? Los registros históricos de producción ya guardados no se eliminan, pero ya no podrás registrar nueva producción para él.')) return;
@@ -2871,43 +2891,58 @@ function fechaMenosUnDia(fechaISO){
   dt.setDate(dt.getDate()-1);
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
+// Fecha más reciente (la mayor) con registro de producción para un insumo,
+// en TODO el historial (no solo el rango visualizado en el Consolidado).
+function ultimaFechaConRegistro(insumoId){
+  let max = null;
+  S.produccion.forEach(r=>{ if(r.insumoId===insumoId && (max===null || r.fecha>max)) max = r.fecha; });
+  return max;
+}
+// ---------------------------------------------------------------------
+// Reglas de alerta del Consolidado de Inventario. Se recalculan en cada
+// render (al cargar, al cambiar el rango, y tras cualquier edición/alta/baja
+// de un registro o de la configuración del insumo).
+// ---------------------------------------------------------------------
+// Regla 1 — bajo consumo (solo insumos en "ml", y solo si el insumo tiene
+// activado "Aplica resaltado de insumo"): toma ÚNICAMENTE la fecha más
+// reciente disponible para ese insumo ("día actual") y los 2 días calendario
+// inmediatamente anteriores — nunca ventanas históricas previas. Si los tres
+// días tienen registro, Reducción = StockTotal(día-2) − StockTotal(día
+// actual); si Reducción < 100 ml, se resalta el nombre del insumo.
+function bajoConsumo(insumo){
+  if((insumo.unidad||'').trim().toLowerCase()!=='ml') return false;
+  if(!insumoAplicaResaltadoInsumo(insumo)) return false;
+  const fechaActual = ultimaFechaConRegistro(insumo.id);
+  if(!fechaActual) return false;
+  const fechaM1 = fechaMenosUnDia(fechaActual);
+  const fechaM2 = fechaMenosUnDia(fechaM1);
+  const rActual = getProduccion(insumo.id, fechaActual);
+  const rM1 = getProduccion(insumo.id, fechaM1);
+  const rM2 = getProduccion(insumo.id, fechaM2);
+  if(!rActual || !rM1 || !rM2) return false; // no hay 3 días consecutivos registrados
+  const stockActual = numProp(rActual.produccion)+numProp(rActual.cierre);
+  const stockM2 = numProp(rM2.produccion)+numProp(rM2.cierre);
+  return (stockM2 - stockActual) < 100;
+}
+// Regla 2 — incremento anormal de cierre sin producción registrada (solo si
+// el insumo tiene activado "Aplica resaltado de celda"): compara contra el
+// día calendario inmediatamente anterior del MISMO insumo (en todo el
+// historial, no solo el rango visible, para no perder el primer día
+// mostrado). Se resalta únicamente la celda de Cierre de esa fecha.
+function incrementoAnormal(insumoId, fecha){
+  const insumo = S.insumos.find(i=>i.id===insumoId);
+  if(insumo && !insumoAplicaResaltadoCelda(insumo)) return false;
+  const r = getProduccion(insumoId, fecha); if(!r) return false;
+  if(numProp(r.produccion) !== 0) return false;
+  const ant = getProduccion(insumoId, fechaMenosUnDia(fecha)); if(!ant) return false;
+  const cierreAnt = numProp(ant.cierre); if(cierreAnt<=0) return false;
+  return numProp(r.cierre) > cierreAnt*1.02;
+}
 
 RENDERERS.inventarioConsolidado = function(){
   const el = document.getElementById('page-inventarioConsolidado');
   const { desde, hasta, fechas } = invRangoEfectivo();
   const reg = (insumoId, fecha) => getProduccion(insumoId, fecha);
-
-  // ---------------------------------------------------------------------
-  // Reglas de alerta (se recalculan en cada render: al cargar, al cambiar
-  // el rango, y tras cualquier edición/alta/baja de un registro).
-  // ---------------------------------------------------------------------
-  // Regla 2 — bajo consumo (solo insumos en "ml"): se resalta el insumo si
-  // existe AL MENOS UNA ventana de 3 días calendario consecutivos (con
-  // registro en los tres) dentro del rango visualizado cuya reducción de
-  // Stock Total (Producción+Cierre) entre el primer y el último día sea
-  // menor a 100 ml.
-  function bajoConsumo(insumo){
-    if((insumo.unidad||'').trim().toLowerCase()!=='ml') return false;
-    for(let i=0;i<fechas.length-2;i++){
-      const r1=reg(insumo.id,fechas[i]), r2=reg(insumo.id,fechas[i+1]), r3=reg(insumo.id,fechas[i+2]);
-      if(!r1||!r2||!r3) continue; // ventana incompleta: no se evalúa
-      const stock1 = numProp(r1.produccion)+numProp(r1.cierre);
-      const stock3 = numProp(r3.produccion)+numProp(r3.cierre);
-      if((stock1-stock3) < 100) return true;
-    }
-    return false;
-  }
-  // Regla 3 — incremento anormal de cierre sin producción registrada: compara
-  // contra el día calendario inmediatamente anterior del MISMO insumo (en
-  // todo el historial, no solo el rango visible, para no perder el primer
-  // día mostrado). Se resalta únicamente la celda de Cierre de esa fecha.
-  function incrementoAnormal(insumoId, fecha){
-    const r = reg(insumoId, fecha); if(!r) return false;
-    if(numProp(r.produccion) !== 0) return false;
-    const ant = getProduccion(insumoId, fechaMenosUnDia(fecha)); if(!ant) return false;
-    const cierreAnt = numProp(ant.cierre); if(cierreAnt<=0) return false;
-    return numProp(r.cierre) > cierreAnt*1.02;
-  }
 
   const hayInsumos = S.insumos.length>0;
   const hayDatos = hayInsumos && S.insumos.some(ins=> fechas.some(f=>reg(ins.id,f)));
@@ -2940,8 +2975,8 @@ RENDERERS.inventarioConsolidado = function(){
       </div>
       <h2>Historial por insumo (${fechas.length} día${fechas.length===1?'':'s'}, ${S.insumos.length} insumo${S.insumos.length===1?'':'s'})</h2>
       <p class="hint" style="margin-top:0">
-        <span class="inv-insumo-alerta">Insumo en rojo y negrita</span>: bajo consumo (insumos en ml; reducción de Stock Total &lt; 100&nbsp;ml en alguna ventana de 3 días consecutivos del rango).
-        <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: incremento de cierre &gt; 2% sin producción registrada ese día.
+        <span class="inv-insumo-alerta">Insumo en rojo y negrita</span>: bajo consumo (insumos en ml con "Resaltado de insumo" activado; se evalúan únicamente los últimos 3 días registrados para ese insumo — reducción de Stock Total entre el día -2 y el día actual &lt; 100&nbsp;ml).
+        <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: insumo con "Resaltado de celda" activado, incremento de cierre &gt; 2% sin producción registrada ese día. Ambos resaltados se configuran por insumo en el módulo <b>Insumos</b>.
       </p>
       ${(!hayInsumos) ? `<div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div>` : (!hayDatos ? `<div class="empty">No hay registros en el rango seleccionado.</div>` : `
       <div class="table-wrap"><table class="inv-matrix">
@@ -3416,7 +3451,8 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad'], S.insumos),
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','resaltadoInsumo','resaltadoCelda'],
+      S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad, resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0 }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Meta: gsRowsToMatrix(['clave','valor'], [
       { clave:'app', valor:'WingsBox Inventario' },
@@ -3500,7 +3536,11 @@ async function gsLoadFromSheets(domain='planilla'){
         gsUpdateSyncStatus('La hoja no tiene datos de insumos.','warn');
         return;
       }
-      S.insumos = (byName['Insumos']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim() }));
+      // Compatibilidad: si la hoja no tiene estas columnas (o vienen en blanco),
+      // se asumen ambos resaltados ACTIVADOS por defecto (requisito 5).
+      const esFalse = v => v===0 || v==='0' || v===false || String(v).trim().toLowerCase()==='false';
+      S.insumos = (byName['Insumos']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim(),
+        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda) }));
       S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
       save(K.insumos,S.insumos); save(K.produccion,S.produccion);
     }else{
