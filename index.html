@@ -2911,38 +2911,55 @@ function fechaMenosUnDia(fechaISO){
   dt.setDate(dt.getDate()-1);
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
-// Fecha más reciente (la mayor) con registro de producción para un insumo,
-// en TODO el historial (no solo el rango visualizado en el Consolidado).
-function ultimaFechaConRegistro(insumoId){
-  let max = null;
-  S.produccion.forEach(r=>{ if(r.insumoId===insumoId && (max===null || r.fecha>max)) max = r.fecha; });
-  return max;
-}
 // ---------------------------------------------------------------------
 // Reglas de alerta del Consolidado de Inventario. Se recalculan en cada
 // render (al cargar, al cambiar el rango, y tras cualquier edición/alta/baja
 // de un registro o de la configuración del insumo).
 // ---------------------------------------------------------------------
 // Regla 1 — bajo consumo (solo insumos en "ml", y solo si el insumo tiene
-// activado "Aplica resaltado de insumo"): toma ÚNICAMENTE la fecha más
-// reciente disponible para ese insumo ("día actual") y los 2 días calendario
-// inmediatamente anteriores — nunca ventanas históricas previas. Si los tres
-// días tienen registro, Reducción = StockTotal(día-2) − StockTotal(día
-// actual); si Reducción < 100 ml, se resalta el nombre del insumo.
+// activado "Aplica resaltado de insumo").
+//
+// Algoritmo (corregido):
+//   1. Tomar los 3 registros más recientes para el insumo (por fecha, desc).
+//   2. Para cada uno de esos 3 días calcular el consumo REAL del día:
+//        Consumo = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
+//      donde "Cierre del día anterior" = el cierre del registro del día
+//      calendario inmediatamente anterior. Si no existe ese registro previo,
+//      se omite ese día (ver "ignorar días sin información").
+//   3. Sumar los consumos válidos obtenidos.
+//   4. Si el consumo acumulado < 100 ml → resaltar en rojo/negrita.
+//
+// Esto corrige el error anterior, que comparaba diferencias de "Stock Total"
+// (produccion + cierre), una métrica que se vuelve negativa cuando hay una
+// gran producción, generando falsos positivos (p.ej. MARACUYÁ CLÁSICO con
+// 4130 ml producidos el 17/06 aparecía incorrectamente resaltado).
 function bajoConsumo(insumo){
   if((insumo.unidad||'').trim().toLowerCase()!=='ml') return false;
   if(!insumoAplicaResaltadoInsumo(insumo)) return false;
-  const fechaActual = ultimaFechaConRegistro(insumo.id);
-  if(!fechaActual) return false;
-  const fechaM1 = fechaMenosUnDia(fechaActual);
-  const fechaM2 = fechaMenosUnDia(fechaM1);
-  const rActual = getProduccion(insumo.id, fechaActual);
-  const rM1 = getProduccion(insumo.id, fechaM1);
-  const rM2 = getProduccion(insumo.id, fechaM2);
-  if(!rActual || !rM1 || !rM2) return false; // no hay 3 días consecutivos registrados
-  const stockActual = numProp(rActual.produccion)+numProp(rActual.cierre);
-  const stockM2 = numProp(rM2.produccion)+numProp(rM2.cierre);
-  return (stockM2 - stockActual) < 100;
+
+  // 1) Los 3 días más recientes con registro (ordenados de más nuevo a más viejo)
+  const ultimos3 = S.produccion
+    .filter(r => r.insumoId === insumo.id)
+    .sort((a, b) => b.fecha.localeCompare(a.fecha))
+    .slice(0, 3);
+
+  if(!ultimos3.length) return false;
+
+  // 2) Consumo por día: Cierre(anterior) + Producción(hoy) - Cierre(hoy)
+  let consumoAcumulado = 0;
+  let diasValidos = 0;
+  for(const reg of ultimos3){
+    const regAnterior = getProduccion(insumo.id, fechaMenosUnDia(reg.fecha));
+    if(!regAnterior) continue; // sin registro del día anterior → omitir ese día
+    const consumo = numProp(regAnterior.cierre) + numProp(reg.produccion) - numProp(reg.cierre);
+    consumoAcumulado += consumo;
+    diasValidos++;
+  }
+
+  if(!diasValidos) return false;
+
+  // 3) Alerta si el consumo acumulado de los días válidos es menor a 100 ml
+  return consumoAcumulado < 100;
 }
 // Regla 2 — incremento anormal de cierre sin producción registrada (solo si
 // el insumo tiene activado "Aplica resaltado de celda"): compara contra el
