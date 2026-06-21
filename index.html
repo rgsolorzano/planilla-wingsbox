@@ -279,6 +279,24 @@ const TIPO_PROPINA_BADGE = { efectivo:'b-extra', yape:'b-free', plin:'b-vac', ta
 const load = (k)=>{ try{ return JSON.parse(localStorage.getItem(k)) || []; }catch(e){ return []; } };
 const save = (k,v)=> localStorage.setItem(k, JSON.stringify(v));
 const uid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+// Dispara una sincronización del dominio "planilla" con Google Sheets en segundo
+// plano (fire-and-forget). Se llama inmediatamente después de cada save(K.xxx)
+// en los módulos de planilla: Empleados, Horarios, Marcaciones, Descuentos,
+// Pagos Extra, Días Libres, Propinas, Horas Extra y Exoneración de Tardanza.
+//
+// Diseño intencional:
+// • No usa async/await en el sitio de llamada → no cambia las firmas de las
+//   funciones CRUD existentes (que son sincrónicas).
+// • gsSaveToSheets() ya maneja internamente sus propios errores y muestra
+//   toasts descriptivos; syncPlanilla() solo captura para no generar unhandled.
+// • No se invoca si no hay sesión activa (isAuthorized() = false): en ese caso
+//   la sincronización ocurrirá la próxima vez que se use el botón manual
+//   "Guardar en Google Sheets" o al iniciar sesión (sync automático en authGrant).
+function syncPlanilla(){
+  if(typeof isAuthorized === 'function' && isAuthorized()){
+    gsSaveToSheets('planilla').catch(e=>console.error('syncPlanilla:', e));
+  }
+}
 
 /* Preferencia por día: ¿incluir pago por horas extra en la quincena? (default: sí) */
 function loadConsiderarHE(){
@@ -332,6 +350,7 @@ function setExoneracionTardanza(empId, fecha, activa, horas){
   if(activa) EXO_TARD[k] = { activa:true, horas: Number(horas)||0 };
   else delete EXO_TARD[k];
   saveExoTard();
+  syncPlanilla();
 }
 function exoTardToRows(){
   return Object.entries(EXO_TARD).map(([k, v])=>{
@@ -368,7 +387,8 @@ function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
-  S.insumos=load(K.insumos); S.produccion=load(K.produccion);
+  S.insumos=load(K.insumos).map(migrarCamposInsumo); // migra tipoAlerta/umbral si faltan
+  S.produccion=load(K.produccion);
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
 // corresponde al rol de la cuenta conectada. Así, durante una sesión de
@@ -885,12 +905,14 @@ function empSave(){
     const e=S.emp.find(x=>x.id===editEmpId);
     Object.assign(e,{nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
+    syncPlanilla();
   }else{
     const id=uid();
     S.emp.push({id,nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
+    syncPlanilla();
   }
   RENDERERS.empleados();
 }
@@ -909,6 +931,7 @@ window.empDel = function(id){
   saveConsiderarHE(CONSIDERAR_HE);
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);save(K.prop,S.prop);
   toast('Empleado eliminado','warn'); RENDERERS.empleados();
+  syncPlanilla();
 };
 // genera horario base (Lun-Vie laboral, Sab/Dom libre) para un empleado
 function crearHorarioDefault(empId){
@@ -995,6 +1018,7 @@ window.horSet = function(dia, campo, val){
 function horGuardar(silent){
   save(K.hor,S.hor);
   if(!silent) toast('Horario guardado','success');
+  syncPlanilla();
 }
 
 /* ================================================================
@@ -1192,6 +1216,7 @@ RENDERERS.marcaciones = function(){
 window.marSet = function(id, campo, val){
   const m=S.mar.find(x=>x.id===id); if(!m) return;
   m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar); RENDERERS.marcaciones();
+  syncPlanilla();
 };
 window.marDel = function(id){
   const m=S.mar.find(x=>x.id===id);
@@ -1199,6 +1224,7 @@ window.marDel = function(id){
   S.mar=S.mar.filter(x=>x.id!==id); save(K.mar,S.mar);
   toast(esManual?'Marcación manual eliminada correctamente':'Marcación eliminada','warn');
   RENDERERS.marcaciones();
+  syncPlanilla();
 };
 function addMarManual(){
   if(!S.emp.length){ toast('Primero registra empleados','error'); return; }
@@ -1222,6 +1248,7 @@ function addMarManual(){
   lastMarcacion = { empleadoId: empId, fecha: fecha };
   toast('Marcación manual agregada correctamente','success');
   RENDERERS.marcaciones();
+  syncPlanilla();
 }
 
 // Convierte un serial de Excel (o Date/string) a {fecha:'YYYY-MM-DD', hm:'HH:MM'}
@@ -1269,6 +1296,7 @@ function importarExcel(){
       const { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas } =
         aplicarGruposMarcacion(grupos, { reemplazar, conservarManuales });
       save(K.mar,S.mar);
+      syncPlanilla();
 
       let msg = `<div class="card" style="background:#f0fdf4;border-color:#bbf7d0">
         <b>✔ Nueva carga procesada correctamente.</b> Filas leídas: ${leidas}. Marcaciones nuevas: ${nuevas}, actualizadas: ${actualizadas}.`;
@@ -1454,17 +1482,17 @@ RENDERERS.descuentos = function(){
     if(editDescId){
       const d=S.desc.find(x=>x.id===editDescId);
       Object.assign(d,{empleadoId:dEmp.value, fecha:dFecha.value, tipo:dTipo.value, monto, detalle:dDet.value.trim()});
-      editDescId=null; save(K.desc,S.desc); toast('Descuento actualizado','success');
+      editDescId=null; save(K.desc,S.desc); toast('Descuento actualizado','success'); syncPlanilla();
     }else{
       S.desc.push({id:uid(), empleadoId:dEmp.value, fecha:dFecha.value, tipo:dTipo.value, monto, detalle:dDet.value.trim()});
-      save(K.desc,S.desc); toast('Descuento registrado','success');
+      save(K.desc,S.desc); toast('Descuento registrado','success'); syncPlanilla();
     }
     RENDERERS.descuentos();
   };
   if(ed) document.getElementById('dCancel').onclick=()=>{ editDescId=null; RENDERERS.descuentos(); };
 };
 window.descEdit=function(id){ editDescId=id; RENDERERS.descuentos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.filter(d=>d.id!==id); save(K.desc,S.desc); toast('Descuento eliminado','warn'); RENDERERS.descuentos(); };
+window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.filter(d=>d.id!==id); save(K.desc,S.desc); toast('Descuento eliminado','warn'); RENDERERS.descuentos(); syncPlanilla(); };
 
 /* ================================================================
    MÓDULO 5: PAGOS EXTRA
@@ -1515,17 +1543,17 @@ RENDERERS.pagos = function(){
     if(editPagoId){
       const p=S.pago.find(x=>x.id===editPagoId);
       Object.assign(p,{empleadoId:pEmp.value, fecha:pFecha.value, tipo:pTipo.value, monto, detalle:pDet.value.trim()});
-      editPagoId=null; save(K.pago,S.pago); toast('Pago extra actualizado','success');
+      editPagoId=null; save(K.pago,S.pago); toast('Pago extra actualizado','success'); syncPlanilla();
     }else{
       S.pago.push({id:uid(), empleadoId:pEmp.value, fecha:pFecha.value, tipo:pTipo.value, monto, detalle:pDet.value.trim()});
-      save(K.pago,S.pago); toast('Pago extra registrado','success');
+      save(K.pago,S.pago); toast('Pago extra registrado','success'); syncPlanilla();
     }
     RENDERERS.pagos();
   };
   if(ed) document.getElementById('pCancel').onclick=()=>{ editPagoId=null; RENDERERS.pagos(); };
 };
 window.pagoEdit=function(id){ editPagoId=id; RENDERERS.pagos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.filter(p=>p.id!==id); save(K.pago,S.pago); toast('Pago extra eliminado','warn'); RENDERERS.pagos(); };
+window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.filter(p=>p.id!==id); save(K.pago,S.pago); toast('Pago extra eliminado','warn'); RENDERERS.pagos(); syncPlanilla(); };
 
 /* ================================================================
    MÓDULO 6: DÍAS LIBRES Y VACACIONES
@@ -1579,7 +1607,7 @@ RENDERERS.libres = function(){
     if(editLibreId){
       const l=S.libre.find(x=>x.id===editLibreId);
       Object.assign(l,{empleadoId:lEmp.value, fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
-      editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success');
+      editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success'); syncPlanilla();
     }else{
       const ini=lFecha.value, fin=document.getElementById('lFechaFin').value;
       if(fin && fin<ini){ toast('La fecha fin no puede ser anterior a la de inicio','error'); return; }
@@ -1594,13 +1622,14 @@ RENDERERS.libres = function(){
       });
       save(K.libre,S.libre);
       toast(creados>1?`${creados} días registrados`:'Registro guardado','success');
+      syncPlanilla();
     }
     RENDERERS.libres();
   };
   if(ed) document.getElementById('lCancel').onclick=()=>{ editLibreId=null; RENDERERS.libres(); };
 };
 window.libreEdit=function(id){ editLibreId=id; RENDERERS.libres(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); };
+window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); syncPlanilla(); };
 
 /* ================================================================
    MÓDULO 6B: INGRESO DE PROPINAS (por mesero y por día)
@@ -1760,6 +1789,7 @@ function propGuardarNuevo(){
   filas.forEach(f=> S.prop.push({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto }));
   save(K.prop,S.prop);
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
+  syncPlanilla();
 
   lastPropina = { empleadoId, fecha };
   // Mantiene el encabezado (mesero/fecha) sincronizado con lo recién guardado,
@@ -1788,6 +1818,7 @@ function propActualizar(){
   propinaItemActualizar(editPropItem, { empleadoId, fecha, tipo, monto:Number(v) });
   save(K.prop,S.prop);
   toast('Propina actualizada','success');
+  syncPlanilla();
   editPropItem=null;
   lastPropina = { empleadoId, fecha };
   RENDERERS.propinas();
@@ -1807,6 +1838,7 @@ window.propDel=function(itemId){
   propinaItemEliminar(item);
   save(K.prop,S.prop);
   toast('Propina eliminada','warn');
+  syncPlanilla();
   RENDERERS.propinas();
 };
 
@@ -2059,6 +2091,7 @@ window.tarjetaValSet=function(fecha, campo, valor){
   if(!v){ v={fecha, niubiz:'', caja:''}; S.tarjetaVal.push(v); }
   v[campo] = (valor===''? '' : numProp(valor));
   save(K.tarjetaVal, S.tarjetaVal);
+  syncPlanilla();
   renderPropinasConsolidado();
 };
 
@@ -2111,6 +2144,7 @@ function calcGuardarConsiderarHE(){
   calcPendingHE = {};
   saveConsiderarHE(CONSIDERAR_HE);
   toast('Preferencias de horas extra guardadas','success');
+  syncPlanilla();
   renderCalculo();
 }
 function updateCalcSaveHEUI(){
@@ -2687,7 +2721,11 @@ const INSUMOS_INICIALES = [
 // se haya sembrado antes (usado por "Recargar insumos de ejemplo").
 function seedInsumos(force){
   if(!force && localStorage.getItem(K.seedInsumos)) return;
-  S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({ id:uid(), nombre, unidad, resaltadoInsumo:true, resaltadoCelda:true }));
+  S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({
+    id:uid(), nombre, unidad,
+    tipoAlerta:'consumo', umbral:umbralPorDefecto(unidad),
+    resaltadoInsumo:true, resaltadoCelda:true
+  }));
   save(K.insumos, S.insumos);
   localStorage.setItem(K.seedInsumos,'1');
 }
@@ -2698,6 +2736,33 @@ function unidadInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.un
 // valor guardado es explícitamente false (checkbox destildado).
 function insumoAplicaResaltadoInsumo(ins){ return !!ins && ins.resaltadoInsumo !== false; }
 function insumoAplicaResaltadoCelda(ins){ return !!ins && ins.resaltadoCelda !== false; }
+// Tipo de alerta configurable por insumo ('consumo' | 'minimo').
+// Un insumo antiguo sin este campo usa 'consumo' por defecto (backward compat).
+function insumoTipoAlerta(ins){ return (ins && ins.tipoAlerta) ? ins.tipoAlerta : 'consumo'; }
+// Umbral configurable por insumo: valor numérico mínimo para disparar la alerta.
+// Si el campo no está configurado, se aplica el umbral por defecto según la unidad.
+function insumoUmbral(ins){
+  if(ins && ins.umbral !== undefined && ins.umbral !== null && ins.umbral !== '') return Number(ins.umbral);
+  return umbralPorDefecto(ins ? ins.unidad : '');
+}
+// Umbral por defecto según la unidad de medida del insumo.
+function umbralPorDefecto(unidad){
+  const u = (unidad||'').trim().toLowerCase();
+  if(u === 'ml') return 100;
+  if(u === 'bolsas') return 1;
+  if(u === 'kg') return 15;
+  return 100; // fallback genérico
+}
+// Migra en memoria (sin guardar) un insumo antiguo que no tenga tipoAlerta/umbral
+// para que los getters los devuelvan correctamente. Se llama en seedInsumos y en la
+// restauración desde Google Sheets; no sobreescribe campos ya configurados.
+function migrarCamposInsumo(ins){
+  if(!ins.tipoAlerta) ins.tipoAlerta = 'consumo';
+  if(ins.umbral === undefined || ins.umbral === null || ins.umbral === '') ins.umbral = umbralPorDefecto(ins.unidad);
+  if(ins.resaltadoInsumo === undefined) ins.resaltadoInsumo = true;
+  if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true;
+  return ins;
+}
 function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
 // Actualiza el registro existente de (insumo, fecha) o crea uno nuevo si no
 // existe. Nunca duplica ni toca registros de otras fechas/insumos.
@@ -2804,19 +2869,29 @@ RENDERERS.insumos = function(){
     </div>
     <div class="card">
       <h2>Lista de insumos (${S.insumos.length})</h2>
-      <p class="hint" style="margin-top:0">Los dos checkboxes controlan, por insumo, las alertas del <b>Consolidado de Inventario</b>: resaltado del nombre por bajo consumo (solo insumos en ml) y resaltado de la celda de cierre por incremento anormal. Ambos vienen activados por defecto. <b>Los cambios en los checkboxes NO se guardan automáticamente</b>: marca/desmarca lo que necesites y presiona "Actualizar" para guardar y sincronizar todos los cambios en una sola acción.</p>
+      <p class="hint" style="margin-top:0">
+        <b>Tipo de alerta</b> — <em>Consumo</em>: alerta si el consumo acumulado de los últimos 3 días es menor al Umbral.
+        <em>Mínimo</em>: alerta si el último cierre registrado es menor al Umbral.
+        El <b>Umbral</b> es el valor numérico de referencia para cada tipo. Los checkboxes controlan si el resaltado se aplica.
+        <b>Los cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
+      </p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th class="num">Umbral</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? S.insumos.map(i=>`
           <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
-            <td class="num"><input type="checkbox" class="insCfgInsumo" data-id="${i.id}" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita si el consumo de los últimos 3 días es bajo"></td>
+            <td><select class="insCfgTipoAlerta" data-id="${i.id}">
+              <option value="consumo" ${insumoTipoAlerta(i)==='consumo'?'selected':''}>Consumo</option>
+              <option value="minimo" ${insumoTipoAlerta(i)==='minimo'?'selected':''}>Mínimo</option>
+            </select></td>
+            <td class="num"><input type="number" class="insCfgUmbral" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbral(i)}" title="Valor de referencia para la alerta"></td>
+            <td class="num"><input type="checkbox" class="insCfgInsumo" data-id="${i.id}" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita según el tipo de alerta configurado"></td>
             <td class="num"><input type="checkbox" class="insCfgCelda" data-id="${i.id}" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada"></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="5" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="7" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
-      <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de resaltado realizados arriba.</p>` : ''}
+      <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
     </div>`;
   document.getElementById('insSave').onclick = insumoSave;
   document.getElementById('insClear').onclick = ()=>{ editInsumoId=null; RENDERERS.insumos(); };
@@ -2835,23 +2910,36 @@ function insumoSave(){
   if(!ok){ toast('Completa nombre y unidad','error'); return; }
   if(editInsumoId){
     const i = S.insumos.find(x=>x.id===editInsumoId);
+    // Solo actualiza nombre y unidad; NO toca tipoAlerta, umbral ni checkboxes
+    // (esos se cambian en la tabla y se guardan con "Actualizar").
     Object.assign(i, { nombre, unidad });
     save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
   }else{
-    // Nuevo insumo: ambos resaltados activados por defecto (requisito 2).
-    S.insumos.push({ id:uid(), nombre, unidad, resaltadoInsumo:true, resaltadoCelda:true });
+    // Nuevo insumo: defaults por unidad para tipoAlerta y umbral.
+    S.insumos.push({ id:uid(), nombre, unidad,
+      tipoAlerta:'consumo', umbral:umbralPorDefecto(unidad),
+      resaltadoInsumo:true, resaltadoCelda:true });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
 }
-// Lee TODOS los checkboxes de resaltado de la tabla (de todos los insumos),
-// aplica los cambios a S.insumos, guarda en localStorage y sincroniza con
-// Google Sheets en una sola acción — los checkboxes en sí ya no disparan
-// guardado/sincronización individual al marcarlos/desmarcarlos.
+// Lee TODOS los controles de configuración de la tabla (tipo, umbral y
+// checkboxes de todos los insumos), aplica los cambios a S.insumos, guarda
+// en localStorage y sincroniza con Google Sheets en una sola acción.
+// Los controles NO disparan guardado/sincronización al cambiar su valor.
 async function insumosActualizarResaltados(){
   const btn = document.getElementById('insActualizar');
   if(btn){ btn.disabled=true; btn.dataset.txt=btn.textContent; btn.textContent='Actualizando…'; }
   try{
+    document.querySelectorAll('.insCfgTipoAlerta').forEach(sel=>{
+      const ins = S.insumos.find(i=>i.id===sel.dataset.id);
+      if(ins) ins.tipoAlerta = sel.value;
+    });
+    document.querySelectorAll('.insCfgUmbral').forEach(inp=>{
+      const ins = S.insumos.find(i=>i.id===inp.dataset.id);
+      const v = parseFloat(inp.value);
+      if(ins) ins.umbral = isNaN(v)||v<0 ? umbralPorDefecto(ins.unidad) : v;
+    });
     document.querySelectorAll('.insCfgInsumo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
       if(ins) ins.resaltadoInsumo = cb.checked;
@@ -2916,28 +3004,35 @@ function fechaMenosUnDia(fechaISO){
 // render (al cargar, al cambiar el rango, y tras cualquier edición/alta/baja
 // de un registro o de la configuración del insumo).
 // ---------------------------------------------------------------------
-// Regla 1 — bajo consumo (solo insumos en "ml", y solo si el insumo tiene
-// activado "Aplica resaltado de insumo").
+// Regla 1 — resaltado de nombre de insumo. Requiere "Aplica resaltado de
+// insumo" activado. El tipo de alerta y el umbral se toman de la
+// configuración individual del insumo (tipoAlerta, umbral).
 //
-// Algoritmo (corregido):
-//   1. Tomar los 3 registros más recientes para el insumo (por fecha, desc).
-//   2. Para cada uno de esos 3 días calcular el consumo REAL del día:
-//        Consumo = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
-//      donde "Cierre del día anterior" = el cierre del registro del día
-//      calendario inmediatamente anterior. Si no existe ese registro previo,
-//      se omite ese día (ver "ignorar días sin información").
-//   3. Sumar los consumos válidos obtenidos.
-//   4. Si el consumo acumulado < 100 ml → resaltar en rojo/negrita.
+// Tipo "consumo" (por defecto):
+//   Para cada uno de los 3 últimos días con registro calcula:
+//     Consumo_día = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
+//   Si el consumo acumulado < umbral → alerta.
 //
-// Esto corrige el error anterior, que comparaba diferencias de "Stock Total"
-// (produccion + cierre), una métrica que se vuelve negativa cuando hay una
-// gran producción, generando falsos positivos (p.ej. MARACUYÁ CLÁSICO con
-// 4130 ml producidos el 17/06 aparecía incorrectamente resaltado).
+// Tipo "mínimo":
+//   Toma el cierre del registro más reciente del insumo.
+//   Si ese cierre < umbral → alerta.
 function bajoConsumo(insumo){
-  if((insumo.unidad||'').trim().toLowerCase()!=='ml') return false;
   if(!insumoAplicaResaltadoInsumo(insumo)) return false;
 
-  // 1) Los 3 días más recientes con registro (ordenados de más nuevo a más viejo)
+  const tipo   = insumoTipoAlerta(insumo);
+  const umbral = insumoUmbral(insumo);
+
+  if(tipo === 'minimo'){
+    // Tipo "mínimo": alerta cuando el último cierre registrado < umbral.
+    const ultimo = S.produccion
+      .filter(r => r.insumoId === insumo.id)
+      .sort((a, b) => b.fecha.localeCompare(a.fecha))[0];
+    if(!ultimo) return false;
+    return numProp(ultimo.cierre) < umbral;
+  }
+
+  // Tipo "consumo" (por defecto):
+  //   1) Los 3 días más recientes con registro (de más nuevo a más viejo)
   const ultimos3 = S.produccion
     .filter(r => r.insumoId === insumo.id)
     .sort((a, b) => b.fecha.localeCompare(a.fecha))
@@ -2945,21 +3040,20 @@ function bajoConsumo(insumo){
 
   if(!ultimos3.length) return false;
 
-  // 2) Consumo por día: Cierre(anterior) + Producción(hoy) - Cierre(hoy)
+  //   2) Consumo del día = Cierre(anterior) + Producción(hoy) - Cierre(hoy)
   let consumoAcumulado = 0;
   let diasValidos = 0;
   for(const reg of ultimos3){
     const regAnterior = getProduccion(insumo.id, fechaMenosUnDia(reg.fecha));
     if(!regAnterior) continue; // sin registro del día anterior → omitir ese día
-    const consumo = numProp(regAnterior.cierre) + numProp(reg.produccion) - numProp(reg.cierre);
-    consumoAcumulado += consumo;
+    consumoAcumulado += numProp(regAnterior.cierre) + numProp(reg.produccion) - numProp(reg.cierre);
     diasValidos++;
   }
 
   if(!diasValidos) return false;
 
-  // 3) Alerta si el consumo acumulado de los días válidos es menor a 100 ml
-  return consumoAcumulado < 100;
+  //   3) Alerta si el consumo acumulado de los días válidos < umbral
+  return consumoAcumulado < umbral;
 }
 // Regla 2 — incremento anormal de cierre sin producción registrada (solo si
 // el insumo tiene activado "Aplica resaltado de celda"): compara contra el
@@ -3447,8 +3541,10 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','resaltadoInsumo','resaltadoCelda'],
-      S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad, resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0 }))),
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','tipoAlerta','umbral','resaltadoInsumo','resaltadoCelda'],
+      S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
+        tipoAlerta:insumoTipoAlerta(i), umbral:insumoUmbral(i),
+        resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0 }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Meta: gsRowsToMatrix(['clave','valor'], [
       { clave:'app', valor:'WingsBox Inventario' },
@@ -3545,10 +3641,14 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         return;
       }
       // Compatibilidad: si la hoja no tiene estas columnas (o vienen en blanco),
-      // se asumen ambos resaltados ACTIVADOS por defecto (requisito 5).
+      // migrarCamposInsumo() asigna los valores por defecto (no sobreescribe existentes).
       const esFalse = v => v===0 || v==='0' || v===false || String(v).trim().toLowerCase()==='false';
-      S.insumos = (byName['Insumos']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim(),
-        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda) }));
+      S.insumos = (byName['Insumos']||[]).map(r=> migrarCamposInsumo({
+        id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim(),
+        tipoAlerta: (r.tipoAlerta==='minimo') ? 'minimo' : 'consumo',
+        umbral: (r.umbral!==undefined && r.umbral!==null && r.umbral!=='') ? Number(r.umbral) : undefined,
+        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda)
+      }));
       S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
       save(K.insumos,S.insumos); save(K.produccion,S.produccion);
     }else{
