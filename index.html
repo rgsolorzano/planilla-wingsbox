@@ -599,6 +599,16 @@ function goto(page){
     toast('No tienes acceso a este módulo con esta cuenta.','error');
     page = paginaPorDefecto();
   }
+  // Advertencia de cambios pendientes en Validación de tarjeta al cambiar de módulo.
+  // Solo se activa si ya hay pendientes Y el usuario está saliendo de propinasConsolidado.
+  if(typeof tarjetaValPendiente !== 'undefined' && tarjetaValPendiente
+     && currentPage === 'propinasConsolidado' && page !== 'propinasConsolidado'){
+    if(!confirm('Tienes cambios pendientes en la Validación de tarjeta (Niubiz vs Caja). ¿Deseas salir sin guardar?')){
+      return; // el usuario cancela la navegación
+    }
+    // el usuario acepta salir: descarta los cambios no guardados
+    tarjetaValPendiente = false;
+  }
   currentPage=page;
   document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -1987,6 +1997,11 @@ function renderPropinasConsolidado(){
   }
 
   // Validación de tarjeta por día
+  // Almacena en S.tarjetaVal un mapa transitorio propTarjeta-por-fecha para que
+  // actualizarFilaValidacionTarjeta() pueda recalcular la diferencia sin re-render.
+  S.tarjetaVal.__propTarjetaPorFecha = {};
+  r.tarjetaPorDia.forEach(t=>{ S.tarjetaVal.__propTarjetaPorFecha[t.fecha] = t.propTarjeta; });
+
   const valRows=r.tarjetaPorDia.map(t=>{
     const v=S.tarjetaVal.find(x=>x.fecha===t.fecha) || {niubiz:'',caja:''};
     const dif=calcularDiferenciaTarjeta(v.niubiz, v.caja, t.propTarjeta);
@@ -1994,12 +2009,12 @@ function renderPropinasConsolidado(){
     const cuadrado=Math.abs(dif)<0.0001;
     const estado= !tieneDatos ? '<span class="badge b-free">—</span>'
       : (cuadrado? '<span class="badge b-ok">Cuadrado</span>' : `<span class="badge b-miss">No cuadra (${money(dif)})</span>`);
-    return `<tr>
+    return `<tr data-fecha="${t.fecha}">
       <td>${fmtFecha(t.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(t.fecha)].slice(0,3)}</small></td>
       <td><input type="number" step="0.01" style="min-width:110px" value="${v.niubiz??''}" onchange="tarjetaValSet('${t.fecha}','niubiz',this.value)"></td>
       <td><input type="number" step="0.01" style="min-width:110px" value="${v.caja??''}" onchange="tarjetaValSet('${t.fecha}','caja',this.value)"></td>
       <td class="num">${money(t.propTarjeta)}</td>
-      <td>${estado}</td>
+      <td class="tarjetaValStatus">${estado}</td>
     </tr>`;
   }).join('');
   const totalTarjetaSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.propTarjeta,0);
@@ -2039,12 +2054,16 @@ function renderPropinasConsolidado(){
 
     <div class="card">
       <h2>Validación de tarjeta (Niubiz vs Caja)</h2>
-      <p class="hint" style="margin-top:0">Regla: <b>Niubiz = Caja + propinas por tarjeta del día</b>. Ingresa los montos por día.</p>
+      <p class="hint" style="margin-top:0">Regla: <b>Niubiz = Caja + propinas por tarjeta del día</b>. Ingresa los montos por día y presiona <b>Guardar</b> para persistirlos y sincronizarlos con Google Sheets. Los cambios no se guardan automáticamente.</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Monto Niubiz</th><th>Monto Caja</th><th class="num">Propinas tarjeta del día</th><th>Validación</th></tr></thead>
         <tbody>${valRows}</tbody>
         <tfoot><tr><td>Total semana</td><td>—</td><td>—</td><td class="num">${money(totalTarjetaSemana)}</td><td></td></tr></tfoot>
       </table></div>
+      <div class="actions" style="margin-top:12px;align-items:center;gap:12px">
+        <button class="btn ${tarjetaValPendiente?'btn-primary':'btn-ghost'}" id="tarjetaValGuardar" onclick="tarjetaValGuardar()">💾 Guardar</button>
+        <span id="tarjetaValPendienteIndicador" style="color:#92400e;font-size:13px;display:${tarjetaValPendiente?'':'none'}">⚠ Hay cambios pendientes de guardar</span>
+      </div>
     </div>
 
     <div class="card">
@@ -2086,14 +2105,76 @@ function propConsCopiarEmpleadoMonto(){
     .catch(()=> toast('No se pudo copiar al portapapeles','error'));
 }
 
+// Estado de "pendiente de guardar" para la Validación de tarjeta (Niubiz vs Caja).
+// Los cambios en los inputs de la tabla solo actualizan S.tarjetaVal en memoria;
+// NO se persisten ni se sincronizan hasta que el usuario presione el botón Guardar.
+let tarjetaValPendiente = false;
+
+// Marca como pendiente, actualiza el estado en memoria y refresca la UI
+// (indicador de cambios pendientes + validación visual) SIN guardar en localStorage.
 window.tarjetaValSet=function(fecha, campo, valor){
   let v=S.tarjetaVal.find(x=>x.fecha===fecha);
   if(!v){ v={fecha, niubiz:'', caja:''}; S.tarjetaVal.push(v); }
   v[campo] = (valor===''? '' : numProp(valor));
-  save(K.tarjetaVal, S.tarjetaVal);
-  syncPlanilla();
-  renderPropinasConsolidado();
+  tarjetaValPendiente = true;
+  // Solo actualiza el indicador de pendiente y la columna de validación en pantalla,
+  // sin re-renderizar toda la tabla (los inputs perderían el foco).
+  actualizarIndicadorTarjetaVal();
+  actualizarFilaValidacionTarjeta(fecha, v);
 };
+// Actualiza únicamente la columna "Validación" y el badge de la fila correspondiente,
+// sin destruir ni recrear toda la tabla (preserva el foco y el cursor del usuario).
+function actualizarFilaValidacionTarjeta(fecha, v){
+  const dif = calcularDiferenciaTarjeta(v.niubiz, v.caja,
+    (S.tarjetaVal.__propTarjetaPorFecha||{})[fecha] || 0);
+  const tieneDatos = (v.niubiz!=='' && v.niubiz!=null) || (v.caja!=='' && v.caja!=null);
+  const cuadrado = Math.abs(dif)<0.0001;
+  const estado = !tieneDatos ? '<span class="badge b-free">—</span>'
+    : (cuadrado ? '<span class="badge b-ok">Cuadrado</span>' : `<span class="badge b-miss">No cuadra (${money(dif)})</span>`);
+  // Busca la celda de validación (última td) de la fila con data-fecha coincidente
+  const td = document.querySelector(`#propConsOut tr[data-fecha="${fecha}"] td.tarjetaValStatus`);
+  if(td) td.innerHTML = estado;
+}
+// Muestra/oculta el indicador de cambios pendientes y ajusta el aspecto del botón Guardar.
+function actualizarIndicadorTarjetaVal(){
+  const ind = document.getElementById('tarjetaValPendienteIndicador');
+  const btn = document.getElementById('tarjetaValGuardar');
+  if(ind){
+    ind.style.display = tarjetaValPendiente ? '' : 'none';
+  }
+  if(btn){
+    btn.classList.toggle('btn-primary', tarjetaValPendiente);
+    btn.classList.toggle('btn-ghost', !tarjetaValPendiente);
+  }
+}
+// Persiste los cambios de tarjetaVal en localStorage, sincroniza con Google Sheets
+// y limpia el estado de pendiente. Se llama SOLO al presionar el botón Guardar.
+async function tarjetaValGuardar(){
+  const btn = document.getElementById('tarjetaValGuardar');
+  if(btn){ btn.disabled=true; btn.dataset.txt=btn.textContent; btn.textContent='Guardando…'; }
+  try{
+    save(K.tarjetaVal, S.tarjetaVal);
+    const ok = await gsSaveToSheets('planilla');
+    if(ok){
+      tarjetaValPendiente = false;
+      toast('Validación de tarjeta guardada correctamente','success');
+    }else{
+      toast('Los datos se guardaron localmente pero ocurrió un error al sincronizar con Google Sheets','error');
+    }
+    actualizarIndicadorTarjetaVal();
+  }catch(e){
+    console.error(e);
+    toast('Error al guardar la validación de tarjeta','error');
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent=btn.dataset.txt||'💾 Guardar'; }
+  }
+}
+// Guarda de navegación: advierte al usuario si intenta salir con cambios pendientes.
+window.addEventListener('beforeunload', e=>{
+  if(!tarjetaValPendiente) return;
+  const msg = '¿Deseas salir sin guardar? Tienes cambios pendientes en la Validación de tarjeta (Niubiz vs Caja).';
+  e.preventDefault(); e.returnValue = msg; return msg;
+});
 
 /* ---------- Estado del periodo (compartido por Cálculo y Consolidado) ---------- */
 const _now = new Date();
