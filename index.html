@@ -214,9 +214,12 @@
       <button data-page="insumos"><span class="ico">🧂</span> Insumos</button>
       <button data-page="inventarioConsolidado"><span class="ico">📈</span> Consolidado de Inventario</button>
       <button data-page="syncInventario"><span class="ico">☁️</span> Sync. Inventario</button>
-      <button data-page="bebidas"><span class="ico">🍾</span> Bebidas</button>
-      <button data-page="invDiarioBebidas"><span class="ico">📋</span> Inv. Diario Bebidas</button>
-      <button data-page="cotejoBebidas"><span class="ico">📊</span> Cotejo Bebidas</button>
+      <button data-page="licores"><span class="ico">🍾</span> Licores</button>
+      <button data-page="invDiarioLicores"><span class="ico">📋</span> Inv. Diario Licores</button>
+      <button data-page="cotejoLicores"><span class="ico">📊</span> Cotejo Licores</button>
+      <button data-page="bebidasAdmin"><span class="ico">🥤</span> Bebidas</button>
+      <button data-page="stockDiarioBebidas"><span class="ico">📋</span> Stock Diario Bebidas</button>
+      <button data-page="consolidadoStockBebidas"><span class="ico">📊</span> Consolidado Bebidas</button>
     </nav>
     <div class="foot">
       <div id="gsSideStatus" style="font-size:11px;color:var(--muted);padding:2px 0">⚪ Google: sin sesión</div>
@@ -245,9 +248,12 @@
     <section class="page" id="page-insumos"></section>
     <section class="page" id="page-inventarioConsolidado"></section>
     <section class="page" id="page-syncInventario"></section>
-    <section class="page" id="page-bebidas"></section>
-    <section class="page" id="page-invDiarioBebidas"></section>
-    <section class="page" id="page-cotejoBebidas"></section>
+    <section class="page" id="page-licores"></section>
+    <section class="page" id="page-invDiarioLicores"></section>
+    <section class="page" id="page-cotejoLicores"></section>
+    <section class="page" id="page-bebidasAdmin"></section>
+    <section class="page" id="page-stockDiarioBebidas"></section>
+    <section class="page" id="page-consolidadoStockBebidas"></section>
   </main>
 </div>
 
@@ -265,8 +271,10 @@ const K = {
   prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza',
   // Módulo Producción / Insumos (inventario)
   insumos:'pl_insumos', produccion:'pl_produccion', seedInsumos:'pl_seedInsumosDone',
-  // Módulo Bebidas (inventario)
-  bebidas:'pl_bebidas', invBebidas:'pl_invBebidas', seedBebidas:'pl_seedBebidasDone'
+  // Módulo Licores (inventario)
+  licores:'pl_licores', invLicores:'pl_invLicores', seedLicores:'pl_seedLicoresDone',
+  // Módulo Bebidas diarias (inventario)
+  bebidasCat:'pl_bebidasCat', stockBebidas:'pl_stockBebidas', seedBebidasCat:'pl_seedBebidasCatDone'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -390,15 +398,17 @@ function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], bebidas:[], invBebidas:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
   S.insumos=load(K.insumos).map(migrarCamposInsumo); // migra tipoAlerta/umbral si faltan
   S.produccion=load(K.produccion);
-  S.bebidas=load(K.bebidas);
-  S.invBebidas=load(K.invBebidas);
+  S.licores=load(K.licores);
+  S.invLicores=load(K.invLicores);
+  S.bebidasCat=load(K.bebidasCat);
+  S.stockBebidas=load(K.stockBebidas);
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
 // corresponde al rol de la cuenta conectada. Así, durante una sesión de
@@ -409,7 +419,7 @@ function limpiarEstadoDominio(domain){
   if(domain==='planilla'){
     S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.prop=[]; S.tarjetaVal=[];
   }else if(domain==='inventario'){
-    S.insumos=[]; S.produccion=[]; S.bebidas=[]; S.invBebidas=[];
+    S.insumos=[]; S.produccion=[]; S.licores=[]; S.invLicores=[]; S.bebidasCat=[]; S.stockBebidas=[];
   }
 }
 
@@ -2746,14 +2756,14 @@ function seedData(){
    inventario nunca borra/reemplaza datos de planilla, y viceversa
    (ambos conjuntos de datos conviven en el mismo localStorage). */
 function dominioKeys(domain){
-  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.bebidas, K.invBebidas, K.seedBebidas]);
+  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat]);
   return domain==='inventario' ? Array.from(invKeys) : Object.values(K).filter(k=>!invKeys.has(k));
 }
 document.getElementById('btnSeed').onclick=()=>{
   const role = currentRole();
   if(role && role.domain==='inventario'){
-    if(confirm('Esto reemplazará la lista de insumos y bebidas de ejemplo (no afecta los registros históricos ya guardados). ¿Continuar?')){
-      seedInsumos(true); seedBebidas(true); reloadState(); limpiarEstadoDominio('planilla'); toast('Catálogos de ejemplo recargados','success'); goto(currentPage);
+    if(confirm('Esto reemplazará la lista de insumos y licores de ejemplo (no afecta los registros históricos ya guardados). ¿Continuar?')){
+      seedInsumos(true); seedLicores(true); seedBebidasCat(true); reloadState(); limpiarEstadoDominio('planilla'); toast('Catálogos de ejemplo recargados','success'); goto(currentPage);
     }
   }else if(confirm('Esto reemplazará TODOS los datos actuales por los datos de ejemplo. ¿Continuar?')){
     seedData(); reloadState(); if(role) limpiarEstadoDominio('inventario'); toast('Datos de ejemplo cargados','success'); goto(currentPage);
@@ -3274,255 +3284,593 @@ function exportarExcelSimple(nombreHoja, datos, nombreArchivo){
 }
 
 /* ================================================================
-   MÓDULO 11C: CONTROL DE INVENTARIO DE BEBIDAS
+   MÓDULO 11C: CONTROL DE INVENTARIO DE LICORES
    ----------------------------------------------------------------
-   Bebida:    { id, nombre, tamanoMl, ozPorBotella }
+   Licor:    { id, nombre, tamanoMl, ozPorBotella }
    InvBebidas:{ id, bebidaId, fecha, momento('Entrada'|'Salida'), onzas, botellas }
-   Unicidad: un único registro por (bebidaId, fecha, momento).
+   Unicidad: un único registro por (licorId, fecha, momento).
    ================================================================ */
-const BEBIDAS_INICIALES = [
+const LICORES_INICIALES = [
   ['AGUA TONICA',750,25.4],['APPEROL',700,23.7],['ESPUMANTE NAPO',750,25.4],
   ['GIN RICHMOND',750,25.4],['GINGER BEER',750,25.4],['PISCO GALPON',750,25.4],
   ['PISCO MULITA',750,25.4],['RON BLANCO BACARDÍ',750,25.4],['RON RUBIO BARCELÓ',750,25.4],
   ['TEQUILA BL CUERVO',750,25.4],['TEQUILA BL OLMECA',750,25.4],
   ['VINO BORG VIÑA VIEJA',750,25.4],['VODKA SMIRNOFF',750,25.4]
 ];
-function seedBebidas(force){
-  if(!force && localStorage.getItem(K.seedBebidas)) return;
-  S.bebidas = BEBIDAS_INICIALES.map(([nombre,tamanoMl,ozPorBotella])=>({ id:uid(), nombre, tamanoMl, ozPorBotella }));
-  save(K.bebidas, S.bebidas);
-  localStorage.setItem(K.seedBebidas,'1');
+function seedLicores(force){
+  if(!force && localStorage.getItem(K.seedLicores)) return;
+  S.licores = LICORES_INICIALES.map(([nombre,tamanoMl,ozPorBotella])=>({ id:uid(), nombre, tamanoMl, ozPorBotella }));
+  save(K.licores, S.licores);
+  localStorage.setItem(K.seedLicores,'1');
 }
-function nombreBebida(id){ const b=S.bebidas.find(x=>x.id===id); return b?b.nombre:'(bebida eliminada)'; }
-function ozPorBotella(id){ const b=S.bebidas.find(x=>x.id===id); return b?b.ozPorBotella:0; }
-function getInvBebida(bebidaId, fecha, momento){ return S.invBebidas.find(x=>x.bebidaId===bebidaId && x.fecha===fecha && x.momento===momento); }
-function invBebidaUpsert(bebidaId, fecha, momento, onzas, botellas){
-  let r = getInvBebida(bebidaId, fecha, momento);
+function nombreLicor(id){ const b=S.licores.find(x=>x.id===id); return b?b.nombre:'(licor eliminado)'; }
+function ozPorBotella(id){ const b=S.licores.find(x=>x.id===id); return b?b.ozPorBotella:0; }
+function getInvLicor(licorId, fecha, momento){ return S.invLicores.find(x=>x.bebidaId===licorId && x.fecha===fecha && x.momento===momento); }
+function invLicorUpsert(licorId, fecha, momento, onzas, botellas){
+  let r = getInvLicor(licorId, fecha, momento);
   if(r){ r.onzas=onzas; r.botellas=botellas; }
-  else S.invBebidas.push({ id:uid(), bebidaId, fecha, momento, onzas, botellas });
+  else S.invLicores.push({ id:uid(), bebidaId:licorId, fecha, momento, onzas, botellas });
 }
-function stockBebida(bebidaId, registro){
+function stockLicor(licorId, registro){
   if(!registro) return 0;
-  return (registro.botellas * ozPorBotella(bebidaId)) + registro.onzas;
+  return (registro.botellas * ozPorBotella(licorId)) + registro.onzas;
 }
 
-/* ─── 11C-1: Administración de Bebidas ─── */
-let editBebidaId = null;
-RENDERERS.bebidas = function(){
-  const el = document.getElementById('page-bebidas');
+/* ─── 11C-1: Administración de Licores ─── */
+let editLicorId = null;
+RENDERERS.licores = function(){
+  const el = document.getElementById('page-licores');
   el.innerHTML = `
-    <div class="page-head"><div><h1>🍾 Administración de Bebidas</h1><p>Administra el catálogo de bebidas para el inventario diario. Edita los campos y presiona "Actualizar" para guardar y sincronizar.</p></div></div>
+    <div class="page-head"><div><h1>🍾 Administración de Licores</h1><p>Administra el catálogo de licores para el inventario diario. Edita los campos y presiona "Actualizar" para guardar y sincronizar.</p></div></div>
     <div class="card">
-      <h2 id="bebFormTitle">Nueva bebida</h2>
+      <h2 id="licFormTitle">Nuevo licor</h2>
       <div class="form-grid">
-        <div class="field"><label>Nombre *</label><input id="bebNombre" placeholder="Ej: VODKA SMIRNOFF"></div>
-        <div class="field"><label>Tamaño botella (ml) *</label><input type="number" id="bebTamano" min="0" step="1" placeholder="750"></div>
-        <div class="field"><label>Oz por botella *</label><input type="number" id="bebOz" min="0" step="0.01" placeholder="25.4"></div>
+        <div class="field"><label>Nombre *</label><input id="licNombre" placeholder="Ej: VODKA SMIRNOFF"></div>
+        <div class="field"><label>Tamaño botella (ml) *</label><input type="number" id="licTamano" min="0" step="1" placeholder="750"></div>
+        <div class="field"><label>Oz por botella *</label><input type="number" id="licOz" min="0" step="0.01" placeholder="25.4"></div>
       </div>
       <div class="actions">
-        <button class="btn btn-primary" id="bebSave">Guardar</button>
-        <button class="btn btn-ghost" id="bebClear">Limpiar</button>
+        <button class="btn btn-primary" id="licSave">Guardar</button>
+        <button class="btn btn-ghost" id="licClear">Limpiar</button>
       </div>
     </div>
     <div class="card">
-      <h2>Catálogo de bebidas (${S.bebidas.length})</h2>
+      <h2>Catálogo de licores (${S.licores.length})</h2>
       <div class="table-wrap"><table>
-        <thead><tr><th>Bebida</th><th class="num">Tamaño (ml)</th><th class="num">Oz por botella</th><th>Acciones</th></tr></thead>
-        <tbody>${S.bebidas.length? [...S.bebidas].sort((a,b)=>a.nombre.localeCompare(b.nombre)).map(b=>`
+        <thead><tr><th>Licor</th><th class="num">Tamaño (ml)</th><th class="num">Oz por botella</th><th>Acciones</th></tr></thead>
+        <tbody>${S.licores.length? [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre)).map(b=>`
           <tr><td>${b.nombre}</td><td class="num">${b.tamanoMl}</td><td class="num">${b.ozPorBotella}</td>
-            <td><button class="btn-icon" onclick="bebidaEdit('${b.id}')">✏️ Editar</button>
-                <button class="btn-icon del" onclick="bebidaDel('${b.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="4" class="empty">No hay bebidas. Crea la primera arriba.</td></tr>`}</tbody>
+            <td><button class="btn-icon" onclick="licorEdit('${b.id}')">✏️ Editar</button>
+                <button class="btn-icon del" onclick="licorDel('${b.id}')">🗑️ Eliminar</button></td></tr>
+        `).join('') : `<tr><td colspan="4" class="empty">No hay licores. Crea la primera arriba.</td></tr>`}</tbody>
       </table></div>
     </div>`;
-  document.getElementById('bebSave').onclick = bebidaSave;
-  document.getElementById('bebClear').onclick = ()=>{ editBebidaId=null; RENDERERS.bebidas(); };
-  if(editBebidaId){
-    const b = S.bebidas.find(x=>x.id===editBebidaId);
-    if(b){ document.getElementById('bebFormTitle').textContent='Editar bebida'; document.getElementById('bebNombre').value=b.nombre; document.getElementById('bebTamano').value=b.tamanoMl; document.getElementById('bebOz').value=b.ozPorBotella; }
+  document.getElementById('licSave').onclick = licorSave;
+  document.getElementById('licClear').onclick = ()=>{ editLicorId=null; RENDERERS.licores(); };
+  if(editLicorId){
+    const b = S.licores.find(x=>x.id===editLicorId);
+    if(b){ document.getElementById('licFormTitle').textContent='Editar licor'; document.getElementById('licNombre').value=b.nombre; document.getElementById('licTamano').value=b.tamanoMl; document.getElementById('licOz').value=b.ozPorBotella; }
   }
 };
-function bebidaSave(){
-  const nombre=document.getElementById('bebNombre').value.trim();
-  const tamanoMl=parseFloat(document.getElementById('bebTamano').value);
-  const ozPorBotella=parseFloat(document.getElementById('bebOz').value);
+function licorSave(){
+  const nombre=document.getElementById('licNombre').value.trim();
+  const tamanoMl=parseFloat(document.getElementById('licTamano').value);
+  const ozPorBotella=parseFloat(document.getElementById('licOz').value);
   let ok=true;
-  [['bebNombre',nombre],].forEach(([id,v])=>{ const f=document.getElementById(id); f.classList.toggle('invalid',!v); if(!v) ok=false; });
-  if(isNaN(tamanoMl)||tamanoMl<0){ document.getElementById('bebTamano').classList.add('invalid'); ok=false; }
-  if(isNaN(ozPorBotella)||ozPorBotella<0){ document.getElementById('bebOz').classList.add('invalid'); ok=false; }
+  [['licNombre',nombre],].forEach(([id,v])=>{ const f=document.getElementById(id); f.classList.toggle('invalid',!v); if(!v) ok=false; });
+  if(isNaN(tamanoMl)||tamanoMl<0){ document.getElementById('licTamano').classList.add('invalid'); ok=false; }
+  if(isNaN(ozPorBotella)||ozPorBotella<0){ document.getElementById('licOz').classList.add('invalid'); ok=false; }
   if(!ok){ toast('Completa todos los campos correctamente','error'); return; }
-  if(editBebidaId){
-    const b=S.bebidas.find(x=>x.id===editBebidaId);
+  if(editLicorId){
+    const b=S.licores.find(x=>x.id===editLicorId);
     Object.assign(b,{nombre,tamanoMl,ozPorBotella});
-    editBebidaId=null; toast('Bebida actualizada','success');
+    editLicorId=null; toast('Licor actualizado','success');
   }else{
-    S.bebidas.push({id:uid(),nombre,tamanoMl,ozPorBotella});
-    toast('Bebida creada','success');
+    S.licores.push({id:uid(),nombre,tamanoMl,ozPorBotella});
+    toast('Licor creado','success');
   }
-  save(K.bebidas,S.bebidas);
+  save(K.licores,S.licores);
   gsSaveToSheets('inventario').catch(()=>{});
-  RENDERERS.bebidas();
+  RENDERERS.licores();
 }
-window.bebidaEdit=function(id){ editBebidaId=id; RENDERERS.bebidas(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.bebidaDel=function(id){
-  if(!confirm('¿Eliminar esta bebida? Los registros históricos de inventario existentes no se eliminan.')) return;
-  if(editBebidaId===id) editBebidaId=null;
-  S.bebidas=S.bebidas.filter(b=>b.id!==id);
-  save(K.bebidas,S.bebidas);
-  toast('Bebida eliminada','warn');
+window.licorEdit=function(id){ editLicorId=id; RENDERERS.licores(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.licorDel=function(id){
+  if(!confirm('¿Eliminar este licor? Los registros históricos de inventario existentes no se eliminan.')) return;
+  if(editLicorId===id) editLicorId=null;
+  S.licores=S.licores.filter(b=>b.id!==id);
+  save(K.licores,S.licores);
+  toast('Licor eliminado','warn');
   gsSaveToSheets('inventario').catch(()=>{});
-  RENDERERS.bebidas();
+  RENDERERS.licores();
 };
 
-/* ─── 11C-2: Inventario Diario de Bebidas ─── */
-let invBebidasFecha = new Date().toISOString().slice(0,10);
-let invBebidasMomento = 'Entrada';
-RENDERERS.invDiarioBebidas = function(){
-  const el = document.getElementById('page-invDiarioBebidas');
-  if(!S.bebidas.length){
-    el.innerHTML=`<div class="page-head"><div><h1>📋 Inventario Diario de Bebidas</h1></div></div>
-      <div class="card"><div class="empty">No hay bebidas registradas. Agrégalas en el módulo <b>Bebidas</b>.</div></div>`;
+/* ─── 11C-2: Inventario Diario de Licores ─── */
+let invLicoresFecha = new Date().toISOString().slice(0,10);
+let invLicoresMomento = 'Entrada';
+RENDERERS.invDiarioLicores = function(){
+  const el = document.getElementById('page-invDiarioLicores');
+  if(!S.licores.length){
+    el.innerHTML=`<div class="page-head"><div><h1>📋 Inventario Diario de Licores</h1></div></div>
+      <div class="card"><div class="empty">No hay licores registrados. Agrégalos en el módulo <b>Licores</b>.</div></div>`;
     return;
   }
-  const bebidasOrdenadas = [...S.bebidas].sort((a,b)=>a.nombre.localeCompare(b.nombre));
-  const filas = bebidasOrdenadas.map(b=>{
-    const r = getInvBebida(b.id, invBebidasFecha, invBebidasMomento);
+  const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
+  const filas = licoresOrdenados.map(b=>{
+    const r = getInvLicor(b.id, invLicoresFecha, invLicoresMomento);
     return `<tr>
       <td>${b.nombre}</td>
-      <td class="num"><input type="number" class="invBebOz" data-id="${b.id}" min="0" step="1" value="${r?r.onzas:''}" placeholder="0"></td>
-      <td class="num"><input type="number" class="invBebBot" data-id="${b.id}" min="0" step="1" value="${r?r.botellas:''}" placeholder="0"></td>
+      <td class="num"><input type="number" class="invLicOz" data-id="${b.id}" min="0" step="1" value="${r?r.onzas:''}" placeholder="0"></td>
+      <td class="num"><input type="number" class="invLicBot" data-id="${b.id}" min="0" step="1" value="${r?r.botellas:''}" placeholder="0"></td>
     </tr>`;
   }).join('');
   el.innerHTML=`
-    <div class="page-head"><div><h1>📋 Inventario Diario de Bebidas</h1><p>Registra el inventario físico de bebidas por fecha y momento. Presiona "Guardar Inventario" para persistir y sincronizar.</p></div></div>
+    <div class="page-head"><div><h1>📋 Inventario Diario de Licores</h1><p>Registra el inventario físico de licores por fecha y momento. Presiona "Guardar Inventario" para persistir y sincronizar.</p></div></div>
     <div class="card">
       <div class="form-grid">
-        <div class="field"><label>Fecha de inventario</label><input type="date" id="invBebFecha" value="${invBebidasFecha}"></div>
-        <div class="field"><label>Momento del inventario</label><select id="invBebMomento">
-          <option value="Entrada" ${invBebidasMomento==='Entrada'?'selected':''}>Entrada</option>
-          <option value="Salida" ${invBebidasMomento==='Salida'?'selected':''}>Salida</option>
+        <div class="field"><label>Fecha de inventario</label><input type="date" id="invLicFecha" value="${invLicoresFecha}"></div>
+        <div class="field"><label>Momento del inventario</label><select id="invLicMomento">
+          <option value="Entrada" ${invLicoresMomento==='Entrada'?'selected':''}>Entrada</option>
+          <option value="Salida" ${invLicoresMomento==='Salida'?'selected':''}>Salida</option>
         </select></div>
       </div>
     </div>
     <div class="card">
-      <h2>Inventario (${fmtFecha(invBebidasFecha)} — ${invBebidasMomento})</h2>
+      <h2>Inventario (${fmtFecha(invLicoresFecha)} — ${invLicoresMomento})</h2>
       <div class="table-wrap"><table>
-        <thead><tr><th>Bebida</th><th class="num">Onzas</th><th class="num">Botellas</th></tr></thead>
+        <thead><tr><th>Licor</th><th class="num">Onzas</th><th class="num">Botellas</th></tr></thead>
         <tbody>${filas}</tbody>
       </table></div>
       <div class="actions" style="margin-top:14px">
-        <button class="btn btn-primary" id="invBebGuardar">💾 Guardar Inventario</button>
-        <button class="btn btn-green" id="invBebExport">⬇ Exportar Excel</button>
+        <button class="btn btn-primary" id="invLicGuardar">💾 Guardar Inventario</button>
+        <button class="btn btn-green" id="invLicExport">⬇ Exportar Excel</button>
       </div>
       <p class="hint">Las onzas y botellas solo admiten números enteros. Si ya existe un registro para esta combinación de Fecha + Momento, se actualizará sin crear duplicados.</p>
     </div>`;
-  document.getElementById('invBebFecha').onchange=(e)=>{ invBebidasFecha=e.target.value||new Date().toISOString().slice(0,10); RENDERERS.invDiarioBebidas(); };
-  document.getElementById('invBebMomento').onchange=(e)=>{ invBebidasMomento=e.target.value; RENDERERS.invDiarioBebidas(); };
-  document.getElementById('invBebGuardar').onclick=invBebidasGuardar;
-  document.getElementById('invBebExport').onclick=invBebidasExportar;
+  document.getElementById('invLicFecha').onchange=(e)=>{ invLicoresFecha=e.target.value||new Date().toISOString().slice(0,10); RENDERERS.invDiarioLicores(); };
+  document.getElementById('invLicMomento').onchange=(e)=>{ invLicoresMomento=e.target.value; RENDERERS.invDiarioLicores(); };
+  document.getElementById('invLicGuardar').onclick=invLicoresGuardar;
+  document.getElementById('invLicExport').onclick=invLicoresExportar;
 };
-async function invBebidasGuardar(){
-  const ozInputs=document.querySelectorAll('.invBebOz');
-  const botInputs=document.querySelectorAll('.invBebBot');
+async function invLicoresGuardar(){
+  const ozInputs=document.querySelectorAll('.invLicOz');
+  const botInputs=document.querySelectorAll('.invLicBot');
   let ok=true;
   ozInputs.forEach(inp=>{ const v=inp.value.trim(); const bad=(v!=='' && (isNaN(Number(v))||Number(v)<0||!Number.isInteger(Number(v)))); inp.classList.toggle('invalid',bad); if(bad)ok=false; });
   botInputs.forEach(inp=>{ const v=inp.value.trim(); const bad=(v!=='' && (isNaN(Number(v))||Number(v)<0||!Number.isInteger(Number(v)))); inp.classList.toggle('invalid',bad); if(bad)ok=false; });
   if(!ok){ toast('Los valores de onzas y botellas deben ser números enteros y no negativos','error'); return; }
   let guardados=0;
-  document.querySelectorAll('.invBebOz').forEach(inp=>{
+  document.querySelectorAll('.invLicOz').forEach(inp=>{
     const bebidaId=inp.dataset.id;
-    const botInp=document.querySelector(`.invBebBot[data-id="${bebidaId}"]`);
+    const botInp=document.querySelector(`.invLicBot[data-id="${bebidaId}"]`);
     const oz=inp.value.trim()===''?0:Number(inp.value);
     const bot=botInp&&botInp.value.trim()!==''?Number(botInp.value):0;
     if(inp.value.trim()!=='' || (botInp&&botInp.value.trim()!=='')){
-      invBebidaUpsert(bebidaId, invBebidasFecha, invBebidasMomento, oz, bot);
+      invLicorUpsert(licorId, invLicoresFecha, invLicoresMomento, oz, bot);
       guardados++;
     }
   });
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
-  save(K.invBebidas,S.invBebidas);
-  toast(`Inventario guardado (${guardados} bebida(s)).`,'success');
+  save(K.invLicores,S.invLicores);
+  toast(`Inventario guardado (${guardados} licor(es)).`,'success');
   const ok2=await gsSaveToSheets('inventario');
   if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
-  RENDERERS.invDiarioBebidas();
+  RENDERERS.invDiarioLicores();
 }
-function invBebidasExportar(){
-  const bebidasOrdenadas=[...S.bebidas].sort((a,b)=>a.nombre.localeCompare(b.nombre));
-  const datos=bebidasOrdenadas.map(b=>{
-    const r=getInvBebida(b.id,invBebidasFecha,invBebidasMomento);
-    return { fecha:invBebidasFecha, momento:invBebidasMomento, bebida:b.nombre, tamanoMl:b.tamanoMl, ozPorBotella:b.ozPorBotella, onzas:r?r.onzas:0, botellas:r?r.botellas:0 };
+function invLicoresExportar(){
+  const licoresOrdenados=[...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
+  const datos=licoresOrdenados.map(b=>{
+    const r=getInvLicor(b.id,invLicoresFecha,invLicoresMomento);
+    return { fecha:invLicoresFecha, momento:invLicoresMomento, licor:b.nombre, tamanoMl:b.tamanoMl, ozPorBotella:b.ozPorBotella, onzas:r?r.onzas:0, botellas:r?r.botellas:0 };
   });
-  exportarExcelSimple('InvBebidas',datos,`inv_bebidas_${invBebidasFecha}_${invBebidasMomento}_${excelTimestamp()}.xlsx`);
-  toast('Excel de inventario de bebidas descargado','success');
+  exportarExcelSimple('InvLicores',datos,`inv_licores_${invLicoresFecha}_${invLicoresMomento}_${excelTimestamp()}.xlsx`);
+  toast('Excel de inventario de licores descargado','success');
 }
 
-/* ─── 11C-3: Cotejo de Consumo de Bebidas ─── */
-let cotejoBebIni  = { fecha: new Date().toISOString().slice(0,10), momento:'Entrada' };
-let cotejoBebFin  = { fecha: new Date().toISOString().slice(0,10), momento:'Salida'  };
-RENDERERS.cotejoBebidas = function(){
-  const el = document.getElementById('page-cotejoBebidas');
-  const bebidasOrdenadas=[...S.bebidas].sort((a,b)=>a.nombre.localeCompare(b.nombre));
-  // Calcular consumo para cada bebida
-  const filas=bebidasOrdenadas.map(b=>{
-    const rIni=getInvBebida(b.id,cotejoBebIni.fecha,cotejoBebIni.momento);
-    const rFin=getInvBebida(b.id,cotejoBebFin.fecha,cotejoBebFin.momento);
-    const sIni=stockBebida(b.id,rIni);
-    const sFin=stockBebida(b.id,rFin);
+/* ─── 11C-3: Cotejo de Consumo de Licores ─── */
+let cotejoLicIni  = { fecha: new Date().toISOString().slice(0,10), momento:'Entrada' };
+let cotejoLicFin  = { fecha: new Date().toISOString().slice(0,10), momento:'Salida'  };
+RENDERERS.cotejoLicores = function(){
+  const el = document.getElementById('page-cotejoLicores');
+  const licoresOrdenados=[...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
+  // Calcular consumo para cada licor
+  const filas=licoresOrdenados.map(b=>{
+    const rIni=getInvLicor(b.id,cotejoLicIni.fecha,cotejoLicIni.momento);
+    const rFin=getInvLicor(b.id,cotejoLicFin.fecha,cotejoLicFin.momento);
+    const sIni=stockLicor(b.id,rIni);
+    const sFin=stockLicor(b.id,rFin);
     const consumo=sIni-sFin;
     return { nombre:b.nombre, sIni, sFin, consumo, tieneIni:!!rIni, tieneFin:!!rFin };
   });
   const totalConsumo=filas.reduce((s,f)=>s+f.consumo,0);
-  const bebidasConDatos=filas.filter(f=>f.tieneIni||f.tieneFin).length;
+  const licoresConDatos=filas.filter(f=>f.tieneIni||f.tieneFin).length;
   el.innerHTML=`
-    <div class="page-head"><div><h1>📊 Cotejo de Consumo de Bebidas</h1><p>Calcula el consumo real de bebidas entre dos inventarios. Los resultados se actualizan automáticamente al cambiar las fechas o momentos.</p></div></div>
+    <div class="page-head"><div><h1>📊 Cotejo de Consumo de Licores</h1><p>Calcula el consumo real de licores entre dos inventarios. Los resultados se actualizan automáticamente al cambiar las fechas o momentos.</p></div></div>
     <div class="card">
       <div class="form-grid">
-        <div class="field"><label>Fecha inicial</label><input type="date" id="cotIniF" value="${cotejoBebIni.fecha}"></div>
-        <div class="field"><label>Momento inicial</label><select id="cotIniM">
-          <option value="Entrada" ${cotejoBebIni.momento==='Entrada'?'selected':''}>Entrada</option>
-          <option value="Salida" ${cotejoBebIni.momento==='Salida'?'selected':''}>Salida</option>
+        <div class="field"><label>Fecha inicial</label><input type="date" id="cotLicIniF" value="${cotejoLicIni.fecha}"></div>
+        <div class="field"><label>Momento inicial</label><select id="cotLicIniM">
+          <option value="Entrada" ${cotejoLicIni.momento==='Entrada'?'selected':''}>Entrada</option>
+          <option value="Salida" ${cotejoLicIni.momento==='Salida'?'selected':''}>Salida</option>
         </select></div>
-        <div class="field"><label>Fecha final</label><input type="date" id="cotFinF" value="${cotejoBebFin.fecha}"></div>
-        <div class="field"><label>Momento final</label><select id="cotFinM">
-          <option value="Entrada" ${cotejoBebFin.momento==='Entrada'?'selected':''}>Entrada</option>
-          <option value="Salida" ${cotejoBebFin.momento==='Salida'?'selected':''}>Salida</option>
+        <div class="field"><label>Fecha final</label><input type="date" id="cotLicFinF" value="${cotejoLicFin.fecha}"></div>
+        <div class="field"><label>Momento final</label><select id="cotLicFinM">
+          <option value="Entrada" ${cotejoLicFin.momento==='Entrada'?'selected':''}>Entrada</option>
+          <option value="Salida" ${cotejoLicFin.momento==='Salida'?'selected':''}>Salida</option>
         </select></div>
       </div>
     </div>
     <div class="card">
       <div class="summary" style="margin-bottom:14px">
-        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoBebIni.fecha)} — ${cotejoBebIni.momento}</div></div>
-        <div class="item"><div class="l">Inventario final</div><div class="v">${fmtFecha(cotejoBebFin.fecha)} — ${cotejoBebFin.momento}</div></div>
-        <div class="item"><div class="l">Bebidas evaluadas</div><div class="v">${bebidasConDatos} de ${bebidasOrdenadas.length}</div></div>
+        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoLicIni.fecha)} — ${cotejoLicIni.momento}</div></div>
+        <div class="item"><div class="l">Inventario final</div><div class="v">${fmtFecha(cotejoLicFin.fecha)} — ${cotejoLicFin.momento}</div></div>
+        <div class="item"><div class="l">Licores evaluados</div><div class="v">${licoresConDatos} de ${licoresOrdenados.length}</div></div>
         <div class="item total"><div class="l">Consumo total</div><div class="v">${totalConsumo.toFixed(1)} oz</div></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Bebida</th><th class="num">Stock inicial (oz)</th><th class="num">Stock final (oz)</th><th class="num">Consumo (oz)</th></tr></thead>
+        <thead><tr><th>Licor</th><th class="num">Stock inicial (oz)</th><th class="num">Stock final (oz)</th><th class="num">Consumo (oz)</th></tr></thead>
         <tbody>${filas.length?filas.map(f=>`
           <tr class="${!f.tieneIni&&!f.tieneFin?'row-vac':''}">
             <td>${f.nombre}</td>
             <td class="num">${f.tieneIni?f.sIni.toFixed(1):'—'}</td>
             <td class="num">${f.tieneFin?f.sFin.toFixed(1):'—'}</td>
             <td class="num ${f.consumo>0?'':''}"><b>${(f.tieneIni||f.tieneFin)?f.consumo.toFixed(1):'—'}</b></td>
-          </tr>`).join(''):`<tr><td colspan="4" class="empty">No hay bebidas registradas.</td></tr>`}</tbody>
+          </tr>`).join(''):`<tr><td colspan="4" class="empty">No hay licores registrados.</td></tr>`}</tbody>
         ${filas.length?`<tfoot><tr><td>Total</td><td>—</td><td>—</td><td class="num">${totalConsumo.toFixed(1)} oz</td></tr></tfoot>`:''}
       </table></div>
       <div class="actions" style="margin-top:14px">
-        <button class="btn btn-green" id="cotExport">⬇ Exportar Excel</button>
+        <button class="btn btn-green" id="cotLicExport">⬇ Exportar Excel</button>
       </div>
-      <p class="hint">Fórmula: <b>Stock Total = (Botellas × Oz por botella) + Onzas</b>. Consumo = Stock inicial − Stock final. Filas en gris: sin datos de inventario para esa bebida en el período seleccionado.</p>
+      <p class="hint">Fórmula: <b>Stock Total = (Botellas × Oz por botella) + Onzas</b>. Consumo = Stock inicial − Stock final. Filas en gris: sin datos de inventario para ese licor en el período seleccionado.</p>
     </div>`;
   const upd=()=>{
-    cotejoBebIni={ fecha:document.getElementById('cotIniF').value||cotejoBebIni.fecha, momento:document.getElementById('cotIniM').value };
-    cotejoBebFin={ fecha:document.getElementById('cotFinF').value||cotejoBebFin.fecha, momento:document.getElementById('cotFinM').value };
-    RENDERERS.cotejoBebidas();
+    cotejoLicIni={ fecha:document.getElementById('cotLicIniF').value||cotejoLicIni.fecha, momento:document.getElementById('cotLicIniM').value };
+    cotejoLicFin={ fecha:document.getElementById('cotLicFinF').value||cotejoLicFin.fecha, momento:document.getElementById('cotLicFinM').value };
+    RENDERERS.cotejoLicores();
   };
-  ['cotIniF','cotIniM','cotFinF','cotFinM'].forEach(id=>document.getElementById(id).onchange=upd);
-  document.getElementById('cotExport').onclick=()=>{
-    const datos=filas.map(f=>({ inventario_inicial:`${fmtFecha(cotejoBebIni.fecha)} ${cotejoBebIni.momento}`, inventario_final:`${fmtFecha(cotejoBebFin.fecha)} ${cotejoBebFin.momento}`, bebida:f.nombre, stock_inicial_oz:f.tieneIni?f.sIni:null, stock_final_oz:f.tieneFin?f.sFin:null, consumo_oz:(f.tieneIni||f.tieneFin)?f.consumo:null }));
-    exportarExcelSimple('Cotejo',datos,`cotejo_bebidas_${excelTimestamp()}.xlsx`);
+  ['cotLicIniF','cotLicIniM','cotLicFinF','cotLicFinM'].forEach(id=>document.getElementById(id).onchange=upd);
+  document.getElementById('cotLicExport').onclick=()=>{
+    const datos=filas.map(f=>({ inventario_inicial:`${fmtFecha(cotejoLicIni.fecha)} ${cotejoLicIni.momento}`, inventario_final:`${fmtFecha(cotejoLicFin.fecha)} ${cotejoLicFin.momento}`, licor:f.nombre, stock_inicial_oz:f.tieneIni?f.sIni:null, stock_final_oz:f.tieneFin?f.sFin:null, consumo_oz:(f.tieneIni||f.tieneFin)?f.consumo:null }));
+    exportarExcelSimple('Cotejo',datos,`cotejo_licores_${excelTimestamp()}.xlsx`);
     toast('Excel de cotejo descargado','success');
   };
+};
+
+/* ================================================================
+   MÓDULO 11D: CONTROL DE STOCK DE BEBIDAS
+   ----------------------------------------------------------------
+   BebidasCat: { id, categoria, nombre, activo }
+   StockBebidas:{ id, bebidaId, fecha, stock }
+   Categorías: CERVEZA | COMPLEMENTOS | GASEOSAS | REFRESCOS | FRIOS
+   Unicidad: un registro por (bebidaId, fecha).
+   ================================================================ */
+const CATEGORIAS_BEBIDAS = ['CERVEZA','COMPLEMENTOS','GASEOSAS','REFRESCOS','FRIOS'];
+// Catálogo inicial (cargado una sola vez desde seedBebidasCat).
+const BEBIDAS_CAT_INICIALES = [
+  ['CERVEZA','CORONA'],['CERVEZA','CUSQUEÑA DORADA 310 ML'],['CERVEZA','CUSQUEÑA NEGRA 310 ML'],
+  ['CERVEZA','CUSQUEÑA TRIGO 310 ML'],['CERVEZA','PILSEN 305 ML'],
+  ['COMPLEMENTOS','NARANJA CAJA'],['COMPLEMENTOS','EVEREST 1.5L'],['COMPLEMENTOS','EVEREST 500ml'],
+  ['COMPLEMENTOS','JARABE DE GOMA'],['COMPLEMENTOS','7UP 300ml'],['COMPLEMENTOS','NARANJA DESHIDRATADA'],
+  ['COMPLEMENTOS','GRANADINA'],
+  ['GASEOSAS','AGUA SAN LUIS SIN GAS'],['GASEOSAS','AGUA SAN LUIS CON GAS'],
+  ['GASEOSAS','COCA COLA (1 L)'],['GASEOSAS','COCA COLA (1.5 L)'],['GASEOSAS','COCA COLA (297ML)'],
+  ['GASEOSAS','COCA COLA 500ML'],['GASEOSAS','COCA COLA ZERO (500ML)'],['GASEOSAS','COCA COLA JUMBO (625ML)'],
+  ['GASEOSAS','FANTA NARANJA'],['GASEOSAS','FANTA ROJA'],
+  ['GASEOSAS','INCA KOLA (1 L)'],['GASEOSAS','INCA KOLA (1.5 L)'],['GASEOSAS','INCA KOLA (297ML)'],
+  ['GASEOSAS','INCA KOLA 500ML'],['GASEOSAS','INCA KOLA GORDITA (625ML)'],['GASEOSAS','INCA KOLA ZERO (500ML)'],
+  ['REFRESCOS','CHICHA BOTELLA'],
+  ['FRIOS','HIELO PREMIUM'],['FRIOS','HIELO BASICO']
+];
+// Stock histórico inicial tomado de la imagen de referencia.
+// Fechas: 2025-06-15 al 2025-06-21 (jun20 sin datos).
+// null = sin registro ese día.
+const STOCK_INICIAL_BEBIDAS = [
+  // [nombre, 15-jun,16-jun,17-jun,18-jun,19-jun,20-jun,21-jun]
+  ['CORONA',                   19,19,19,19,8,null,17],
+  ['CUSQUEÑA DORADA 310 ML',   14,14,14,14,8,null,9],
+  ['CUSQUEÑA NEGRA 310 ML',    13,13,13,13,13,null,11],
+  ['CUSQUEÑA TRIGO 310 ML',    12,12,12,12,12,null,6],
+  ['PILSEN 305 ML',            28,28,28,28,28,null,19],
+  ['NARANJA CAJA',             2,2,2,4,4,null,5],
+  ['EVEREST 1.5L',             3,3,3,3,3,null,2],
+  ['7UP 300ml',                13,8,8,8,23,null,24],
+  ['AGUA SAN LUIS SIN GAS',    10,8,8,6,18,null,17],
+  ['AGUA SAN LUIS CON GAS',    23,20,20,20,20,null,19],
+  ['COCA COLA (1 L)',           18,17,17,17,17,null,11],
+  ['COCA COLA (1.5 L)',         10,10,10,10,10,null,9],
+  ['COCA COLA (297ML)',         21,21,21,20,19,null,18],
+  ['COCA COLA 500ML',          21,17,16,13,12,null,8],
+  ['COCA COLA ZERO (500ML)',    7,7,7,6,11,null,4],
+  ['COCA COLA JUMBO (625ML)',   18,18,18,18,17,null,14],
+  ['FANTA NARANJA',            9,9,9,9,6,null,5],
+  ['FANTA ROJA',               9,9,9,9,8,null,6],
+  ['INCA KOLA (1 L)',           12,12,10,9,8,null,8],
+  ['INCA KOLA (1.5 L)',         14,13,13,13,12,null,10],
+  ['INCA KOLA (297ML)',         29,29,28,27,26,null,25],
+  ['INCA KOLA 500ML',          13,13,11,6,6,null,1],
+  ['INCA KOLA GORDITA (625ML)', 18,18,18,17,29,null,24],
+  ['INCA KOLA ZERO (500ML)',    7,7,7,7,13,null,10],
+  ['CHICHA BOTELLA',           null,null,null,null,null,null,2]
+];
+const FECHAS_STOCK_INICIAL = ['2025-06-15','2025-06-16','2025-06-17','2025-06-18','2025-06-19','2025-06-20','2025-06-21'];
+
+function seedBebidasCat(force){
+  if(!force && localStorage.getItem(K.seedBebidasCat)) return;
+  S.bebidasCat = BEBIDAS_CAT_INICIALES.map(([categoria,nombre])=>({ id:uid(), categoria, nombre, activo:true }));
+  save(K.bebidasCat, S.bebidasCat);
+  // Insertar stock histórico inicial (no sobreescribe registros ya existentes)
+  STOCK_INICIAL_BEBIDAS.forEach(([nombre,...stocks])=>{
+    const beb = S.bebidasCat.find(b=>b.nombre===nombre);
+    if(!beb) return;
+    FECHAS_STOCK_INICIAL.forEach((fecha,i)=>{
+      const v = stocks[i];
+      if(v==null) return; // sin dato ese día → no crear registro
+      if(!getStockBebida(beb.id, fecha))
+        S.stockBebidas.push({ id:uid(), bebidaId:beb.id, fecha, stock:v });
+    });
+  });
+  save(K.stockBebidas, S.stockBebidas);
+  localStorage.setItem(K.seedBebidasCat,'1');
+}
+function getStockBebida(bebidaId, fecha){ return S.stockBebidas.find(x=>x.bebidaId===bebidaId && x.fecha===fecha); }
+function upsertStockBebida(bebidaId, fecha, stock){
+  let r = getStockBebida(bebidaId, fecha);
+  if(r) r.stock = stock;
+  else S.stockBebidas.push({ id:uid(), bebidaId, fecha, stock });
+}
+function nombreBebidaCat(id){ const b=S.bebidasCat.find(x=>x.id===id); return b?b.nombre:'(bebida eliminada)'; }
+function categoriaBebidaCat(id){ const b=S.bebidasCat.find(x=>x.id===id); return b?b.categoria:''; }
+
+/* ─── 11D-1: Administración de Bebidas ─── */
+let editBebidaCatId = null;
+RENDERERS.bebidasAdmin = function(){
+  const el = document.getElementById('page-bebidasAdmin');
+  const porCategoria = {};
+  CATEGORIAS_BEBIDAS.forEach(c=>{ porCategoria[c] = S.bebidasCat.filter(b=>b.categoria===c).sort((a,b_)=>a.nombre.localeCompare(b_.nombre)); });
+  el.innerHTML = `
+    <div class="page-head"><div><h1>🥤 Administración de Bebidas</h1><p>Administra el catálogo de bebidas para el stock diario. Los cambios de nombre/categoría se guardan con el botón "Guardar"; activar/desactivar se guarda inmediatamente.</p></div></div>
+    <div class="card">
+      <h2 id="bebCatFormTitle">Nueva bebida</h2>
+      <div class="form-grid">
+        <div class="field"><label>Categoría *</label><select id="bebCatCategoria">
+          ${CATEGORIAS_BEBIDAS.map(c=>`<option value="${c}" ${editBebidaCatId&&S.bebidasCat.find(x=>x.id===editBebidaCatId)?.categoria===c?'selected':''}>${c}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Nombre *</label><input id="bebCatNombre" placeholder="Ej: CORONA"></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="bebCatSave">Guardar</button>
+        <button class="btn btn-ghost" id="bebCatClear">Limpiar</button>
+      </div>
+    </div>
+    ${CATEGORIAS_BEBIDAS.map(cat=>{
+      const lista = porCategoria[cat];
+      if(!lista.length) return `<div class="card"><h2>${cat} (0)</h2><div class="empty">Sin bebidas en esta categoría.</div></div>`;
+      return `<div class="card">
+        <h2>${cat} (${lista.length})</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Nombre</th><th class="num">Activo</th><th>Acciones</th></tr></thead>
+          <tbody>${lista.map(b=>`
+            <tr class="${!b.activo?'row-vac':''}">
+              <td>${b.nombre}</td>
+              <td class="num"><input type="checkbox" ${b.activo?'checked':''} onchange="bebCatToggle('${b.id}',this.checked)" title="${b.activo?'Desactivar':'Activar'} esta bebida"></td>
+              <td><button class="btn-icon" onclick="bebCatEdit('${b.id}')">✏️ Editar</button>
+                  <button class="btn-icon del" onclick="bebCatDel('${b.id}')">🗑️ Eliminar</button></td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </div>`;
+    }).join('')}`;
+  document.getElementById('bebCatSave').onclick = bebCatSave;
+  document.getElementById('bebCatClear').onclick = ()=>{ editBebidaCatId=null; RENDERERS.bebidasAdmin(); };
+  if(editBebidaCatId){
+    const b = S.bebidasCat.find(x=>x.id===editBebidaCatId);
+    if(b){ document.getElementById('bebCatFormTitle').textContent='Editar bebida'; document.getElementById('bebCatNombre').value=b.nombre; document.getElementById('bebCatCategoria').value=b.categoria; }
+  }
+};
+function bebCatSave(){
+  const nombre = document.getElementById('bebCatNombre').value.trim();
+  const categoria = document.getElementById('bebCatCategoria').value;
+  if(!nombre){ document.getElementById('bebCatNombre').classList.add('invalid'); toast('Ingresa el nombre de la bebida','error'); return; }
+  document.getElementById('bebCatNombre').classList.remove('invalid');
+  if(editBebidaCatId){
+    const b = S.bebidasCat.find(x=>x.id===editBebidaCatId);
+    Object.assign(b,{nombre,categoria});
+    editBebidaCatId=null; toast('Bebida actualizada','success');
+  }else{
+    S.bebidasCat.push({id:uid(),categoria,nombre,activo:true});
+    toast('Bebida creada','success');
+  }
+  save(K.bebidasCat,S.bebidasCat);
+  gsSaveToSheets('inventario').catch(()=>{});
+  RENDERERS.bebidasAdmin();
+}
+window.bebCatToggle = function(id, activo){
+  const b = S.bebidasCat.find(x=>x.id===id); if(!b) return;
+  b.activo = !!activo;
+  save(K.bebidasCat,S.bebidasCat);
+  toast(activo?'Bebida activada':'Bebida desactivada','success');
+  gsSaveToSheets('inventario').catch(()=>{});
+  RENDERERS.bebidasAdmin();
+};
+window.bebCatEdit = function(id){ editBebidaCatId=id; RENDERERS.bebidasAdmin(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.bebCatDel = function(id){
+  if(!confirm('¿Eliminar esta bebida? Los registros históricos de stock no se eliminarán.')) return;
+  if(editBebidaCatId===id) editBebidaCatId=null;
+  S.bebidasCat = S.bebidasCat.filter(b=>b.id!==id);
+  save(K.bebidasCat,S.bebidasCat);
+  toast('Bebida eliminada','warn');
+  gsSaveToSheets('inventario').catch(()=>{});
+  RENDERERS.bebidasAdmin();
+};
+
+/* ─── 11D-2: Stock Diario de Bebidas ─── */
+let stockBebidasFecha = new Date().toISOString().slice(0,10);
+RENDERERS.stockDiarioBebidas = function(){
+  const el = document.getElementById('page-stockDiarioBebidas');
+  const activas = S.bebidasCat.filter(b=>b.activo!==false).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
+  if(!activas.length){
+    el.innerHTML=`<div class="page-head"><div><h1>📋 Stock Diario de Bebidas</h1></div></div>
+      <div class="card"><div class="empty">No hay bebidas activas. Actívalas en el módulo <b>Bebidas</b>.</div></div>`;
+    return;
+  }
+  let catActual='';
+  const filas = activas.map(b=>{
+    const r = getStockBebida(b.id, stockBebidasFecha);
+    const catHeader = b.categoria!==catActual ? (()=>{ catActual=b.categoria; return `<tr style="background:var(--bg2)"><td colspan="3"><b>${b.categoria}</b></td></tr>`; })() : '';
+    return catHeader+`<tr>
+      <td><small class="badge b-free">${b.categoria}</small></td>
+      <td>${b.nombre}</td>
+      <td class="num"><input type="number" class="stockBebInput" data-id="${b.id}" min="0" step="0.01" value="${r!=null?r.stock:''}" placeholder="0"></td>
+    </tr>`;
+  }).join('');
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📋 Stock Diario de Bebidas</h1><p>Registra el stock de bebidas para la fecha seleccionada. Presiona "Guardar" para persistir y sincronizar.</p></div></div>
+    <div class="card">
+      <div class="toolbar"><div class="field"><label>Fecha</label><input type="date" id="stockBebFecha" value="${stockBebidasFecha}"></div></div>
+    </div>
+    <div class="card">
+      <h2>Stock del día — ${fmtFecha(stockBebidasFecha)}</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Categoría</th><th>Bebida</th><th class="num">Stock</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>
+      <div class="actions" style="margin-top:14px">
+        <button class="btn btn-primary" id="stockBebGuardar">💾 Guardar</button>
+        <button class="btn btn-green" id="stockBebExport">⬇ Exportar Excel</button>
+      </div>
+      <p class="hint">Los valores negativos no están permitidos. Si ya existe un registro para esta combinación de Fecha + Bebida, se actualiza sin duplicar.</p>
+    </div>`;
+  document.getElementById('stockBebFecha').onchange=(e)=>{ stockBebidasFecha=e.target.value||new Date().toISOString().slice(0,10); RENDERERS.stockDiarioBebidas(); };
+  document.getElementById('stockBebGuardar').onclick=stockBebidasGuardar;
+  document.getElementById('stockBebExport').onclick=stockBebidasExportar;
+};
+async function stockBebidasGuardar(){
+  const inputs=document.querySelectorAll('.stockBebInput');
+  let ok=true;
+  inputs.forEach(inp=>{ const v=inp.value.trim(); const bad=(v!==''&&(isNaN(Number(v))||Number(v)<0)); inp.classList.toggle('invalid',bad); if(bad)ok=false; });
+  if(!ok){ toast('Los valores de stock deben ser numéricos y no negativos','error'); return; }
+  let guardados=0;
+  inputs.forEach(inp=>{
+    if(inp.value.trim()==='') return;
+    upsertStockBebida(inp.dataset.id, stockBebidasFecha, Number(inp.value));
+    guardados++;
+  });
+  if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
+  save(K.stockBebidas,S.stockBebidas);
+  toast(`Stock guardado (${guardados} bebida(s)).`,'success');
+  const ok2=await gsSaveToSheets('inventario');
+  if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+  RENDERERS.stockDiarioBebidas();
+}
+function stockBebidasExportar(){
+  const activas=S.bebidasCat.filter(b=>b.activo!==false).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
+  const datos=activas.map(b=>{ const r=getStockBebida(b.id,stockBebidasFecha); return { fecha:stockBebidasFecha, categoria:b.categoria, bebida:b.nombre, stock:r!=null?r.stock:'' }; });
+  exportarExcelSimple('StockBebidas',datos,`stock_bebidas_${stockBebidasFecha}_${excelTimestamp()}.xlsx`);
+  toast('Excel de stock de bebidas descargado','success');
+}
+
+/* ─── 11D-3: Consolidado de Stock de Bebidas ─── */
+let consBebidasFilter = (()=>{
+  const hoy=new Date(), hace6=new Date(hoy.getTime()-6*86400000), fmt=d=>d.toISOString().slice(0,10);
+  return { desde:fmt(hace6), hasta:fmt(hoy), categoria:'', busqueda:'' };
+})();
+const CONS_BEB_MAX_DIAS = 60;
+function consBebidasRangoEfectivo(){
+  const hoy=new Date().toISOString().slice(0,10);
+  let desde=consBebidasFilter.desde||hoy, hasta=consBebidasFilter.hasta||hoy;
+  if(desde>hasta){ const t=desde; desde=hasta; hasta=t; }
+  let fechas=rangoFechas(desde,hasta);
+  if(fechas.length>CONS_BEB_MAX_DIAS) fechas=fechas.slice(-CONS_BEB_MAX_DIAS);
+  return { desde, hasta, fechas };
+}
+RENDERERS.consolidadoStockBebidas = function(){
+  const el = document.getElementById('page-consolidadoStockBebidas');
+  const { desde, hasta, fechas } = consBebidasRangoEfectivo();
+  const categoriaFiltro = consBebidasFilter.categoria;
+  const busqueda = (consBebidasFilter.busqueda||'').toLowerCase();
+  const bebidasFiltradas = S.bebidasCat.filter(b=>
+    (!categoriaFiltro || b.categoria===categoriaFiltro) &&
+    (!busqueda || b.nombre.toLowerCase().includes(busqueda))
+  ).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
+  const hayDatos = bebidasFiltradas.some(b=>fechas.some(f=>getStockBebida(b.id,f)));
+
+  const theadFechas = fechas.map(f=>`<th>
+    <div>${fmtFecha(f)}<small style="font-weight:400;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</small></div>
+    <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="consBebidasDelDia('${f}')" title="Eliminar todos los registros de este día">🗑️ Eliminar día</button>
+  </th>`).join('');
+
+  let catActual='';
+  const filas=bebidasFiltradas.map(b=>{
+    const celdas=fechas.map(f=>{
+      const r=getStockBebida(b.id,f);
+      return `<td class="num">${r!=null?`<input type="number" min="0" step="0.01" value="${r.stock}" onchange="consBebidasSet('${r.id}',this.value)">`:''}  </td>`;
+    }).join('');
+    const catHeader = b.categoria!==catActual ? (()=>{ catActual=b.categoria; return `<tr style="background:var(--bg2)"><td colspan="${fechas.length+1}"><b>${b.categoria}</b></td></tr>`; })() : '';
+    return catHeader+`<tr><td>${b.nombre}</td>${celdas}</tr>`;
+  }).join('');
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario por bebida, en formato matricial.</p></div></div>
+    <div class="card">
+      <div class="form-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
+        <div class="field"><label>Desde</label><input type="date" id="consBebDesde" value="${desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="consBebHasta" value="${hasta}"></div>
+        <div class="field"><label>Categoría</label><select id="consBebCat">
+          <option value="">Todas</option>
+          ${CATEGORIAS_BEBIDAS.map(c=>`<option value="${c}" ${categoriaFiltro===c?'selected':''}>${c}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Buscar bebida</label><input id="consBebBusqueda" value="${consBebidasFilter.busqueda||''}" placeholder="Nombre…"></div>
+        <div class="field" style="align-self:end"><button class="btn btn-ghost btn-sm" id="consBebClear">Últimos 7 días</button></div>
+      </div>
+      <h2>Historial (${fechas.length} día${fechas.length===1?'':'s'}, ${bebidasFiltradas.length} bebida${bebidasFiltradas.length===1?'':'s'})</h2>
+      ${(!hayDatos&&bebidasFiltradas.length) ? `<div class="empty">No hay registros de stock en el rango seleccionado.</div>` :
+        !bebidasFiltradas.length ? `<div class="empty">No hay bebidas que coincidan con los filtros.</div>` : `
+      <div class="table-wrap"><table class="inv-matrix">
+        <thead>
+          <tr><th rowspan="2">Bebida</th>${theadFechas}</tr>
+        </thead>
+        <tbody>${filas}</tbody>
+      </table></div>`}
+      <div class="actions" style="margin-top:14px"><button class="btn btn-green" id="consBebExport">⬇ Exportar Excel</button></div>
+    </div>`;
+
+  const applyF=()=>{
+    const d=document.getElementById('consBebDesde').value, h=document.getElementById('consBebHasta').value;
+    if(d&&h&&d>h){ toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error'); return; }
+    consBebidasFilter={ desde:d, hasta:h, categoria:document.getElementById('consBebCat').value, busqueda:document.getElementById('consBebBusqueda').value };
+    RENDERERS.consolidadoStockBebidas();
+  };
+  ['consBebDesde','consBebHasta','consBebCat','consBebBusqueda'].forEach(id=>{ const e=document.getElementById(id); if(e) e.onchange=applyF; if(e&&e.tagName==='INPUT') e.oninput=applyF; });
+  document.getElementById('consBebClear').onclick=()=>{
+    const hoy=new Date(), hace6=new Date(hoy.getTime()-6*86400000), fmt=d=>d.toISOString().slice(0,10);
+    consBebidasFilter={ desde:fmt(hace6), hasta:fmt(hoy), categoria:'', busqueda:'' };
+    RENDERERS.consolidadoStockBebidas();
+  };
+  document.getElementById('consBebExport').onclick=()=>{
+    const datos=[];
+    bebidasFiltradas.forEach(b=>{ fechas.forEach(f=>{ const r=getStockBebida(b.id,f); datos.push({ fecha:f, categoria:b.categoria, bebida:b.nombre, stock:r!=null?r.stock:'' }); }); });
+    exportarExcelSimple('StockBebidas',datos,`consolidado_bebidas_${desde}_a_${hasta}_${excelTimestamp()}.xlsx`);
+    toast('Excel de consolidado de bebidas descargado','success');
+  };
+};
+window.consBebidasSet = async function(id, valor){
+  const r=S.stockBebidas.find(x=>x.id===id); if(!r) return;
+  const v=String(valor).trim();
+  if(v!==''&&(isNaN(Number(v))||Number(v)<0)){ toast('El valor debe ser numérico y no negativo','error'); RENDERERS.consolidadoStockBebidas(); return; }
+  r.stock=(v===''?0:Number(v));
+  save(K.stockBebidas,S.stockBebidas);
+  toast('Stock actualizado','success');
+  RENDERERS.consolidadoStockBebidas();
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+};
+window.consBebidasDelDia = async function(fecha){
+  const cantidad=S.stockBebidas.filter(r=>r.fecha===fecha).length;
+  if(!cantidad){ toast('No hay registros para ese día','info'); return; }
+  if(!confirm(`¿Está seguro que desea eliminar todos los registros de stock del día ${fmtFecha(fecha)}? Esta acción no se puede deshacer.`)) return;
+  S.stockBebidas=S.stockBebidas.filter(r=>r.fecha!==fecha);
+  save(K.stockBebidas,S.stockBebidas);
+  toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
+  RENDERERS.consolidadoStockBebidas();
+  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
 };
 
 /* ================================================================
@@ -3570,7 +3918,7 @@ const ACCOUNT_ROLES = {
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
-    modules: ['produccion','insumos','inventarioConsolidado','syncInventario','bebidas','invDiarioBebidas','cotejoBebidas']
+    modules: ['produccion','insumos','inventarioConsolidado','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas']
   }
 };
 // Scopes: openid/email/profile para identificar al usuario (login) +
@@ -3599,7 +3947,7 @@ const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 // inventario se almacene en un Spreadsheet de Wingsbox.oficial@gmail.com).
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Bebidas','InvBebidas','Meta'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','Meta'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -3889,8 +4237,10 @@ function gsSerializeInventario(){
         tipoAlerta:insumoTipoAlerta(i), umbral:insumoUmbral(i),
         resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0 }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
-    Bebidas: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.bebidas),
-    InvBebidas: gsRowsToMatrix(['id','bebidaId','fecha','momento','onzas','botellas'], S.invBebidas),
+    Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
+    InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','momento','onzas','botellas'], S.invLicores),
+    BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo'], S.bebidasCat.map(b=>({...b, activo:b.activo!==false?1:0}))),
+    StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
     Meta: gsRowsToMatrix(['clave','valor'], [
       { clave:'app', valor:'WingsBox Inventario' },
       { clave:'lastSync', valor:new Date().toISOString() }
@@ -3995,9 +4345,11 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda)
       }));
       S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
-      S.bebidas = (byName['Bebidas']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
-      S.invBebidas = (byName['InvBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), momento:String(r.momento||'Entrada'), onzas:Number(r.onzas)||0, botellas:Number(r.botellas)||0 }));
-      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.bebidas,S.bebidas); save(K.invBebidas,S.invBebidas);
+      S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
+      S.invLicores = (byName['InvLicores']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), momento:String(r.momento||'Entrada'), onzas:Number(r.onzas)||0, botellas:Number(r.botellas)||0 }));
+      S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false') }));
+      S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), stock:Number(r.stock)||0 }));
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
         if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn'); }
@@ -4278,7 +4630,8 @@ function gsRevokeToken(){
 (function init(){
   if(!localStorage.getItem(K.seed)) seedData(); // carga inicial de ejemplo (planilla)
   seedInsumos(); // carga inicial de ejemplo (insumos), solo si nunca se sembró
-  seedBebidas(); // carga inicial de bebidas, solo si nunca se sembró
+  seedLicores(); // carga inicial de licores, solo si nunca se sembró
+  seedBebidasCat(); // catálogo + stock histórico de bebidas (una sola vez)
   reloadState();
   goto('empleados');
   gsUpdateSyncStatus('', 'info');
