@@ -42,6 +42,18 @@
   .nav button:hover{background:var(--panel)}
   .nav button.active{background:var(--panel);border-left-color:var(--primary);font-weight:600}
   .nav .ico{width:20px;text-align:center}
+  /* Accordion nav groups (inventario account) */
+  .nav-group{margin:0}
+  .nav-group-header{width:100%;text-align:left;background:none;border:0;border-left:3px solid transparent;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 14px;font-size:12px;font-weight:700;color:var(--c-muted);text-transform:uppercase;letter-spacing:.06em;transition:.15s;user-select:none}
+  .nav-group-header:hover{background:rgba(255,255,255,.06)}
+  .nav-group-header .nav-chevron{margin-left:auto;font-size:10px;display:inline-block;transition:transform .2s}
+  .nav-group.open>.nav-group-header .nav-chevron{transform:rotate(90deg)}
+  .nav-group.open>.nav-group-header{color:var(--text);border-left-color:var(--primary)}
+  .nav-group-body{display:none;padding:2px 0 4px}
+  .nav-group.open>.nav-group-body{display:block}
+  .nav-group-body button{padding-left:28px!important;font-size:13px}
+  /* Highlight group header when a child is active but group is collapsed */
+  .nav-group:not(.open).has-active>.nav-group-header{color:var(--text);background:rgba(255,255,255,.04)}
   .sidebar .foot{padding:14px 18px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
 
   /* ---------- Contenido ---------- */
@@ -653,15 +665,19 @@ function goto(page){
     tarjetaValPendiente = false;
   }
   currentPage=page;
-  document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
+  // Para el dominio inventario re-renderiza el accordion completo (gestiona activos y grupos).
+  // Para el dominio planilla actualiza el resaltado de botones estáticos como antes.
+  const role = currentRole();
+  if(role && role.domain==='inventario'){
+    renderNavAccordion(page);
+  } else {
+    document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.getElementById('page-'+page).classList.add('active');
   document.getElementById('nav').classList.remove('open');
   if(RENDERERS[page]) RENDERERS[page]();
 }
-document.getElementById('nav').addEventListener('click', e=>{
-  const b=e.target.closest('button[data-page]'); if(b) goto(b.dataset.page);
-});
 document.getElementById('navToggle').addEventListener('click', ()=> document.getElementById('nav').classList.toggle('open'));
 
 /* ---------- Colapsar / expandir el panel lateral ---------- */
@@ -3924,9 +3940,15 @@ RENDERERS.efectivoCaja = function(){
   const apBolsa = registro ? (registro.apBolsa||0) : 0;
   const clBolsa = registro ? (registro.clBolsa||0) : 0;
 
-  // Responsable: lee nombres desde localStorage de planilla (sin romper aislamiento de dominio)
+  // Responsable: lee desde localStorage de planilla, filtra solo Meseros (orden alfabético).
+  // Lee de localStorage directamente (sin usar S.emp que está vacío en el dominio inventario)
+  // sin romper el aislamiento en memoria — es solo lectura para poblar un datalist.
   const empleadosPlanilla = (()=>{ try{ return JSON.parse(localStorage.getItem('pl_empleados')||'[]'); }catch(e){ return []; } })();
-  const datalistOpts = empleadosPlanilla.map(e=>`<option value="${e.nombre}">`).join('');
+  const meseros = empleadosPlanilla
+    .filter(e=> (e.tipo||'Mesero')==='Mesero')
+    .sort((a,b)=>a.nombre.localeCompare(b.nombre,'es'));
+  const datalistOpts = meseros.map(e=>`<option value="${e.nombre}">`).join('');
+  const noMeserosMsg = meseros.length===0 ? '<p class="hint" style="color:#dc2626;margin-top:4px">No hay meseros registrados. Agrégalos en Empleados (cuenta Multiboxes).</p>' : '';
 
   const cuadroHTML = (tipo, qtys, bolsa) => {
     const tituloTipo = tipo==='ap' ? 'Apertura de Caja' : 'Cierre de Caja';
@@ -3972,7 +3994,8 @@ RENDERERS.efectivoCaja = function(){
           <option value="Mañana" ${cajaTurno==='Mañana'?'selected':''}>Mañana</option>
           <option value="Tarde" ${cajaTurno==='Tarde'?'selected':''}>Tarde</option>
         </select></div>
-        <div class="field"><label>Responsable *</label><input id="cajaResp" list="cajaRespList" placeholder="Nombre del responsable" value="${registro?registro.responsable:''}"></div>
+        <div class="field"><label>Responsable *</label><input id="cajaResp" list="cajaRespList" placeholder="Nombre del responsable" value="${registro?registro.responsable:''}">
+        ${noMeserosMsg}</div>
       </div>
       ${registro ? '<p class="hint" style="margin-top:4px;color:#059669">✓ Registro existente cargado. Puedes editar y guardar para actualizarlo.</p>' : ''}
     </div>
@@ -4781,13 +4804,93 @@ function paginaPorDefecto(){
 // Oculta del menú lateral los módulos que no pertenecen al rol de la cuenta
 // conectada. Si todavía no hay sesión (currentRole()===null), no oculta nada:
 // el menú entero está detrás del auth gate (ver CSS body:not(.authed)).
+// Captura el HTML del menú estático de planilla al inicio para poder restaurarlo
+// si la sesión cambia de un usuario de inventario (accordion) a uno de planilla.
+const PLANILLA_NAV_HTML = document.getElementById('nav').innerHTML;
+
+// ── Definición de grupos del menú accordion (solo para el dominio inventario) ──
+// Los módulos del dominio planilla mantienen el menú plano existente.
+const NAV_GROUPS_INVENTARIO = [
+  { id:'admin',  ico:'📂', label:'Administración y Configuración',
+    modules:['insumos','licores','bebidasAdmin','syncInventario'] },
+  { id:'diario', ico:'📝', label:'Registro Diario',
+    modules:['produccion','invDiarioLicores','stockDiarioBebidas'] },
+  { id:'cons',   ico:'📊', label:'Consolidados y Cotejos',
+    modules:['inventarioConsolidado','cotejoLicores','consolidadoStockBebidas'] },
+  { id:'caja',   ico:'💰', label:'Caja',
+    modules:['efectivoCaja','consolidadoCaja'] }
+];
+// Labels e íconos de cada módulo del inventario (para generarlos dinámicamente)
+const NAV_MODULE_LABELS = {
+  insumos:['🧂','Insumos'], licores:['🍾','Licores'], bebidasAdmin:['🥤','Bebidas'],
+  syncInventario:['☁️','Sync. Inventario'], produccion:['📦','Producción'],
+  invDiarioLicores:['📋','Inv. Diario Licores'], stockDiarioBebidas:['📋','Stock Diario Bebidas'],
+  inventarioConsolidado:['📈','Consolidado de Inventario'], cotejoLicores:['📊','Cotejo Licores'],
+  consolidadoStockBebidas:['📊','Consolidado Bebidas'],
+  efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja']
+};
+// Estado de los grupos accordion durante la sesión (open/closed por ID de grupo).
+// Por defecto todos están cerrados.
+let navGroupState = {};
+
+// Genera y monta el menú accordion para el dominio inventario.
+// Para el dominio planilla el menú es estático (HTML) y no se toca.
+function renderNavAccordion(activePage){
+  const role = currentRole();
+  if(!role || role.domain !== 'inventario') return; // planilla: menú plano estático
+  const nav = document.getElementById('nav');
+  let html = '';
+  NAV_GROUPS_INVENTARIO.forEach(g=>{
+    // Solo incluir el grupo si al menos uno de sus módulos está permitido para este rol
+    const modulos = g.modules.filter(m=> role.modules.includes(m));
+    if(!modulos.length) return;
+    const hayActivo = modulos.includes(activePage);
+    // Auto-abrir el grupo que contiene la página activa
+    if(hayActivo) navGroupState[g.id] = true;
+    const isOpen = !!navGroupState[g.id];
+    html += `<div class="nav-group ${isOpen?'open':''} ${hayActivo?'has-active':''}" data-group="${g.id}">
+      <button class="nav-group-header" data-toggle-group="${g.id}">
+        <span>${g.ico}</span><span>${g.label}</span><span class="nav-chevron">▶</span>
+      </button>
+      <div class="nav-group-body">
+        ${modulos.map(m=>{ const [ico,lbl]=NAV_MODULE_LABELS[m]||['','?']; return `<button data-page="${m}" class="${m===activePage?'active':''}"><span class="ico">${ico}</span>${lbl}</button>`; }).join('')}
+      </div>
+    </div>`;
+  });
+  nav.innerHTML = html;
+}
+
+// Reemplaza la función original que mostraba/ocultaba botones en el menú estático.
+// Para el dominio inventario renderiza el accordion completo.
+// Para el dominio planilla muestra/oculta los botones estáticos como antes.
 function aplicarPermisosNav(){
   const role = currentRole();
-  document.querySelectorAll('.nav button[data-page]').forEach(b=>{
-    const permitido = !role || role.modules.includes(b.dataset.page);
-    b.style.display = permitido ? '' : 'none';
-  });
+  if(role && role.domain === 'inventario'){
+    renderNavAccordion(currentPage);
+  } else {
+    // Restaurar el HTML del nav estático si fue reemplazado por el accordion de inventario.
+    if(nav.querySelector('.nav-group')){
+      nav.innerHTML = PLANILLA_NAV_HTML;
+    }
+    document.querySelectorAll('.nav button[data-page]').forEach(b=>{
+      const permitido = !role || role.modules.includes(b.dataset.page);
+      b.style.display = permitido ? '' : 'none';
+    });
+  }
 }
+
+// Toggle de grupos accordion (delegado en el nav)
+document.getElementById('nav').addEventListener('click', e=>{
+  const toggleBtn = e.target.closest('[data-toggle-group]');
+  if(toggleBtn){
+    const gid = toggleBtn.dataset.toggleGroup;
+    navGroupState[gid] = !navGroupState[gid];
+    toggleBtn.closest('.nav-group').classList.toggle('open', !!navGroupState[gid]);
+    return; // no propagar a goto()
+  }
+  const b = e.target.closest('button[data-page]');
+  if(b) goto(b.dataset.page);
+});
 function authSetMsg(msg, type){
   const el=document.getElementById('authMsg');
   if(el){ el.textContent=msg||''; el.className='auth-msg '+(type||'info'); }
