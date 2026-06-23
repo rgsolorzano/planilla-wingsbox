@@ -102,6 +102,14 @@
   .inv-cell-wrap input{min-width:64px}
   table input,table select{width:100%;min-width:80px;padding:5px 6px;border:1px solid var(--c-line);border-radius:6px;font-size:12px;background:#fff}
   .empty{padding:30px;text-align:center;color:var(--c-muted);font-size:13px}
+  /* Control de Efectivo en Caja */
+  .caja-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.caja-grid{grid-template-columns:1fr}}
+  .caja-qty{width:80px!important;min-width:60px;text-align:right}
+  .caja-bolsa{width:110px!important;min-width:80px;text-align:right}
+  .caja-res{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;padding-right:6px!important;font-size:13px}
+  .caja-total-row>td{font-weight:700;background:var(--c-line);font-size:14px;padding:10px 8px}
+  .caja-nom{font-size:13px;font-weight:600}
 
   /* ---------- Badges / alertas de color ---------- */
   .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
@@ -220,6 +228,8 @@
       <button data-page="bebidasAdmin"><span class="ico">🥤</span> Bebidas</button>
       <button data-page="stockDiarioBebidas"><span class="ico">📋</span> Stock Diario Bebidas</button>
       <button data-page="consolidadoStockBebidas"><span class="ico">📊</span> Consolidado Bebidas</button>
+      <button data-page="efectivoCaja"><span class="ico">💰</span> Control de Caja</button>
+      <button data-page="consolidadoCaja"><span class="ico">📋</span> Consolidado Caja</button>
     </nav>
     <div class="foot">
       <div id="gsSideStatus" style="font-size:11px;color:var(--muted);padding:2px 0">⚪ Google: sin sesión</div>
@@ -254,6 +264,8 @@
     <section class="page" id="page-bebidasAdmin"></section>
     <section class="page" id="page-stockDiarioBebidas"></section>
     <section class="page" id="page-consolidadoStockBebidas"></section>
+    <section class="page" id="page-efectivoCaja"></section>
+    <section class="page" id="page-consolidadoCaja"></section>
   </main>
 </div>
 
@@ -274,7 +286,9 @@ const K = {
   // Módulo Licores (inventario)
   licores:'pl_licores', invLicores:'pl_invLicores', seedLicores:'pl_seedLicoresDone',
   // Módulo Bebidas diarias (inventario)
-  bebidasCat:'pl_bebidasCat', stockBebidas:'pl_stockBebidas', seedBebidasCat:'pl_seedBebidasCatDone'
+  bebidasCat:'pl_bebidasCat', stockBebidas:'pl_stockBebidas', seedBebidasCat:'pl_seedBebidasCatDone',
+  // Módulo Control de Efectivo en Caja (inventario)
+  efectivoCaja:'pl_efectivoCaja'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -406,7 +420,7 @@ function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
@@ -417,6 +431,7 @@ function reloadState(){
   S.invLicores=load(K.invLicores);
   S.bebidasCat=load(K.bebidasCat);
   S.stockBebidas=load(K.stockBebidas);
+  S.efectivoCaja=load(K.efectivoCaja);
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
 // corresponde al rol de la cuenta conectada. Así, durante una sesión de
@@ -427,7 +442,7 @@ function limpiarEstadoDominio(domain){
   if(domain==='planilla'){
     S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.prop=[]; S.tarjetaVal=[];
   }else if(domain==='inventario'){
-    S.insumos=[]; S.produccion=[]; S.licores=[]; S.invLicores=[]; S.bebidasCat=[]; S.stockBebidas=[];
+    S.insumos=[]; S.produccion=[]; S.licores=[]; S.invLicores=[]; S.bebidasCat=[]; S.stockBebidas=[]; S.efectivoCaja=[];
   }
 }
 
@@ -2764,7 +2779,7 @@ function seedData(){
    inventario nunca borra/reemplaza datos de planilla, y viceversa
    (ambos conjuntos de datos conviven en el mismo localStorage). */
 function dominioKeys(domain){
-  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat]);
+  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat, K.efectivoCaja]);
   return domain==='inventario' ? Array.from(invKeys) : Object.values(K).filter(k=>!invKeys.has(k));
 }
 document.getElementById('btnSeed').onclick=()=>{
@@ -3882,6 +3897,236 @@ window.consBebidasDelDia = async function(fecha){
 };
 
 /* ================================================================
+   MÓDULO 11E: CONTROL DE EFECTIVO EN CAJA
+   ----------------------------------------------------------------
+   Registro de apertura y cierre de caja por fecha + turno.
+   Estructura: { id, fecha, turno, responsable,
+                 apQtys[11], apBolsa, clQtys[11], clBolsa }
+   ================================================================ */
+// Denominaciones en soles (orden fijo, el índice es la clave en GS).
+const DENOMINACIONES = [0.10, 0.20, 0.50, 1.00, 2.00, 5.00, 10.00, 20.00, 50.00, 100.00, 200.00];
+// Estado local del formulario (no persiste; se carga desde S.efectivoCaja al buscar).
+let cajaFecha = fechaHoy();
+let cajaTurno = 'Mañana';
+
+// Busca un registro por (fecha, turno).
+function getCaja(fecha, turno){ return S.efectivoCaja.find(r=>r.fecha===fecha && r.turno===turno); }
+// Total de un cuadro (apertura o cierre): suma de (nominal × cantidad) + bolsa.
+function totalCaja(qtys, bolsa){
+  return DENOMINACIONES.reduce((s,nom,i)=>s + nom*(qtys[i]||0), 0) + (bolsa||0);
+}
+
+RENDERERS.efectivoCaja = function(){
+  const el = document.getElementById('page-efectivoCaja');
+  const registro = getCaja(cajaFecha, cajaTurno);
+  const apQtys = registro ? [...registro.apQtys] : new Array(11).fill(0);
+  const clQtys = registro ? [...registro.clQtys] : new Array(11).fill(0);
+  const apBolsa = registro ? (registro.apBolsa||0) : 0;
+  const clBolsa = registro ? (registro.clBolsa||0) : 0;
+
+  // Responsable: lee nombres desde localStorage de planilla (sin romper aislamiento de dominio)
+  const empleadosPlanilla = (()=>{ try{ return JSON.parse(localStorage.getItem('pl_empleados')||'[]'); }catch(e){ return []; } })();
+  const datalistOpts = empleadosPlanilla.map(e=>`<option value="${e.nombre}">`).join('');
+
+  const cuadroHTML = (tipo, qtys, bolsa) => {
+    const tituloTipo = tipo==='ap' ? 'Apertura de Caja' : 'Cierre de Caja';
+    const filasDenom = DENOMINACIONES.map((nom, i)=>{
+      const res = nom * (qtys[i]||0);
+      return `<tr>
+        <td class="caja-nom">S/ ${nom.toFixed(2)}</td>
+        <td><input type="number" class="caja-qty" data-tipo="${tipo}" data-idx="${i}" min="0" step="1" value="${qtys[i]||''}" placeholder="0" oninput="cajaRecalc('${tipo}')"></td>
+        <td class="caja-res" id="caja-res-${tipo}-${i}">${money(res)}</td>
+      </tr>`;
+    }).join('');
+    const totalAp = totalCaja(qtys, bolsa);
+    return `
+      <div class="card" style="margin:0">
+        <h2 style="margin-bottom:14px">${tipo==='ap'?'🔓':'🔒'} ${tituloTipo}</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Nominal</th><th>Cantidad</th><th class="num">Resultado</th></tr></thead>
+          <tbody>
+            ${filasDenom}
+            <tr style="border-top:2px solid var(--c-line)">
+              <td class="caja-nom" style="font-weight:600">Bolsa</td>
+              <td><input type="number" class="caja-bolsa" data-tipo="${tipo}" min="0" step="0.01" value="${bolsa||''}" placeholder="0.00" oninput="cajaRecalc('${tipo}')"></td>
+              <td class="caja-res" id="caja-bolsa-res-${tipo}">${money(bolsa)}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr class="caja-total-row">
+              <td colspan="2">TOTAL</td>
+              <td class="num" id="caja-total-${tipo}">${money(totalAp)}</td>
+            </tr>
+          </tfoot>
+        </table></div>
+      </div>`;
+  };
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>💰 Control de Efectivo en Caja</h1><p>Registra el efectivo físico en caja al inicio y al final de cada turno.</p></div></div>
+    <datalist id="cajaRespList">${datalistOpts}</datalist>
+    <div class="card">
+      <div class="form-grid">
+        <div class="field"><label>Fecha *</label><input type="date" id="cajaFecha" value="${cajaFecha}" required></div>
+        <div class="field"><label>Turno *</label><select id="cajaTurno">
+          <option value="Mañana" ${cajaTurno==='Mañana'?'selected':''}>Mañana</option>
+          <option value="Tarde" ${cajaTurno==='Tarde'?'selected':''}>Tarde</option>
+        </select></div>
+        <div class="field"><label>Responsable *</label><input id="cajaResp" list="cajaRespList" placeholder="Nombre del responsable" value="${registro?registro.responsable:''}"></div>
+      </div>
+      ${registro ? '<p class="hint" style="margin-top:4px;color:#059669">✓ Registro existente cargado. Puedes editar y guardar para actualizarlo.</p>' : ''}
+    </div>
+    <div class="caja-grid">
+      ${cuadroHTML('ap', apQtys, apBolsa)}
+      ${cuadroHTML('cl', clQtys, clBolsa)}
+    </div>
+    <div class="actions" style="margin-top:14px">
+      <button class="btn btn-primary" id="cajaBtnGuardar">💾 Guardar</button>
+    </div>
+    <p class="hint">Los totales se actualizan en tiempo real. Un único registro por Fecha + Turno; si ya existe, al guardar se actualiza sin crear duplicados.</p>`;
+
+  document.getElementById('cajaFecha').onchange = e=>{ cajaFecha = e.target.value||fechaHoy(); RENDERERS.efectivoCaja(); };
+  document.getElementById('cajaTurno').onchange = e=>{ cajaTurno = e.target.value; RENDERERS.efectivoCaja(); };
+  document.getElementById('cajaBtnGuardar').onclick = cajaGuardar;
+};
+
+// Recalcula en tiempo real los resultados y el total de un cuadro (sin re-renderizar la tabla).
+window.cajaRecalc = function(tipo){
+  let total = 0;
+  DENOMINACIONES.forEach((nom,i)=>{
+    const qtyEl = document.querySelector(`.caja-qty[data-tipo="${tipo}"][data-idx="${i}"]`);
+    const resEl = document.getElementById(`caja-res-${tipo}-${i}`);
+    const qty = Math.max(0, parseInt(qtyEl?.value||'0')||0);
+    const res = nom * qty;
+    if(resEl) resEl.textContent = money(res);
+    total += res;
+  });
+  const bolsaEl = document.querySelector(`.caja-bolsa[data-tipo="${tipo}"]`);
+  const bolsaResEl = document.getElementById(`caja-bolsa-res-${tipo}`);
+  const bolsa = Math.max(0, parseFloat(bolsaEl?.value||'0')||0);
+  if(bolsaResEl) bolsaResEl.textContent = money(bolsa);
+  total += bolsa;
+  const totalEl = document.getElementById(`caja-total-${tipo}`);
+  if(totalEl) totalEl.textContent = money(total);
+};
+
+async function cajaGuardar(){
+  const fecha = document.getElementById('cajaFecha').value;
+  const turno = document.getElementById('cajaTurno').value;
+  const responsable = document.getElementById('cajaResp').value.trim();
+  // Validación
+  let ok = true;
+  if(!fecha){ document.getElementById('cajaFecha').classList.add('invalid'); ok=false; }
+  else document.getElementById('cajaFecha').classList.remove('invalid');
+  if(!responsable){ document.getElementById('cajaResp').classList.add('invalid'); ok=false; }
+  else document.getElementById('cajaResp').classList.remove('invalid');
+  if(!ok){ toast('Fecha y responsable son obligatorios','error'); return; }
+
+  // Leer quantys de ambos cuadros
+  const apQtys = DENOMINACIONES.map((_,i)=>Math.max(0,parseInt(document.querySelector(`.caja-qty[data-tipo="ap"][data-idx="${i}"]`)?.value||'0')||0));
+  const apBolsa = Math.max(0,parseFloat(document.querySelector('.caja-bolsa[data-tipo="ap"]')?.value||'0')||0);
+  const clQtys = DENOMINACIONES.map((_,i)=>Math.max(0,parseInt(document.querySelector(`.caja-qty[data-tipo="cl"][data-idx="${i}"]`)?.value||'0')||0));
+  const clBolsa = Math.max(0,parseFloat(document.querySelector('.caja-bolsa[data-tipo="cl"]')?.value||'0')||0);
+
+  // Upsert (sin duplicados)
+  let registro = getCaja(fecha, turno);
+  if(registro){
+    Object.assign(registro, { responsable, apQtys, apBolsa, clQtys, clBolsa });
+  }else{
+    S.efectivoCaja.push({ id:uid(), fecha, turno, responsable, apQtys, apBolsa, clQtys, clBolsa });
+  }
+  save(K.efectivoCaja, S.efectivoCaja);
+  toast(`Registro de caja guardado (${turno} · ${fmtFecha(fecha)})`,'success');
+  const ok2 = await gsSaveToSheets('inventario');
+  if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+  RENDERERS.efectivoCaja();
+}
+
+/* ================================================================
+   MÓDULO 11F: CONSOLIDADO DE CAJA
+   ================================================================ */
+let cajaCons = { desde:'', hasta:'', turno:'' };
+RENDERERS.consolidadoCaja = function(){
+  const el = document.getElementById('page-consolidadoCaja');
+  const filtrada = S.efectivoCaja
+    .filter(r=> (!cajaCons.desde||r.fecha>=cajaCons.desde) && (!cajaCons.hasta||r.fecha<=cajaCons.hasta) && (!cajaCons.turno||r.turno===cajaCons.turno))
+    .sort((a,b)=>b.fecha.localeCompare(a.fecha)||b.turno.localeCompare(a.turno));
+
+  const filas = filtrada.map(r=>{
+    const ap = totalCaja(r.apQtys, r.apBolsa);
+    const cl = totalCaja(r.clQtys, r.clBolsa);
+    const dif = cl - ap;
+    const difClass = dif>=0 ? 'color:#059669' : 'color:#dc2626';
+    return `<tr>
+      <td>${fmtFecha(r.fecha)}</td>
+      <td>${r.turno}</td>
+      <td>${r.responsable||'—'}</td>
+      <td class="num">${money(ap)}</td>
+      <td class="num">${money(cl)}</td>
+      <td class="num" style="${difClass};font-weight:600">${dif>=0?'+':''}${money(dif)}</td>
+      <td>
+        <button class="btn-icon" onclick="cajaConsEditar('${r.id}')">✏️</button>
+        <button class="btn-icon del" onclick="cajaConsDel('${r.id}')">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>📋 Consolidado de Caja</h1><p>Historial de registros de apertura y cierre de caja. La diferencia es Cierre − Apertura.</p></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="ccDesde" value="${cajaCons.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="ccHasta" value="${cajaCons.hasta}"></div>
+        <div class="field"><label>Turno</label><select id="ccTurno">
+          <option value="" ${cajaCons.turno===''?'selected':''}>Todos</option>
+          <option value="Mañana" ${cajaCons.turno==='Mañana'?'selected':''}>Mañana</option>
+          <option value="Tarde" ${cajaCons.turno==='Tarde'?'selected':''}>Tarde</option>
+        </select></div>
+        <button class="btn btn-green" id="ccExport">⬇ Exportar Excel</button>
+      </div>
+      <h2>Registros (${filtrada.length})</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Turno</th><th>Responsable</th><th class="num">Total Apertura</th><th class="num">Total Cierre</th><th class="num">Diferencia</th><th>Acciones</th></tr></thead>
+        <tbody>${filas||`<tr><td colspan="7" class="empty">No hay registros${cajaCons.desde||cajaCons.hasta||cajaCons.turno?' en el filtro seleccionado':'. Usa el módulo "Control de Caja" para crear el primero.'}.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+
+  const applyF = ()=>{
+    const d=document.getElementById('ccDesde').value, h=document.getElementById('ccHasta').value;
+    if(d&&h&&d>h){ toast('Rango de fechas inválido','error'); return; }
+    cajaCons = { desde:d, hasta:h, turno:document.getElementById('ccTurno').value };
+    RENDERERS.consolidadoCaja();
+  };
+  ['ccDesde','ccHasta','ccTurno'].forEach(id=>document.getElementById(id).onchange=applyF);
+  document.getElementById('ccExport').onclick = ()=>{
+    const datos = filtrada.map(r=>({
+      fecha:r.fecha, turno:r.turno, responsable:r.responsable||'',
+      total_apertura:totalCaja(r.apQtys,r.apBolsa),
+      total_cierre:totalCaja(r.clQtys,r.clBolsa),
+      diferencia:totalCaja(r.clQtys,r.clBolsa)-totalCaja(r.apQtys,r.apBolsa)
+    }));
+    exportarExcelSimple('Consolidado Caja', datos, `consolidado_caja_${excelTimestamp()}.xlsx`);
+    toast('Excel de consolidado de caja descargado','success');
+  };
+};
+
+window.cajaConsEditar = function(id){
+  const r = S.efectivoCaja.find(x=>x.id===id);
+  if(!r) return;
+  cajaFecha = r.fecha; cajaTurno = r.turno;
+  goto('efectivoCaja');
+};
+window.cajaConsDel = async function(id){
+  if(!confirm('¿Eliminar este registro de caja? Esta acción no se puede deshacer.')) return;
+  S.efectivoCaja = S.efectivoCaja.filter(x=>x.id!==id);
+  save(K.efectivoCaja, S.efectivoCaja);
+  toast('Registro eliminado','warn');
+  RENDERERS.consolidadoCaja();
+  const ok = await gsSaveToSheets('inventario');
+  if(!ok) toast('Eliminado localmente, pero la sincronización falló','error');
+};
+
+/* ================================================================
    MÓDULO 12: SINCRONIZACIÓN CON GOOGLE SHEETS
    ----------------------------------------------------------------
    CONFIGURACIÓN (ver Nat/README.md para el paso a paso):
@@ -3926,7 +4171,7 @@ const ACCOUNT_ROLES = {
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
-    modules: ['produccion','insumos','inventarioConsolidado','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas']
+    modules: ['produccion','insumos','inventarioConsolidado','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja']
   }
 };
 // Scopes: openid/email/profile para identificar al usuario (login) +
@@ -3955,7 +4200,7 @@ const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 // inventario se almacene en un Spreadsheet de Wingsbox.oficial@gmail.com).
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','Meta'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -4249,6 +4494,19 @@ function gsSerializeInventario(){
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','momento','onzas','botellas'], S.invLicores),
     BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo'], S.bebidasCat.map(b=>({...b, activo:b.activo!==false?1:0}))),
     StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
+    EfectivoCaja: (()=>{
+      // Serialización plana: id,fecha,turno,responsable + ap_bolsa,ap0..ap10 + cl_bolsa,cl0..cl10
+      const hdr = ['id','fecha','turno','responsable','apBolsa',
+        'ap0','ap1','ap2','ap3','ap4','ap5','ap6','ap7','ap8','ap9','ap10',
+        'clBolsa','cl0','cl1','cl2','cl3','cl4','cl5','cl6','cl7','cl8','cl9','cl10'];
+      const rows = S.efectivoCaja.map(r=>{
+        const row = { id:r.id, fecha:r.fecha, turno:r.turno, responsable:r.responsable||'', apBolsa:r.apBolsa||0, clBolsa:r.clBolsa||0 };
+        (r.apQtys||[]).forEach((q,i)=>{ row['ap'+i]=q; });
+        (r.clQtys||[]).forEach((q,i)=>{ row['cl'+i]=q; });
+        return row;
+      });
+      return gsRowsToMatrix(hdr, rows);
+    })(),
     Meta: gsRowsToMatrix(['clave','valor'], [
       { clave:'app', valor:'WingsBox Inventario' },
       { clave:'lastSync', valor:new Date().toISOString() }
@@ -4357,7 +4615,14 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.invLicores = (byName['InvLicores']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), momento:String(r.momento||'Entrada'), onzas:Number(r.onzas)||0, botellas:Number(r.botellas)||0 }));
       S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false') }));
       S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), stock:Number(r.stock)||0 }));
-      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas);
+      S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
+        id:String(r.id||uid()), fecha:String(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
+        apBolsa:Number(r.apBolsa)||0,
+        apQtys:DENOMINACIONES.map((_,i)=>Number(r['ap'+i])||0),
+        clBolsa:Number(r.clBolsa)||0,
+        clQtys:DENOMINACIONES.map((_,i)=>Number(r['cl'+i])||0)
+      }));
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
         if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn'); }
