@@ -295,6 +295,14 @@ const TIPO_PROPINA_BADGE = { efectivo:'b-extra', yape:'b-free', plin:'b-vac', ta
 const load = (k)=>{ try{ return JSON.parse(localStorage.getItem(k)) || []; }catch(e){ return []; } };
 const save = (k,v)=> localStorage.setItem(k, JSON.stringify(v));
 const uid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+// Devuelve la fecha de HOY en formato YYYY-MM-DD usando la zona horaria del
+// navegador (hora local). new Date().toISOString() usa UTC, lo que hace que
+// en zonas UTC-5 (Lima/Perú) después de las 19:00 UTC la fecha devuelta sea
+// el día siguiente, mostrando "mañana" como fecha por defecto en los módulos.
+function fechaHoy(){
+  const d=new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 // Dispara una sincronización del dominio "planilla" con Google Sheets en segundo
 // plano (fire-and-forget). Se llama inmediatamente después de cada save(K.xxx)
 // en los módulos de planilla: Empleados, Horarios, Marcaciones, Descuentos,
@@ -1163,7 +1171,7 @@ RENDERERS.marcaciones = function(){
   const dataAll = [...S.mar].sort((a,b)=> a.fecha.localeCompare(b.fecha) || nombreEmp(a.empleadoId).localeCompare(nombreEmp(b.empleadoId)));
   const data = aplicaFiltro(dataAll, marFilter);
 
-  const hoy = new Date().toISOString().slice(0,10);
+  const hoy = fechaHoy();
   const manuales = data.filter(m=>marOrigen(m)==='manual').length;
   const empOpts = empOptions(lastMarcacion.empleadoId);
 
@@ -1471,7 +1479,7 @@ let descFilter={emp:'',desde:'',hasta:''};
 RENDERERS.descuentos = function(){
   const el=document.getElementById('page-descuentos');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>➖ Descuentos</h1></div></div>`+noEmpWarning(); return; }
-  const hoy=new Date().toISOString().slice(0,10);
+  const hoy=fechaHoy();
   const list=aplicaFiltro([...S.desc].sort((a,b)=>b.fecha.localeCompare(a.fecha)), descFilter);
   const ed = editDescId? S.desc.find(x=>x.id===editDescId) : null;
   el.innerHTML=`
@@ -1532,7 +1540,7 @@ let pagoFilter={emp:'',desde:'',hasta:''};
 RENDERERS.pagos = function(){
   const el=document.getElementById('page-pagos');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>➕ Pagos extra</h1></div></div>`+noEmpWarning(); return; }
-  const hoy=new Date().toISOString().slice(0,10);
+  const hoy=fechaHoy();
   const list=aplicaFiltro([...S.pago].sort((a,b)=>b.fecha.localeCompare(a.fecha)), pagoFilter);
   const ed = editPagoId? S.pago.find(x=>x.id===editPagoId) : null;
   el.innerHTML=`
@@ -1600,7 +1608,7 @@ let editLibreId=null;
 RENDERERS.libres = function(){
   const el=document.getElementById('page-libres');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>🌴 Días libres / Vacaciones</h1></div></div>`+noEmpWarning(); return; }
-  const hoy=new Date().toISOString().slice(0,10);
+  const hoy=fechaHoy();
   const list=[...S.libre].sort((a,b)=>b.fecha.localeCompare(a.fecha));
   const ed = editLibreId? S.libre.find(x=>x.id===editLibreId) : null;
   el.innerHTML=`
@@ -1706,7 +1714,7 @@ RENDERERS.propinas = function(){
       <div class="card"><div class="empty">No hay empleados de tipo <b>Mesero</b>. Crea o asigna el tipo "Mesero" en el módulo <b>Empleados</b>.</div></div>`;
     return;
   }
-  const hoy=new Date().toISOString().slice(0,10);
+  const hoy=fechaHoy();
   const allItems=propinaItems();
   const list=aplicaFiltro([...allItems].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter);
   const ed=editPropItem;
@@ -1880,7 +1888,7 @@ window.propDel=function(itemId){
    - Validación de tarjeta (Niubiz vs Caja) por día.
    - Diferencia total de la semana.
    ================================================================ */
-let propSemana = inicioSemana(new Date().toISOString().slice(0,10));
+let propSemana = inicioSemana(fechaHoy());
 // Última lista de filas (meseros + cocina) mostrada en "Cálculo por empleado",
 // en el mismo orden que la tabla; la usa el botón "Copiar empleado y monto".
 let propConsFilasActuales = [];
@@ -1968,8 +1976,8 @@ RENDERERS.propinasConsolidado = function(){
       <p class="hint" style="margin:0">La semana se calcula automáticamente de lunes a domingo según la fecha elegida.</p>
     </div>
     <div id="propConsOut"></div>`;
-  document.getElementById('psGen').onclick=()=>{ propSemana=inicioSemana(document.getElementById('psFecha').value||new Date().toISOString().slice(0,10)); renderPropinasConsolidado(); };
-  document.getElementById('psFecha').onchange=(e)=>{ propSemana=inicioSemana(e.target.value||new Date().toISOString().slice(0,10)); };
+  document.getElementById('psGen').onclick=()=>{ propSemana=inicioSemana(document.getElementById('psFecha').value||fechaHoy()); renderPropinasConsolidado(); };
+  document.getElementById('psFecha').onchange=(e)=>{ propSemana=inicioSemana(e.target.value||fechaHoy()); };
   renderPropinasConsolidado();
 };
 
@@ -2729,7 +2737,7 @@ function seedData(){
   S.libre.push({id:uid(),empleadoId:e2,fecha:`${y}-${m}-06`,tipo:'Vacaciones',comentario:'Vacaciones programadas'});
 
   // Propinas de ejemplo (semana actual) + marcaciones de cocineros esos días
-  const lunes = inicioSemana(new Date().toISOString().slice(0,10));
+  const lunes = inicioSemana(fechaHoy());
   const [ly,lm,ld] = lunes.split('-').map(Number);
   const diaSem = (offset)=>{ const dt=new Date(ly,lm-1,ld+offset); return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`; };
   const cocineros = S.emp.filter(esCocina);
@@ -2874,7 +2882,7 @@ function produccionUpsert(insumoId, fecha, produccion, cierre){
 }
 
 /* ---------- Producción: registro diario por insumo ---------- */
-let prodFecha = new Date().toISOString().slice(0,10);
+let prodFecha = fechaHoy();
 RENDERERS.produccion = function(){
   const el = document.getElementById('page-produccion');
   if(!S.insumos.length){
@@ -2904,7 +2912,7 @@ RENDERERS.produccion = function(){
       </div>
       <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con Google Sheets.</p>
     </div>`;
-  document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || new Date().toISOString().slice(0,10); RENDERERS.produccion(); };
+  document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
   document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
   document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
 };
@@ -3082,7 +3090,7 @@ const INV_MAX_DIAS = 60;
 // Resuelve el rango efectivo (con valores por defecto si el usuario dejó algún
 // campo vacío) y la lista de fechas (ascendente) que se usará como columnas.
 function invRangoEfectivo(){
-  const hoy = new Date().toISOString().slice(0,10);
+  const hoy = fechaHoy();
   let desde = invConsFilter.desde || hoy;
   let hasta = invConsFilter.hasta || hoy;
   if(desde>hasta){ const t=desde; desde=hasta; hasta=t; }
@@ -3385,7 +3393,7 @@ window.licorDel=function(id){
 };
 
 /* ─── 11C-2: Inventario Diario de Licores ─── */
-let invLicoresFecha = new Date().toISOString().slice(0,10);
+let invLicoresFecha = fechaHoy();
 let invLicoresMomento = 'Entrada';
 RENDERERS.invDiarioLicores = function(){
   const el = document.getElementById('page-invDiarioLicores');
@@ -3426,7 +3434,7 @@ RENDERERS.invDiarioLicores = function(){
       </div>
       <p class="hint">Las onzas y botellas solo admiten números enteros. Si ya existe un registro para esta combinación de Fecha + Momento, se actualizará sin crear duplicados.</p>
     </div>`;
-  document.getElementById('invLicFecha').onchange=(e)=>{ invLicoresFecha=e.target.value||new Date().toISOString().slice(0,10); RENDERERS.invDiarioLicores(); };
+  document.getElementById('invLicFecha').onchange=(e)=>{ invLicoresFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioLicores(); };
   document.getElementById('invLicMomento').onchange=(e)=>{ invLicoresMomento=e.target.value; RENDERERS.invDiarioLicores(); };
   document.getElementById('invLicGuardar').onclick=invLicoresGuardar;
   document.getElementById('invLicExport').onclick=invLicoresExportar;
@@ -3440,8 +3448,8 @@ async function invLicoresGuardar(){
   if(!ok){ toast('Los valores de onzas y botellas deben ser números enteros y no negativos','error'); return; }
   let guardados=0;
   document.querySelectorAll('.invLicOz').forEach(inp=>{
-    const bebidaId=inp.dataset.id;
-    const botInp=document.querySelector(`.invLicBot[data-id="${bebidaId}"]`);
+    const licorId=inp.dataset.id;   // ← corregido: era "bebidaId" (variable no declarada)
+    const botInp=document.querySelector(`.invLicBot[data-id="${licorId}"]`);
     const oz=inp.value.trim()===''?0:Number(inp.value);
     const bot=botInp&&botInp.value.trim()!==''?Number(botInp.value):0;
     if(inp.value.trim()!=='' || (botInp&&botInp.value.trim()!=='')){
@@ -3467,8 +3475,8 @@ function invLicoresExportar(){
 }
 
 /* ─── 11C-3: Cotejo de Consumo de Licores ─── */
-let cotejoLicIni  = { fecha: new Date().toISOString().slice(0,10), momento:'Entrada' };
-let cotejoLicFin  = { fecha: new Date().toISOString().slice(0,10), momento:'Salida'  };
+let cotejoLicIni  = { fecha: fechaHoy(), momento:'Entrada' };
+let cotejoLicFin  = { fecha: fechaHoy(), momento:'Salida'  };
 RENDERERS.cotejoLicores = function(){
   const el = document.getElementById('page-cotejoLicores');
   const licoresOrdenados=[...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
@@ -3703,7 +3711,7 @@ window.bebCatDel = function(id){
 };
 
 /* ─── 11D-2: Stock Diario de Bebidas ─── */
-let stockBebidasFecha = new Date().toISOString().slice(0,10);
+let stockBebidasFecha = fechaHoy();
 RENDERERS.stockDiarioBebidas = function(){
   const el = document.getElementById('page-stockDiarioBebidas');
   const activas = S.bebidasCat.filter(b=>b.activo!==false).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
@@ -3739,7 +3747,7 @@ RENDERERS.stockDiarioBebidas = function(){
       </div>
       <p class="hint">Los valores negativos no están permitidos. Si ya existe un registro para esta combinación de Fecha + Bebida, se actualiza sin duplicar.</p>
     </div>`;
-  document.getElementById('stockBebFecha').onchange=(e)=>{ stockBebidasFecha=e.target.value||new Date().toISOString().slice(0,10); RENDERERS.stockDiarioBebidas(); };
+  document.getElementById('stockBebFecha').onchange=(e)=>{ stockBebidasFecha=e.target.value||fechaHoy(); RENDERERS.stockDiarioBebidas(); };
   document.getElementById('stockBebGuardar').onclick=stockBebidasGuardar;
   document.getElementById('stockBebExport').onclick=stockBebidasExportar;
 };
@@ -3775,7 +3783,7 @@ let consBebidasFilter = (()=>{
 })();
 const CONS_BEB_MAX_DIAS = 60;
 function consBebidasRangoEfectivo(){
-  const hoy=new Date().toISOString().slice(0,10);
+  const hoy=fechaHoy();
   let desde=consBebidasFilter.desde||hoy, hasta=consBebidasFilter.hasta||hoy;
   if(desde>hasta){ const t=desde; desde=hasta; hasta=t; }
   let fechas=rangoFechas(desde,hasta);
