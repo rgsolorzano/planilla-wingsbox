@@ -665,14 +665,9 @@ function goto(page){
     tarjetaValPendiente = false;
   }
   currentPage=page;
-  // Para el dominio inventario re-renderiza el accordion completo (gestiona activos y grupos).
-  // Para el dominio planilla actualiza el resaltado de botones estáticos como antes.
-  const role = currentRole();
-  if(role && role.domain==='inventario'){
-    renderNavAccordion(page);
-  } else {
-    document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
-  }
+  // Ambos dominios (planilla e inventario) usan el accordion: re-renderiza con la
+  // página activa marcada y el grupo correspondiente auto-abierto.
+  renderNavAccordion(page);
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.getElementById('page-'+page).classList.add('active');
   document.getElementById('nav').classList.remove('open');
@@ -3984,16 +3979,8 @@ RENDERERS.efectivoCaja = function(){
   const apBolsa = registro ? (registro.apBolsa||0) : 0;
   const clBolsa = registro ? (registro.clBolsa||0) : 0;
 
-  // Responsable: lee desde localStorage de planilla, filtra solo Meseros (orden alfabético).
-  // Lee de localStorage directamente (sin usar S.emp que está vacío en el dominio inventario)
-  // sin romper el aislamiento en memoria — es solo lectura para poblar un datalist.
-  const empleadosPlanilla = (()=>{ try{ return JSON.parse(localStorage.getItem('pl_empleados')||'[]'); }catch(e){ return []; } })();
-  const meseros = empleadosPlanilla
-    .filter(e=> (e.tipo||'Mesero')==='Mesero')
-    .sort((a,b)=>a.nombre.localeCompare(b.nombre,'es'));
-  const datalistOpts = meseros.map(e=>`<option value="${e.nombre}">`).join('');
-  const noMeserosMsg = meseros.length===0 ? '<p class="hint" style="color:#dc2626;margin-top:4px">No hay meseros registrados. Agrégalos en Empleados (cuenta Multiboxes).</p>' : '';
-
+  // Campo Responsable: texto libre — el usuario escribe el nombre directamente.
+  // Compatible con registros históricos que venían del datalist de meseros.
   const cuadroHTML = (tipo, qtys, bolsa) => {
     const tituloTipo = tipo==='ap' ? 'Apertura de Caja' : 'Cierre de Caja';
     const filasDenom = DENOMINACIONES.map((nom, i)=>{
@@ -4030,7 +4017,7 @@ RENDERERS.efectivoCaja = function(){
 
   el.innerHTML = `
     <div class="page-head"><div><h1>💰 Control de Efectivo en Caja</h1><p>Registra el efectivo físico en caja al inicio y al final de cada turno.</p></div></div>
-    <datalist id="cajaRespList">${datalistOpts}</datalist>
+    <datalist id="cajaRespList"></datalist>
     <div class="card">
       <div class="form-grid">
         <div class="field"><label>Fecha *</label><input type="date" id="cajaFecha" value="${cajaFecha}" required></div>
@@ -4038,8 +4025,7 @@ RENDERERS.efectivoCaja = function(){
           <option value="Mañana" ${cajaTurno==='Mañana'?'selected':''}>Mañana</option>
           <option value="Tarde" ${cajaTurno==='Tarde'?'selected':''}>Tarde</option>
         </select></div>
-        <div class="field"><label>Responsable *</label><input id="cajaResp" list="cajaRespList" placeholder="Nombre del responsable" value="${registro?registro.responsable:''}">
-        ${noMeserosMsg}</div>
+        <div class="field"><label>Responsable *</label><input type="text" id="cajaResp" placeholder="Nombre de quien realiza el arqueo" value="${registro?registro.responsable:''}"></div>
       </div>
       ${registro ? '<p class="hint" style="margin-top:4px;color:#059669">✓ Registro existente cargado. Puedes editar y guardar para actualizarlo.</p>' : ''}
     </div>
@@ -4112,11 +4098,19 @@ async function cajaGuardar(){
 /* ================================================================
    MÓDULO 11F: CONSOLIDADO DE CAJA
    ================================================================ */
-let cajaCons = { desde:'', hasta:'', turno:'' };
+let cajaCons = (()=>{
+  const hoy = fechaHoy();
+  const hace7 = new Date(); hace7.setDate(hace7.getDate()-7);
+  const desde = `${hace7.getFullYear()}-${String(hace7.getMonth()+1).padStart(2,'0')}-${String(hace7.getDate()).padStart(2,'0')}`;
+  return { desde, hasta:hoy, turno:'', resp:'' };
+})();
 RENDERERS.consolidadoCaja = function(){
   const el = document.getElementById('page-consolidadoCaja');
   const filtrada = S.efectivoCaja
-    .filter(r=> (!cajaCons.desde||r.fecha>=cajaCons.desde) && (!cajaCons.hasta||r.fecha<=cajaCons.hasta) && (!cajaCons.turno||r.turno===cajaCons.turno))
+    .filter(r=> (!cajaCons.desde||r.fecha>=cajaCons.desde)
+             && (!cajaCons.hasta||r.fecha<=cajaCons.hasta)
+             && (!cajaCons.turno||r.turno===cajaCons.turno)
+             && (!cajaCons.resp||(r.responsable||'').toLowerCase().includes(cajaCons.resp.toLowerCase())))
     .sort((a,b)=>b.fecha.localeCompare(a.fecha)||b.turno.localeCompare(a.turno));
 
   const filas = filtrada.map(r=>{
@@ -4149,22 +4143,24 @@ RENDERERS.consolidadoCaja = function(){
           <option value="Mañana" ${cajaCons.turno==='Mañana'?'selected':''}>Mañana</option>
           <option value="Tarde" ${cajaCons.turno==='Tarde'?'selected':''}>Tarde</option>
         </select></div>
+        <div class="field"><label>Responsable</label><input type="text" id="ccResp" placeholder="Buscar por nombre…" value="${cajaCons.resp}"></div>
         <button class="btn btn-green" id="ccExport">⬇ Exportar Excel</button>
       </div>
       <h2>Registros (${filtrada.length})</h2>
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Turno</th><th>Responsable</th><th class="num">Total Apertura</th><th class="num">Total Cierre</th><th class="num">Diferencia</th><th>Acciones</th></tr></thead>
-        <tbody>${filas||`<tr><td colspan="7" class="empty">No hay registros${cajaCons.desde||cajaCons.hasta||cajaCons.turno?' en el filtro seleccionado':'. Usa el módulo "Control de Caja" para crear el primero.'}.</td></tr>`}</tbody>
+        <tbody>${filas||`<tr><td colspan="7" class="empty">No hay registros${cajaCons.desde||cajaCons.hasta||cajaCons.turno||cajaCons.resp?' en el filtro seleccionado':'. Usa el módulo "Control de Caja" para crear el primero.'}.</td></tr>`}</tbody>
       </table></div>
     </div>`;
 
   const applyF = ()=>{
     const d=document.getElementById('ccDesde').value, h=document.getElementById('ccHasta').value;
     if(d&&h&&d>h){ toast('Rango de fechas inválido','error'); return; }
-    cajaCons = { desde:d, hasta:h, turno:document.getElementById('ccTurno').value };
+    cajaCons = { desde:d, hasta:h, turno:document.getElementById('ccTurno').value, resp:document.getElementById('ccResp').value };
     RENDERERS.consolidadoCaja();
   };
   ['ccDesde','ccHasta','ccTurno'].forEach(id=>document.getElementById(id).onchange=applyF);
+  document.getElementById('ccResp').oninput=applyF;
   document.getElementById('ccExport').onclick = ()=>{
     const datos = filtrada.map(r=>({
       fecha:r.fecha, turno:r.turno, responsable:r.responsable||'',
@@ -4860,47 +4856,70 @@ function paginaPorDefecto(){
 // el menú entero está detrás del auth gate (ver CSS body:not(.authed)).
 // Captura el HTML del menú estático de planilla al inicio para poder restaurarlo
 // si la sesión cambia de un usuario de inventario (accordion) a uno de planilla.
-const PLANILLA_NAV_HTML = document.getElementById('nav').innerHTML;
+const PLANILLA_NAV_HTML = document.getElementById('nav').innerHTML; // fallback de seguridad
 
-// ── Definición de grupos del menú accordion (solo para el dominio inventario) ──
-// Los módulos del dominio planilla mantienen el menú plano existente.
+// ── Grupos accordion del dominio INVENTARIO (Wingsbox) ──
 const NAV_GROUPS_INVENTARIO = [
-  { id:'admin',  ico:'📂', label:'Administración y Configuración',
+  { id:'inv-admin',  ico:'📂', label:'Administración y Configuración',
     modules:['insumos','licores','bebidasAdmin','syncInventario'] },
-  { id:'diario', ico:'📝', label:'Registro Diario',
+  { id:'inv-diario', ico:'📝', label:'Registro Diario',
     modules:['produccion','invDiarioLicores','stockDiarioBebidas'] },
-  { id:'cons',   ico:'📊', label:'Consolidados y Cotejos',
+  { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
     modules:['inventarioConsolidado','cotejoLicores','consolidadoStockBebidas'] },
-  { id:'caja',   ico:'💰', label:'Caja',
+  { id:'inv-caja',   ico:'💰', label:'Caja',
     modules:['efectivoCaja','consolidadoCaja'] }
 ];
-// Labels e íconos de cada módulo del inventario (para generarlos dinámicamente)
+
+// ── Grupos accordion del dominio PLANILLA (Multiboxes) ──
+const NAV_GROUPS_PLANILLA = [
+  { id:'pl-admin',    ico:'👥', label:'Administración y Configuración',
+    modules:['empleados','horarios','admin'] },
+  { id:'pl-registro', ico:'📝', label:'Registro de Información',
+    modules:['marcaciones','descuentos','pagos','libres'] },
+  { id:'pl-propinas', ico:'💵', label:'Propinas',
+    modules:['propinas','propinasConsolidado'] },
+  { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
+    modules:['calculo','consolidado','boleta'] }
+];
+
+// ── Labels e íconos de todos los módulos (inventario + planilla) ──
 const NAV_MODULE_LABELS = {
+  // Inventario
   insumos:['🧂','Insumos'], licores:['🍾','Licores'], bebidasAdmin:['🥤','Bebidas'],
   syncInventario:['☁️','Sync. Inventario'], produccion:['📦','Producción'],
   invDiarioLicores:['📋','Inv. Diario Licores'], stockDiarioBebidas:['📋','Stock Diario Bebidas'],
   inventarioConsolidado:['📈','Consolidado de Inventario'], cotejoLicores:['📊','Cotejo Licores'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'],
-  efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja']
+  efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja'],
+  // Planilla
+  empleados:['👥','Empleados'], horarios:['🕒','Horarios'], admin:['⚙️','Administración'],
+  marcaciones:['📥','Carga de horas'], descuentos:['➖','Descuentos'],
+  pagos:['➕','Pagos Extra'], libres:['🌴','Días Libres / Vacaciones'],
+  propinas:['💵','Propinas'], propinasConsolidado:['🧮','Consolidado Propinas'],
+  calculo:['🧮','Cálculo Quincenal'], consolidado:['📊','Consolidado'], boleta:['🧾','Boleta por Empleado']
 };
-// Estado de los grupos accordion durante la sesión (open/closed por ID de grupo).
-// Por defecto todos están cerrados.
+
+// Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
+// (pl-* vs inv-*) para que coexistan sin conflicto en este mismo objeto.
 let navGroupState = {};
 
-// Genera y monta el menú accordion para el dominio inventario.
-// Para el dominio planilla el menú es estático (HTML) y no se toca.
-function renderNavAccordion(activePage){
+// Renderiza el menú accordion para el dominio activo.
+// Elige automáticamente los grupos de Planilla o Inventario según el rol conectado.
+// Si no hay rol (sin sesión), muestra los grupos de planilla por defecto.
+// suppressAutoOpen=true: no abre el grupo de la página activa (útil al iniciar sesión
+//   para que el menú comience completamente contraído; el usuario navega para abrir).
+function renderNavAccordion(activePage, suppressAutoOpen){
   const role = currentRole();
-  if(!role || role.domain !== 'inventario') return; // planilla: menú plano estático
+  const domain = role ? role.domain : 'planilla';
+  const groups = domain === 'inventario' ? NAV_GROUPS_INVENTARIO : NAV_GROUPS_PLANILLA;
   const nav = document.getElementById('nav');
   let html = '';
-  NAV_GROUPS_INVENTARIO.forEach(g=>{
-    // Solo incluir el grupo si al menos uno de sus módulos está permitido para este rol
-    const modulos = g.modules.filter(m=> role.modules.includes(m));
+  groups.forEach(g=>{
+    // Filtra módulos que el rol permite ver (sin rol: muestra todos del grupo)
+    const modulos = g.modules.filter(m=> !role || role.modules.includes(m));
     if(!modulos.length) return;
     const hayActivo = modulos.includes(activePage);
-    // Auto-abrir el grupo que contiene la página activa
-    if(hayActivo) navGroupState[g.id] = true;
+    if(hayActivo && !suppressAutoOpen) navGroupState[g.id] = true; // auto-abrir el grupo con la página activa
     const isOpen = !!navGroupState[g.id];
     html += `<div class="nav-group ${isOpen?'open':''} ${hayActivo?'has-active':''}" data-group="${g.id}">
       <button class="nav-group-header" data-toggle-group="${g.id}">
@@ -4914,23 +4933,10 @@ function renderNavAccordion(activePage){
   nav.innerHTML = html;
 }
 
-// Reemplaza la función original que mostraba/ocultaba botones en el menú estático.
-// Para el dominio inventario renderiza el accordion completo.
-// Para el dominio planilla muestra/oculta los botones estáticos como antes.
+// Aplica el accordion de acuerdo con el dominio del rol activo.
+// Pasa suppressAutoOpen=true para que el menú comience contraído al iniciar sesión.
 function aplicarPermisosNav(){
-  const role = currentRole();
-  if(role && role.domain === 'inventario'){
-    renderNavAccordion(currentPage);
-  } else {
-    // Restaurar el HTML del nav estático si fue reemplazado por el accordion de inventario.
-    if(nav.querySelector('.nav-group')){
-      nav.innerHTML = PLANILLA_NAV_HTML;
-    }
-    document.querySelectorAll('.nav button[data-page]').forEach(b=>{
-      const permitido = !role || role.modules.includes(b.dataset.page);
-      b.style.display = permitido ? '' : 'none';
-    });
-  }
+  renderNavAccordion(currentPage, /*suppressAutoOpen=*/true);
 }
 
 // Toggle de grupos accordion (delegado en el nav)
