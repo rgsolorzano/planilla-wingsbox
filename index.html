@@ -329,24 +329,8 @@ function fechaHoy(){
   const d=new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
-// Dispara una sincronización del dominio "planilla" con Google Sheets en segundo
-// plano (fire-and-forget). Se llama inmediatamente después de cada save(K.xxx)
-// en los módulos de planilla: Empleados, Horarios, Marcaciones, Descuentos,
-// Pagos Extra, Días Libres, Propinas, Horas Extra y Exoneración de Tardanza.
-//
-// Diseño intencional:
-// • No usa async/await en el sitio de llamada → no cambia las firmas de las
-//   funciones CRUD existentes (que son sincrónicas).
-// • gsSaveToSheets() ya maneja internamente sus propios errores y muestra
-//   toasts descriptivos; syncPlanilla() solo captura para no generar unhandled.
-// • No se invoca si no hay sesión activa (isAuthorized() = false): en ese caso
-//   la sincronización ocurrirá la próxima vez que se use el botón manual
-//   "Guardar en Google Sheets" o al iniciar sesión (sync automático en authGrant).
-function syncPlanilla(){
-  if(typeof isAuthorized === 'function' && isAuthorized()){
-    gsSaveToSheets('planilla').catch(e=>console.error('syncPlanilla:', e));
-  }
-}
+// syncPlanilla() fue eliminada — cada módulo llama a su propio wrapper de sincronización
+// (syncEmpleados, syncHorarios, syncMarcaciones, etc.) para garantizar aislamiento total.
 
 /* Preferencia por día: ¿incluir pago por horas extra en la quincena? (default: sí) */
 function loadConsiderarHE(){
@@ -400,7 +384,7 @@ function setExoneracionTardanza(empId, fecha, activa, horas){
   if(activa) EXO_TARD[k] = { activa:true, horas: Number(horas)||0 };
   else delete EXO_TARD[k];
   saveExoTard();
-  syncPlanilla();
+  syncExoTardGS();
 }
 function exoTardToRows(){
   return Object.entries(EXO_TARD).map(([k, v])=>{
@@ -969,14 +953,14 @@ function empSave(){
     const e=S.emp.find(x=>x.id===editEmpId);
     Object.assign(e,{nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
-    syncPlanilla();
+    syncEmpleados();
   }else{
     const id=uid();
     S.emp.push({id,nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
-    syncPlanilla();
+    syncEmpleados(); syncHorarios();
   }
   RENDERERS.empleados();
 }
@@ -995,7 +979,7 @@ window.empDel = function(id){
   saveConsiderarHE(CONSIDERAR_HE);
   save(K.emp,S.emp);save(K.hor,S.hor);save(K.mar,S.mar);save(K.desc,S.desc);save(K.pago,S.pago);save(K.libre,S.libre);save(K.prop,S.prop);
   toast('Empleado eliminado','warn'); RENDERERS.empleados();
-  syncPlanilla();
+  syncEmpleados(); syncHorarios(); syncMarcaciones(); syncDescuentos(); syncPagosDom(); syncLibresDom(); syncPropinas();
 };
 // genera horario base (Lun-Vie laboral, Sab/Dom libre) para un empleado
 function crearHorarioDefault(empId){
@@ -1082,7 +1066,7 @@ window.horSet = function(dia, campo, val){
 function horGuardar(silent){
   save(K.hor,S.hor);
   if(!silent) toast('Horario guardado','success');
-  syncPlanilla();
+  syncHorarios();
 }
 
 /* ================================================================
@@ -1280,7 +1264,7 @@ RENDERERS.marcaciones = function(){
 window.marSet = function(id, campo, val){
   const m=S.mar.find(x=>x.id===id); if(!m) return;
   m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar); RENDERERS.marcaciones();
-  syncPlanilla();
+  syncMarcaciones();
 };
 window.marDel = function(id){
   const m=S.mar.find(x=>x.id===id);
@@ -1288,7 +1272,7 @@ window.marDel = function(id){
   S.mar=S.mar.filter(x=>x.id!==id); save(K.mar,S.mar);
   toast(esManual?'Marcación manual eliminada correctamente':'Marcación eliminada','warn');
   RENDERERS.marcaciones();
-  syncPlanilla();
+  syncMarcaciones();
 };
 function addMarManual(){
   if(!S.emp.length){ toast('Primero registra empleados','error'); return; }
@@ -1312,7 +1296,7 @@ function addMarManual(){
   lastMarcacion = { empleadoId: empId, fecha: fecha };
   toast('Marcación manual agregada correctamente','success');
   RENDERERS.marcaciones();
-  syncPlanilla();
+  syncMarcaciones();
 }
 
 // Convierte un serial de Excel (o Date/string) a {fecha:'YYYY-MM-DD', hm:'HH:MM'}
@@ -1360,7 +1344,7 @@ function importarExcel(){
       const { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas } =
         aplicarGruposMarcacion(grupos, { reemplazar, conservarManuales });
       save(K.mar,S.mar);
-      syncPlanilla();
+      syncMarcaciones();
 
       let msg = `<div class="card" style="background:#f0fdf4;border-color:#bbf7d0">
         <b>✔ Nueva carga procesada correctamente.</b> Filas leídas: ${leidas}. Marcaciones nuevas: ${nuevas}, actualizadas: ${actualizadas}.`;
@@ -1453,8 +1437,7 @@ async function sincronizarMarcacionesDesdeSheet(){
     // Refleja el cambio también en el spreadsheet de almacenamiento de la app,
     // reutilizando tal cual el mecanismo de guardado ya existente (mismo botón
     // "⬆ Guardar en Google Sheets" del módulo de Administración).
-    try{ await gsSaveToSheets(); }
-    catch(e){ console.error(e); /* gsSaveToSheets ya muestra su propio toast de error */ }
+    syncMarcaciones();
 
   }catch(err){
     console.error(err);
@@ -1546,17 +1529,17 @@ RENDERERS.descuentos = function(){
     if(editDescId){
       const d=S.desc.find(x=>x.id===editDescId);
       Object.assign(d,{empleadoId:dEmp.value, fecha:dFecha.value, tipo:dTipo.value, monto, detalle:dDet.value.trim()});
-      editDescId=null; save(K.desc,S.desc); toast('Descuento actualizado','success'); syncPlanilla();
+      editDescId=null; save(K.desc,S.desc); toast('Descuento actualizado','success'); syncDescuentos();
     }else{
       S.desc.push({id:uid(), empleadoId:dEmp.value, fecha:dFecha.value, tipo:dTipo.value, monto, detalle:dDet.value.trim()});
-      save(K.desc,S.desc); toast('Descuento registrado','success'); syncPlanilla();
+      save(K.desc,S.desc); toast('Descuento registrado','success'); syncDescuentos();
     }
     RENDERERS.descuentos();
   };
   if(ed) document.getElementById('dCancel').onclick=()=>{ editDescId=null; RENDERERS.descuentos(); };
 };
 window.descEdit=function(id){ editDescId=id; RENDERERS.descuentos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.filter(d=>d.id!==id); save(K.desc,S.desc); toast('Descuento eliminado','warn'); RENDERERS.descuentos(); syncPlanilla(); };
+window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.filter(d=>d.id!==id); save(K.desc,S.desc); toast('Descuento eliminado','warn'); RENDERERS.descuentos(); syncDescuentos(); };
 
 /* ================================================================
    MÓDULO 5: PAGOS EXTRA
@@ -1607,17 +1590,17 @@ RENDERERS.pagos = function(){
     if(editPagoId){
       const p=S.pago.find(x=>x.id===editPagoId);
       Object.assign(p,{empleadoId:pEmp.value, fecha:pFecha.value, tipo:pTipo.value, monto, detalle:pDet.value.trim()});
-      editPagoId=null; save(K.pago,S.pago); toast('Pago extra actualizado','success'); syncPlanilla();
+      editPagoId=null; save(K.pago,S.pago); toast('Pago extra actualizado','success'); syncPagosDom();
     }else{
       S.pago.push({id:uid(), empleadoId:pEmp.value, fecha:pFecha.value, tipo:pTipo.value, monto, detalle:pDet.value.trim()});
-      save(K.pago,S.pago); toast('Pago extra registrado','success'); syncPlanilla();
+      save(K.pago,S.pago); toast('Pago extra registrado','success'); syncPagosDom();
     }
     RENDERERS.pagos();
   };
   if(ed) document.getElementById('pCancel').onclick=()=>{ editPagoId=null; RENDERERS.pagos(); };
 };
 window.pagoEdit=function(id){ editPagoId=id; RENDERERS.pagos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.filter(p=>p.id!==id); save(K.pago,S.pago); toast('Pago extra eliminado','warn'); RENDERERS.pagos(); syncPlanilla(); };
+window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.filter(p=>p.id!==id); save(K.pago,S.pago); toast('Pago extra eliminado','warn'); RENDERERS.pagos(); syncPagosDom(); };
 
 /* ================================================================
    MÓDULO 6: DÍAS LIBRES Y VACACIONES
@@ -1671,7 +1654,7 @@ RENDERERS.libres = function(){
     if(editLibreId){
       const l=S.libre.find(x=>x.id===editLibreId);
       Object.assign(l,{empleadoId:lEmp.value, fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
-      editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success'); syncPlanilla();
+      editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success'); syncLibresDom();
     }else{
       const ini=lFecha.value, fin=document.getElementById('lFechaFin').value;
       if(fin && fin<ini){ toast('La fecha fin no puede ser anterior a la de inicio','error'); return; }
@@ -1686,14 +1669,14 @@ RENDERERS.libres = function(){
       });
       save(K.libre,S.libre);
       toast(creados>1?`${creados} días registrados`:'Registro guardado','success');
-      syncPlanilla();
+      syncLibresDom();
     }
     RENDERERS.libres();
   };
   if(ed) document.getElementById('lCancel').onclick=()=>{ editLibreId=null; RENDERERS.libres(); };
 };
 window.libreEdit=function(id){ editLibreId=id; RENDERERS.libres(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); syncPlanilla(); };
+window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); syncLibresDom(); };
 
 /* ================================================================
    MÓDULO 6B: INGRESO DE PROPINAS (por mesero y por día)
@@ -1853,7 +1836,7 @@ function propGuardarNuevo(){
   filas.forEach(f=> S.prop.push({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto }));
   save(K.prop,S.prop);
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
-  syncPlanilla();
+  syncPropinas();
 
   lastPropina = { empleadoId, fecha };
   // Mantiene el encabezado (mesero/fecha) sincronizado con lo recién guardado,
@@ -1882,7 +1865,7 @@ function propActualizar(){
   propinaItemActualizar(editPropItem, { empleadoId, fecha, tipo, monto:Number(v) });
   save(K.prop,S.prop);
   toast('Propina actualizada','success');
-  syncPlanilla();
+  syncPropinas();
   editPropItem=null;
   lastPropina = { empleadoId, fecha };
   RENDERERS.propinas();
@@ -1902,7 +1885,7 @@ window.propDel=function(itemId){
   propinaItemEliminar(item);
   save(K.prop,S.prop);
   toast('Propina eliminada','warn');
-  syncPlanilla();
+  syncPropinas();
   RENDERERS.propinas();
 };
 
@@ -2208,7 +2191,8 @@ async function tarjetaValGuardar(){
   if(btn){ btn.disabled=true; btn.dataset.txt=btn.textContent; btn.textContent='Guardando…'; }
   try{
     save(K.tarjetaVal, S.tarjetaVal);
-    const ok = await gsSaveToSheets('planilla');
+    console.log('[TarjetaVal] Guardando', S.tarjetaVal.length, 'registros de validación de tarjeta');
+    const ok = await gsSaveSheet('planilla','ValidacionTarjeta', gsSerializeSheet('planilla','ValidacionTarjeta'));
     if(ok){
       tarjetaValPendiente = false;
       toast('Validación de tarjeta guardada correctamente','success');
@@ -2279,7 +2263,7 @@ function calcGuardarConsiderarHE(){
   calcPendingHE = {};
   saveConsiderarHE(CONSIDERAR_HE);
   toast('Preferencias de horas extra guardadas','success');
-  syncPlanilla();
+  syncConsHE();
   renderCalculo();
 }
 function updateCalcSaveHEUI(){
@@ -2974,7 +2958,7 @@ async function guardarProduccion(){
   save(K.produccion, S.produccion);
   toast(`Producción guardada (${guardados} insumo(s)).`,'success');
   RENDERERS.produccion();
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+  syncProduccion();
 }
 function exportarProduccionDiaExcel(){
   const datos = S.insumos.map(ins=>{
@@ -3084,7 +3068,7 @@ async function insumosActualizarResaltados(){
       if(ins) ins.resaltadoCelda = cb.checked;
     });
     save(K.insumos, S.insumos);
-    const ok = await gsSaveToSheets('inventario');
+    const ok = await gsSaveSheet('inventario','Insumos',gsSerializeSheet('inventario','Insumos'));
     if(ok) toast('Cambios actualizados y sincronizados correctamente','success');
     else toast('Los cambios se guardaron localmente, pero ocurrió un error al sincronizar con Google Sheets','error');
   }finally{
@@ -3285,7 +3269,7 @@ window.invSetCampo = async function(id, campo, valor){
   save(K.produccion, S.produccion);
   toast('Registro actualizado','success');
   RENDERERS.inventarioConsolidado();
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+  syncProduccion();
 };
 // Elimina TODOS los registros de producción (de TODOS los insumos) de una
 // fecha específica. Reemplaza la eliminación por registro individual.
@@ -3297,7 +3281,7 @@ window.invDeleteDia = async function(fecha){
   save(K.produccion, S.produccion);
   toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
   RENDERERS.inventarioConsolidado();
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+  syncProduccion();
 };
 
 /* ---------- Administración de sincronización (Inventario) ---------- */
@@ -3432,7 +3416,7 @@ function licorSave(){
     toast('Licor creado','success');
   }
   save(K.licores,S.licores);
-  gsSaveToSheets('inventario').catch(()=>{});
+  syncLicores();
   RENDERERS.licores();
 }
 window.licorEdit=function(id){ editLicorId=id; RENDERERS.licores(); window.scrollTo({top:0,behavior:'smooth'}); };
@@ -3442,7 +3426,7 @@ window.licorDel=function(id){
   S.licores=S.licores.filter(b=>b.id!==id);
   save(K.licores,S.licores);
   toast('Licor eliminado','warn');
-  gsSaveToSheets('inventario').catch(()=>{});
+  syncLicores();
   RENDERERS.licores();
 };
 
@@ -3531,7 +3515,7 @@ async function invLicoresGuardar(){
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
   save(K.invLicores,S.invLicores);
   toast(`Inventario guardado (${guardados} licor(es)).`,'success');
-  const ok2=await gsSaveToSheets('inventario');
+  const ok2=await gsSaveSheet('inventario','InvLicores',gsSerializeSheet('inventario','InvLicores'));
   if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
   RENDERERS.invDiarioLicores();
 }
@@ -3758,7 +3742,7 @@ function bebCatSave(){
     toast('Bebida creada','success');
   }
   save(K.bebidasCat,S.bebidasCat);
-  gsSaveToSheets('inventario').catch(()=>{});
+  syncBebidasCat();
   RENDERERS.bebidasAdmin();
 }
 window.bebCatToggle = function(id, activo){
@@ -3766,7 +3750,7 @@ window.bebCatToggle = function(id, activo){
   b.activo = !!activo;
   save(K.bebidasCat,S.bebidasCat);
   toast(activo?'Bebida activada':'Bebida desactivada','success');
-  gsSaveToSheets('inventario').catch(()=>{});
+  syncBebidasCat();
   RENDERERS.bebidasAdmin();
 };
 window.bebCatEdit = function(id){ editBebidaCatId=id; RENDERERS.bebidasAdmin(); window.scrollTo({top:0,behavior:'smooth'}); };
@@ -3776,7 +3760,7 @@ window.bebCatDel = function(id){
   S.bebidasCat = S.bebidasCat.filter(b=>b.id!==id);
   save(K.bebidasCat,S.bebidasCat);
   toast('Bebida eliminada','warn');
-  gsSaveToSheets('inventario').catch(()=>{});
+  syncBebidasCat();
   RENDERERS.bebidasAdmin();
 };
 
@@ -3835,7 +3819,7 @@ async function stockBebidasGuardar(){
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
   save(K.stockBebidas,S.stockBebidas);
   toast(`Stock guardado (${guardados} bebida(s)).`,'success');
-  const ok2=await gsSaveToSheets('inventario');
+  const ok2=await gsSaveSheet('inventario','StockBebidas',gsSerializeSheet('inventario','StockBebidas'));
   if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
   RENDERERS.stockDiarioBebidas();
 }
@@ -3938,7 +3922,7 @@ window.consBebidasSet = async function(id, valor){
   save(K.stockBebidas,S.stockBebidas);
   toast('Stock actualizado','success');
   RENDERERS.consolidadoStockBebidas();
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+  syncStockBebidas();
 };
 window.consBebidasDelDia = async function(fecha){
   const cantidad=S.stockBebidas.filter(r=>r.fecha===fecha).length;
@@ -3948,7 +3932,7 @@ window.consBebidasDelDia = async function(fecha){
   save(K.stockBebidas,S.stockBebidas);
   toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
   RENDERERS.consolidadoStockBebidas();
-  try{ await gsSaveToSheets('inventario'); }catch(e){ console.error(e); }
+  syncStockBebidas();
 };
 
 /* ================================================================
@@ -4090,7 +4074,7 @@ async function cajaGuardar(){
   }
   save(K.efectivoCaja, S.efectivoCaja);
   toast(`Registro de caja guardado (${turno} · ${fmtFecha(fecha)})`,'success');
-  const ok2 = await gsSaveToSheets('inventario');
+  const ok2 = await gsSaveSheet('inventario','EfectivoCaja',gsSerializeSheet('inventario','EfectivoCaja'));
   if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
   RENDERERS.efectivoCaja();
 }
@@ -4185,7 +4169,7 @@ window.cajaConsDel = async function(id){
   save(K.efectivoCaja, S.efectivoCaja);
   toast('Registro eliminado','warn');
   RENDERERS.consolidadoCaja();
-  const ok = await gsSaveToSheets('inventario');
+  const ok = await gsSaveSheet('inventario','EfectivoCaja',gsSerializeSheet('inventario','EfectivoCaja'));
   if(!ok) toast('Eliminado localmente, pero la sincronización falló','error');
 };
 
@@ -4623,6 +4607,81 @@ async function gsSaveToSheets(domain='planilla'){
   return ok;
 }
 
+// ── Guardado selectivo (una sola hoja) ──────────────────────────────────────
+// gsSaveSheet: actualiza ÚNICAMENTE la hoja indicada, sin tocar ninguna otra.
+// Esto evita que al guardar un módulo se sobrescriban datos de otros módulos
+// con información desactualizada que pueda existir en memoria.
+// Se usa desde los wrappers de sincronización por módulo (syncXxx).
+// gsSaveToSheets (la función completa de arriba) se reserva para la
+// sincronización inicial al iniciar sesión y el botón "Guardar en GS".
+async function gsSaveSheet(domain, sheetName, matrix){
+  if(!isAuthorized()) return false;
+  try{
+    const id = await gsEnsureSpreadsheet(domain);
+    if(!id){ console.warn('[GS] No se encontró spreadsheet para', domain); return false; }
+    // Asegura que la hoja exista (idempotente; solo crea si falta).
+    await gsEnsureSheetsExist(domain);
+    const eid = encodeURIComponent(id);
+    // 1) Limpia solo esta hoja
+    const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+'/values:batchClear', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ranges:[sheetName+'!A:Z'] })
+    });
+    if(!cr.ok) throw new Error('No se pudo limpiar la hoja '+sheetName);
+    // 2) Escribe solo esta hoja (si hay datos)
+    if(matrix && matrix.length > 0){
+      const ur = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+'/values:batchUpdate', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ valueInputOption:'RAW', data:[{ range:sheetName+'!A1', majorDimension:'ROWS', values:matrix }] })
+      });
+      if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
+    }
+    gsState.lastSync = new Date();
+    console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas)');
+    gsUpdateSyncStatus('"'+sheetName+'" guardado.','success');
+    gsRenderControls();
+    return true;
+  }catch(err){
+    console.error('[GS] Error al guardar hoja "'+sheetName+'":', err);
+    gsHandleError(err, 'guardar');
+    gsRenderControls();
+    return false;
+  }
+}
+// Devuelve la matrix serializada de una hoja específica sin recalcular todo el dominio.
+function gsSerializeSheet(domain, sheetName){
+  const all = domain==='inventario' ? gsSerializeInventario() : gsSerializeAll();
+  return all[sheetName] || [[]];
+}
+// ── Wrappers de sincronización por módulo ──────────────────────────────────
+// Cada función sincroniza ÚNICAMENTE su propia hoja.
+// Son fire-and-forget: los CRUD las llaman sin await para no bloquear la UI.
+// Los errores se logean en consola y se muestran vía gsHandleError() internamente.
+function _syncSheet(domain, sheet, label, count){
+  if(!isAuthorized()) return;
+  console.log('['+label+'] Sincronizando hoja "'+sheet+'" ('+count+' registros)...');
+  gsSaveSheet(domain, sheet, gsSerializeSheet(domain, sheet)).catch(e=>console.error('['+label+'] Error:', e));
+}
+// ── INVENTARIO ──
+function syncInsumos()     { _syncSheet('inventario','Insumos',    'Insumos',    S.insumos.length); }
+function syncProduccion()  { _syncSheet('inventario','Produccion', 'Producción', S.produccion.length); }
+function syncLicores()     { _syncSheet('inventario','Licores',    'Licores',    S.licores.length); }
+function syncInvLicores()  { _syncSheet('inventario','InvLicores', 'Inv.Licores',S.invLicores.length); }
+function syncBebidasCat()  { _syncSheet('inventario','BebidasCat', 'Bebidas',    S.bebidasCat.length); }
+function syncStockBebidas(){ _syncSheet('inventario','StockBebidas','StockBebidas',S.stockBebidas.length); }
+function syncEfectivoCaja(){ _syncSheet('inventario','EfectivoCaja','Caja',      S.efectivoCaja.length); }
+// ── PLANILLA ──
+function syncEmpleados()   { _syncSheet('planilla','Empleados',         'Empleados', S.emp.length); }
+function syncHorarios()    { _syncSheet('planilla','Horarios',          'Horarios',  S.hor.length); }
+function syncMarcaciones() { _syncSheet('planilla','Marcaciones',       'Marcaciones',S.mar.length); }
+function syncDescuentos()  { _syncSheet('planilla','Descuentos',        'Descuentos',S.desc.length); }
+function syncPagosDom()    { _syncSheet('planilla','PagosExtra',        'PagosExtra',S.pago.length); }
+function syncLibresDom()   { _syncSheet('planilla','DiasLibres',        'DiasLibres',S.libre.length); }
+function syncPropinas()    { _syncSheet('planilla','Propinas',          'Propinas',  S.prop.length); }
+function syncTarjetaValGS(){ _syncSheet('planilla','ValidacionTarjeta', 'TarjetaVal',S.tarjetaVal.length); }
+function syncConsHE()      { _syncSheet('planilla','ConsiderarHoraExtra','ConsHE',   Object.keys(CONSIDERAR_HE).length); }
+function syncExoTardGS()   { _syncSheet('planilla','ExoneracionTardanza','ExoTard',  Object.keys(EXO_TARD).length); }
+
 
 /* ================================================================
    CARGAR desde Google Sheets
@@ -5017,14 +5076,14 @@ function authGrant(viaLogin){
   goto(moduloPermitido(currentPage) ? currentPage : paginaPorDefecto());
 
   const domain = role ? role.domain : 'planilla';
-  // Intentar detectar/crear el spreadsheet del dominio de esta cuenta (no bloquea el acceso).
+  // Sincronización automática en DOS situaciones:
+  //   1) Login explícito (viaLogin=true): el usuario presionó "Iniciar sesión".
+  //   2) Restauración de sesión en recarga de página (viaLogin=false): F5 / reapertura.
+  // En ambos casos Google Sheets es la fuente de verdad; los datos locales se
+  // actualizan con lo que haya en la hoja. Esto NO ocurre al navegar entre módulos
+  // ni al cambiar de pestaña dentro de la app (esos flujos no pasan por authGrant).
   const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
-  if(viaLogin){
-    // Sincronización automática SOLO al iniciar sesión explícitamente: trae
-    // todos los datos del dominio de esta cuenta desde Google Sheets, sin
-    // diálogo de confirmación (opts.auto=true) y sin bloquear el acceso si falla.
-    ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
-  }
+  ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
   gsRenderControls();
 }
 
