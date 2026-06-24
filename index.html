@@ -509,6 +509,7 @@ function retrasoMensualMinutos(emp, year, month){
 let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
+  normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
   S.insumos=load(K.insumos).map(migrarCamposInsumo); // migra tipoAlerta/umbral si faltan
@@ -793,6 +794,10 @@ function calcHorasProgramadas(empleadoId, fecha){
   return round0(diffHoras(h.entrada, h.salida));
 }
 
+// Ventana de tolerancia de cruce de medianoche: marcaciones entre las 00:00 y las
+// OVERNIGHT_MAX_HOUR:00 AM pueden pertenecer a la jornada iniciada el día anterior.
+const OVERNIGHT_MAX_HOUR = 2; // default 02:00 AM
+
 // Descuento por tardanza (en HORAS):
 //  > 30 min tarde  => 1 hora
 //  cada bloque adicional de 60 min después de los primeros 30 => +1 hora
@@ -808,9 +813,18 @@ function calcHorasTardanza(entradaReal, entradaProg){
 // Descuento por salida anticipada (en HORAS):
 //  > 30 min antes => 1 hora
 //  cada bloque adicional de 60 min => +1 hora
+// Maneja turnos con cruce de medianoche: si la salida programada es tarde
+// (≥ 22:00) y la salida real está en la ventana de medianoche (00:xx-02:xx),
+// la salida real se interpreta como perteneciente al día siguiente para evitar
+// una falsa penalización de ~23 horas.
 function calcHorasSalidaAnt(salidaReal, salidaProg){
-  const real=hmToMin(salidaReal), prog=hmToMin(salidaProg);
+  let real=hmToMin(salidaReal), prog=hmToMin(salidaProg);
   if(real==null||prog==null) return 0;
+  // Turno nocturno con cruce de medianoche: ajustar la salida real al día siguiente.
+  // Ejemplo: salidaProg=23:00 (1380 min), salidaReal=00:03 (3 min).
+  // Sin ajuste: antes = 1380 - 3 = 1377 min → penalización falsa de 23h.
+  // Con ajuste: real = 3 + 1440 = 1443 → antes = 1380 - 1443 = -63 → 0 (no hay salida anticipada).
+  if(real < OVERNIGHT_MAX_HOUR * 60 && prog >= 22 * 60) real += 24 * 60;
   const antes = prog - real;
   if(antes <= 30) return 0;
   return 1 + Math.floor((antes - 30) / 60);
@@ -829,6 +843,76 @@ function getMarcacion(empleadoId, fecha){ return S.mar.find(m=>m.empleadoId===em
 function marOrigen(m){ return (m && m.origen === 'manual') ? 'manual' : 'archivo'; }
 function esDiaLibre(empleadoId, fecha){ return S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha); }
 function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha); return l? l.tipo : null; }
+
+// ── normalizarMarcacionesMedianoche ────────────────────────────────────────
+// Detecta y corrige el patrón clásico de turnos nocturnos:
+//
+//   Día D:    entradaReal = 'HH:MM'   salidaReal = null
+//   Día D+1:  entradaReal = '00:XX'   (dentro de la ventana 00:00–OVERNIGHT_MAX_HOUR)
+//
+// En ese caso el scan de las 00:XX del día D+1 es en realidad la salida de la
+// jornada iniciada el día D. Esta función reasigna físicamente el dato:
+//
+//   Día D:    entradaReal = 'HH:MM'   salidaReal = '00:XX'   ← corregido
+//   Día D+1:  entradaReal = siguiente scan del D+1 (o registro eliminado si no había más)
+//
+// ─── Propiedades de la función ───────────────────────────────────────────
+//  • Idempotente: aplicarla dos veces produce el mismo resultado (D ya tiene
+//    salidaReal, así que la condición no vuelve a dispararse).
+//  • NO sincroniza con GS: eso corresponde al código que la invoca.
+//  • Devuelve true si modificó algún dato, false si nada cambió.
+// ─────────────────────────────────────────────────────────────────────────
+function normalizarMarcacionesMedianoche(){
+  const VENTANA_MIN = OVERNIGHT_MAX_HOUR * 60; // 120 min = 02:00 AM
+
+  // Agrupa marcaciones por empleado y ordena cronológicamente.
+  const byEmp = {};
+  S.mar.forEach(m=>{ (byEmp[m.empleadoId] = byEmp[m.empleadoId]||[]).push(m); });
+
+  const toRemove = new Set();
+  let changed = false;
+
+  Object.values(byEmp).forEach(arr=>{
+    arr.sort((a,b)=>a.fecha.localeCompare(b.fecha));
+    for(let i=0; i<arr.length-1; i++){
+      const mD  = arr[i];
+      const mD1 = arr[i+1];
+
+      // ── Condición 1: deben ser días consecutivos (D y D+1) ──
+      const d0 = new Date(mD.fecha +'T12:00:00');
+      const d1 = new Date(mD1.fecha+'T12:00:00');
+      if(Math.round((d1-d0)/86400000) !== 1) continue;
+
+      // ── Condición 2: D tiene entrada pero NO tiene salida ──
+      if(!mD.entradaReal || mD.salidaReal) continue;
+
+      // ── Condición 3: D+1 empieza con un scan en la ventana de medianoche ──
+      const entMin1 = hmToMin(mD1.entradaReal);
+      if(entMin1 === null || entMin1 >= VENTANA_MIN) continue;
+
+      // ✓ Reasignar: el scan de medianoche es la SALIDA del día D
+      console.log(`[Medianoche] ${mD.fecha} ${mD.entradaReal}→ sin salida + ${mD1.fecha} ${mD1.entradaReal} en ventana → reasignando como salida del ${mD.fecha}`);
+      mD.salidaReal = mD1.entradaReal;
+
+      if(mD1.salidaReal){
+        // D+1 tenía también una salida: promoverla a entradaReal del D+1
+        // (la jornada del D+1 empieza a esa hora, que fue la "segunda" marcación del D+1)
+        mD1.entradaReal = mD1.salidaReal;
+        mD1.salidaReal  = null;
+      } else {
+        // D+1 queda vacío: eliminar el registro huérfano
+        toRemove.add(mD1.id);
+      }
+      changed = true;
+    }
+  });
+
+  if(changed){
+    if(toRemove.size) S.mar = S.mar.filter(m=>!toRemove.has(m.id));
+    save(K.mar, S.mar);
+  }
+  return changed;
+}
 
 /* Calcula la fila diaria completa de un empleado para una fecha */
 function calcDia(emp, fecha){
@@ -1295,6 +1379,9 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
     }
     else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal, origen:'archivo'}); nuevas++; }
   });
+  // Corregir marcaciones de cruce de medianoche ANTES de guardar y sincronizar.
+  // (idempotente: si no hay cambios, retorna false sin tocar nada)
+  normalizarMarcacionesMedianoche();
   return { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas };
 }
 
@@ -1389,7 +1476,9 @@ RENDERERS.marcaciones = function(){
 // para que se conserve ante futuras reimportaciones desde archivo.
 window.marSet = function(id, campo, val){
   const m=S.mar.find(x=>x.id===id); if(!m) return;
-  m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar); RENDERERS.marcaciones();
+  m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar);
+  normalizarMarcacionesMedianoche();
+  RENDERERS.marcaciones();
   syncMarcaciones();
 };
 window.marDel = function(id){
@@ -1419,6 +1508,7 @@ function addMarManual(){
     S.mar.push({id:uid(), empleadoId:empId, fecha, entradaReal:entrada, salidaReal:salida, origen:'manual'});
   }
   save(K.mar,S.mar);
+  normalizarMarcacionesMedianoche(); // corrige si este scan entra en la ventana de medianoche
   lastMarcacion = { empleadoId: empId, fecha: fecha };
   toast('Marcación manual agregada correctamente','success');
   RENDERERS.marcaciones();
@@ -4920,6 +5010,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
         entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
         origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo' }));
+      normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados al restaurar desde GS
       S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
