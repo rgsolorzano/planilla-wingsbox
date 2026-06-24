@@ -412,7 +412,94 @@ function convertirHorasAMinutos(horas){ return (Number(horas)||0) * 60; }
 // Bono S/25 solo en 2ª quincena si el retraso mensual neto <= 15 min.
 function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
   if(!esSegundaQuincena) return 0;
-  return retrasoMensualMinutos <= BONO_PUNT_MAX_MINUTOS ? BONO_PUNTUALIDAD : 0;
+  return retrasoMensualMinutos < BONO_PUNT_MAX_MINUTOS ? BONO_PUNTUALIDAD : 0;
+}
+// Minutos REALES de tardanza de un día para el bono de puntualidad.
+// ── Regla diferente a calcHorasTardanza ──
+//   • calcHorasTardanza: para DESCUENTO SALARIAL (umbral 30 min, bloques de 1 h).
+//   • calcMinutosTardanzaReal: para BONO DE PUNTUALIDAD (minuto a minuto, sin gracia).
+//     - Llegada antes de la hora programada → 0 (nunca negativo).
+//     - Llegada exactamente a la hora → 0.
+//     - Llegada con retraso → minutos exactos de retraso.
+// Exoneraciones de tardanza aplicadas al descuento NO descuentan aquí:
+// el bono mide la puntualidad real, no la penalizada.
+function calcMinutosTardanzaReal(entradaReal, entradaProg){
+  const real = hmToMin(entradaReal), prog = hmToMin(entradaProg);
+  if(real == null || prog == null) return 0;
+  return Math.max(0, real - prog); // nunca negativo; llegadas anticipadas = 0
+}
+
+// ── evaluarBonoPuntualidad ──────────────────────────────────────────────────
+// Función central para el Bono de Puntualidad. Evalúa DOS criterios:
+//
+//  Criterio 1 — Tardanza acumulada (mes completo, ambas quincenas):
+//    Suma los minutos exactos de retraso de todos los días laborables con
+//    marcación de entrada. La suma debe ser < BONO_PUNT_MAX_MINUTOS (15 min).
+//    Las llegadas anticipadas valen 0; no compensan tardanzas de otros días.
+//
+//  Criterio 2 — Sin ausencias en días laborables:
+//    Si hay al menos un día en el que el empleado tenía programado trabajar
+//    y NO registra marcación de entrada válida, pierde el bono automáticamente.
+//    Las vacaciones, días libres y descansos programados están excluidos de
+//    esta evaluación.
+//
+// Devuelve: {
+//   minutosAcum:  number,   — tardanza acumulada en minutos
+//   diasSinEntrada: number, — días laborables sin marcación de entrada
+//   cumpleTardanza: bool,   — minutosAcum < BONO_PUNT_MAX_MINUTOS
+//   cumpleAsistencia: bool, — diasSinEntrada === 0
+//   aplica: bool,           — ambos criterios cumplidos
+//   motivo: string,         — razón legible para el usuario
+//   bono: number            — S/25 si aplica, 0 si no
+// }
+function evaluarBonoPuntualidad(emp, year, month){
+  let minutosAcum  = 0;
+  let diasSinEntrada = 0;
+
+  [1,2].forEach(q=>{
+    rangoQuincena(year, month, q).forEach(f=>{
+      // Excluir días de vacaciones/libre registrados en el sistema
+      if(esDiaLibre(emp.id, f)) return;
+      // Excluir días de descanso según horario semanal
+      const hor = getHorario(emp.id, diaSemana(f));
+      if(!hor || hor.libre) return;
+      // Día laborable: evaluar
+      const mar = getMarcacion(emp.id, f);
+      if(!mar || !mar.entradaReal){
+        diasSinEntrada++; // Criterio 2: falta de marcación de entrada
+      } else {
+        minutosAcum += calcMinutosTardanzaReal(mar.entradaReal, hor.entrada); // Criterio 1
+      }
+    });
+  });
+
+  const cumpleTardanza   = minutosAcum < BONO_PUNT_MAX_MINUTOS;
+  const cumpleAsistencia = diasSinEntrada === 0;
+  const aplica           = cumpleTardanza && cumpleAsistencia;
+
+  // Motivo legible para auditoría y UI
+  let motivo;
+  if(aplica){
+    motivo = `Cumple: ${minutosAcum} min acumulados (límite < ${BONO_PUNT_MAX_MINUTOS} min) y todos los días laborables con entrada registrada.`;
+  } else if(!cumpleTardanza && !cumpleAsistencia){
+    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite < ${BONO_PUNT_MAX_MINUTOS} min) y tiene ${diasSinEntrada} día(s) laborable(s) sin marcación de entrada.`;
+  } else if(!cumpleTardanza){
+    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite < ${BONO_PUNT_MAX_MINUTOS} min).`;
+  } else {
+    motivo = `No aplica: existe al menos ${diasSinEntrada} día(s) laborable(s) sin marcación de entrada.`;
+  }
+
+  return {
+    minutosAcum, diasSinEntrada,
+    cumpleTardanza, cumpleAsistencia,
+    aplica, motivo,
+    bono: aplica ? BONO_PUNTUALIDAD : 0
+  };
+}
+
+// Mantiene la firma antigua para compatibilidad con llamadas directas existentes.
+function retrasoMensualMinutos(emp, year, month){
+  return evaluarBonoPuntualidad(emp, year, month).minutosAcum;
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
@@ -854,20 +941,17 @@ function calcQuincenaEmpleado(emp, year, month, q){
   }
 
   const base = Number(emp.sueldoQuincenal)||0;
-  // Bono por puntualidad: solo 2ª quincena y si el retraso mensual neto <= 15 min.
-  const retrasoMin = retrasoMensualMinutos(emp, year, month);
-  const bonoPuntualidad = calcularBonoPuntualidad(q===2, retrasoMin);
+  // Bono por puntualidad: solo 2ª quincena, evaluación completa (tardanza + asistencia).
+  const evBono = evaluarBonoPuntualidad(emp, year, month);
+  const bonoPuntualidad = q===2 ? evBono.bono : 0;
   // Total = base + pagos extra + pago horas extra + bono - desc. manuales - desc. automáticos
   const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras + bonoPuntualidad - tot.descManual - tot.descAuto;
-  return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad, retrasoMensualMinutos:retrasoMin };
-}
-
-// Suma de tardanzas NETAS (en minutos) de todo el mes, ambas quincenas.
-// Usa calcDia directamente para evitar recursión con calcQuincenaEmpleado.
-function retrasoMensualMinutos(emp, year, month){
-  let horas = 0;
-  [1,2].forEach(q=> rangoQuincena(year, month, q).forEach(f=>{ horas += (calcDia(emp, f).hTard || 0); }));
-  return convertirHorasAMinutos(horas);
+  return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad,
+           retrasoMensualMinutos:evBono.minutosAcum,
+           diasSinEntrada:evBono.diasSinEntrada,
+           motivoBono:evBono.motivo,
+           cumpleTardanza:evBono.cumpleTardanza,
+           cumpleAsistencia:evBono.cumpleAsistencia };
 }
 
 /* ================================================================
@@ -2384,13 +2468,29 @@ function renderCalculo(){
         </tr></thead>
         <tbody>${filas}</tbody>
       </table></div>
-      <div class="summary">
+        <div class="summary">
         <div class="item"><div class="l">Sueldo quincenal base</div><div class="v">${money(r.base)}</div></div>
         <div class="item"><div class="l">Desc. automáticos</div><div class="v" style="color:var(--red)">- ${money(r.tot.descAuto)}</div></div>
         <div class="item"><div class="l">Desc. manuales</div><div class="v" style="color:var(--red)">- ${money(r.tot.descManual)}</div></div>
         <div class="item"><div class="l">Pagos extra</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoManual)}</div></div>
         <div class="item"><div class="l">Total horas extra (${r.tot.horasExtra}h)</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoExtraHoras)}</div></div>
-        <div class="item"><div class="l">Bono puntualidad ${PER.q==2?`(retraso mes: ${(r.retrasoMensualMinutos||0).toFixed(0)} min)`:'(solo 2ª quincena)'}</div><div class="v" style="color:var(--green)">+ ${money(r.bonoPuntualidad||0)}</div></div>
+        ${PER.q===2 ? (()=>{
+          const minAcum  = Math.round(r.retrasoMensualMinutos||0);
+          const sinEnt   = r.diasSinEntrada||0;
+          const aplica   = (r.bonoPuntualidad||0) > 0;
+          const color    = aplica ? '#059669' : '#dc2626';
+          const estado   = aplica ? '✅ Aplica' : '❌ No aplica';
+          const motivo   = r.motivoBono || '';
+          return `<div class="item" style="flex-direction:column;align-items:flex-start;gap:4px;background:${aplica?'#f0fdf4':'#fff1f2'};border-radius:8px;padding:10px 14px;border:1px solid ${aplica?'#bbf7d0':'#fecdd3'}">
+            <div style="font-weight:600;color:${color}">🏆 Bono de Puntualidad — ${estado}</div>
+            <div style="font-size:12px;color:var(--c-muted);display:grid;grid-template-columns:repeat(3,1fr);gap:6px 16px;margin-top:4px">
+              <span>Tardanza acumulada (mes): <b style="color:${r.cumpleTardanza?'#059669':'#dc2626'}">${minAcum} min</b> / &lt; ${BONO_PUNT_MAX_MINUTOS} min</span>
+              <span>Días laborables sin entrada: <b style="color:${r.cumpleAsistencia?'#059669':'#dc2626'}">${sinEnt}</b> (debe ser 0)</span>
+              <span>Bono: <b style="color:${color}">${aplica ? money(r.bonoPuntualidad) : '—'}</b></span>
+            </div>
+            <div style="font-size:11px;color:#6b7280;margin-top:4px;font-style:italic">${motivo}</div>
+          </div>`;
+        })() : `<div class="item"><div class="l" style="color:var(--c-muted)">🏆 Bono puntualidad</div><div class="v" style="color:var(--c-muted)">Solo 2ª quincena</div></div>`}
         <div class="item total"><div class="l">Total a pagar quincena</div><div class="v">${money(r.totalPagar)}</div></div>
       </div>
     </div>`;
@@ -2452,7 +2552,8 @@ function renderConsolidado(){
     return {nombre:emp.nombre, esLibre:r.esLibre===true, sueldoHora:Number(emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
       horasExtra:r.tot.horasExtra, pagoExtraHoras:r.tot.pagoExtraHoras, descAuto:r.tot.descAuto,
       descManual:r.tot.descManual, pagoManual:r.tot.pagoManual,
-      bonoPuntualidad:r.bonoPuntualidad||0, retrasoMin:r.retrasoMensualMinutos||0, total:r.totalPagar,
+      bonoPuntualidad:r.bonoPuntualidad||0, retrasoMin:r.retrasoMensualMinutos||0,
+      diasSinEntrada:r.diasSinEntrada||0, motivoBono:r.motivoBono||'', total:r.totalPagar,
       sueldoPlanilla, sueldoTransfer};
   });
   const T=_consolidado.reduce((a,c)=>({
@@ -2487,7 +2588,7 @@ function renderConsolidado(){
           <td class="num">${c.horasExtra}</td><td class="num">${money(c.pagoExtraHoras)}</td>
           <td class="num" style="color:var(--red)">${money(c.descAuto)}</td><td class="num" style="color:var(--red)">${money(c.descManual)}</td>
           <td class="num" style="color:var(--green)">${money(c.pagoManual)}</td>
-          <td class="num" style="color:var(--green)">${money(c.bonoPuntualidad)}<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min mes</small></td>
+          <td class="num" style="color:${c.bonoPuntualidad>0?'var(--green)':'var(--c-muted)'}" title="${c.motivoBono}">${c.bonoPuntualidad>0?money(c.bonoPuntualidad):'—'}<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min${c.diasSinEntrada>0?' · '+c.diasSinEntrada+'d s/ent.':''}</small></td>
           <td class="num">${money(c.sueldoPlanilla)}</td><td class="num">${money(c.sueldoTransfer)}</td><td class="num"><b>${money(c.total)}</b></td>
         </tr>`).join('')}</tbody>
         <tfoot><tr>
@@ -2575,7 +2676,7 @@ function renderBoleta(){
   // Detalle de horas extra POR DÍA (cuando hay pago por horas extra)
   r.dias.forEach(d=>{ if(d.pagoExtraHoras>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
   r.dias.forEach(d=> d.pagoExtraList.forEach(p=> pagosRows.push([`${fmtFecha(d.fecha)} · ${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, Number(p.monto)||0])));
-  if((r.bonoPuntualidad||0) > 0) pagosRows.push(['Bono puntualidad (retraso mes: '+(r.retrasoMensualMinutos||0).toFixed(0)+' min)', r.bonoPuntualidad]);
+  if((r.bonoPuntualidad||0) > 0) pagosRows.push([`Bono puntualidad (${(r.retrasoMensualMinutos||0).toFixed(0)} min tardanza · ${r.diasSinEntrada||0} días sin entrada)`, r.bonoPuntualidad]);
   const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual + (r.bonoPuntualidad||0);
 
   // ----- Detalle de descuentos -----
