@@ -455,15 +455,18 @@ function calcMinutosTardanzaReal(entradaReal, entradaProg){
 function evaluarBonoPuntualidad(emp, year, month){
   let minutosAcum  = 0;
   let diasSinEntrada = 0;
+  const hoy = fechaHoy();
 
   [1,2].forEach(q=>{
     rangoQuincena(year, month, q).forEach(f=>{
+      // Excluir fechas futuras y el día actual sin marcación
+      if(f >= hoy && !getMarcacion(emp.id, f)?.entradaReal) return;
       // Excluir días de vacaciones/libre registrados en el sistema
       if(esDiaLibre(emp.id, f)) return;
       // Excluir días de descanso según horario semanal
       const hor = getHorario(emp.id, diaSemana(f));
       if(!hor || hor.libre) return;
-      // Día laborable: evaluar
+      // Día laborable pasado: evaluar
       const mar = getMarcacion(emp.id, f);
       if(!mar || !mar.entradaReal){
         diasSinEntrada++; // Criterio 2: falta de marcación de entrada
@@ -829,7 +832,45 @@ function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId==
 
 /* Calcula la fila diaria completa de un empleado para una fecha */
 function calcDia(emp, fecha){
+  const hoy = fechaHoy(); // fecha local (sin sesgo UTC)
+
+  // ── Fechas futuras y día actual sin marcación ────────────────────────────
+  // Ningún día >= hoy puede clasificarse como falta automáticamente.
+  // El día de hoy puede estar en curso; el futuro aún no ha ocurrido.
+  // Si existe una marcación real en esas fechas (dato ya cargado), sí se evalúa.
+  // Solo días pasados (< hoy) pueden generar faltas / descuentos / tardanzas.
   const mar = getMarcacion(emp.id, fecha);
+  const tieneMarcacion = !!(mar && (mar.entradaReal || mar.salidaReal));
+
+  if(fecha >= hoy && !tieneMarcacion){
+    // ── Estado "Pendiente / No evaluado" ──────────────────────────────────
+    // Se devuelve la estructura completa pero con todos los valores en cero
+    // y los flags de falta en false, para que la UI y los totales no
+    // acumulen descuentos por días que aún no han terminado.
+    const libre       = esDiaLibre(emp.id, fecha);
+    const tipoLibre   = tipoDiaLibre(emp.id, fecha);
+    const hor         = getHorario(emp.id, diaSemana(fecha));
+    const horasProg   = calcHorasProgramadas(emp.id, fecha);
+    const debeTrabajar= !libre && hor && !hor.libre && hor.entrada && hor.salida;
+    const exo         = getExoneracionTardanza(emp.id, fecha);
+    const descManualList = S.desc.filter(d=>d.empleadoId===emp.id && d.fecha===fecha);
+    const pagoExtraList  = S.pago.filter(p=>p.empleadoId===emp.id && p.fecha===fecha);
+    const descManual     = descManualList.reduce((s,d)=>s+(Number(d.monto)||0),0);
+    const pagoManual     = pagoExtraList.reduce((s,p)=>s+(Number(p.monto)||0),0);
+    const totalDia = pagoManual - descManual;
+    return {
+      fecha, entradaReal:null, salidaReal:null,
+      horasEf:0, horasProg, horasExtra:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:exo.activa, hSal:0,
+      horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras:0,
+      descManualList, pagoExtraList, faltaMarc:false, esFalta:false,
+      salidaAsumida:false, esPayday:false, libre, tipoLibre, debeTrabajar,
+      totalDia,
+      esPendiente:debeTrabajar && !libre, // día laborable sin datos aún
+    };
+  }
+
+  // ── Días pasados (o con marcación): evaluación normal ────────────────────
   const entradaReal = mar? mar.entradaReal : null;
   let salidaReal    = mar? mar.salidaReal  : null;
   const libre = esDiaLibre(emp.id, fecha);
@@ -891,7 +932,8 @@ function calcDia(emp, fecha){
   return {
     fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra,
     hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
-    descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia
+    descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia,
+    esPendiente:false // día pasado evaluado normalmente
   };
 }
 
@@ -2413,7 +2455,10 @@ function renderCalculo(){
     }
 
     const filas=r.dias.map(d=>{
-      let cls=''; if(d.libre)cls='row-vac'; else if(d.esFalta||d.faltaMarc)cls='row-miss';
+      let cls='';
+      if(d.libre) cls='row-vac';
+      else if(d.esPendiente) cls=''; // neutral — no marcar como falta
+      else if(d.esFalta||d.faltaMarc) cls='row-miss';
       const detDescAuto=[];
       if(d.esFalta) detDescAuto.push(`Falta - ausencia (${d.horasProg}h prog.)`);
       if(d.hTard>0) detDescAuto.push(`Tardanza (${d.hTard}h${d.horasTardExoneradas>0?(' neta, exon. '+d.horasTardExoneradas+'h de '+d.hTardOriginal+'h'):''})`);
@@ -2424,6 +2469,7 @@ function renderCalculo(){
       const detPago=d.pagoExtraList.map(x=>`${x.tipo}: ${money(x.monto)}`).join('<br>') || '';
       let estado='';
       if(d.libre) estado=`<span class="badge ${d.tipoLibre==='Vacaciones'?'b-vac':'b-free'}">${d.tipoLibre}</span>`;
+      else if(d.esPendiente) estado='<span class="badge b-free" style="opacity:.7">Pendiente</span>';
       else if(d.esFalta) estado='<span class="badge b-miss">⛔ Falta</span>';
       else if(d.faltaMarc) estado='<span class="badge b-miss">⚠ Falta marcación</span>';
       else if(d.hTard>0||d.hSal>0) estado='<span class="badge b-late">Tardanza/Salida</span>';
