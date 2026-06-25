@@ -918,6 +918,39 @@ function normalizarMarcacionesMedianoche(){
 function calcDia(emp, fecha){
   const hoy = fechaHoy(); // fecha local (sin sesgo UTC)
 
+  // ── Empleado Libre (cobra por horas) ─────────────────────────────────────
+  // Los empleados libres no tienen horario fijo, por lo que:
+  //   • horasProg = 0 (no existe obligación de horas)
+  //   • esFalta = false (no generan faltas por ausencia)
+  //   • hTard = 0 (no hay hora programada contra la que medir tardanza)
+  //   • descAuto = 0 (ningún descuento automático por asistencia)
+  // Solo se calcula horasEf para el pago por hora efectiva.
+  if(empEsLibre(emp)){
+    const mar = getMarcacion(emp.id, fecha);
+    const entradaReal = mar?.entradaReal || null;
+    const salidaReal  = mar?.salidaReal  || null;
+    const libre  = esDiaLibre(emp.id, fecha);
+    const tipoLibre = tipoDiaLibre(emp.id, fecha);
+    const horasEf = calcHorasEfectivas(entradaReal, salidaReal);
+    const descManualList = S.desc.filter(d=>d.empleadoId===emp.id && d.fecha===fecha);
+    const pagoExtraList  = S.pago.filter(p=>p.empleadoId===emp.id && p.fecha===fecha);
+    const descManual = descManualList.reduce((s,d)=>s+(Number(d.monto)||0),0);
+    const pagoManual = pagoExtraList.reduce((s,p)=>s+(Number(p.monto)||0),0);
+    const pagoExtraHoras = 0; // libre no tiene "horas extra" vs programadas
+    const totalDia = pagoManual + pagoExtraHoras - descManual;
+    return {
+      fecha, entradaReal, salidaReal,
+      horasEf, horasProg:0, horasExtra:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
+      horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras,
+      descManualList, pagoExtraList, faltaMarc:false, esFalta:false,
+      salidaAsumida:false, esPayday:false, libre, tipoLibre,
+      debeTrabajar:false, // libre no "debe" trabajar según horario fijo
+      totalDia,
+      esPendiente:false,
+    };
+  }
+
   // ── Fechas futuras y día actual sin marcación ────────────────────────────
   // Ningún día >= hoy puede clasificarse como falta automáticamente.
   // El día de hoy puede estar en curso; el futuro aún no ha ocurrido.
@@ -2611,6 +2644,7 @@ function renderCalculo(){
         <div class="item"><div class="l">Pagos extra</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoManual)}</div></div>
         <div class="item"><div class="l">Total horas extra (${r.tot.horasExtra}h)</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoExtraHoras)}</div></div>
         ${PER.q===2 ? (()=>{
+          if(r.esLibre) return `<div class="item"><div class="l" style="color:var(--c-muted)">🏆 Bono puntualidad</div><div class="v" style="color:var(--c-muted)">Excluido (empleado libre)</div></div>`;
           const minAcum  = Math.round(r.retrasoMensualMinutos||0);
           const sinEnt   = r.diasSinEntrada||0;
           const aplica   = (r.bonoPuntualidad||0) > 0;
@@ -2626,7 +2660,7 @@ function renderCalculo(){
             </div>
             <div style="font-size:11px;color:#6b7280;margin-top:4px;font-style:italic">${motivo}</div>
           </div>`;
-        })() : `<div class="item"><div class="l" style="color:var(--c-muted)">🏆 Bono puntualidad</div><div class="v" style="color:var(--c-muted)">Solo 2ª quincena</div></div>`}
+        })() : `<div class="item"><div class="l" style="color:var(--c-muted)">🏆 Bono puntualidad</div><div class="v" style="color:var(--c-muted)">${r.esLibre?'Excluido (empleado libre)':'Solo 2ª quincena'}</div></div>`}
         <div class="item total"><div class="l">Total a pagar quincena</div><div class="v">${money(r.totalPagar)}</div></div>
       </div>
     </div>`;
@@ -2720,11 +2754,16 @@ function renderConsolidado(){
           <th class="num">Sueldo planilla</th><th class="num">Sueldo transferencia</th><th class="num">Total a pagar</th>
         </tr></thead>
         <tbody>${_consolidado.map(c=>`<tr>
-          <td>${c.nombre}${c.esLibre?` <span class="badge b-late">Libre</span><br><small style="color:var(--c-muted)">${money(c.sueldoHora)}/h × ${c.horasEf}h</small>`:''}</td><td class="num">${money(c.base)}</td><td class="num">${c.horasEf}</td><td class="num">${c.horasProg}</td>
-          <td class="num">${c.horasExtra}</td><td class="num">${money(c.pagoExtraHoras)}</td>
-          <td class="num" style="color:var(--red)">${money(c.descAuto)}</td><td class="num" style="color:var(--red)">${money(c.descManual)}</td>
+          <td>${c.nombre}${c.esLibre?` <span class="badge b-late">Libre</span><br><small style="color:var(--c-muted)">${money(c.sueldoHora)}/h × ${c.horasEf}h</small>`:''}</td>
+          <td class="num">${money(c.base)}</td>
+          <td class="num">${c.horasEf}</td>
+          <td class="num" style="color:${c.esLibre?'var(--c-muted)':'inherit'}">${c.esLibre?'—':c.horasProg}</td>
+          <td class="num">${c.horasExtra||0}</td>
+          <td class="num">${money(c.pagoExtraHoras)}</td>
+          <td class="num" style="color:${c.descAuto>0?'var(--red)':'var(--c-muted)'}">${c.esLibre?'<span title="No aplica a empleados libres">—</span>':money(c.descAuto)}</td>
+          <td class="num" style="color:var(--red)">${money(c.descManual)}</td>
           <td class="num" style="color:var(--green)">${money(c.pagoManual)}</td>
-          <td class="num" style="color:${c.bonoPuntualidad>0?'var(--green)':'var(--c-muted)'}" title="${c.motivoBono}">${c.bonoPuntualidad>0?money(c.bonoPuntualidad):'—'}<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min${c.diasSinEntrada>0?' · '+c.diasSinEntrada+'d s/ent.':''}</small></td>
+          <td class="num" style="color:${c.esLibre?'var(--c-muted)':c.bonoPuntualidad>0?'var(--green)':'var(--c-muted)'}" title="${c.esLibre?'Excluido (empleado libre)':c.motivoBono}">${c.esLibre?'Excluido':c.bonoPuntualidad>0?money(c.bonoPuntualidad):'—'}${!c.esLibre?`<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min${c.diasSinEntrada>0?' · '+c.diasSinEntrada+'d s/ent.':''}</small>`:''}</td>
           <td class="num">${money(c.sueldoPlanilla)}</td><td class="num">${money(c.sueldoTransfer)}</td><td class="num"><b>${money(c.total)}</b></td>
         </tr>`).join('')}</tbody>
         <tfoot><tr>
