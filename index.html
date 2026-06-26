@@ -328,7 +328,7 @@ const BONO_PUNTUALIDAD = 25;            // S/ por puntualidad mensual (2ª quinc
 const BONO_PUNT_MAX_MINUTOS = 15;       // máximo de retraso mensual neto para calificar
 const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
 const TIPOS_LIBRE = ['Día libre','Vacaciones'];
-const TIPOS_EMP = ['Mesero','Cocina'];
+const TIPOS_EMP = ['Mesero','Cocina','Caja'];
 // Tipos de propina admitidos por fila en el formulario de ingreso (formato nuevo).
 const TIPOS_PROPINA = ['efectivo','yape','plin','tarjeta'];
 const TIPO_PROPINA_LABEL = { efectivo:'Efectivo', yape:'Yape', plin:'Plin', tarjeta:'Tarjeta' };
@@ -555,6 +555,8 @@ function limpiarEstadoDominio(domain){
 function empTipo(e){ return (e && e.tipo) ? e.tipo : 'Mesero'; }
 function esMesero(e){ return empTipo(e)==='Mesero'; }
 function esCocina(e){ return empTipo(e)==='Cocina'; }
+// Empleado activo: por defecto activo si el campo no existe (compatibilidad con datos históricos).
+function empEsActivo(e){ return !(e && e.activo === false); }
 // Empleado "libre": cobra por horas trabajadas, no por sueldo quincenal.
 // Compatibilidad: si no tiene el campo esLibre, se asume false (empleado normal).
 function empEsLibre(e){ return !!(e && e.esLibre===true); }
@@ -1154,7 +1156,7 @@ function empArea(emp){
   const tl = t.toLowerCase();
   if(tl.includes('cocin')) return 'Cocina';
   if(tl.includes('mesero')||tl.includes('mozo')||tl.includes('waiter')) return 'Mesa';
-  if(tl.includes('caja')||tl.includes('cajero')||tl.includes('cashier')) return 'Caja';
+  if(tl==='caja'||tl.includes('cajero')||tl.includes('cashier')) return 'Caja';
   return t||'Otros'; // cualquier otro tipo genera su propia área
 }
 // Color consistente por empleado (basado en posición en S.emp)
@@ -1180,9 +1182,26 @@ RENDERERS.cuadrante = function(){
     return;
   }
 
-  // ── 1) Deriva las áreas dinámicamente de los tipos de empleados ──────────
-  const allAreas = [...new Set(S.emp.map(e=>empArea(e)))].sort();
-  const allCats  = [...new Set(S.emp.map(e=>e.tipo||'').filter(Boolean))].sort();
+  // ── 1) Calcula acrónimos inteligentes: si hay nombre duplicado, diferencia con apellido ──
+  // Solo incluye empleados ACTIVOS y NO-libres
+  const empsActivos = S.emp.filter(e=>empEsActivo(e) && !empEsLibre(e));
+  const primerosNombres = {};
+  empsActivos.forEach(e=>{
+    const pn=(e.nombre||'').split(' ')[0].toLowerCase();
+    primerosNombres[pn]=(primerosNombres[pn]||0)+1;
+  });
+  function cuadLabel(e){
+    const partes=(e.nombre||'').split(' ');
+    const pn=partes[0].toLowerCase();
+    if((primerosNombres[pn]||0)<=1) return partes[0].slice(0,4).toUpperCase();
+    // Nombre duplicado: primer apellido o hasta 6 chars de él
+    if(partes.length>=2) return (partes[1].slice(0,5).toUpperCase());
+    return partes[0].slice(0,4).toUpperCase()+String(e.id).slice(-1);
+  }
+
+  // ── 2) Deriva las áreas dinámicamente de los tipos de empleados ──────────
+  const allAreas = [...new Set(empsActivos.map(e=>empArea(e)))].sort();
+  const allCats  = [...new Set(empsActivos.map(e=>e.tipo||'').filter(Boolean))].sort();
 
   // ── 2) Calcula el rango horario (primer entrada → última salida) ─────────
   let minH=24, maxH=0;
@@ -1206,7 +1225,7 @@ RENDERERS.cuadrante = function(){
   // ── 3) Aplica filtros de columnas y filas ────────────────────────────────
   const dispDias  = cuadranteFilter.dia  ? CUAD_DIAS.filter(d=>String(d)===cuadranteFilter.dia) : CUAD_DIAS;
   const dispAreas = cuadranteFilter.area ? allAreas.filter(a=>a===cuadranteFilter.area) : allAreas;
-  const filtEmps  = S.emp.filter(e=>
+  const filtEmps  = empsActivos.filter(e=>
     (!cuadranteFilter.empId     || e.id===cuadranteFilter.empId) &&
     (!cuadranteFilter.categoria || e.tipo===cuadranteFilter.categoria)
   );
@@ -1259,7 +1278,7 @@ RENDERERS.cuadrante = function(){
             const hor=getHorario(emp.id,dia);
             const color=cuadEmpColor(emp.id);
             const tipTxt=`${emp.nombre}\n${emp.tipo||'—'} · ${area}\n${CUAD_DIA_LABEL[CUAD_DIAS.indexOf(dia)]}: ${hor.entrada}–${hor.salida}`;
-            return `<span class="quad-chip" style="background:${color}" title="${tipTxt}" data-eid="${emp.id}" data-dia="${dia}">${cuadAcronimo(emp.nombre)}</span>`;
+            return `<span class="quad-chip" style="background:${color}" title="${tipTxt}" data-eid="${emp.id}" data-dia="${dia}">${cuadLabel(emp)}</span>`;
           }).join('');
           const sep = ai===0 ? ' day-sep':'';
           return `<td class="cuad-cell${sep}">${chips}</td>`;
@@ -1302,7 +1321,7 @@ RENDERERS.cuadrante = function(){
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${
         filtEmps.map(e=>`<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px">
           <span style="width:12px;height:12px;border-radius:2px;background:${cuadEmpColor(e.id)};display:inline-block"></span>
-          <b>${cuadAcronimo(e.nombre)}</b> ${e.nombre}
+          <b>${cuadLabel(e)}</b> ${e.nombre}
         </span>`).join('')
       }</div>
     </div>
@@ -1377,6 +1396,7 @@ RENDERERS.empleados = function(){
         <div class="field"><label>Sueldo planilla *</label><input id="empSueldoP" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Sueldo por hora *</label><input id="empSueldoH" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Modalidad</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empEsLibre"> Empleado libre (cobra por horas)</label></div>
+        <div class="field"><label>Estado</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empActivo" checked> Activo</label></div>
       </div>
       <p class="hint" style="margin-top:0">Un <b>empleado libre</b> no cobra sueldo quincenal: su pago es las horas trabajadas de cada día × sueldo por hora. Requiere sueldo por hora.</p>
       <div class="actions">
@@ -1391,14 +1411,15 @@ RENDERERS.empleados = function(){
           <thead><tr><th>Nombre</th><th>Documento</th><th>Tipo</th><th class="num">Sueldo quincenal</th><th class="num">Sueldo planilla</th><th class="num">Sueldo/hora</th><th>Acciones</th></tr></thead>
           <tbody>
             ${S.emp.length? S.emp.map(e=>`
-              <tr>
-                <td>${e.nombre} ${empEsLibre(e)?'<span class="badge b-late">Libre</span>':''}</td><td>${e.documento}</td>
-                <td><span class="badge ${esCocina(e)?'b-vac':'b-extra'}">${empTipo(e)}</span></td>
+              <tr style="${!empEsActivo(e)?'opacity:.55':''}">
+                <td>${e.nombre} ${empEsLibre(e)?'<span class="badge b-late" style="font-size:10px">Libre</span>':''} ${!empEsActivo(e)?'<span class="badge b-miss" style="font-size:10px">Inactivo</span>':''}</td><td>${e.documento}</td>
+                <td><span class="badge ${esCocina(e)?'b-vac':empTipo(e)==='Caja'?'':'b-extra'}">${empTipo(e)}</span></td>
                 <td class="num">${money(e.sueldoQuincenal)}</td>
                 <td class="num">${money(e.sueldoPlanilla)}</td>
                 <td class="num">${money(e.sueldoHora)}</td>
                 <td>
                   <button class="btn-icon" onclick="empEdit('${e.id}')">✏️ Editar</button>
+                  <button class="btn-icon" onclick="empToggleActivo('${e.id}')" title="${empEsActivo(e)?'Marcar como Inactivo':'Reactivar empleado'}" style="opacity:${empEsActivo(e)?'.6':'1'}">${empEsActivo(e)?'🔕 Inactivar':'✅ Reactivar'}</button>
                   <button class="btn-icon del" onclick="empDel('${e.id}')">🗑️ Eliminar</button>
                 </td>
               </tr>`).join('') : `<tr><td colspan="7" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
@@ -1417,6 +1438,7 @@ RENDERERS.empleados = function(){
       empNombre.value=e.nombre; empDoc.value=e.documento;
       document.getElementById('empTipo').value=empTipo(e);
       document.getElementById('empEsLibre').checked=empEsLibre(e);
+      document.getElementById('empActivo').checked=empEsActivo(e);
       empSueldoQ.value=e.sueldoQuincenal; empSueldoP.value=e.sueldoPlanilla; empSueldoH.value=e.sueldoHora;
     }
   }
@@ -1426,6 +1448,7 @@ function empSave(){
   const nombre=empNombre.value.trim(), doc=empDoc.value.trim();
   const tipo=document.getElementById('empTipo').value;
   const esLibre=document.getElementById('empEsLibre').checked;
+  const activo=document.getElementById('empActivo').checked;
   const sq=parseFloat(empSueldoQ.value), sp=parseFloat(empSueldoP.value), sh=parseFloat(empSueldoH.value);
   // validación de campos obligatorios
   let ok=true;
@@ -1437,12 +1460,12 @@ function empSave(){
 
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
-    Object.assign(e,{nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    Object.assign(e,{nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
     syncEmpleados();
   }else{
     const id=uid();
-    S.emp.push({id,nombre,documento:doc,tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    S.emp.push({id,nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
@@ -1451,6 +1474,18 @@ function empSave(){
   RENDERERS.empleados();
 }
 window.empEdit = function(id){ editEmpId=id; RENDERERS.empleados(); window.scrollTo({top:0,behavior:'smooth'}); };
+// Alterna el estado activo/inactivo del empleado sin borrar ningún dato histórico.
+window.empToggleActivo = function(id){
+  const e = S.emp.find(x=>x.id===id); if(!e) return;
+  const nuevoEstado = !empEsActivo(e);
+  const accion = nuevoEstado ? 'reactivar' : 'marcar como inactivo';
+  if(!confirm(`¿Deseas ${accion} a ${e.nombre}? Su información histórica (horarios, marcaciones, propinas, etc.) se conservará.`)) return;
+  e.activo = nuevoEstado;
+  save(K.emp, S.emp);
+  toast(`${e.nombre} marcado como ${nuevoEstado?'activo':'inactivo'}`, nuevoEstado?'success':'warn');
+  RENDERERS.empleados();
+  syncEmpleados();
+};
 window.empDel = function(id){
   if(!confirm('¿Eliminar este empleado y todos sus datos asociados?')) return;
   S.emp=S.emp.filter(e=>e.id!==id);
@@ -1478,7 +1513,7 @@ function crearHorarioDefault(empId){
 // Exporta toda la información registrada de Empleados a un Excel (.xlsx).
 function exportarEmpleadosExcel(){
   const datos = S.emp.map(e=>({
-    id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0,
+    id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0,
     sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora
   }));
   exportarExcelSimple('Empleados', datos, `empleados_${excelTimestamp()}.xlsx`);
@@ -1486,12 +1521,16 @@ function exportarEmpleadosExcel(){
 }
 
 /* Helper: <option> de empleados */
-function empOptions(selected){
-  return S.emp.map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
+function empOptions(selected, includeInactive){
+  // Solo activos por defecto; pasar includeInactive=true en reportes históricos.
+  return S.emp
+    .filter(e=>includeInactive || empEsActivo(e))
+    .map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}${!empEsActivo(e)?' (inactivo)':''}</option>`)
+    .join('');
 }
-/* Helper: <option> solo de empleados tipo Mesero (para propinas) */
+/* Helper: <option> solo de empleados tipo Mesero ACTIVOS (para propinas) */
 function meseroOptions(selected){
-  return S.emp.filter(esMesero).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
+  return S.emp.filter(e=>esMesero(e)&&empEsActivo(e)).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
 }
 function noEmpWarning(){
   return `<div class="card"><div class="empty">Primero registra empleados en el módulo <b>Empleados</b>.</div></div>`;
@@ -2785,7 +2824,7 @@ RENDERERS.calculo = function(){
     <div class="card">
       <div class="toolbar">
         ${periodSelector('c')}
-        <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados</option>${S.emp.map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
+        <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados activos</option>${S.emp.filter(empEsActivo).map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
         <button class="btn btn-primary" id="cGen">Generar reporte</button>
         <button class="btn btn-green" id="cSaveHE" ${hasPendingConsiderarHE() ? '' : 'disabled'}>💾 Guardar horas extra</button>
       </div>
@@ -2830,7 +2869,7 @@ function renderCalculo(){
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena (1-15)':'2ª quincena (16-fin)'}`;
   let html=`<div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Periodo:</b> ${titulo}</div>`;
 
-  const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp;
+  const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp.filter(empEsActivo);
   emps.forEach(emp=>{
     const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
 
@@ -3007,7 +3046,7 @@ RENDERERS.consolidado = function(){
 function renderConsolidado(){
   const out=document.getElementById('consOut');
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
-  _consolidado = S.emp.map(emp=>{
+  _consolidado = S.emp.filter(empEsActivo).map(emp=>{
     const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
     const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
     // Sueldo transferencia = Total a pagar - Sueldo planilla
@@ -3093,7 +3132,10 @@ let boletaEmpSel=null;
 RENDERERS.boleta = function(){
   const el=document.getElementById('page-boleta');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>🧾 Boleta por empleado</h1></div></div>`+noEmpWarning(); return; }
-  if(!boletaEmpSel || !S.emp.find(e=>e.id===boletaEmpSel)) boletaEmpSel=S.emp[0].id;
+  if(!boletaEmpSel || !S.emp.find(e=>e.id===boletaEmpSel)){
+    const primeroActivo = S.emp.find(empEsActivo);
+    boletaEmpSel = primeroActivo ? primeroActivo.id : (S.emp[0]?.id || null);
+  }
   el.innerHTML=`
     <div class="page-head"><div><h1>🧾 Boleta por empleado</h1><p>Detalle desagregado del pago de la quincena para enviar a cada empleado.</p></div></div>
     <div class="card">
@@ -3258,6 +3300,7 @@ function adminImport(){
       S.emp = emp.map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
         tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
+        activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
         sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
       S.hor = (hor||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
@@ -5335,6 +5378,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.emp = byName['Empleados'].map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
         tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
+        activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
         sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
       S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
