@@ -1863,12 +1863,36 @@ function rangoFechas(ini, fin){
   return out;
 }
 let editLibreId=null;
+// Estado de filtros del módulo Días Libres / Vacaciones.
+// Se resetea a valores por defecto al recargar la app (no persiste entre sesiones).
+let libreFilter = (()=>{
+  const hoy = fechaHoy();
+  const hace30 = new Date(); hace30.setDate(hace30.getDate()-30);
+  const desde = `${hace30.getFullYear()}-${String(hace30.getMonth()+1).padStart(2,'0')}-${String(hace30.getDate()).padStart(2,'0')}`;
+  return { desde, hasta:hoy, empId:'', tipo:'' };
+})();
+
 RENDERERS.libres = function(){
   const el=document.getElementById('page-libres');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>🌴 Días libres / Vacaciones</h1></div></div>`+noEmpWarning(); return; }
   const hoy=fechaHoy();
-  const list=[...S.libre].sort((a,b)=>b.fecha.localeCompare(a.fecha));
+
+  // Aplicar filtros antes de renderizar
+  const filtrada = [...S.libre]
+    .filter(l=>{
+      if(libreFilter.desde && l.fecha < libreFilter.desde) return false;
+      if(libreFilter.hasta && l.fecha > libreFilter.hasta) return false;
+      if(libreFilter.empId && l.empleadoId !== libreFilter.empId) return false;
+      if(libreFilter.tipo  && l.tipo !== libreFilter.tipo)  return false;
+      return true;
+    })
+    .sort((a,b)=>b.fecha.localeCompare(a.fecha));
+
+  const tiposUnicos = [...new Set(S.libre.map(l=>l.tipo).filter(Boolean))].sort();
+  const tiposOpts = tiposUnicos.map(t=>`<option value="${t}" ${libreFilter.tipo===t?'selected':''}>${t}</option>`).join('');
+
   const ed = editLibreId? S.libre.find(x=>x.id===editLibreId) : null;
+
   el.innerHTML=`
     <div class="page-head"><div><h1>🌴 Días libres / Vacaciones</h1><p>En estos días no se aplican descuentos por tardanza ni por falta de marcación.</p></div></div>
     <div class="card">
@@ -1887,17 +1911,44 @@ RENDERERS.libres = function(){
       </div>
     </div>
     <div class="card">
-      <h2>Registros (${S.libre.length})</h2>
+      <h2>Filtros</h2>
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="lFDes" value="${libreFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="lFHas" value="${libreFilter.hasta}"></div>
+        <div class="field"><label>Empleado</label><select id="lFEmp">
+          <option value="">Todos</option>
+          ${S.emp.map(e=>`<option value="${e.id}" ${libreFilter.empId===e.id?'selected':''}>${e.nombre}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Tipo</label><select id="lFTip">
+          <option value="">Todos</option>${tiposOpts}
+        </select></div>
+        <button class="btn btn-ghost btn-sm" id="lFClear">🗑 Limpiar</button>
+      </div>
+      <h2>Registros (${filtrada.length} de ${S.libre.length})</h2>
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Empleado</th><th>Tipo</th><th>Comentario</th><th>Acciones</th></tr></thead>
-        <tbody>${list.length? list.map(l=>`
+        <tbody>${filtrada.length? filtrada.map(l=>`
           <tr class="row-vac"><td>${fmtFecha(l.fecha)}</td><td>${nombreEmp(l.empleadoId)}</td>
           <td><span class="badge ${l.tipo==='Vacaciones'?'b-vac':'b-free'}">${l.tipo}</span></td>
           <td>${l.comentario||'—'}</td>
           <td><button class="btn-icon" onclick="libreEdit('${l.id}')">✏️</button> <button class="btn-icon del" onclick="libreDel('${l.id}')">🗑️</button></td></tr>`).join('')
-          : `<tr><td colspan="5" class="empty">Sin días libres o vacaciones.</td></tr>`}</tbody>
+          : `<tr><td colspan="5" class="empty">${S.libre.length?'Sin registros para el filtro seleccionado.':'Sin días libres o vacaciones.'}</td></tr>`}</tbody>
       </table></div>
     </div>`;
+
+  // Aplicar filtros automáticamente al cambiar cualquier control
+  const applyF = ()=>{
+    const d=document.getElementById('lFDes').value, h=document.getElementById('lFHas').value;
+    if(d && h && d>h){ toast('Rango de fechas inválido','error'); return; }
+    libreFilter = { desde:d, hasta:h, empId:document.getElementById('lFEmp').value, tipo:document.getElementById('lFTip').value };
+    RENDERERS.libres();
+  };
+  ['lFDes','lFHas','lFEmp','lFTip'].forEach(id=>document.getElementById(id).onchange=applyF);
+  document.getElementById('lFClear').onclick=()=>{
+    libreFilter = { desde:'', hasta:'', empId:'', tipo:'' };
+    RENDERERS.libres();
+  };
+
   document.getElementById('lSave').onclick=()=>{
     if(!lFecha.value){ lFecha.classList.add('invalid'); toast('Selecciona una fecha','error'); return; }
     if(editLibreId){
@@ -1907,7 +1958,6 @@ RENDERERS.libres = function(){
     }else{
       const ini=lFecha.value, fin=document.getElementById('lFechaFin').value;
       if(fin && fin<ini){ toast('La fecha fin no puede ser anterior a la de inicio','error'); return; }
-      // Rango de fechas: se crea un registro por cada día (evitando duplicados existentes)
       const fechas = fin ? rangoFechas(ini, fin) : [ini];
       let creados=0;
       fechas.forEach(f=>{
