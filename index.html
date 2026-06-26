@@ -1943,7 +1943,7 @@ async function sincronizarMarcacionesDesdeSheet(){
   if(btn){ btn.disabled=true; btn.dataset.txt = btn.textContent; btn.textContent = 'Sincronizando…'; }
   gsUpdateSyncStatus('Sincronizando marcaciones desde Google Sheets…','info');
   try{
-    const range = "'"+sheetName.replace(/'/g,"''")+"'!A1:Z";
+    const range = "'"+sheetName.replace(/'/g,"''")+"'!A1:AZ";
     // UNFORMATTED_VALUE + SERIAL_NUMBER: el timestamp llega como número serial
     // de hoja de cálculo, igual que en un Excel, así reutilizamos sin cambios
     // el mismo parseExcelTS() que ya usa la importación de Excel.
@@ -5224,7 +5224,8 @@ async function gsSaveToSheets(domain='planilla'){
     const id = encodeURIComponent(gsState.spreadsheetId);
 
     // 1) Limpiar todas las hojas
-    const clearRanges = cfg.sheets.map(n=>n+'!A:Z');
+    // Rango A:AZ para cubrir hojas con más de 26 columnas (EfectivoCaja tiene 28)
+    const clearRanges = cfg.sheets.map(n=>n+'!A:AZ');
     const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchClear', {
       method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ ranges: clearRanges })
     });
@@ -5265,10 +5266,14 @@ async function gsSaveSheet(domain, sheetName, matrix){
     // Asegura que la hoja exista (idempotente; solo crea si falta).
     await gsEnsureSheetsExist(domain);
     const eid = encodeURIComponent(id);
-    // 1) Limpia solo esta hoja
+    // 1) Limpia solo esta hoja — rango amplio (A:AZ = 52 columnas) para cubrir
+    //    hojas con más de 26 columnas (p.ej. EfectivoCaja tiene 28 cols: A..AB).
+    //    Usar A:Z provocaba que las columnas AA y AB (cl9=S/100, cl10=S/200 del
+    //    Cierre de Caja) no se limpiaran y tampoco se leyeran en el batchGet,
+    //    causando que esos valores se perdieran al recargar la página.
     const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+'/values:batchClear', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ranges:[sheetName+'!A:Z'] })
+      body: JSON.stringify({ ranges:[sheetName+'!A:AZ'] })
     });
     if(!cr.ok) throw new Error('No se pudo limpiar la hoja '+sheetName);
     // 2) Escribe solo esta hoja (si hay datos)
@@ -5346,7 +5351,11 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     const id = await gsEnsureSpreadsheet(domain);
     if(!id){ if(!auto) toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
-    const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:Z')).join('&');
+    // Rango A:AZ (52 cols) en lugar de A:Z (26) para leer correctamente hojas
+    // con más de 26 columnas. EfectivoCaja tiene 28 columnas (hasta AB = cl10);
+    // con A:Z las columnas AA (cl9=S/100) y AB (cl10=S/200) del Cierre quedaban
+    // fuera del rango y siempre se leían como vacías → bug de persistencia.
+    const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:AZ')).join('&');
     // UNFORMATTED_VALUE: devuelve los números como números reales (sin separadores de
     // miles ni moneda del locale), evitando que Number() falle y los sueldos queden en 0.
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
