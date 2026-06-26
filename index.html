@@ -116,6 +116,22 @@
   .empty{padding:30px;text-align:center;color:var(--c-muted);font-size:13px}
   /* Control de Efectivo en Caja */
   .caja-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+
+  /* Cuadrante Semanal */
+  .cuadrante-outer{overflow:auto;max-height:calc(100vh - 260px);border-radius:0 0 10px 10px}
+  .cuadrante-table{border-collapse:collapse;font-size:11px;table-layout:fixed}
+  .cuadrante-table th,.cuadrante-table td{border:1px solid var(--c-line)}
+  .cuad-day-hdr{text-align:center;font-weight:700;font-size:12px;background:#ede9fe;color:#4c1d95;padding:5px 2px;position:sticky;top:0;z-index:3}
+  .cuad-area-hdr{text-align:center;font-size:10px;font-weight:600;background:#f5f3ff;color:#6d28d9;padding:3px 4px;position:sticky;top:29px;z-index:3;min-width:58px;max-width:90px}
+  .cuad-hr{background:var(--panel);font-size:10px;font-weight:600;color:var(--c-muted);text-align:right;padding:2px 8px;position:sticky;left:0;z-index:2;white-space:nowrap;min-width:48px;border-right:2px solid var(--c-line)}
+  .cuad-hr.hdr-hr{z-index:4;position:sticky;left:0;top:0;background:var(--panel)}
+  .cuad-cell{vertical-align:top;padding:2px 2px;height:24px;min-width:58px;max-width:90px}
+  .cuad-cell.day-sep{border-left:2px solid var(--c-line)}
+  .cuad-row:hover .cuad-cell{background:rgba(109,40,217,.04)}
+  .quad-chip{display:inline-block;border-radius:3px;padding:1px 4px;font-size:10px;font-weight:700;cursor:pointer;margin:1px;color:#fff;white-space:nowrap;line-height:1.5;letter-spacing:.3px;text-shadow:0 1px 2px rgba(0,0,0,.25);transition:filter .1s,transform .1s}
+  .quad-chip:hover{filter:brightness(1.12);transform:scale(1.1)}
+  .cuad-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:1000;display:flex;align-items:center;justify-content:center}
+  .cuad-modal-box{background:#fff;border-radius:14px;padding:22px 24px;max-width:320px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,.22)}
   @media(max-width:820px){.caja-grid{grid-template-columns:1fr}}
   .caja-qty{width:80px!important;min-width:60px;text-align:right}
   .caja-bolsa{width:110px!important;min-width:80px;text-align:right}
@@ -256,6 +272,7 @@
     <!-- Las páginas se inyectan/poblan vía JS -->
     <section class="page active" id="page-empleados"></section>
     <section class="page" id="page-horarios"></section>
+    <section class="page" id="page-cuadrante"></section>
     <section class="page" id="page-marcaciones"></section>
     <section class="page" id="page-propinas"></section>
     <section class="page" id="page-propinasConsolidado"></section>
@@ -1112,6 +1129,232 @@ function calcQuincenaEmpleado(emp, year, month, q){
            cumpleTardanza:evBono.cumpleTardanza,
            cumpleAsistencia:evBono.cumpleAsistencia };
 }
+
+/* ================================================================
+   MÓDULO 0B: CUADRANTE SEMANAL DE HORARIOS
+   Vista visual-only derivada de S.hor + S.emp. No persiste datos propios.
+   Visible solo para multiboxes.peru@gmail.com.
+   ================================================================ */
+// Orden de visualización lunes → domingo
+const CUAD_DIAS = [1,2,3,4,5,6,0];
+const CUAD_DIA_LABEL = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
+// Paleta de 20 colores distintos para las fichas de empleados
+const CUAD_COLORS = [
+  '#dc2626','#ea580c','#d97706','#65a30d','#16a34a',
+  '#0d9488','#0284c7','#4f46e5','#7c3aed','#a21caf',
+  '#be185d','#f97316','#ca8a04','#4ade80','#06b6d4',
+  '#818cf8','#c084fc','#fb7185','#34d399','#fbbf24',
+];
+let cuadranteFilter = { dia:'', area:'', empId:'', categoria:'' };
+
+// Determina el "área" de un empleado a partir de su tipo.
+// Completamente dinámico: tipos no reconocidos forman su propia área.
+function empArea(emp){
+  const t = String(emp.tipo||'');
+  const tl = t.toLowerCase();
+  if(tl.includes('cocin')) return 'Cocina';
+  if(tl.includes('mesero')||tl.includes('mozo')||tl.includes('waiter')) return 'Mesa';
+  if(tl.includes('caja')||tl.includes('cajero')||tl.includes('cashier')) return 'Caja';
+  return t||'Otros'; // cualquier otro tipo genera su propia área
+}
+// Color consistente por empleado (basado en posición en S.emp)
+function cuadEmpColor(empId){
+  const idx = S.emp.findIndex(e=>e.id===empId);
+  return CUAD_COLORS[(idx<0?0:idx) % CUAD_COLORS.length];
+}
+// Acrónimo de 4 letras de la primera palabra del nombre
+function cuadAcronimo(nombre){
+  return (nombre||'?').split(' ')[0].slice(0,4).toUpperCase();
+}
+// Formatea una hora 0-30 → "HH:00" (valores ≥24 pertenecen al día siguiente)
+function cuadHLabel(h){
+  const n = h>=24 ? h-24 : h;
+  return `${String(n).padStart(2,'0')}:00`;
+}
+
+RENDERERS.cuadrante = function(){
+  const el = document.getElementById('page-cuadrante');
+  if(!el) return;
+  if(!S.emp.length){
+    el.innerHTML=`<div class="page-head"><div><h1>📅 Cuadrante Semanal</h1></div></div>`+noEmpWarning();
+    return;
+  }
+
+  // ── 1) Deriva las áreas dinámicamente de los tipos de empleados ──────────
+  const allAreas = [...new Set(S.emp.map(e=>empArea(e)))].sort();
+  const allCats  = [...new Set(S.emp.map(e=>e.tipo||'').filter(Boolean))].sort();
+
+  // ── 2) Calcula el rango horario (primer entrada → última salida) ─────────
+  let minH=24, maxH=0;
+  S.emp.forEach(e=>{
+    CUAD_DIAS.forEach(dia=>{
+      const h=getHorario(e.id, dia);
+      if(!h||h.libre||!h.entrada||!h.salida) return;
+      const eM=hmToMin(h.entrada), sM=hmToMin(h.salida);
+      if(eM===null||sM===null) return;
+      const eH=Math.floor(eM/60);
+      const sMAjust = sM<=eM ? sM+24*60 : sM;
+      const sH=Math.ceil(sMAjust/60);
+      if(eH<minH) minH=eH;
+      if(sH>maxH) maxH=sH;
+    });
+  });
+  if(minH>maxH){ minH=8; maxH=24; }
+  maxH=Math.min(maxH, minH+20); // cota de 20 franjas máximo
+  const hours = Array.from({length:maxH-minH},(_,i)=>minH+i);
+
+  // ── 3) Aplica filtros de columnas y filas ────────────────────────────────
+  const dispDias  = cuadranteFilter.dia  ? CUAD_DIAS.filter(d=>String(d)===cuadranteFilter.dia) : CUAD_DIAS;
+  const dispAreas = cuadranteFilter.area ? allAreas.filter(a=>a===cuadranteFilter.area) : allAreas;
+  const filtEmps  = S.emp.filter(e=>
+    (!cuadranteFilter.empId     || e.id===cuadranteFilter.empId) &&
+    (!cuadranteFilter.categoria || e.tipo===cuadranteFilter.categoria)
+  );
+
+  // ── 4) Construye lookup[dia][area][hora] = [emp,...] ────────────────────
+  const lkp = {};
+  dispDias.forEach(dia=>{
+    lkp[dia]={};
+    dispAreas.forEach(area=>{
+      lkp[dia][area]={};
+      hours.forEach(h=>{ lkp[dia][area][h]=[]; });
+    });
+    filtEmps.forEach(emp=>{
+      const hor=getHorario(emp.id,dia);
+      if(!hor||hor.libre||!hor.entrada||!hor.salida) return;
+      const area=empArea(emp);
+      if(!dispAreas.includes(area)) return;
+      const eM=hmToMin(hor.entrada), sM=hmToMin(hor.salida);
+      if(eM===null||sM===null) return;
+      const sMAjust = sM<=eM ? sM+24*60 : sM;
+      const eH=Math.floor(eM/60);
+      const sH=Math.ceil(sMAjust/60);
+      for(let h=eH; h<sH; h++){
+        if(h>=minH && h<maxH && lkp[dia][area]?.[h]!==undefined)
+          lkp[dia][area][h].push(emp);
+      }
+    });
+  });
+
+  // ── 5) Genera el HTML de la tabla ────────────────────────────────────────
+  const noCols = dispDias.length * dispAreas.length;
+  let tableHTML = '';
+  if(noCols > 0){
+    // Encabezado fila 1: días (spanning por número de áreas)
+    const row1 = dispDias.map((d,di)=>{
+      const label = CUAD_DIA_LABEL[CUAD_DIAS.indexOf(d)];
+      return `<th colspan="${dispAreas.length}" class="cuad-day-hdr">${label}</th>`;
+    }).join('');
+    // Encabezado fila 2: áreas
+    const row2 = dispDias.map((d,di)=>
+      dispAreas.map(a=>`<th class="cuad-area-hdr">${a}</th>`).join('')
+    ).join('');
+    // Filas de horas
+    const bodyRows = hours.map(h=>{
+      const hLabel=`${cuadHLabel(h)}<br><small style="opacity:.55;font-size:9px">${cuadHLabel(h+1)}</small>`;
+      const cells = dispDias.map((dia,di)=>
+        dispAreas.map((area,ai)=>{
+          const emps = lkp[dia]?.[area]?.[h] || [];
+          const chips = emps.map(emp=>{
+            const hor=getHorario(emp.id,dia);
+            const color=cuadEmpColor(emp.id);
+            const tipTxt=`${emp.nombre}\n${emp.tipo||'—'} · ${area}\n${CUAD_DIA_LABEL[CUAD_DIAS.indexOf(dia)]}: ${hor.entrada}–${hor.salida}`;
+            return `<span class="quad-chip" style="background:${color}" title="${tipTxt}" data-eid="${emp.id}" data-dia="${dia}">${cuadAcronimo(emp.nombre)}</span>`;
+          }).join('');
+          const sep = ai===0 ? ' day-sep':'';
+          return `<td class="cuad-cell${sep}">${chips}</td>`;
+        }).join('')
+      ).join('');
+      return `<tr class="cuad-row"><td class="cuad-hr">${hLabel}</td>${cells}</tr>`;
+    }).join('');
+
+    tableHTML = `<div class="cuadrante-outer"><table class="cuadrante-table">
+      <thead>
+        <tr><th class="cuad-hr hdr-hr" rowspan="2">Hora</th>${row1}</tr>
+        <tr>${row2}</tr>
+      </thead>
+      <tbody>${bodyRows}</tbody>
+    </table></div>`;
+  }
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>📅 Cuadrante Semanal de Horarios</h1><p>Vista en tiempo real de la distribución del personal. Se actualiza automáticamente con los cambios de Horarios y Empleados.</p></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Día</label><select id="cuaDia">
+          <option value="">Toda la semana</option>
+          ${CUAD_DIAS.map((d,i)=>`<option value="${d}" ${cuadranteFilter.dia===String(d)?'selected':''}>${CUAD_DIA_LABEL[i]}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Área</label><select id="cuaArea">
+          <option value="">Todas las áreas</option>
+          ${allAreas.map(a=>`<option value="${a}" ${cuadranteFilter.area===a?'selected':''}>${a}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Empleado</label><select id="cuaEmp">
+          <option value="">Todos</option>
+          ${S.emp.map(e=>`<option value="${e.id}" ${cuadranteFilter.empId===e.id?'selected':''}>${e.nombre}</option>`).join('')}
+        </select></div>
+        <div class="field"><label>Categoría</label><select id="cuaCat">
+          <option value="">Todas</option>
+          ${allCats.map(c=>`<option value="${c}" ${cuadranteFilter.categoria===c?'selected':''}>${c}</option>`).join('')}
+        </select></div>
+        <button class="btn btn-ghost btn-sm" id="cuaClear">🗑 Limpiar</button>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${
+        filtEmps.map(e=>`<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px">
+          <span style="width:12px;height:12px;border-radius:2px;background:${cuadEmpColor(e.id)};display:inline-block"></span>
+          <b>${cuadAcronimo(e.nombre)}</b> ${e.nombre}
+        </span>`).join('')
+      }</div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      ${noCols ? tableHTML : '<div class="empty" style="padding:40px">Sin horarios configurados para mostrar. Agrega horarios en el módulo Horarios.</div>'}
+    </div>`;
+
+  // Bind filtros (auto-aplica al cambiar)
+  const applyF=()=>{
+    cuadranteFilter={
+      dia:   document.getElementById('cuaDia').value,
+      area:  document.getElementById('cuaArea').value,
+      empId: document.getElementById('cuaEmp').value,
+      categoria: document.getElementById('cuaCat').value,
+    };
+    RENDERERS.cuadrante();
+  };
+  ['cuaDia','cuaArea','cuaEmp','cuaCat'].forEach(id=>document.getElementById(id).onchange=applyF);
+  document.getElementById('cuaClear').onclick=()=>{ cuadranteFilter={dia:'',area:'',empId:'',categoria:''}; RENDERERS.cuadrante(); };
+
+  // Click en ficha → modal con detalle del empleado
+  document.querySelectorAll('.quad-chip').forEach(chip=>{
+    chip.onclick=ev=>{
+      ev.stopPropagation();
+      const empId=chip.dataset.eid, dia=Number(chip.dataset.dia);
+      const emp=S.emp.find(x=>x.id===empId); if(!emp) return;
+      const hor=getHorario(empId,dia);
+      const color=cuadEmpColor(empId);
+      const diaLabel=CUAD_DIA_LABEL[CUAD_DIAS.indexOf(dia)];
+      document.querySelectorAll('.cuad-modal-bg').forEach(m=>m.remove());
+      const overlay=document.createElement('div');
+      overlay.className='cuad-modal-bg';
+      overlay.innerHTML=`<div class="cuad-modal-box">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+          <div style="width:44px;height:44px;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;letter-spacing:.5px;flex-shrink:0">${cuadAcronimo(emp.nombre)}</div>
+          <div><div style="font-weight:700;font-size:16px">${emp.nombre}</div><div style="font-size:12px;color:#888;margin-top:2px">${emp.documento||''}</div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:13px;line-height:1.4">
+          <span style="color:#888">Cargo</span><b>${emp.tipo||'—'}</b>
+          <span style="color:#888">Área</span><b>${empArea(emp)}</b>
+          <span style="color:#888">Día</span><b>${diaLabel}</b>
+          <span style="color:#888">Entrada</span><b>${hor?.entrada||'—'}</b>
+          <span style="color:#888">Salida</span><b>${hor?.salida||'—'}</b>
+          <span style="color:#888">Sueldo/h</span><b>${money(emp.sueldoHora||0)}</b>
+        </div>
+        <button class="btn btn-ghost" style="margin-top:18px;width:100%" onclick="this.closest('.cuad-modal-bg').remove()">✕ Cerrar</button>
+      </div>`;
+      overlay.onclick=ev=>{ if(ev.target===overlay) overlay.remove(); };
+      document.body.appendChild(overlay);
+    };
+  });
+};
 
 /* ================================================================
    MÓDULO 1: EMPLEADOS
@@ -4540,7 +4783,7 @@ const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.goo
 const ACCOUNT_ROLES = {
   'multiboxes.peru@gmail.com': {
     domain: 'planilla',
-    modules: ['empleados','horarios','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin']
+    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin']
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
@@ -5259,7 +5502,7 @@ const NAV_GROUPS_INVENTARIO = [
 // ── Grupos accordion del dominio PLANILLA (Multiboxes) ──
 const NAV_GROUPS_PLANILLA = [
   { id:'pl-admin',    ico:'👥', label:'Administración y Configuración',
-    modules:['empleados','horarios','admin'] },
+    modules:['empleados','horarios','cuadrante','admin'] },
   { id:'pl-registro', ico:'📝', label:'Registro de Información',
     modules:['marcaciones','descuentos','pagos','libres'] },
   { id:'pl-propinas', ico:'💵', label:'Propinas',
@@ -5279,6 +5522,7 @@ const NAV_MODULE_LABELS = {
   efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja'],
   // Planilla
   empleados:['👥','Empleados'], horarios:['🕒','Horarios'], admin:['⚙️','Administración'],
+  cuadrante:['📅','Cuadrante Semanal'],
   marcaciones:['📥','Carga de horas'], descuentos:['➖','Descuentos'],
   pagos:['➕','Pagos Extra'], libres:['🌴','Días Libres / Vacaciones'],
   propinas:['💵','Propinas'], propinasConsolidado:['🧮','Consolidado Propinas'],
