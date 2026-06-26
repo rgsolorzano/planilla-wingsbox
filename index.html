@@ -1147,7 +1147,8 @@ const CUAD_COLORS = [
   '#be185d','#f97316','#ca8a04','#4ade80','#06b6d4',
   '#818cf8','#c084fc','#fb7185','#34d399','#fbbf24',
 ];
-let cuadranteFilter = { dia:'', area:'', empId:'', categoria:'' };
+// areas = null → todas las áreas (sin filtro). Set → solo las áreas del Set.
+let cuadranteFilter = { dia:'', areas:null, empId:'' };
 
 // Determina el "área" de un empleado a partir de su tipo.
 // Completamente dinámico: tipos no reconocidos forman su propia área.
@@ -1201,7 +1202,6 @@ RENDERERS.cuadrante = function(){
 
   // ── 2) Deriva las áreas dinámicamente de los tipos de empleados ──────────
   const allAreas = [...new Set(empsActivos.map(e=>empArea(e)))].sort();
-  const allCats  = [...new Set(empsActivos.map(e=>e.tipo||'').filter(Boolean))].sort();
 
   // ── 2) Calcula el rango horario (primer entrada → última salida) ─────────
   let minH=24, maxH=0;
@@ -1224,10 +1224,12 @@ RENDERERS.cuadrante = function(){
 
   // ── 3) Aplica filtros de columnas y filas ────────────────────────────────
   const dispDias  = cuadranteFilter.dia  ? CUAD_DIAS.filter(d=>String(d)===cuadranteFilter.dia) : CUAD_DIAS;
-  const dispAreas = cuadranteFilter.area ? allAreas.filter(a=>a===cuadranteFilter.area) : allAreas;
+  // null = todas las áreas (sin filtro activo); Set = solo las indicadas (puede ser vacío)
+  const dispAreas = cuadranteFilter.areas === null
+    ? allAreas
+    : allAreas.filter(a=>cuadranteFilter.areas.has(a));
   const filtEmps  = empsActivos.filter(e=>
-    (!cuadranteFilter.empId     || e.id===cuadranteFilter.empId) &&
-    (!cuadranteFilter.categoria || e.tipo===cuadranteFilter.categoria)
+    (!cuadranteFilter.empId || e.id===cuadranteFilter.empId)
   );
 
   // ── 4) Construye lookup[dia][area][hora] = [emp,...] ────────────────────
@@ -1299,24 +1301,30 @@ RENDERERS.cuadrante = function(){
   el.innerHTML = `
     <div class="page-head"><div><h1>📅 Cuadrante Semanal de Horarios</h1><p>Vista en tiempo real de la distribución del personal. Se actualiza automáticamente con los cambios de Horarios y Empleados.</p></div></div>
     <div class="card">
-      <div class="toolbar">
+      <div class="toolbar" style="flex-wrap:wrap;gap:12px 20px;align-items:flex-start">
         <div class="field"><label>Día</label><select id="cuaDia">
           <option value="">Toda la semana</option>
           ${CUAD_DIAS.map((d,i)=>`<option value="${d}" ${cuadranteFilter.dia===String(d)?'selected':''}>${CUAD_DIA_LABEL[i]}</option>`).join('')}
         </select></div>
-        <div class="field"><label>Área</label><select id="cuaArea">
-          <option value="">Todas las áreas</option>
-          ${allAreas.map(a=>`<option value="${a}" ${cuadranteFilter.area===a?'selected':''}>${a}</option>`).join('')}
-        </select></div>
+        <div class="field">
+          <label>Áreas</label>
+          <div style="display:flex;flex-wrap:wrap;gap:6px 12px;padding-top:4px" id="cuaAreasWrap">
+            <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px;user-select:none">
+              <input type="checkbox" id="cuaAreaTodas" ${cuadranteFilter.areas===null?'checked':''}>
+              <span>Todas</span>
+            </label>
+            ${allAreas.map(a=>`
+            <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px;user-select:none">
+              <input type="checkbox" class="cuaAreaChk" value="${a}" ${cuadranteFilter.areas===null||cuadranteFilter.areas.has(a)?'checked':''}>
+              <span>${a}</span>
+            </label>`).join('')}
+          </div>
+        </div>
         <div class="field"><label>Empleado</label><select id="cuaEmp">
           <option value="">Todos</option>
-          ${S.emp.map(e=>`<option value="${e.id}" ${cuadranteFilter.empId===e.id?'selected':''}>${e.nombre}</option>`).join('')}
+          ${empsActivos.map(e=>`<option value="${e.id}" ${cuadranteFilter.empId===e.id?'selected':''}>${e.nombre}</option>`).join('')}
         </select></div>
-        <div class="field"><label>Categoría</label><select id="cuaCat">
-          <option value="">Todas</option>
-          ${allCats.map(c=>`<option value="${c}" ${cuadranteFilter.categoria===c?'selected':''}>${c}</option>`).join('')}
-        </select></div>
-        <button class="btn btn-ghost btn-sm" id="cuaClear">🗑 Limpiar</button>
+        <button class="btn btn-ghost btn-sm" id="cuaClear" style="align-self:flex-end;margin-bottom:2px">🗑 Limpiar</button>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">${
         filtEmps.map(e=>`<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px">
@@ -1330,17 +1338,40 @@ RENDERERS.cuadrante = function(){
     </div>`;
 
   // Bind filtros (auto-aplica al cambiar)
-  const applyF=()=>{
-    cuadranteFilter={
-      dia:   document.getElementById('cuaDia').value,
-      area:  document.getElementById('cuaArea').value,
-      empId: document.getElementById('cuaEmp').value,
-      categoria: document.getElementById('cuaCat').value,
-    };
+  const applyAreas = ()=>{
+    const chkEls  = Array.from(document.querySelectorAll('.cuaAreaChk'));
+    const checked  = chkEls.filter(c=>c.checked).map(c=>c.value);
+    const todasEl  = document.getElementById('cuaAreaTodas');
+    // Si todos los individuales están marcados → null (sin filtro = todas)
+    if(checked.length === chkEls.length){
+      cuadranteFilter.areas = null;
+      if(todasEl) todasEl.checked = true;
+    } else {
+      cuadranteFilter.areas = new Set(checked);
+      if(todasEl) todasEl.checked = false;
+    }
     RENDERERS.cuadrante();
   };
-  ['cuaDia','cuaArea','cuaEmp','cuaCat'].forEach(id=>document.getElementById(id).onchange=applyF);
-  document.getElementById('cuaClear').onclick=()=>{ cuadranteFilter={dia:'',area:'',empId:'',categoria:''}; RENDERERS.cuadrante(); };
+  const applyF=()=>{
+    cuadranteFilter.dia   = document.getElementById('cuaDia').value;
+    cuadranteFilter.empId = document.getElementById('cuaEmp').value;
+    applyAreas();
+  };
+
+  // "Todas": marcar/desmarcar todos los checkboxes individuales
+  const todasChk = document.getElementById('cuaAreaTodas');
+  if(todasChk) todasChk.onchange=()=>{
+    document.querySelectorAll('.cuaAreaChk').forEach(c=>{ c.checked=todasChk.checked; });
+    cuadranteFilter.areas = todasChk.checked ? null : new Set();
+    RENDERERS.cuadrante();
+  };
+  // Checkboxes individuales
+  document.querySelectorAll('.cuaAreaChk').forEach(c=>{ c.onchange=applyAreas; });
+  ['cuaDia','cuaEmp'].forEach(id=>document.getElementById(id).onchange=applyF);
+  document.getElementById('cuaClear').onclick=()=>{
+    cuadranteFilter={dia:'',areas:null,empId:''};
+    RENDERERS.cuadrante();
+  };
 
   // Click en ficha → modal con detalle del empleado
   document.querySelectorAll('.quad-chip').forEach(chip=>{
