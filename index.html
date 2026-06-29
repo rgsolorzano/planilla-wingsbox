@@ -1431,29 +1431,49 @@ function saveAlertasEnviadas(map){ localStorage.setItem(K_ALERTAS_ENV, JSON.stri
 async function sendGmailEmail(subject, htmlBody){
   if(!isAuthorized()) return false;
   try{
-    const raw = [
+    // Helper: convierte cualquier cadena Unicode a base64url (Gmail API "raw" field).
+    // Usa TextEncoder para manejar correctamente emojis, tildes, ñ, etc.
+    // btoa() nativo solo acepta Latin-1; TextEncoder resuelve el problema.
+    function toBase64url(str){
+      const bytes = new TextEncoder().encode(str);
+      let bin = '';
+      bytes.forEach(b=>{ bin += String.fromCharCode(b); });
+      return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    }
+    // Subject con caracteres especiales (tildes, emojis) codificado en MIME encoded-word
+    const subjectEncoded = `=?UTF-8?B?${btoa(unescape(encodeURIComponent(subject)))}?=`;
+    // Mensaje RFC 2822 completo — el body HTML va directamente en UTF-8
+    const rfcMessage = [
       `To: ${ALERTA_EMAIL_DEST}`,
       `From: ${gsState.email||'noreply'}`,
-      `Subject: ${subject}`,
+      `Subject: ${subjectEncoded}`,
       'MIME-Version: 1.0',
       'Content-Type: text/html; charset=UTF-8',
       '',
       htmlBody
     ].join('\r\n');
-    // Base64url encoding (requerido por Gmail API)
-    const encoded = btoa(unescape(encodeURIComponent(raw)))
-      .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+    const encoded = toBase64url(rfcMessage);
+    console.log('[Alerta Email] Enviando a', ALERTA_EMAIL_DEST, 'desde', gsState.email);
+
     const resp = await gsApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({ raw: encoded })
     });
+
     if(!resp.ok){
-      const err = await resp.json().catch(()=>({}));
-      console.error('[Alerta Email] Error Gmail API:', resp.status, err);
+      let errMsg = '';
+      try{ const e=await resp.json(); errMsg=e?.error?.message||''; }catch(ex){}
+      console.error('[Alerta Email] Error HTTP', resp.status, errMsg);
+      if(resp.status===403){
+        toast('📧 Sin permiso para enviar correos. Cierra sesión → vuelve a iniciar sesión → acepta el permiso de Gmail cuando Google lo solicite.','error');
+      }
+      return false;
     }
-    return resp.ok;
+    console.log('[Alerta Email] ✓ Correo enviado correctamente.');
+    return true;
   }catch(e){
-    console.error('[Alerta Email] Excepción al enviar correo:', e);
+    console.error('[Alerta Email] Excepción:', e.message||e);
     return false;
   }
 }
