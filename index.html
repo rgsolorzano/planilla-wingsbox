@@ -1406,9 +1406,124 @@ RENDERERS.cuadrante = function(){
   });
 };
 
-/* ================================================================
-   MÓDULO 1: EMPLEADOS
-   ================================================================ */
+/* ── ALERTAS POR CORREO ── Inventario de Insumos (stock mínimo) ─────────
+   Solo insumos con tipoAlerta='minimo' y alertaEmail=true.
+   Se evalúan después de guardar la producción.
+   Se envía UN solo correo consolidado por sesión de guardado.
+   Anti-duplicado: persiste en localStorage por (insumoId, fecha).
+   ──────────────────────────────────────────────────────────────────────── */
+const ALERTA_EMAIL_DEST = 'multiboxes.peru@gmail.com';
+const K_ALERTAS_ENV     = 'inv_alertasEnviadas'; // localStorage key
+// Lee el Set de alertas ya enviadas {insumoId_fecha → isoTimestamp}
+function loadAlertasEnviadas(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(K_ALERTAS_ENV)||'{}');
+    // Purgar entradas con más de 7 días para no acumular indefinidamente
+    const cutoff = Date.now() - 7*24*3600*1000;
+    Object.keys(raw).forEach(k=>{ if(new Date(raw[k]).getTime() < cutoff) delete raw[k]; });
+    return raw;
+  }catch(e){ return {}; }
+}
+function saveAlertasEnviadas(map){ localStorage.setItem(K_ALERTAS_ENV, JSON.stringify(map)); }
+
+// Envía un correo via Gmail API usando el token del usuario activo.
+// Requiere scope 'gmail.send'.
+async function sendGmailEmail(subject, htmlBody){
+  if(!isAuthorized()) return false;
+  try{
+    const raw = [
+      `To: ${ALERTA_EMAIL_DEST}`,
+      `From: ${gsState.email||'noreply'}`,
+      `Subject: ${subject}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/html; charset=UTF-8',
+      '',
+      htmlBody
+    ].join('\r\n');
+    // Base64url encoding (requerido por Gmail API)
+    const encoded = btoa(unescape(encodeURIComponent(raw)))
+      .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    const resp = await gsApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ raw: encoded })
+    });
+    if(!resp.ok){
+      const err = await resp.json().catch(()=>({}));
+      console.error('[Alerta Email] Error Gmail API:', resp.status, err);
+    }
+    return resp.ok;
+  }catch(e){
+    console.error('[Alerta Email] Excepción al enviar correo:', e);
+    return false;
+  }
+}
+
+// Evalúa los insumos en alerta tras guardar producción y envía un único correo
+// consolidado si hay al menos uno nuevo. Respeta anti-duplicado por (id, fecha).
+async function evaluarAlertasInsumos(fecha){
+  if(!isAuthorized()) return;
+  const enviadas = loadAlertasEnviadas();
+  const nuevas = [];
+
+  S.insumos.forEach(ins=>{
+    // Solo aplica a tipo 'minimo' con alertaEmail=true
+    if(insumoTipoAlerta(ins)!=='minimo' || !ins.alertaEmail) return;
+    const reg = getProduccion(ins.id, fecha);
+    if(!reg || reg.cierre===undefined || reg.cierre===null) return;
+    const umbral = insumoUmbral(ins);
+    if(reg.cierre >= umbral) return; // dentro del umbral: no alertar
+    const key = ins.id+'_'+fecha;
+    if(enviadas[key]){
+      console.log(`[Alerta Email] Ya enviada para ${ins.nombre} en ${fecha}; omitiendo.`);
+      return;
+    }
+    nuevas.push({ ins, cierre:reg.cierre, umbral, fecha });
+  });
+
+  if(!nuevas.length) return;
+
+  const now = new Date();
+  const horaStr = now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
+  const fechaStr = fmtFecha(fecha);
+
+  const filas = nuevas.map(a=>`
+    <tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb"><b>${a.ins.nombre}</b></td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right;color:#dc2626"><b>${a.cierre} ${a.ins.unidad}</b></td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right">${a.umbral} ${a.ins.unidad}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">${a.ins.unidad}</td>
+    </tr>`).join('');
+
+  const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+    <div style="background:#dc2626;padding:16px 24px;border-radius:8px 8px 0 0">
+      <h2 style="color:#fff;margin:0;font-size:18px">⚠️ Alerta de Inventario — Stock mínimo detectado</h2>
+    </div>
+    <div style="background:#fff;border:1px solid #e5e7eb;border-top:0;padding:20px 24px;border-radius:0 0 8px 8px">
+      <p style="color:#374151">Se detectaron <b>${nuevas.length}</b> insumo(s) por debajo del stock mínimo configurado al guardar el inventario del día <b>${fechaStr}</b>.</p>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">
+        <thead><tr style="background:#f3f4f6">
+          <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;text-transform:uppercase">Insumo</th>
+          <th style="padding:10px 12px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase">Stock actual</th>
+          <th style="padding:10px 12px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase">Umbral mínimo</th>
+          <th style="padding:10px 12px;font-size:12px;color:#6b7280;text-transform:uppercase">Unidad</th>
+        </tr></thead>
+        <tbody>${filas}</tbody>
+      </table>
+      <p style="margin-top:20px;font-size:13px;color:#9ca3af">Generado automáticamente el ${fechaStr} a las ${horaStr} por WingsBox Inventario.</p>
+    </div>
+  </div>`;
+
+  console.log(`[Alerta Email] Enviando correo consolidado para ${nuevas.length} insumo(s) en ${fecha}...`);
+  const ok = await sendGmailEmail('⚠️ Alerta de inventario — Stock mínimo detectado', htmlBody);
+  if(ok){
+    nuevas.forEach(a=>{ enviadas[a.ins.id+'_'+a.fecha] = now.toISOString(); });
+    saveAlertasEnviadas(enviadas);
+    console.log('[Alerta Email] Correo enviado correctamente.');
+    toast(`📧 Alerta de stock mínimo enviada (${nuevas.length} insumo(s)).`,'info');
+  }else{
+    toast('⚠️ El inventario se guardó, pero no se pudo enviar la alerta por correo.','error');
+  }
+}
 let editEmpId = null;
 RENDERERS.empleados = function(){
   const el = document.getElementById('page-empleados');
@@ -3523,6 +3638,7 @@ function migrarCamposInsumo(ins){
   if(ins.umbral === undefined || ins.umbral === null || ins.umbral === '') ins.umbral = umbralPorDefecto(ins.unidad);
   if(ins.resaltadoInsumo === undefined) ins.resaltadoInsumo = true;
   if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true;
+  if(ins.alertaEmail === undefined) ins.alertaEmail = false; // nuevo: alerta por correo (tipo='minimo' only)
   return ins;
 }
 function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
@@ -3602,6 +3718,9 @@ async function guardarProduccion(){
   toast(`Producción guardada (${guardados} insumo(s)).`,'success');
   RENDERERS.produccion();
   syncProduccion();
+  // Evalúa alertas de stock mínimo DESPUÉS de confirmar el guardado.
+  // Fire-and-forget: un error en el correo no afecta el inventario guardado.
+  evaluarAlertasInsumos(prodFecha).catch(e=>console.error('[Alerta Email] Error inesperado:', e));
 }
 function exportarProduccionDiaExcel(){
   const datos = S.insumos.map(ins=>{
@@ -3638,7 +3757,7 @@ RENDERERS.insumos = function(){
         <b>Los cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th class="num">Umbral</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th class="num">Umbral</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th class="num" title="Envía correo a multiboxes.peru@gmail.com cuando el stock esté bajo el umbral (solo tipo Mínimo)">📧 Correo</th><th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? S.insumos.map(i=>`
           <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
             <td><select class="insCfgTipoAlerta" data-id="${i.id}">
@@ -3648,6 +3767,7 @@ RENDERERS.insumos = function(){
             <td class="num"><input type="number" class="insCfgUmbral" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbral(i)}" title="Valor de referencia para la alerta"></td>
             <td class="num"><input type="checkbox" class="insCfgInsumo" data-id="${i.id}" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita según el tipo de alerta configurado"></td>
             <td class="num"><input type="checkbox" class="insCfgCelda" data-id="${i.id}" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada"></td>
+            <td class="num"><input type="checkbox" class="insCfgEmail" data-id="${i.id}" ${i.alertaEmail?'checked':''} ${i.tipoAlerta!=='minimo'?'disabled title="Solo disponible para tipo de alerta Mínimo"':'title="Envía correo de alerta cuando el cierre esté bajo el umbral configurado"'}></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
         `).join('') : `<tr><td colspan="7" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
@@ -3680,7 +3800,7 @@ function insumoSave(){
     // Nuevo insumo: defaults por unidad para tipoAlerta y umbral.
     S.insumos.push({ id:uid(), nombre, unidad,
       tipoAlerta:'consumo', umbral:umbralPorDefecto(unidad),
-      resaltadoInsumo:true, resaltadoCelda:true });
+      resaltadoInsumo:true, resaltadoCelda:true, alertaEmail:false });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
@@ -3709,6 +3829,10 @@ async function insumosActualizarResaltados(){
     document.querySelectorAll('.insCfgCelda').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
       if(ins) ins.resaltadoCelda = cb.checked;
+    });
+    document.querySelectorAll('.insCfgEmail').forEach(cb=>{
+      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
+      if(ins) ins.alertaEmail = cb.checked;
     });
     save(K.insumos, S.insumos);
     const ok = await gsSaveSheet('inventario','Insumos',gsSerializeSheet('inventario','Insumos'));
@@ -4878,7 +5002,7 @@ const ACCOUNT_ROLES = {
 // Google Cloud está en modo "Testing", confirmar que el scope esté habilitado
 // en la pantalla de consentimiento (mismo paso ya documentado arriba para
 // drive.file), y que AMBAS cuentas estén en la lista de "usuarios de prueba".
-const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly';
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/gmail.send';
 // Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
 // (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
 // inicia sesión (por eso queda en su propio Drive).
@@ -5175,10 +5299,11 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','tipoAlerta','umbral','resaltadoInsumo','resaltadoCelda'],
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','tipoAlerta','umbral','resaltadoInsumo','resaltadoCelda','alertaEmail'],
       S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
         tipoAlerta:insumoTipoAlerta(i), umbral:insumoUmbral(i),
-        resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0 }))),
+        resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0,
+        alertaEmail:i.alertaEmail?1:0 }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
@@ -5382,7 +5507,8 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim(),
         tipoAlerta: (r.tipoAlerta==='minimo') ? 'minimo' : 'consumo',
         umbral: (r.umbral!==undefined && r.umbral!==null && r.umbral!=='') ? Number(r.umbral) : undefined,
-        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda)
+        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda),
+        alertaEmail: !esFalse(r.alertaEmail) && (r.alertaEmail===1||r.alertaEmail==='1'||r.alertaEmail===true||String(r.alertaEmail).toLowerCase()==='true')
       }));
       S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
