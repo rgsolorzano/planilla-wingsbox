@@ -102,7 +102,6 @@
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   tfoot td{font-weight:700;background:#f1ecfa}
   /* Consolidado de Inventario: alertas (mismos colores que .b-miss) */
-  .inv-insumo-alerta{color:#991b1b;font-weight:700}
   .inv-cell-alerta{background:#fee2e2}
   .inv-cell-alerta input{color:#991b1b;font-weight:700}
   .inv-matrix th small{display:block}
@@ -286,6 +285,7 @@
     <section class="page" id="page-produccion"></section>
     <section class="page" id="page-insumos"></section>
     <section class="page" id="page-inventarioConsolidado"></section>
+    <section class="page" id="page-alertaInsumos"></section>
     <section class="page" id="page-syncInventario"></section>
     <section class="page" id="page-licores"></section>
     <section class="page" id="page-invDiarioLicores"></section>
@@ -1406,144 +1406,6 @@ RENDERERS.cuadrante = function(){
   });
 };
 
-/* ── ALERTAS POR CORREO ── Inventario de Insumos (stock mínimo) ─────────
-   Solo insumos con tipoAlerta='minimo' y alertaEmail=true.
-   Se evalúan después de guardar la producción.
-   Se envía UN solo correo consolidado por sesión de guardado.
-   Anti-duplicado: persiste en localStorage por (insumoId, fecha).
-   ──────────────────────────────────────────────────────────────────────── */
-const ALERTA_EMAIL_DEST = 'multiboxes.peru@gmail.com';
-const K_ALERTAS_ENV     = 'inv_alertasEnviadas'; // localStorage key
-// Lee el Set de alertas ya enviadas {insumoId_fecha → isoTimestamp}
-function loadAlertasEnviadas(){
-  try{
-    const raw = JSON.parse(localStorage.getItem(K_ALERTAS_ENV)||'{}');
-    // Purgar entradas con más de 7 días para no acumular indefinidamente
-    const cutoff = Date.now() - 7*24*3600*1000;
-    Object.keys(raw).forEach(k=>{ if(new Date(raw[k]).getTime() < cutoff) delete raw[k]; });
-    return raw;
-  }catch(e){ return {}; }
-}
-function saveAlertasEnviadas(map){ localStorage.setItem(K_ALERTAS_ENV, JSON.stringify(map)); }
-
-// Envía un correo via Gmail API usando el token del usuario activo.
-// Requiere scope 'gmail.send'.
-async function sendGmailEmail(subject, htmlBody){
-  if(!isAuthorized()) return false;
-  try{
-    // Helper: convierte cualquier cadena Unicode a base64url (Gmail API "raw" field).
-    // Usa TextEncoder para manejar correctamente emojis, tildes, ñ, etc.
-    // btoa() nativo solo acepta Latin-1; TextEncoder resuelve el problema.
-    function toBase64url(str){
-      const bytes = new TextEncoder().encode(str);
-      let bin = '';
-      bytes.forEach(b=>{ bin += String.fromCharCode(b); });
-      return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-    }
-    // Subject con caracteres especiales (tildes, emojis) codificado en MIME encoded-word
-    const subjectEncoded = `=?UTF-8?B?${btoa(unescape(encodeURIComponent(subject)))}?=`;
-    // Mensaje RFC 2822 completo — el body HTML va directamente en UTF-8
-    const rfcMessage = [
-      `To: ${ALERTA_EMAIL_DEST}`,
-      `From: ${gsState.email||'noreply'}`,
-      `Subject: ${subjectEncoded}`,
-      'MIME-Version: 1.0',
-      'Content-Type: text/html; charset=UTF-8',
-      '',
-      htmlBody
-    ].join('\r\n');
-
-    const encoded = toBase64url(rfcMessage);
-    console.log('[Alerta Email] Enviando a', ALERTA_EMAIL_DEST, 'desde', gsState.email);
-
-    const resp = await gsApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ raw: encoded })
-    });
-
-    if(!resp.ok){
-      let errMsg = '';
-      try{ const e=await resp.json(); errMsg=e?.error?.message||''; }catch(ex){}
-      console.error('[Alerta Email] Error HTTP', resp.status, errMsg);
-      if(resp.status===403){
-        toast('📧 Sin permiso para enviar correos. Cierra sesión → vuelve a iniciar sesión → acepta el permiso de Gmail cuando Google lo solicite.','error');
-      }
-      return false;
-    }
-    console.log('[Alerta Email] ✓ Correo enviado correctamente.');
-    return true;
-  }catch(e){
-    console.error('[Alerta Email] Excepción:', e.message||e);
-    return false;
-  }
-}
-
-// Evalúa los insumos en alerta tras guardar producción y envía un único correo
-// consolidado si hay al menos uno nuevo. Respeta anti-duplicado por (id, fecha).
-async function evaluarAlertasInsumos(fecha){
-  if(!isAuthorized()) return;
-  const enviadas = loadAlertasEnviadas();
-  const nuevas = [];
-
-  S.insumos.forEach(ins=>{
-    // Solo aplica a tipo 'minimo' con alertaEmail=true
-    if(insumoTipoAlerta(ins)!=='minimo' || !ins.alertaEmail) return;
-    const reg = getProduccion(ins.id, fecha);
-    if(!reg || reg.cierre===undefined || reg.cierre===null) return;
-    const umbral = insumoUmbral(ins);
-    if(reg.cierre >= umbral) return; // dentro del umbral: no alertar
-    const key = ins.id+'_'+fecha;
-    if(enviadas[key]){
-      console.log(`[Alerta Email] Ya enviada para ${ins.nombre} en ${fecha}; omitiendo.`);
-      return;
-    }
-    nuevas.push({ ins, cierre:reg.cierre, umbral, fecha });
-  });
-
-  if(!nuevas.length) return;
-
-  const now = new Date();
-  const horaStr = now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-  const fechaStr = fmtFecha(fecha);
-
-  const filas = nuevas.map(a=>`
-    <tr>
-      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb"><b>${a.ins.nombre}</b></td>
-      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right;color:#dc2626"><b>${a.cierre} ${a.ins.unidad}</b></td>
-      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right">${a.umbral} ${a.ins.unidad}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">${a.ins.unidad}</td>
-    </tr>`).join('');
-
-  const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-    <div style="background:#dc2626;padding:16px 24px;border-radius:8px 8px 0 0">
-      <h2 style="color:#fff;margin:0;font-size:18px">⚠️ Alerta de Inventario — Stock mínimo detectado</h2>
-    </div>
-    <div style="background:#fff;border:1px solid #e5e7eb;border-top:0;padding:20px 24px;border-radius:0 0 8px 8px">
-      <p style="color:#374151">Se detectaron <b>${nuevas.length}</b> insumo(s) por debajo del stock mínimo configurado al guardar el inventario del día <b>${fechaStr}</b>.</p>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">
-        <thead><tr style="background:#f3f4f6">
-          <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;text-transform:uppercase">Insumo</th>
-          <th style="padding:10px 12px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase">Stock actual</th>
-          <th style="padding:10px 12px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase">Umbral mínimo</th>
-          <th style="padding:10px 12px;font-size:12px;color:#6b7280;text-transform:uppercase">Unidad</th>
-        </tr></thead>
-        <tbody>${filas}</tbody>
-      </table>
-      <p style="margin-top:20px;font-size:13px;color:#9ca3af">Generado automáticamente el ${fechaStr} a las ${horaStr} por WingsBox Inventario.</p>
-    </div>
-  </div>`;
-
-  console.log(`[Alerta Email] Enviando correo consolidado para ${nuevas.length} insumo(s) en ${fecha}...`);
-  const ok = await sendGmailEmail('⚠️ Alerta de inventario — Stock mínimo detectado', htmlBody);
-  if(ok){
-    nuevas.forEach(a=>{ enviadas[a.ins.id+'_'+a.fecha] = now.toISOString(); });
-    saveAlertasEnviadas(enviadas);
-    console.log('[Alerta Email] Correo enviado correctamente.');
-    toast(`📧 Alerta de stock mínimo enviada (${nuevas.length} insumo(s)).`,'info');
-  }else{
-    toast('⚠️ El inventario se guardó, pero no se pudo enviar la alerta por correo.','error');
-  }
-}
 let editEmpId = null;
 RENDERERS.empleados = function(){
   const el = document.getElementById('page-empleados');
@@ -3620,29 +3482,31 @@ function seedInsumos(force){
   if(!force && localStorage.getItem(K.seedInsumos)) return;
   S.insumos = INSUMOS_INICIALES.map(([nombre,unidad])=>({
     id:uid(), nombre, unidad,
-    tipoAlerta:'consumo', umbral:umbralPorDefecto(unidad),
-    resaltadoInsumo:true, resaltadoCelda:true
+    alertaConsumo:true, umbralConsumo:umbralPorDefecto(unidad),
+    alertaMinimo:false, umbralMinimo:umbralPorDefecto(unidad),
+    resaltadoCelda:true
   }));
   save(K.insumos, S.insumos);
   localStorage.setItem(K.seedInsumos,'1');
 }
 function nombreInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.nombre : '(insumo eliminado)'; }
 function unidadInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.unidad : ''; }
-// Accesores de configuración por insumo: un insumo antiguo sin estos campos
-// (undefined) se considera ACTIVADO por defecto; solo se desactiva si el
-// valor guardado es explícitamente false (checkbox destildado).
-function insumoAplicaResaltadoInsumo(ins){ return !!ins && ins.resaltadoInsumo !== false; }
-function insumoAplicaResaltadoCelda(ins){ return !!ins && ins.resaltadoCelda !== false; }
-// Tipo de alerta configurable por insumo ('consumo' | 'minimo').
-// Un insumo antiguo sin este campo usa 'consumo' por defecto (backward compat).
-function insumoTipoAlerta(ins){ return (ins && ins.tipoAlerta) ? ins.tipoAlerta : 'consumo'; }
-// Umbral configurable por insumo: valor numérico mínimo para disparar la alerta.
-// Si el campo no está configurado, se aplica el umbral por defecto según la unidad.
-function insumoUmbral(ins){
-  if(ins && ins.umbral !== undefined && ins.umbral !== null && ins.umbral !== '') return Number(ins.umbral);
+// ── Configuración de alertas por insumo (nuevo modelo dual) ────────────────
+// alertaConsumo (bool)   — evalúa consumo acumulado de los últimos 3 días
+// umbralConsumo (number) — consumo mínimo esperado en 3 días
+// alertaMinimo  (bool)   — evalúa el último cierre registrado
+// umbralMinimo  (number) — stock mínimo permitido
+function insumoAlertaConsumo(ins){ return !!ins && ins.alertaConsumo === true; }
+function insumoAlertaMinimo(ins){ return !!ins && ins.alertaMinimo === true; }
+function insumoUmbralConsumo(ins){
+  if(ins && ins.umbralConsumo !== undefined && ins.umbralConsumo !== null && ins.umbralConsumo !== '') return Number(ins.umbralConsumo);
   return umbralPorDefecto(ins ? ins.unidad : '');
 }
-// Umbral por defecto según la unidad de medida del insumo.
+function insumoUmbralMinimo(ins){
+  if(ins && ins.umbralMinimo !== undefined && ins.umbralMinimo !== null && ins.umbralMinimo !== '') return Number(ins.umbralMinimo);
+  return umbralPorDefecto(ins ? ins.unidad : '');
+}
+// Umbral por defecto según la unidad de medida del insumo (usado al crear o migrar).
 function umbralPorDefecto(unidad){
   const u = (unidad||'').trim().toLowerCase();
   if(u === 'ml') return 100;
@@ -3650,15 +3514,28 @@ function umbralPorDefecto(unidad){
   if(u === 'kg') return 15;
   return 100; // fallback genérico
 }
-// Migra en memoria (sin guardar) un insumo antiguo que no tenga tipoAlerta/umbral
-// para que los getters los devuelvan correctamente. Se llama en seedInsumos y en la
-// restauración desde Google Sheets; no sobreescribe campos ya configurados.
+// Migra en memoria (sin guardar) un insumo al nuevo modelo de alertas.
+// Compatibilidad con datos antiguos: si existía tipoAlerta='minimo' con
+// resaltadoInsumo activo, se traduce a alertaMinimo=true con el umbral
+// previo; si era 'consumo', se traduce a alertaConsumo=true. Los campos
+// obsoletos (tipoAlerta, umbral, resaltadoInsumo, alertaEmail) se conservan
+// sin usarse por si se necesitara auditar versiones anteriores, pero ya no
+// los lee ninguna función del sistema.
 function migrarCamposInsumo(ins){
-  if(!ins.tipoAlerta) ins.tipoAlerta = 'consumo';
-  if(ins.umbral === undefined || ins.umbral === null || ins.umbral === '') ins.umbral = umbralPorDefecto(ins.unidad);
-  if(ins.resaltadoInsumo === undefined) ins.resaltadoInsumo = true;
-  if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true;
-  if(ins.alertaEmail === undefined) ins.alertaEmail = false; // nuevo: alerta por correo (tipo='minimo' only)
+  if(ins.alertaConsumo === undefined){
+    // Traducción desde el modelo anterior (si existía)
+    ins.alertaConsumo = (ins.tipoAlerta === 'consumo' || ins.tipoAlerta === undefined) && ins.resaltadoInsumo !== false;
+  }
+  if(ins.alertaMinimo === undefined){
+    ins.alertaMinimo = ins.tipoAlerta === 'minimo' && ins.resaltadoInsumo !== false;
+  }
+  if(ins.umbralConsumo === undefined || ins.umbralConsumo === null || ins.umbralConsumo === ''){
+    ins.umbralConsumo = (ins.tipoAlerta === 'consumo' && ins.umbral!==undefined) ? Number(ins.umbral) : umbralPorDefecto(ins.unidad);
+  }
+  if(ins.umbralMinimo === undefined || ins.umbralMinimo === null || ins.umbralMinimo === ''){
+    ins.umbralMinimo = (ins.tipoAlerta === 'minimo' && ins.umbral!==undefined) ? Number(ins.umbral) : umbralPorDefecto(ins.unidad);
+  }
+  if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true; // se mantiene: regla de incremento anormal
   return ins;
 }
 function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
@@ -3738,9 +3615,9 @@ async function guardarProduccion(){
   toast(`Producción guardada (${guardados} insumo(s)).`,'success');
   RENDERERS.produccion();
   syncProduccion();
-  // Evalúa alertas de stock mínimo DESPUÉS de confirmar el guardado.
-  // Fire-and-forget: un error en el correo no afecta el inventario guardado.
-  evaluarAlertasInsumos(prodFecha).catch(e=>console.error('[Alerta Email] Error inesperado:', e));
+  // Refresca el módulo "Alerta de Insumos" si está abierto en otra pestaña/grupo
+  // del menú, para reflejar inmediatamente cualquier cambio sin recarga manual.
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
 }
 function exportarProduccionDiaExcel(){
   const datos = S.insumos.map(ins=>{
@@ -3771,23 +3648,24 @@ RENDERERS.insumos = function(){
     <div class="card">
       <h2>Lista de insumos (${S.insumos.length})</h2>
       <p class="hint" style="margin-top:0">
-        <b>Tipo de alerta</b> — <em>Consumo</em>: alerta si el consumo acumulado de los últimos 3 días es menor al Umbral.
-        <em>Mínimo</em>: alerta si el último cierre registrado es menor al Umbral.
-        El <b>Umbral</b> es el valor numérico de referencia para cada tipo. Los checkboxes controlan si el resaltado se aplica.
+        <b>Alerta por consumo</b>: se activa cuando el consumo acumulado de los últimos 3 días es menor al valor configurado en <b>Consumo</b>.
+        <b>Alerta por mínimo</b>: se activa cuando el último inventario registrado es menor al valor configurado en <b>Mínimo</b>.
+        Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
         <b>Los cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th class="num">Umbral</th><th class="num">Aplica resaltado de insumo</th><th class="num">Aplica resaltado de celda</th><th class="num" title="Envía correo a multiboxes.peru@gmail.com cuando el stock esté bajo el umbral (solo tipo Mínimo)">📧 Correo</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Insumo</th><th>Unidad</th>
+          <th class="num" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
+          <th class="num" title="Stock mínimo permitido">Mínimo</th>
+          <th class="num" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por consumo</th>
+          <th class="num" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por mínimo</th>
+          <th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? S.insumos.map(i=>`
           <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
-            <td><select class="insCfgTipoAlerta" data-id="${i.id}">
-              <option value="consumo" ${insumoTipoAlerta(i)==='consumo'?'selected':''}>Consumo</option>
-              <option value="minimo" ${insumoTipoAlerta(i)==='minimo'?'selected':''}>Mínimo</option>
-            </select></td>
-            <td class="num"><input type="number" class="insCfgUmbral" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbral(i)}" title="Valor de referencia para la alerta"></td>
-            <td class="num"><input type="checkbox" class="insCfgInsumo" data-id="${i.id}" ${insumoAplicaResaltadoInsumo(i)?'checked':''} title="Resalta el nombre en rojo/negrita según el tipo de alerta configurado"></td>
-            <td class="num"><input type="checkbox" class="insCfgCelda" data-id="${i.id}" ${insumoAplicaResaltadoCelda(i)?'checked':''} title="Resalta la celda de Cierre si hay un incremento anormal sin producción registrada"></td>
-            <td class="num"><input type="checkbox" class="insCfgEmail" data-id="${i.id}" ${i.alertaEmail?'checked':''} ${i.tipoAlerta!=='minimo'?'disabled title="Solo disponible para tipo de alerta Mínimo"':'title="Envía correo de alerta cuando el cierre esté bajo el umbral configurado"'}></td>
+            <td class="num"><input type="number" class="insCfgUmbralConsumo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralConsumo(i)}" title="Consumo mínimo esperado en 3 días"></td>
+            <td class="num"><input type="number" class="insCfgUmbralMinimo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralMinimo(i)}" title="Stock mínimo permitido"></td>
+            <td class="num"><input type="checkbox" class="insCfgAlertaConsumo" data-id="${i.id}" ${insumoAlertaConsumo(i)?'checked':''}></td>
+            <td class="num"><input type="checkbox" class="insCfgAlertaMinimo" data-id="${i.id}" ${insumoAlertaMinimo(i)?'checked':''}></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
         `).join('') : `<tr><td colspan="7" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
@@ -3812,47 +3690,44 @@ function insumoSave(){
   if(!ok){ toast('Completa nombre y unidad','error'); return; }
   if(editInsumoId){
     const i = S.insumos.find(x=>x.id===editInsumoId);
-    // Solo actualiza nombre y unidad; NO toca tipoAlerta, umbral ni checkboxes
-    // (esos se cambian en la tabla y se guardan con "Actualizar").
+    // Solo actualiza nombre y unidad; la configuración de alertas se cambia
+    // en la tabla y se guarda con "Actualizar".
     Object.assign(i, { nombre, unidad });
     save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
   }else{
-    // Nuevo insumo: defaults por unidad para tipoAlerta y umbral.
+    // Nuevo insumo: alerta por consumo activada por defecto (comportamiento histórico).
     S.insumos.push({ id:uid(), nombre, unidad,
-      tipoAlerta:'consumo', umbral:umbralPorDefecto(unidad),
-      resaltadoInsumo:true, resaltadoCelda:true, alertaEmail:false });
+      alertaConsumo:true, umbralConsumo:umbralPorDefecto(unidad),
+      alertaMinimo:false, umbralMinimo:umbralPorDefecto(unidad),
+      resaltadoCelda:true });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
 }
-// Lee TODOS los controles de configuración de la tabla (tipo, umbral y
-// checkboxes de todos los insumos), aplica los cambios a S.insumos, guarda
-// en localStorage y sincroniza con Google Sheets en una sola acción.
-// Los controles NO disparan guardado/sincronización al cambiar su valor.
+// Lee TODOS los controles de configuración de la tabla (umbrales y
+// checkboxes de alerta de todos los insumos), aplica los cambios a
+// S.insumos, guarda en localStorage y sincroniza con Google Sheets.
 async function insumosActualizarResaltados(){
   const btn = document.getElementById('insActualizar');
   if(btn){ btn.disabled=true; btn.dataset.txt=btn.textContent; btn.textContent='Actualizando…'; }
   try{
-    document.querySelectorAll('.insCfgTipoAlerta').forEach(sel=>{
-      const ins = S.insumos.find(i=>i.id===sel.dataset.id);
-      if(ins) ins.tipoAlerta = sel.value;
-    });
-    document.querySelectorAll('.insCfgUmbral').forEach(inp=>{
+    document.querySelectorAll('.insCfgUmbralConsumo').forEach(inp=>{
       const ins = S.insumos.find(i=>i.id===inp.dataset.id);
       const v = parseFloat(inp.value);
-      if(ins) ins.umbral = isNaN(v)||v<0 ? umbralPorDefecto(ins.unidad) : v;
+      if(ins) ins.umbralConsumo = isNaN(v)||v<0 ? umbralPorDefecto(ins.unidad) : v;
     });
-    document.querySelectorAll('.insCfgInsumo').forEach(cb=>{
-      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
-      if(ins) ins.resaltadoInsumo = cb.checked;
+    document.querySelectorAll('.insCfgUmbralMinimo').forEach(inp=>{
+      const ins = S.insumos.find(i=>i.id===inp.dataset.id);
+      const v = parseFloat(inp.value);
+      if(ins) ins.umbralMinimo = isNaN(v)||v<0 ? umbralPorDefecto(ins.unidad) : v;
     });
-    document.querySelectorAll('.insCfgCelda').forEach(cb=>{
+    document.querySelectorAll('.insCfgAlertaConsumo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
-      if(ins) ins.resaltadoCelda = cb.checked;
+      if(ins) ins.alertaConsumo = cb.checked;
     });
-    document.querySelectorAll('.insCfgEmail').forEach(cb=>{
+    document.querySelectorAll('.insCfgAlertaMinimo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
-      if(ins) ins.alertaEmail = cb.checked;
+      if(ins) ins.alertaMinimo = cb.checked;
     });
     save(K.insumos, S.insumos);
     const ok = await gsSaveSheet('inventario','Insumos',gsSerializeSheet('inventario','Insumos'));
@@ -3861,6 +3736,7 @@ async function insumosActualizarResaltados(){
   }finally{
     if(btn){ btn.disabled=false; btn.textContent=btn.dataset.txt||'💾 Actualizar'; }
     RENDERERS.insumos();
+    if(typeof RENDERERS.alertaInsumos==='function' && document.getElementById('page-alertaInsumos')?.classList.contains('active')) RENDERERS.alertaInsumos();
   }
 }
 window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.scrollTo({top:0,behavior:'smooth'}); };
@@ -3871,6 +3747,7 @@ window.insumoDel = function(id){
   save(K.insumos, S.insumos);
   toast('Insumo eliminado','warn');
   RENDERERS.insumos();
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
 };
 
 /* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
@@ -3906,69 +3783,67 @@ function fechaMenosUnDia(fechaISO){
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
 // ---------------------------------------------------------------------
-// Reglas de alerta del Consolidado de Inventario. Se recalculan en cada
-// render (al cargar, al cambiar el rango, y tras cualquier edición/alta/baja
-// de un registro o de la configuración del insumo).
+// Cálculo de consumo de 3 días — lógica EXISTENTE, sin modificar.
+// Consumo_día = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
+// Consumo de 3 días = suma del consumo diario de los últimos 3 registros.
+// Devuelve null si no hay datos suficientes para evaluar.
 // ---------------------------------------------------------------------
-// Regla 1 — resaltado de nombre de insumo. Requiere "Aplica resaltado de
-// insumo" activado. El tipo de alerta y el umbral se toman de la
-// configuración individual del insumo (tipoAlerta, umbral).
-//
-// Tipo "consumo" (por defecto):
-//   Para cada uno de los 3 últimos días con registro calcula:
-//     Consumo_día = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
-//   Si el consumo acumulado < umbral → alerta.
-//
-// Tipo "mínimo":
-//   Toma el cierre del registro más reciente del insumo.
-//   Si ese cierre < umbral → alerta.
-function bajoConsumo(insumo){
-  if(!insumoAplicaResaltadoInsumo(insumo)) return false;
-
-  const tipo   = insumoTipoAlerta(insumo);
-  const umbral = insumoUmbral(insumo);
-
-  if(tipo === 'minimo'){
-    // Tipo "mínimo": alerta cuando el último cierre registrado < umbral.
-    const ultimo = S.produccion
-      .filter(r => r.insumoId === insumo.id)
-      .sort((a, b) => b.fecha.localeCompare(a.fecha))[0];
-    if(!ultimo) return false;
-    return numProp(ultimo.cierre) < umbral;
-  }
-
-  // Tipo "consumo" (por defecto):
-  //   1) Los 3 días más recientes con registro (de más nuevo a más viejo)
+function consumoUltimos3Dias(insumoId){
   const ultimos3 = S.produccion
-    .filter(r => r.insumoId === insumo.id)
+    .filter(r => r.insumoId === insumoId)
     .sort((a, b) => b.fecha.localeCompare(a.fecha))
     .slice(0, 3);
+  if(!ultimos3.length) return null;
 
-  if(!ultimos3.length) return false;
-
-  //   2) Consumo del día = Cierre(anterior) + Producción(hoy) - Cierre(hoy)
   let consumoAcumulado = 0;
   let diasValidos = 0;
   for(const reg of ultimos3){
-    const regAnterior = getProduccion(insumo.id, fechaMenosUnDia(reg.fecha));
+    const regAnterior = getProduccion(insumoId, fechaMenosUnDia(reg.fecha));
     if(!regAnterior) continue; // sin registro del día anterior → omitir ese día
     consumoAcumulado += numProp(regAnterior.cierre) + numProp(reg.produccion) - numProp(reg.cierre);
     diasValidos++;
   }
-
-  if(!diasValidos) return false;
-
-  //   3) Alerta si el consumo acumulado de los días válidos < umbral
-  return consumoAcumulado < umbral;
+  if(!diasValidos) return null;
+  return { consumo: consumoAcumulado, ultimaFecha: ultimos3[0].fecha };
 }
-// Regla 2 — incremento anormal de cierre sin producción registrada (solo si
-// el insumo tiene activado "Aplica resaltado de celda"): compara contra el
-// día calendario inmediatamente anterior del MISMO insumo (en todo el
-// historial, no solo el rango visible, para no perder el primer día
-// mostrado). Se resalta únicamente la celda de Cierre de esa fecha.
+// Último registro de producción/cierre del insumo (cualquier fecha).
+function ultimoRegistroInsumo(insumoId){
+  return S.produccion
+    .filter(r => r.insumoId === insumoId)
+    .sort((a, b) => b.fecha.localeCompare(a.fecha))[0] || null;
+}
+// ---------------------------------------------------------------------
+// Evalúa AMBAS reglas de alerta de forma independiente para un insumo.
+// Devuelve { consumo:{activa,valor,umbral,fecha}|null, minimo:{activa,valor,umbral,fecha}|null }
+// null en una clave significa que esa alerta no está configurada/activada
+// o no hay datos suficientes para evaluarla (no es lo mismo que "no en alerta").
+// ---------------------------------------------------------------------
+function evaluarAlertasInsumo(insumo){
+  const out = { consumo:null, minimo:null };
+
+  if(insumoAlertaConsumo(insumo)){
+    const c = consumoUltimos3Dias(insumo.id);
+    if(c){
+      const umbral = insumoUmbralConsumo(insumo);
+      out.consumo = { activa: c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
+    }
+  }
+  if(insumoAlertaMinimo(insumo)){
+    const u = ultimoRegistroInsumo(insumo.id);
+    if(u){
+      const umbral = insumoUmbralMinimo(insumo);
+      const cierre = numProp(u.cierre);
+      out.minimo = { activa: cierre < umbral, valor: cierre, umbral, fecha: u.fecha };
+    }
+  }
+  return out;
+}
+// Regla de incremento anormal de cierre sin producción registrada (se
+// MANTIENE intacta): compara contra el día calendario inmediatamente
+// anterior del MISMO insumo. Se resalta únicamente la celda de Cierre.
 function incrementoAnormal(insumoId, fecha){
   const insumo = S.insumos.find(i=>i.id===insumoId);
-  if(insumo && !insumoAplicaResaltadoCelda(insumo)) return false;
+  if(insumo && insumo.resaltadoCelda === false) return false;
   const r = getProduccion(insumoId, fecha); if(!r) return false;
   if(numProp(r.produccion) !== 0) return false;
   const ant = getProduccion(insumoId, fechaMenosUnDia(fecha)); if(!ant) return false;
@@ -3994,7 +3869,6 @@ RENDERERS.inventarioConsolidado = function(){
   const theadSub = fechas.map(()=>`<th class="num">Producción</th><th class="num">Cierre</th>`).join('');
 
   const filasInsumos = S.insumos.map(ins=>{
-    const alerta = bajoConsumo(ins);
     const celdas = fechas.map(f=>{
       const r = reg(ins.id,f);
       if(!r) return `<td class="num"></td><td class="num"></td>`;
@@ -4003,7 +3877,7 @@ RENDERERS.inventarioConsolidado = function(){
       const cierreCell = `<input type="number" min="0" step="0.01" value="${r.cierre}" onchange="invSetCampo('${r.id}','cierre',this.value)">`;
       return `<td class="num">${prodCell}</td><td class="num ${anomalo?'inv-cell-alerta':''}">${cierreCell}</td>`;
     }).join('');
-    return `<tr><td class="${alerta?'inv-insumo-alerta':''}">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
+    return `<tr><td>${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
 
   el.innerHTML = `
@@ -4016,8 +3890,8 @@ RENDERERS.inventarioConsolidado = function(){
       </div>
       <h2>Historial por insumo (${fechas.length} día${fechas.length===1?'':'s'}, ${S.insumos.length} insumo${S.insumos.length===1?'':'s'})</h2>
       <p class="hint" style="margin-top:0">
-        <span class="inv-insumo-alerta">Insumo en rojo y negrita</span>: bajo consumo (insumos en ml con "Resaltado de insumo" activado; se evalúan únicamente los últimos 3 días registrados para ese insumo — reducción de Stock Total entre el día -2 y el día actual &lt; 100&nbsp;ml).
-        <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: insumo con "Resaltado de celda" activado, incremento de cierre &gt; 2% sin producción registrada ese día. Ambos resaltados se configuran por insumo en el módulo <b>Insumos</b>.
+        <span class="inv-cell-alerta" style="padding:1px 6px;border-radius:4px">Celda de Cierre resaltada</span>: incremento de cierre &gt; 2% sin producción registrada ese día.
+        Consulta el módulo <b>Alerta de Insumos</b> para ver todos los insumos con consumo bajo o stock mínimo.
         El botón <b>🗑️ Eliminar día</b> de cada columna borra los registros de TODOS los insumos para esa fecha.
       </p>
       ${(!hayInsumos) ? `<div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div>` : (!hayDatos ? `<div class="empty">No hay registros en el rango seleccionado.</div>` : `
@@ -4056,6 +3930,7 @@ window.invSetCampo = async function(id, campo, valor){
   save(K.produccion, S.produccion);
   toast('Registro actualizado','success');
   RENDERERS.inventarioConsolidado();
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
   syncProduccion();
 };
 // Elimina TODOS los registros de producción (de TODOS los insumos) de una
@@ -4068,6 +3943,7 @@ window.invDeleteDia = async function(fecha){
   save(K.produccion, S.produccion);
   toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
   RENDERERS.inventarioConsolidado();
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
   syncProduccion();
 };
 
@@ -4317,6 +4193,76 @@ function invLicoresExportar(){
   exportarExcelSimple('InvLicores',datos,`inv_licores_${invLicoresFecha}_${excelTimestamp()}.xlsx`);
   toast('Excel de inventario de licores descargado','success');
 }
+
+/* ================================================================
+   MÓDULO: ALERTA DE INSUMOS — vista consolidada de todas las alertas
+   activas (Consumo bajo + Stock mínimo). Solo lectura; no persiste
+   datos propios. Se recalcula en cada render desde S.insumos y
+   S.produccion, por lo que refleja cualquier cambio de inmediato.
+   ================================================================ */
+RENDERERS.alertaInsumos = function(){
+  const el = document.getElementById('page-alertaInsumos');
+  if(!el) return;
+  if(!S.insumos.length){
+    el.innerHTML = `<div class="page-head"><div><h1>🔔 Alerta de Insumos</h1></div></div>
+      <div class="card"><div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div></div>`;
+    return;
+  }
+
+  // Evalúa ambas reglas para cada insumo y arma UNA fila por insumo con
+  // ambos badges si corresponde (sin duplicar registros).
+  const filas = [];
+  S.insumos.forEach(ins=>{
+    const ev = evaluarAlertasInsumo(ins);
+    const consumoAlerta = ev.consumo && ev.consumo.activa;
+    const minimoAlerta  = ev.minimo  && ev.minimo.activa;
+    if(!consumoAlerta && !minimoAlerta) return; // sin alerta: no se muestra
+
+    // "Gravedad" = mayor desviación porcentual respecto al umbral, para ordenar
+    // los casos más críticos primero.
+    let gravedad = 0;
+    if(consumoAlerta) gravedad = Math.max(gravedad, (ev.consumo.umbral - ev.consumo.valor) / (ev.consumo.umbral||1));
+    if(minimoAlerta)  gravedad = Math.max(gravedad, (ev.minimo.umbral - ev.minimo.valor) / (ev.minimo.umbral||1));
+
+    filas.push({ ins, ev, consumoAlerta, minimoAlerta, gravedad });
+  });
+
+  filas.sort((a,b)=> b.gravedad - a.gravedad);
+
+  const filasHTML = filas.map(f=>{
+    const badges = [];
+    if(f.consumoAlerta) badges.push(`<span class="badge b-miss" title="Consumo acumulado de 3 días: ${f.ev.consumo.valor.toFixed(1)} ${f.ins.unidad} (umbral: ${f.ev.consumo.umbral} ${f.ins.unidad})">📉 Consumo bajo</span>`);
+    if(f.minimoAlerta)  badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Último inventario: ${f.ev.minimo.valor} ${f.ins.unidad} (mínimo: ${f.ev.minimo.umbral} ${f.ins.unidad})">📦 Stock mínimo</span>`);
+
+    // "Valor actual" y "Umbral" — si ambas alertas están activas se muestran
+    // ambas en líneas separadas para no perder información.
+    const valores = [];
+    if(f.consumoAlerta) valores.push(`Consumo 3d: <b style="color:#991b1b">${f.ev.consumo.valor.toFixed(1)}</b> / ${f.ev.consumo.umbral} ${f.ins.unidad}`);
+    if(f.minimoAlerta)  valores.push(`Último inv.: <b style="color:#991b1b">${f.ev.minimo.valor}</b> / ${f.ev.minimo.umbral} ${f.ins.unidad}`);
+
+    const fechaRef = f.minimoAlerta ? f.ev.minimo.fecha : (f.consumoAlerta ? f.ev.consumo.fecha : '');
+
+    return `<tr>
+      <td><b>${f.ins.nombre}</b></td>
+      <td><span class="badge b-free">${f.ins.unidad}</span></td>
+      <td>${badges.join(' ')}</td>
+      <td style="font-size:12px;line-height:1.6">${valores.join('<br>')}</td>
+      <td>${fechaRef ? fmtFecha(fechaRef) : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>🔔 Alerta de Insumos</h1><p>Vista consolidada de insumos con consumo bajo o stock por debajo del mínimo configurado. Se actualiza automáticamente con cada cambio en Producción o en la configuración de Insumos.</p></div></div>
+    <div class="card">
+      ${filas.length===0
+        ? `<div class="empty" style="padding:32px;text-align:center;color:#15803d;font-weight:600">✅ No existen alertas de inventario en este momento.</div>`
+        : `<h2>Insumos en alerta (${filas.length})</h2>
+           <div class="table-wrap"><table>
+             <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th>Valor actual / Umbral</th><th>Fecha de referencia</th></tr></thead>
+             <tbody>${filasHTML}</tbody>
+           </table></div>`}
+    </div>`;
+};
 
 /* ─── 11C-3: Cotejo de Consumo de Licores ─── */
 // Stock inicial = Entrada de la fecha inicial.
@@ -5005,7 +4951,7 @@ const ACCOUNT_ROLES = {
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
-    modules: ['produccion','insumos','inventarioConsolidado','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja']
+    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja']
   }
 };
 // Scopes: openid/email/profile para identificar al usuario (login) +
@@ -5022,7 +4968,7 @@ const ACCOUNT_ROLES = {
 // Google Cloud está en modo "Testing", confirmar que el scope esté habilitado
 // en la pantalla de consentimiento (mismo paso ya documentado arriba para
 // drive.file), y que AMBAS cuentas estén en la lista de "usuarios de prueba".
-const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/gmail.send';
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly';
 // Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
 // (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
 // inicia sesión (por eso queda en su propio Drive).
@@ -5319,11 +5265,11 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','tipoAlerta','umbral','resaltadoInsumo','resaltadoCelda','alertaEmail'],
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda'],
       S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
-        tipoAlerta:insumoTipoAlerta(i), umbral:insumoUmbral(i),
-        resaltadoInsumo:insumoAplicaResaltadoInsumo(i)?1:0, resaltadoCelda:insumoAplicaResaltadoCelda(i)?1:0,
-        alertaEmail:i.alertaEmail?1:0 }))),
+        umbralConsumo:insumoUmbralConsumo(i), umbralMinimo:insumoUmbralMinimo(i),
+        alertaConsumo:insumoAlertaConsumo(i)?1:0, alertaMinimo:insumoAlertaMinimo(i)?1:0,
+        resaltadoCelda:(i.resaltadoCelda!==false)?1:0 }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
@@ -5523,12 +5469,19 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       // Compatibilidad: si la hoja no tiene estas columnas (o vienen en blanco),
       // migrarCamposInsumo() asigna los valores por defecto (no sobreescribe existentes).
       const esFalse = v => v===0 || v==='0' || v===false || String(v).trim().toLowerCase()==='false';
+      const esTrue = v => v===1 || v==='1' || v===true || String(v).trim().toLowerCase()==='true';
       S.insumos = (byName['Insumos']||[]).map(r=> migrarCamposInsumo({
         id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), unidad:String(r.unidad||'').trim(),
-        tipoAlerta: (r.tipoAlerta==='minimo') ? 'minimo' : 'consumo',
-        umbral: (r.umbral!==undefined && r.umbral!==null && r.umbral!=='') ? Number(r.umbral) : undefined,
-        resaltadoInsumo: !esFalse(r.resaltadoInsumo), resaltadoCelda: !esFalse(r.resaltadoCelda),
-        alertaEmail: !esFalse(r.alertaEmail) && (r.alertaEmail===1||r.alertaEmail==='1'||r.alertaEmail===true||String(r.alertaEmail).toLowerCase()==='true')
+        // Campos nuevos: si la columna no existe en la hoja (planilla antigua),
+        // se deja undefined para que migrarCamposInsumo traduzca desde tipoAlerta/resaltadoInsumo.
+        umbralConsumo: (r.umbralConsumo!==undefined && r.umbralConsumo!==null && r.umbralConsumo!=='') ? Number(r.umbralConsumo) : undefined,
+        umbralMinimo:  (r.umbralMinimo!==undefined  && r.umbralMinimo!==null  && r.umbralMinimo!=='')  ? Number(r.umbralMinimo)  : undefined,
+        alertaConsumo: r.alertaConsumo!==undefined ? esTrue(r.alertaConsumo) : undefined,
+        alertaMinimo:  r.alertaMinimo!==undefined  ? esTrue(r.alertaMinimo)  : undefined,
+        resaltadoCelda: !esFalse(r.resaltadoCelda),
+        // Campos del modelo anterior (si existen en la hoja, se usan solo para
+        // la traducción de compatibilidad dentro de migrarCamposInsumo).
+        tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
       }));
       S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
@@ -5724,7 +5677,7 @@ const NAV_GROUPS_INVENTARIO = [
   { id:'inv-diario', ico:'📝', label:'Registro Diario',
     modules:['produccion','invDiarioLicores','stockDiarioBebidas'] },
   { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
-    modules:['inventarioConsolidado','cotejoLicores','consolidadoStockBebidas'] },
+    modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas'] },
   { id:'inv-caja',   ico:'💰', label:'Caja',
     modules:['efectivoCaja','consolidadoCaja'] }
 ];
@@ -5747,7 +5700,7 @@ const NAV_MODULE_LABELS = {
   insumos:['🧂','Insumos'], licores:['🍾','Licores'], bebidasAdmin:['🥤','Bebidas'],
   syncInventario:['☁️','Sync. Inventario'], produccion:['📦','Producción'],
   invDiarioLicores:['📋','Inv. Diario Licores'], stockDiarioBebidas:['📋','Stock Diario Bebidas'],
-  inventarioConsolidado:['📈','Consolidado de Inventario'], cotejoLicores:['📊','Cotejo Licores'],
+  inventarioConsolidado:['📈','Consolidado de Inventario'], alertaInsumos:['🔔','Alerta de Insumos'], cotejoLicores:['📊','Cotejo Licores'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'],
   efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja'],
   // Planilla
