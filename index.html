@@ -714,6 +714,7 @@ function diaSemana(fecha){ const [y,m,d]=fecha.split('-').map(Number); return ne
 const money = (n)=> 'S/ ' + (Number(n)||0).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
 const round0 = (n)=> Math.round(Number(n)||0); // redondeo a horas completas
 function fmtFecha(f){ const [y,m,d]=f.split('-'); return `${d}/${m}/${y}`; }
+function fmtFechaCorta(f){ const [,m,d]=f.split('-'); return `${d}/${m}`; } // DD/MM para encabezados compactos
 function nombreEmp(id){ const e=S.emp.find(x=>x.id===id); return e? e.nombre : '—'; }
 
 // Último día del mes (number)
@@ -4302,65 +4303,131 @@ RENDERERS.alertaInsumos = function(){
 // Stock final   = Salida de la fecha final.
 // Ya no hay selector de Momento: la Entrada siempre es el inventario inicial
 // y la Salida siempre es el inventario final (nueva estructura del módulo).
-let cotejoLicFechaIni = fechaHoy();
+let cotejoLicFechaIni = (()=>{ const d=new Date(); d.setDate(d.getDate()-4); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
 let cotejoLicFechaFin = fechaHoy();
+
 RENDERERS.cotejoLicores = function(){
   const el = document.getElementById('page-cotejoLicores');
-  const licoresOrdenados=[...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
-  const filas=licoresOrdenados.map(b=>{
-    const rIni=getInvLicor(b.id, cotejoLicFechaIni);
-    const rFin=getInvLicor(b.id, cotejoLicFechaFin);
-    const sIni=stockLicor(b.id, rIni, 'entrada');  // Entrada de la fecha inicial
-    const sFin=stockLicor(b.id, rFin, 'salida');   // Salida de la fecha final
-    const consumo=sIni-sFin;
-    const tieneIni = !!rIni && (rIni.entradaOzs||rIni.entradaBots);
-    const tieneFin = !!rFin && (rFin.salidaOzs||rFin.salidaBots);
-    return { nombre:b.nombre, sIni, sFin, consumo, tieneIni:!!tieneIni, tieneFin:!!tieneFin };
+  const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
+  const fechas = rangoFechas(cotejoLicFechaIni, cotejoLicFechaFin);
+
+  // Para cada licor: calcular stock/consumo por día + consumo acumulado del período
+  const filasDatos = licoresOrdenados.map(lic=>{
+    const dias = fechas.map(f=>{
+      const r = getInvLicor(lic.id, f);
+      const sEnt = stockLicor(lic.id, r, 'entrada');
+      const sSal = stockLicor(lic.id, r, 'salida');
+      const tieneEnt = !!r && (r.entradaOzs||r.entradaBots);
+      const tieneSal = !!r && (r.salidaOzs||r.salidaBots);
+      const consumo  = tieneEnt || tieneSal ? sEnt - sSal : null;
+      return { sEnt, sSal, consumo, tieneEnt:!!tieneEnt, tieneSal:!!tieneSal };
+    });
+    // Consumo acumulado = Entrada(fechaIni) - Salida(fechaFin)
+    const rIni   = getInvLicor(lic.id, cotejoLicFechaIni);
+    const rFin   = getInvLicor(lic.id, cotejoLicFechaFin);
+    const sIni   = stockLicor(lic.id, rIni, 'entrada');
+    const sFin   = stockLicor(lic.id, rFin, 'salida');
+    const tieneAcum = (!!rIni && (rIni.entradaOzs||rIni.entradaBots)) ||
+                      (!!rFin && (rFin.salidaOzs  ||rFin.salidaBots));
+    const acumulado = tieneAcum ? sIni - sFin : null;
+    return { lic, dias, sIni, sFin, acumulado, tieneAcum };
   });
-  const totalConsumo=filas.reduce((s,f)=>s+f.consumo,0);
-  const licoresConDatos=filas.filter(f=>f.tieneIni||f.tieneFin).length;
-  el.innerHTML=`
-    <div class="page-head"><div><h1>📊 Cotejo de Consumo de Licores</h1><p>Calcula el consumo real de licores entre dos fechas. El stock inicial usa la Entrada de la fecha inicial; el final usa la Salida de la fecha final.</p></div></div>
+
+  // Totales por columna de día
+  const totDias = fechas.map((_,fi)=>({
+    sEnt:    filasDatos.reduce((s,f)=> f.dias[fi].tieneEnt ? s+f.dias[fi].sEnt : s, 0),
+    sSal:    filasDatos.reduce((s,f)=> f.dias[fi].tieneSal ? s+f.dias[fi].sSal : s, 0),
+    consumo: filasDatos.reduce((s,f)=> f.dias[fi].consumo!==null ? s+f.dias[fi].consumo : s, 0),
+    hasData: filasDatos.some(f=>f.dias[fi].tieneEnt||f.dias[fi].tieneSal),
+  }));
+  const totAcum = filasDatos.reduce((s,f)=> f.acumulado!==null ? s+f.acumulado : s, 0);
+  const licoresEvalFmt = filasDatos.filter(f=>f.tieneAcum).length;
+
+  // Encabezados: 3 columnas por fecha + 1 columna Consumo acumulado
+  const hdrFechas = fechas.map(f=>
+    `<th colspan="3" class="num" style="text-align:center;background:#ede9fe;border-left:2px solid #c4b5fd">${fmtFechaCorta(f)}</th>`
+  ).join('');
+  const hdrSub = fechas.map(()=>
+    `<th class="num" style="font-size:10px;font-weight:600;border-left:2px solid #c4b5fd;white-space:nowrap">Entrada</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;white-space:nowrap">Salida</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap">Consumo</th>`
+  ).join('');
+
+  // Filas de datos
+  const filasHTML = filasDatos.length ? filasDatos.map(f=>{
+    const celdas = f.dias.map(d=>
+      `<td class="num" style="border-left:2px solid #e9d5ff">${d.tieneEnt ? d.sEnt.toFixed(1) : '&#8212;'}</td>` +
+      `<td class="num">${d.tieneSal ? d.sSal.toFixed(1) : '&#8212;'}</td>` +
+      `<td class="num" style="color:${d.consumo!==null&&d.consumo>0?'#059669':d.consumo!==null&&d.consumo<0?'#dc2626':'inherit'}">${d.consumo!==null ? d.consumo.toFixed(1) : '&#8212;'}</td>`
+    ).join('');
+    const acumCell = f.acumulado!==null
+      ? `<td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:${f.acumulado>0?'#059669':f.acumulado<0?'#dc2626':'inherit'}">${f.acumulado.toFixed(1)} oz</td>`
+      : `<td class="num" style="border-left:3px solid #4c1d95">&#8212;</td>`;
+    const sinDatos = !f.tieneAcum && f.dias.every(d=>!d.tieneEnt&&!d.tieneSal);
+    const cls = sinDatos ? 'row-vac' : '';
+    const bg  = sinDatos ? '#f5f3ff' : '#fff';
+    return `<tr class="${cls}"><td style="position:sticky;left:0;background:${bg};z-index:1">${f.lic.nombre}</td>${celdas}${acumCell}</tr>`;
+  }).join('') : `<tr><td colspan="${3*fechas.length+2}" class="empty">No hay licores registrados.</td></tr>`;
+
+  // Fila Total
+  const totCeldas = totDias.map(t=>
+    `<td class="num" style="border-left:2px solid #c4b5fd">${t.hasData ? t.sEnt.toFixed(1) : '&#8212;'}</td>` +
+    `<td class="num">${t.hasData ? t.sSal.toFixed(1) : '&#8212;'}</td>` +
+    `<td class="num" style="font-weight:700">${t.hasData ? t.consumo.toFixed(1) : '&#8212;'}</td>`
+  ).join('');
+
+  el.innerHTML = `
+    <div class="page-head"><div><h1>&#x1F4CA; Cotejo de Consumo de Licores</h1>
+      <p>Detalle d&#237;a a d&#237;a del stock de entrada, salida y consumo de cada licor. La columna <b>Consumo acumulado</b> compara la Entrada de la fecha inicial con la Salida de la fecha final.</p></div></div>
     <div class="card">
-      <div class="form-grid">
-        <div class="field"><label>Fecha inicial (Entrada)</label><input type="date" id="cotLicIniF" value="${cotejoLicFechaIni}"></div>
-        <div class="field"><label>Fecha final (Salida)</label><input type="date" id="cotLicFinF" value="${cotejoLicFechaFin}"></div>
+      <div class="toolbar">
+        <div class="field"><label>Fecha inicial</label><input type="date" id="cotLicIniF" value="${cotejoLicFechaIni}"></div>
+        <div class="field"><label>Fecha final</label><input type="date" id="cotLicFinF" value="${cotejoLicFechaFin}"></div>
       </div>
     </div>
-    <div class="card">
-      <div class="summary" style="margin-bottom:14px">
-        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoLicFechaIni)} — Entrada</div></div>
-        <div class="item"><div class="l">Inventario final</div><div class="v">${fmtFecha(cotejoLicFechaFin)} — Salida</div></div>
-        <div class="item"><div class="l">Licores evaluados</div><div class="v">${licoresConDatos} de ${licoresOrdenados.length}</div></div>
-        <div class="item total"><div class="l">Consumo total</div><div class="v">${totalConsumo.toFixed(1)} oz</div></div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div class="summary" style="padding:14px 16px;border-bottom:1px solid var(--c-line)">
+        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoLicFechaIni)} &#8212; Entrada</div></div>
+        <div class="item"><div class="l">Inventario final</div><div class="v">${fmtFecha(cotejoLicFechaFin)} &#8212; Salida</div></div>
+        <div class="item"><div class="l">Licores con datos</div><div class="v">${licoresEvalFmt} de ${licoresOrdenados.length}</div></div>
+        <div class="item total"><div class="l">Consumo acumulado total</div><div class="v">${totAcum.toFixed(1)} oz</div></div>
       </div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Licor</th><th class="num">Stock inicial (oz)</th><th class="num">Stock final (oz)</th><th class="num">Consumo (oz)</th></tr></thead>
-        <tbody>${filas.length?filas.map(f=>`
-          <tr class="${!f.tieneIni&&!f.tieneFin?'row-vac':''}">
-            <td>${f.nombre}</td>
-            <td class="num">${f.tieneIni?f.sIni.toFixed(1):'—'}</td>
-            <td class="num">${f.tieneFin?f.sFin.toFixed(1):'—'}</td>
-            <td class="num"><b>${(f.tieneIni||f.tieneFin)?f.consumo.toFixed(1):'—'}</b></td>
-          </tr>`).join(''):`<tr><td colspan="4" class="empty">No hay licores registrados.</td></tr>`}</tbody>
-        ${filas.length?`<tfoot><tr><td>Total</td><td>—</td><td>—</td><td class="num">${totalConsumo.toFixed(1)} oz</td></tr></tfoot>`:''}
-      </table></div>
-      <div class="actions" style="margin-top:14px">
-        <button class="btn btn-green" id="cotLicExport">⬇ Exportar Excel</button>
+      <div class="cuadrante-outer">
+        <table class="cuadrante-table" style="font-size:11px">
+          <thead>
+            <tr>
+              <th rowspan="2" style="position:sticky;left:0;z-index:4;background:var(--panel);min-width:140px;font-size:11px">Licor</th>
+              ${hdrFechas}
+              <th rowspan="2" class="num" style="min-width:100px;background:#4c1d95;color:#fff;border-left:3px solid #4c1d95;padding:4px 8px;font-size:11px;white-space:nowrap">Consumo<br>acumulado</th>
+            </tr>
+            <tr>${hdrSub}</tr>
+          </thead>
+          <tbody>${filasHTML}</tbody>
+          ${filasDatos.length ? `<tfoot><tr>
+            <td style="position:sticky;left:0;background:var(--panel);font-weight:700;font-size:11px;z-index:1">Total</td>
+            ${totCeldas}
+            <td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:#4c1d95">${totAcum.toFixed(1)} oz</td>
+          </tr></tfoot>` : ''}
+        </table>
       </div>
-      <p class="hint">Fórmula: <b>Stock Total = (Botellas × Oz por botella) + Onzas</b>. Consumo = Stock inicial (Entrada) − Stock final (Salida). Filas en gris: sin datos para ese licor en las fechas seleccionadas.</p>
+      <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
+        <b>Stock = (Botellas &#215; Oz por botella) + Onzas</b> &#183;
+        <b>Consumo diario = Entrada &#8722; Salida del mismo d&#237;a</b> &#183;
+        <b>Consumo acumulado = Entrada fecha inicial &#8722; Salida fecha final</b>.
+        Filas en gris: sin registros en ninguna fecha del per&#237;odo.
+      </p>
     </div>`;
-  const upd=()=>{
-    cotejoLicFechaIni = document.getElementById('cotLicIniF').value||cotejoLicFechaIni;
-    cotejoLicFechaFin = document.getElementById('cotLicFinF').value||cotejoLicFechaFin;
-    RENDERERS.cotejoLicores();
-  };
-  ['cotLicIniF','cotLicFinF'].forEach(id=>document.getElementById(id).onchange=upd);
-  document.getElementById('cotLicExport').onclick=()=>{
-    const datos=filas.map(f=>({ fecha_ini:`${fmtFecha(cotejoLicFechaIni)} (Entrada)`, fecha_fin:`${fmtFecha(cotejoLicFechaFin)} (Salida)`, licor:f.nombre, stock_inicial_oz:f.tieneIni?f.sIni:null, stock_final_oz:f.tieneFin?f.sFin:null, consumo_oz:(f.tieneIni||f.tieneFin)?f.consumo:null }));
-    exportarExcelSimple('CotejoLicores',datos,`cotejo_licores_${excelTimestamp()}.xlsx`);
-    toast('Excel de cotejo descargado','success');
-  };
+
+  ['cotLicIniF','cotLicFinF'].forEach(id=>{
+    document.getElementById(id).onchange=()=>{
+      const ini=document.getElementById('cotLicIniF').value;
+      const fin=document.getElementById('cotLicFinF').value;
+      if(ini && fin && ini>fin){ toast('La fecha inicial no puede ser posterior a la final','error'); return; }
+      if(ini) cotejoLicFechaIni=ini;
+      if(fin) cotejoLicFechaFin=fin;
+      RENDERERS.cotejoLicores();
+    };
+  });
 };
 
 /* ================================================================
