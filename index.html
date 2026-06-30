@@ -325,7 +325,7 @@ const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No ma
 // Los históricos con esos tipos siguen mostrándose y editándose sin cambiar su tipo.
 const TIPOS_DESC_NUEVOS = TIPOS_DESC.filter(t=> t!=='Falta' && t!=='No marcación');
 const BONO_PUNTUALIDAD = 25;            // S/ por puntualidad mensual (2ª quincena)
-const BONO_PUNT_MAX_MINUTOS = 15;       // máximo de retraso mensual neto para calificar
+const BONO_PUNT_MAX_MINUTOS = 20;       // máximo de retraso mensual neto para calificar (<=20 min)
 const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
 const TIPOS_LIBRE = ['Día libre','Vacaciones'];
 const TIPOS_EMP = ['Mesero','Cocina','Caja'];
@@ -426,33 +426,41 @@ function calcularTardanzaNeta(tardanzaOriginalHoras, horasExoneradas){
   return Math.max(0, t - Math.min(e, t));
 }
 function convertirHorasAMinutos(horas){ return (Number(horas)||0) * 60; }
-// Bono S/25 solo en 2ª quincena si el retraso mensual neto <= 15 min.
+// Bono S/25 solo en 2ª quincena si el retraso mensual neto <= 20 min.
 function calcularBonoPuntualidad(esSegundaQuincena, retrasoMensualMinutos){
   if(!esSegundaQuincena) return 0;
-  return retrasoMensualMinutos < BONO_PUNT_MAX_MINUTOS ? BONO_PUNTUALIDAD : 0;
+  return retrasoMensualMinutos <= BONO_PUNT_MAX_MINUTOS ? BONO_PUNTUALIDAD : 0;
 }
 // Minutos REALES de tardanza de un día para el bono de puntualidad.
 // ── Regla diferente a calcHorasTardanza ──
 //   • calcHorasTardanza: para DESCUENTO SALARIAL (umbral 30 min, bloques de 1 h).
-//   • calcMinutosTardanzaReal: para BONO DE PUNTUALIDAD (minuto a minuto, sin gracia).
+//   • calcMinutosTardanzaReal: para BONO DE PUNTUALIDAD, con tolerancia diaria
+//     de 5 minutos:
 //     - Llegada antes de la hora programada → 0 (nunca negativo).
-//     - Llegada exactamente a la hora → 0.
-//     - Llegada con retraso → minutos exactos de retraso.
+//     - Retraso de 1 a 5 minutos → 0 (tolerancia completa, no se acumula nada).
+//     - Retraso de 6 minutos o más → se contabiliza la tardanza REAL completa
+//       (no "minutos desde la tolerancia"). Ej: llegar 6 min tarde suma 6,
+//       no 1; llegar 15 min tarde suma 15, no 10.
 // Exoneraciones de tardanza aplicadas al descuento NO descuentan aquí:
 // el bono mide la puntualidad real, no la penalizada.
+const BONO_PUNT_TOLERANCIA_DIARIA_MIN = 5; // minutos de gracia por jornada antes de contar
 function calcMinutosTardanzaReal(entradaReal, entradaProg){
   const real = hmToMin(entradaReal), prog = hmToMin(entradaProg);
   if(real == null || prog == null) return 0;
-  return Math.max(0, real - prog); // nunca negativo; llegadas anticipadas = 0
+  const tarde = Math.max(0, real - prog); // nunca negativo; llegadas anticipadas = 0
+  if(tarde <= BONO_PUNT_TOLERANCIA_DIARIA_MIN) return 0; // tolerancia: 1-5 min no cuentan
+  return tarde; // desde el minuto 6: se cuenta la tardanza real completa
 }
 
 // ── evaluarBonoPuntualidad ──────────────────────────────────────────────────
 // Función central para el Bono de Puntualidad. Evalúa DOS criterios:
 //
 //  Criterio 1 — Tardanza acumulada (mes completo, ambas quincenas):
-//    Suma los minutos exactos de retraso de todos los días laborables con
-//    marcación de entrada. La suma debe ser < BONO_PUNT_MAX_MINUTOS (15 min).
-//    Las llegadas anticipadas valen 0; no compensan tardanzas de otros días.
+//    Suma los minutos de retraso de todos los días laborables con marcación
+//    de entrada, aplicando una tolerancia diaria de 5 minutos (ver
+//    calcMinutosTardanzaReal). La suma debe ser <= BONO_PUNT_MAX_MINUTOS
+//    (20 min). Las llegadas anticipadas valen 0; no compensan tardanzas de
+//    otros días.
 //
 //  Criterio 2 — Sin ausencias en días laborables:
 //    Si hay al menos un día en el que el empleado tenía programado trabajar
@@ -463,7 +471,7 @@ function calcMinutosTardanzaReal(entradaReal, entradaProg){
 // Devuelve: {
 //   minutosAcum:  number,   — tardanza acumulada en minutos
 //   diasSinEntrada: number, — días laborables sin marcación de entrada
-//   cumpleTardanza: bool,   — minutosAcum < BONO_PUNT_MAX_MINUTOS
+//   cumpleTardanza: bool,   — minutosAcum <= BONO_PUNT_MAX_MINUTOS
 //   cumpleAsistencia: bool, — diasSinEntrada === 0
 //   aplica: bool,           — ambos criterios cumplidos
 //   motivo: string,         — razón legible para el usuario
@@ -493,18 +501,18 @@ function evaluarBonoPuntualidad(emp, year, month){
     });
   });
 
-  const cumpleTardanza   = minutosAcum < BONO_PUNT_MAX_MINUTOS;
+  const cumpleTardanza   = minutosAcum <= BONO_PUNT_MAX_MINUTOS;
   const cumpleAsistencia = diasSinEntrada === 0;
   const aplica           = cumpleTardanza && cumpleAsistencia;
 
   // Motivo legible para auditoría y UI
   let motivo;
   if(aplica){
-    motivo = `Cumple: ${minutosAcum} min acumulados (límite < ${BONO_PUNT_MAX_MINUTOS} min) y todos los días laborables con entrada registrada.`;
+    motivo = `Cumple: ${minutosAcum} min acumulados (límite ≤ ${BONO_PUNT_MAX_MINUTOS} min) y todos los días laborables con entrada registrada.`;
   } else if(!cumpleTardanza && !cumpleAsistencia){
-    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite < ${BONO_PUNT_MAX_MINUTOS} min) y tiene ${diasSinEntrada} día(s) laborable(s) sin marcación de entrada.`;
+    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite ≤ ${BONO_PUNT_MAX_MINUTOS} min) y tiene ${diasSinEntrada} día(s) laborable(s) sin marcación de entrada.`;
   } else if(!cumpleTardanza){
-    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite < ${BONO_PUNT_MAX_MINUTOS} min).`;
+    motivo = `No aplica: acumula ${minutosAcum} min de tardanza (límite ≤ ${BONO_PUNT_MAX_MINUTOS} min).`;
   } else {
     motivo = `No aplica: existe al menos ${diasSinEntrada} día(s) laborable(s) sin marcación de entrada.`;
   }
@@ -3039,7 +3047,7 @@ function renderCalculo(){
           return `<div class="item" style="flex-direction:column;align-items:flex-start;gap:4px;background:${aplica?'#f0fdf4':'#fff1f2'};border-radius:8px;padding:10px 14px;border:1px solid ${aplica?'#bbf7d0':'#fecdd3'}">
             <div style="font-weight:600;color:${color}">🏆 Bono de Puntualidad — ${estado}</div>
             <div style="font-size:12px;color:var(--c-muted);display:grid;grid-template-columns:repeat(3,1fr);gap:6px 16px;margin-top:4px">
-              <span>Tardanza acumulada (mes): <b style="color:${r.cumpleTardanza?'#059669':'#dc2626'}">${minAcum} min</b> / &lt; ${BONO_PUNT_MAX_MINUTOS} min</span>
+              <span>Tardanza acumulada (mes): <b style="color:${r.cumpleTardanza?'#059669':'#dc2626'}">${minAcum} min</b> / &le; ${BONO_PUNT_MAX_MINUTOS} min</span>
               <span>Días laborables sin entrada: <b style="color:${r.cumpleAsistencia?'#059669':'#dc2626'}">${sinEnt}</b> (debe ser 0)</span>
               <span>Bono: <b style="color:${color}">${aplica ? money(r.bonoPuntualidad) : '—'}</b></span>
             </div>
