@@ -864,20 +864,23 @@ function esDiaLibre(empleadoId, fecha){ return S.libre.some(l=>l.empleadoId===em
 function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha); return l? l.tipo : null; }
 
 // ── normalizarMarcacionesMedianoche ────────────────────────────────────────
-// Detecta y corrige el patrón clásico de turnos nocturnos:
+// Auditoría y reparación de datos HISTÓRICOS ya corrompidos por el bug de
+// cruce de medianoche (datos importados antes de la corrección de
+// agruparFilasMarcacion, que ahora bucketiza correctamente los scans nuevos).
 //
+// Patrón real detectado en producción (caso Wendy Castro):
+//   Día D:    entradaReal = 'HH:MM'   salidaReal = null      (jornada abierta)
+//   Día D+1:  entradaReal = 'HH:MM'   salidaReal = '00:XX'   (huérfana, en ventana)
+// La salida huérfana del D+1 en realidad cierra la jornada del D.
+//
+// Patrón secundario (datos sin tag explícito Entrada/Salida, agrupados por
+// "primer scan del día = entrada"):
 //   Día D:    entradaReal = 'HH:MM'   salidaReal = null
-//   Día D+1:  entradaReal = '00:XX'   (dentro de la ventana 00:00–OVERNIGHT_MAX_HOUR)
-//
-// En ese caso el scan de las 00:XX del día D+1 es en realidad la salida de la
-// jornada iniciada el día D. Esta función reasigna físicamente el dato:
-//
-//   Día D:    entradaReal = 'HH:MM'   salidaReal = '00:XX'   ← corregido
-//   Día D+1:  entradaReal = siguiente scan del D+1 (o registro eliminado si no había más)
+//   Día D+1:  entradaReal = '00:XX'   (dentro de la ventana, sin salida propia)
 //
 // ─── Propiedades de la función ───────────────────────────────────────────
-//  • Idempotente: aplicarla dos veces produce el mismo resultado (D ya tiene
-//    salidaReal, así que la condición no vuelve a dispararse).
+//  • Idempotente: tras corregir, D ya tiene salidaReal y D+1 queda limpio,
+//    así que una segunda pasada no vuelve a disparar ninguna condición.
 //  • NO sincroniza con GS: eso corresponde al código que la invoca.
 //  • Devuelve true si modificó algún dato, false si nada cambió.
 // ─────────────────────────────────────────────────────────────────────────
@@ -897,37 +900,43 @@ function normalizarMarcacionesMedianoche(){
       const mD  = arr[i];
       const mD1 = arr[i+1];
 
-      // ── Condición 1: deben ser días consecutivos (D y D+1) ──
+      // ── Condición común: deben ser días consecutivos (D y D+1) ──
       const d0 = new Date(mD.fecha +'T12:00:00');
       const d1 = new Date(mD1.fecha+'T12:00:00');
       if(Math.round((d1-d0)/86400000) !== 1) continue;
 
-      // ── Condición 2: D tiene entrada pero NO tiene salida ──
+      // ── Condición común: D tiene entrada abierta (sin salida) ──
       if(!mD.entradaReal || mD.salidaReal) continue;
 
-      // ── Condición 3: D+1 empieza con un scan en la ventana de medianoche ──
-      const entMin1 = hmToMin(mD1.entradaReal);
-      if(entMin1 === null || entMin1 >= VENTANA_MIN) continue;
-
-      // ✓ Reasignar: el scan de medianoche es la SALIDA del día D
-      console.log(`[Medianoche] ${mD.fecha} ${mD.entradaReal}→ sin salida + ${mD1.fecha} ${mD1.entradaReal} en ventana → reasignando como salida del ${mD.fecha}`);
-      mD.salidaReal = mD1.entradaReal;
-
-      if(mD1.salidaReal){
-        // D+1 tenía también una salida: promoverla a entradaReal del D+1
-        // (la jornada del D+1 empieza a esa hora, que fue la "segunda" marcación del D+1)
-        mD1.entradaReal = mD1.salidaReal;
-        mD1.salidaReal  = null;
-      } else {
-        // D+1 queda vacío: eliminar el registro huérfano
-        toRemove.add(mD1.id);
+      // ── Patrón principal: D+1 tiene una salidaReal huérfana en la ventana ──
+      // (scans correctamente tagueados Entrada/Salida, pero agrupados por
+      // fecha de calendario en vez de por continuidad de jornada).
+      const salMin1 = hmToMin(mD1.salidaReal);
+      if(mD1.salidaReal && salMin1 !== null && salMin1 < VENTANA_MIN){
+        console.log(`[Medianoche] ${mD.fecha} sin salida + ${mD1.fecha} salida=${mD1.salidaReal} (huérfana, en ventana) → reasignando como salida del ${mD.fecha}`);
+        mD.salidaReal = mD1.salidaReal;
+        mD1.salidaReal = null; // D+1 conserva su propia entrada; su salida se resolverá con D+2
+        changed = true;
+        continue;
       }
-      changed = true;
+
+      // ── Patrón secundario: D+1 entradaReal cae en la ventana (sin salida propia) ──
+      const entMin1 = hmToMin(mD1.entradaReal);
+      if(!mD1.salidaReal && entMin1 !== null && entMin1 < VENTANA_MIN){
+        console.log(`[Medianoche] ${mD.fecha} sin salida + ${mD1.fecha} entrada=${mD1.entradaReal} (en ventana, sin tag) → reasignando como salida del ${mD.fecha}`);
+        mD.salidaReal = mD1.entradaReal;
+        toRemove.add(mD1.id); // D+1 queda sin datos propios: se elimina el registro huérfano
+        changed = true;
+      }
     }
   });
 
   if(changed){
     if(toRemove.size) S.mar = S.mar.filter(m=>!toRemove.has(m.id));
+    // Limpieza: tras el encadenamiento de reasignaciones, algún registro de
+    // origen 'archivo' puede quedar totalmente vacío (entrada y salida null).
+    // Se elimina para no dejar filas huérfanas en el listado de Marcaciones.
+    S.mar = S.mar.filter(m => !(m.origen!=='manual' && !m.entradaReal && !m.salidaReal));
     save(K.mar, S.mar);
   }
   return changed;
@@ -1687,10 +1696,26 @@ function agruparFilasMarcacion(filasRaw){
     if(!emp){ if(!noReconocidos.includes(nombre)) noReconocidos.push(nombre); return; }
     const p = parseExcelTS(ts); if(!p) return;
     leidas++;
-    const key = emp.id+'|'+p.fecha;
-    if(!grupos[key]) grupos[key] = { empleadoId:emp.id, fecha:p.fecha, entradas:[], salidas:[] };
     const t = (tipo||'').toString().trim().toLowerCase();
-    if(t.startsWith('sal')) grupos[key].salidas.push(p.hm);
+    const esSalida = t.startsWith('sal');
+    // ── Cruce de medianoche ──────────────────────────────────────────────
+    // Una marcación de SALIDA registrada entre las 00:00 y las
+    // OVERNIGHT_MAX_HOUR:00 AM pertenece a la jornada iniciada el DÍA
+    // ANTERIOR (su fecha de calendario), no al día calendario en que el
+    // reloj físico registró el scan. Sin este ajuste, una salida real como
+    // "27/06 00:06" terminaba agrupada como salida del 27/06 en lugar del
+    // cierre de la jornada del 26/06, dejando al 26/06 sin salida y a la
+    // entrada del 27/06 emparejada con una salida que no le pertenece.
+    let fechaEfectiva = p.fecha;
+    if(esSalida){
+      const minutos = hmToMin(p.hm);
+      if(minutos !== null && minutos < OVERNIGHT_MAX_HOUR*60){
+        fechaEfectiva = fechaMenosUnDia(p.fecha);
+      }
+    }
+    const key = emp.id+'|'+fechaEfectiva;
+    if(!grupos[key]) grupos[key] = { empleadoId:emp.id, fecha:fechaEfectiva, entradas:[], salidas:[] };
+    if(esSalida) grupos[key].salidas.push(p.hm);
     else grupos[key].entradas.push(p.hm); // por defecto Entrada
   });
   return { grupos, noReconocidos, leidas };
