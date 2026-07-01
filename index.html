@@ -4633,7 +4633,7 @@ RENDERERS.bebidasAdmin = function(){
   const porCategoria = {};
   CATEGORIAS_BEBIDAS.forEach(c=>{ porCategoria[c] = S.bebidasCat.filter(b=>b.categoria===c).sort((a,b_)=>a.nombre.localeCompare(b_.nombre)); });
   el.innerHTML = `
-    <div class="page-head"><div><h1>🥤 Administración de Bebidas</h1><p>Administra el catálogo de bebidas para el stock diario. Los cambios de nombre/categoría se guardan con el botón "Guardar"; activar/desactivar se guarda inmediatamente.</p></div></div>
+    <div class="page-head"><div><h1>🥤 Administración de Bebidas</h1><p>Administra el catálogo de bebidas para el stock diario. Los cambios de nombre/categoría se guardan con el botón "Guardar"; los valores numéricos se guardan con "Actualizar".</p></div></div>
     <div class="card">
       <h2 id="bebCatFormTitle">Nueva bebida</h2>
       <div class="form-grid">
@@ -4652,17 +4652,21 @@ RENDERERS.bebidasAdmin = function(){
       if(!lista.length) return `<div class="card"><h2>${cat} (0)</h2><div class="empty">Sin bebidas en esta categoría.</div></div>`;
       return `<div class="card">
         <h2>${cat} (${lista.length})</h2>
+        <p class="hint" style="margin-top:0"><b>Nro. botellas vacías</b>: cantidad esperada de botellas retornables (vacío = no retornable). <b>Stock mínimo</b>: alerta roja en el consolidado si el inventario es menor.</p>
         <div class="table-wrap"><table>
-          <thead><tr><th>Nombre</th><th class="num">Activo</th><th>Acciones</th></tr></thead>
+          <thead><tr><th>Nombre</th><th class="num" title="Botellas retornables esperadas. Vacío = no retornable.">Nro. botellas vacías</th><th class="num" title="Alerta roja cuando el inventario sea menor a este valor">Stock mínimo</th><th class="num">Activo</th><th>Acciones</th></tr></thead>
           <tbody>${lista.map(b=>`
             <tr class="${!b.activo?'row-vac':''}">
               <td>${b.nombre}</td>
+              <td class="num"><input type="number" min="0" step="1" placeholder="—" class="bebCfgVacias" data-id="${b.id}" value="${b.nroBotellasVacias!=null?b.nroBotellasVacias:''}" style="min-width:70px" title="Botellas retornables vacías esperadas"></td>
+              <td class="num"><input type="number" min="0" step="0.01" placeholder="—" class="bebCfgMinimo" data-id="${b.id}" value="${b.stockMinimo!=null?b.stockMinimo:''}" style="min-width:70px" title="Stock mínimo permitido"></td>
               <td class="num"><input type="checkbox" ${b.activo?'checked':''} onchange="bebCatToggle('${b.id}',this.checked)" title="${b.activo?'Desactivar':'Activar'} esta bebida"></td>
               <td><button class="btn-icon" onclick="bebCatEdit('${b.id}')">✏️ Editar</button>
                   <button class="btn-icon del" onclick="bebCatDel('${b.id}')">🗑️ Eliminar</button></td>
             </tr>`).join('')}
           </tbody>
         </table></div>
+        <div class="actions"><button class="btn btn-primary btn-sm" onclick="bebCatActualizar()">💾 Actualizar</button></div>
       </div>`;
     }).join('')}`;
   document.getElementById('bebCatSave').onclick = bebCatSave;
@@ -4672,6 +4676,20 @@ RENDERERS.bebidasAdmin = function(){
     if(b){ document.getElementById('bebCatFormTitle').textContent='Editar bebida'; document.getElementById('bebCatNombre').value=b.nombre; document.getElementById('bebCatCategoria').value=b.categoria; }
   }
 };
+function bebCatActualizar(){
+  document.querySelectorAll('.bebCfgVacias').forEach(inp=>{
+    const b=S.bebidasCat.find(x=>x.id===inp.dataset.id); if(!b) return;
+    b.nroBotellasVacias = (inp.value===''||inp.value===null) ? null : Math.max(0,Number(inp.value));
+  });
+  document.querySelectorAll('.bebCfgMinimo').forEach(inp=>{
+    const b=S.bebidasCat.find(x=>x.id===inp.dataset.id); if(!b) return;
+    b.stockMinimo = (inp.value===''||inp.value===null) ? null : Math.max(0,Number(inp.value));
+  });
+  save(K.bebidasCat,S.bebidasCat);
+  syncBebidasCat();
+  toast('Configuración de bebidas actualizada','success');
+  RENDERERS.bebidasAdmin();
+}
 function bebCatSave(){
   const nombre = document.getElementById('bebCatNombre').value.trim();
   const categoria = document.getElementById('bebCatCategoria').value;
@@ -4799,23 +4817,43 @@ RENDERERS.consolidadoStockBebidas = function(){
   ).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
   const hayDatos = bebidasFiltradas.some(b=>fechas.some(f=>getStockBebida(b.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th>
-    <div>${fmtFecha(f)}<small style="font-weight:400;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</small></div>
-    <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="consBebidasDelDia('${f}')" title="Eliminar todos los registros de este día">🗑️ Eliminar día</button>
-  </th>`).join('');
+  // Encabezados: 2 columnas por fecha (Inventario + Botellas vacías)
+  const theadFechas = fechas.map(f=>`
+    <th colspan="2" style="text-align:center;background:#f1ecfa;padding:4px 2px">
+      <div style="font-weight:700;font-size:12px">${fmtFecha(f)}</div>
+      <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
+      <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="consBebidasDelDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>
+    </th>`).join('');
+
+  const theadSub = fechas.map(()=>
+    `<th class="num" style="font-size:10px;font-weight:600;color:var(--c-muted)">Inv.</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed">Vacías</th>`
+  ).join('');
 
   let catActual='';
   const filas=bebidasFiltradas.map(b=>{
+    const tieneVacias = b.nroBotellasVacias!=null;
+    const nroVacias   = tieneVacias ? Number(b.nroBotellasVacias) : 0;
+    const minimo      = b.stockMinimo!=null ? Number(b.stockMinimo) : null;
     const celdas=fechas.map(f=>{
       const r=getStockBebida(b.id,f);
-      return `<td class="num">${r!=null?`<input type="number" min="0" step="0.01" value="${r.stock}" onchange="consBebidasSet('${r.id}',this.value)">`:''}  </td>`;
+      const stock = r!=null ? Number(r.stock) : null;
+      const bajoMinimo = minimo!==null && stock!==null && stock < minimo;
+      const vacías = stock!==null ? Math.max(0, nroVacias - stock) : (tieneVacias ? nroVacias : 0);
+      const invCell = r!=null
+        ? `<input type="number" min="0" step="0.01" value="${r.stock}" onchange="consBebidasSet('${r.id}',this.value)">`
+        : '';
+      return `<td class="num${bajoMinimo?' inv-cell-alerta':''}" title="${bajoMinimo?'Stock por debajo del mínimo ('+minimo+')':''}">${invCell}</td>` +
+             `<td class="num" style="color:#7c3aed;font-weight:${stock!==null?600:400}">${stock!==null ? vacías : '—'}</td>`;
     }).join('');
-    const catHeader = b.categoria!==catActual ? (()=>{ catActual=b.categoria; return `<tr style="background:var(--bg2)"><td colspan="${fechas.length+1}"><b>${b.categoria}</b></td></tr>`; })() : '';
-    return catHeader+`<tr><td>${b.nombre}</td>${celdas}</tr>`;
+    const catHeader = b.categoria!==catActual ? (()=>{ catActual=b.categoria; return `<tr style="background:var(--bg2)"><td colspan="${2*fechas.length+1}"><b>${b.categoria}</b></td></tr>`; })() : '';
+    return catHeader+`<tr>
+      <td>${b.nombre}${minimo!==null?`<span class="badge b-free" style="float:right;font-size:9px">mín ${minimo}</span>`:''}${tieneVacias?`<span title="Botellas retornables: ${nroVacias}" style="float:right;font-size:9px;color:#7c3aed;margin-right:4px">🍾${nroVacias}</span>`:''}
+      </td>${celdas}</tr>`;
   }).join('');
 
   el.innerHTML=`
-    <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario por bebida, en formato matricial.</p></div></div>
+    <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario. <span style="color:#dc2626">Celdas rojas</span>: inventario menor al stock mínimo configurado. Columna <b style="color:#7c3aed">Vacías</b>: botellas retornables esperadas menos inventario.</p></div></div>
     <div class="card">
       <div class="form-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
         <div class="field"><label>Desde</label><input type="date" id="consBebDesde" value="${desde}"></div>
@@ -4833,6 +4871,7 @@ RENDERERS.consolidadoStockBebidas = function(){
       <div class="table-wrap"><table class="inv-matrix">
         <thead>
           <tr><th rowspan="2">Bebida</th>${theadFechas}</tr>
+          <tr>${theadSub}</tr>
         </thead>
         <tbody>${filas}</tbody>
       </table></div>`}
@@ -5484,7 +5523,10 @@ function gsSerializeInventario(){
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
-    BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo'], S.bebidasCat.map(b=>({...b, activo:b.activo!==false?1:0}))),
+    BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo','nroBotellasVacias','stockMinimo'],
+      S.bebidasCat.map(b=>({...b, activo:b.activo!==false?1:0,
+        nroBotellasVacias: b.nroBotellasVacias!=null ? b.nroBotellasVacias : '',
+        stockMinimo: b.stockMinimo!=null ? b.stockMinimo : '' }))),
     StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
     EfectivoCaja: (()=>{
       // Serialización plana: id,fecha,turno,responsable + ap_bolsa,ap0..ap10 + cl_bolsa,cl0..cl10
@@ -5707,7 +5749,9 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
           salidaOzs:Number(r.salidaOzs)||0, salidaBots:Number(r.salidaBots)||0 };
       });
       migrarInvLicores(); // fusiona pares Entrada/Salida si vienen del formato antiguo
-      S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false') }));
+      S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false'),
+        nroBotellasVacias: (r.nroBotellasVacias!==undefined&&r.nroBotellasVacias!==null&&r.nroBotellasVacias!=='') ? Number(r.nroBotellasVacias) : null,
+        stockMinimo: (r.stockMinimo!==undefined&&r.stockMinimo!==null&&r.stockMinimo!=='') ? Number(r.stockMinimo) : null }));
       S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), stock:Number(r.stock)||0 }));
       S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
         id:String(r.id||uid()), fecha:String(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
