@@ -124,6 +124,118 @@
   .cuad-area-hdr{text-align:center;font-size:10px;font-weight:600;background:#f5f3ff;color:#6d28d9;padding:3px 4px;position:sticky;top:29px;z-index:3;min-width:58px;max-width:90px}
   .cuad-hr{background:var(--panel);font-size:10px;font-weight:600;color:var(--c-muted);text-align:right;padding:2px 8px;position:sticky;left:0;z-index:2;white-space:nowrap;min-width:48px;border-right:2px solid var(--c-line)}
   .cuad-hr.hdr-hr{z-index:4;position:sticky;left:0;top:0;background:var(--panel)}
+
+  /* Cotejo de Licores — tabla con scroll bidireccional, columna fija y encabezados pegajosos */
+  .cotejo-outer{
+    overflow:auto;
+    /* Max-height relativo a la ventana para que el scroll vertical active los sticky headers */
+    max-height:calc(100vh - 240px);
+    border-radius:0 0 10px 10px;
+    -webkit-overflow-scrolling:touch; /* scroll fluido en iOS */
+  }
+  .cotejo-table{
+    border-collapse:separate; /* separate es necesario para que sticky funcione con bordes */
+    border-spacing:0;
+    font-size:11px;
+    table-layout:fixed; /* columnas con ancho fijo para evitar compresión */
+    width:max-content; /* ancho natural para el scroll horizontal */
+    min-width:100%;
+  }
+  .cotejo-table th,.cotejo-table td{
+    border-right:1px solid var(--c-line);
+    border-bottom:1px solid var(--c-line);
+  }
+  /* Fila de encabezado 1 (fechas) — sticky top */
+  .cotejo-table thead tr:first-child th{
+    position:sticky;
+    top:0;
+    z-index:3;
+    background:#ede9fe;
+  }
+  /* Fila de encabezado 2 (Entrada/Salida/Consumo) — sticky debajo de la primera fila */
+  .cotejo-table thead tr:last-child th{
+    position:sticky;
+    top:48px; /* altura de la fila de fechas (fecha + día de semana) */
+    z-index:3;
+    background:#f5f3ff;
+  }
+  /* Columna "Licor" fija a la izquierda — celdas de datos */
+  .cotejo-col-licor{
+    position:sticky;
+    left:0;
+    z-index:2;
+    background:#fff;
+    min-width:150px;
+    max-width:180px;
+    width:160px;
+    white-space:normal;      /* permite salto de línea */
+    word-break:break-word;
+    padding:4px 8px;
+    border-right:2px solid #c4b5fd !important; /* separador visual */
+    font-size:11px;
+  }
+  /* Esquina superior izquierda — encabezado "Licor" fijo en top Y left */
+  .cotejo-corner{
+    position:sticky;
+    left:0;
+    top:0;
+    z-index:5; /* sobre todo lo demás */
+    background:var(--panel);
+    min-width:150px;
+    max-width:180px;
+    width:160px;
+    border-right:2px solid #c4b5fd !important;
+    border-bottom:2px solid #c4b5fd !important;
+    vertical-align:middle;
+    padding:4px 8px;
+  }
+  /* Columnas de datos (Entrada / Salida / Consumo) */
+  .cotejo-table td.num,.cotejo-table th.num{
+    min-width:62px;
+    max-width:80px;
+    text-align:right;
+    padding:3px 6px;
+    white-space:nowrap;
+  }
+  /* Columna Consumo acumulado */
+  .cotejo-acum-hdr{
+    position:sticky;
+    top:0;
+    z-index:3;
+    background:#4c1d95;
+    color:#fff;
+    border-left:3px solid #4c1d95 !important;
+    min-width:90px;
+    padding:4px 8px;
+    font-size:11px;
+    white-space:normal;
+    word-break:break-word;
+    text-align:center;
+    vertical-align:middle;
+  }
+  /* Fila Total */
+  .cotejo-table tfoot td{
+    font-weight:700;
+    background:var(--panel);
+    border-top:2px solid var(--c-line);
+    position:sticky;
+    bottom:0;
+    z-index:2;
+  }
+  .cotejo-table tfoot .cotejo-col-licor{
+    z-index:3; /* sobre las celdas de datos */
+  }
+  /* Filas alternas (opcional, mejora lectura) */
+  .cotejo-table tbody tr:nth-child(even) .cotejo-col-licor,
+  .cotejo-table tbody tr.row-vac .cotejo-col-licor{
+    background:inherit;
+  }
+  .cotejo-table tbody tr:hover td{
+    background:rgba(109,40,217,.04);
+  }
+  .cotejo-table tbody tr:hover .cotejo-col-licor{
+    background:#f5f3ff;
+  }
   .cuad-cell{vertical-align:top;padding:2px 2px;height:24px;min-width:58px;max-width:90px}
   .cuad-cell.day-sep{border-left:2px solid var(--c-line)}
   .cuad-row:hover .cuad-cell{background:rgba(109,40,217,.04)}
@@ -4347,9 +4459,9 @@ RENDERERS.cotejoLicores = function(){
            `<div style="font-weight:400;font-size:10px;color:#7c3aed;margin-top:1px">${dow}</div></th>`;
   }).join('');
   const hdrSub = fechas.map(()=>
-    `<th class="num" style="font-size:10px;font-weight:600;border-left:2px solid #c4b5fd;white-space:nowrap">Entrada</th>` +
-    `<th class="num" style="font-size:10px;font-weight:600;white-space:nowrap">Salida</th>` +
-    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap">Consumo</th>`
+    `<th class="num" style="font-size:10px;font-weight:600;border-left:2px solid #c4b5fd;white-space:nowrap;background:#f5f3ff;color:#6d28d9">Entrada</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;white-space:nowrap;background:#f5f3ff;color:#6d28d9">Salida</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff">Consumo</th>`
   ).join('');
 
   // Filas de datos
@@ -4365,7 +4477,7 @@ RENDERERS.cotejoLicores = function(){
     const sinDatos = !f.tieneAcum && f.dias.every(d=>!d.tieneEnt&&!d.tieneSal);
     const cls = sinDatos ? 'row-vac' : '';
     const bg  = sinDatos ? '#f5f3ff' : '#fff';
-    return `<tr class="${cls}"><td style="position:sticky;left:0;background:${bg};z-index:1">${f.lic.nombre}</td>${celdas}${acumCell}</tr>`;
+    return `<tr class="${cls}"><td class="cotejo-col-licor" style="background:${bg}">${f.lic.nombre}</td>${celdas}${acumCell}</tr>`;
   }).join('') : `<tr><td colspan="${3*fechas.length+2}" class="empty">No hay licores registrados.</td></tr>`;
 
   // Fila Total
@@ -4391,19 +4503,19 @@ RENDERERS.cotejoLicores = function(){
         <div class="item"><div class="l">Licores con datos</div><div class="v">${licoresEvalFmt} de ${licoresOrdenados.length}</div></div>
         <div class="item total"><div class="l">Consumo acumulado total</div><div class="v">${totAcum.toFixed(1)} oz</div></div>
       </div>
-      <div class="cuadrante-outer">
-        <table class="cuadrante-table" style="font-size:11px">
+      <div class="cotejo-outer">
+        <table class="cotejo-table">
           <thead>
             <tr>
-              <th rowspan="2" style="position:sticky;left:0;z-index:4;background:var(--panel);min-width:140px;font-size:11px">Licor</th>
+              <th class="cotejo-corner" rowspan="2">Licor</th>
               ${hdrFechas}
-              <th rowspan="2" class="num" style="min-width:100px;background:#4c1d95;color:#fff;border-left:3px solid #4c1d95;padding:4px 8px;font-size:11px;white-space:nowrap">Consumo<br>acumulado</th>
+              <th class="cotejo-acum-hdr" rowspan="2">Consumo<br>acumulado</th>
             </tr>
             <tr>${hdrSub}</tr>
           </thead>
           <tbody>${filasHTML}</tbody>
           ${filasDatos.length ? `<tfoot><tr>
-            <td style="position:sticky;left:0;background:var(--panel);font-weight:700;font-size:11px;z-index:1">Total</td>
+            <td class="cotejo-col-licor" style="font-weight:700;font-size:11px">Total</td>
             ${totCeldas}
             <td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:#4c1d95">${totAcum.toFixed(1)} oz</td>
           </tr></tfoot>` : ''}
