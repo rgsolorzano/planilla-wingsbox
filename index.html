@@ -2246,17 +2246,18 @@ function exportarEmpleadosExcel(){
   toast('Excel de empleados descargado','success');
 }
 
-/* Helper: <option> de empleados */
+/* Helper: <option> de empleados — todos (activos e inactivos con etiqueta) */
 function empOptions(selected, includeInactive){
-  // Solo activos por defecto; pasar includeInactive=true en reportes históricos.
+  // Muestra todos los empleados. Los inactivos llevan etiqueta "(inactivo)".
+  // Solo el Cuadrante Semanal filtra empleados activos (lo hace en su propio renderer).
+  // El parámetro includeInactive se conserva por compatibilidad pero ya no es necesario.
   return S.emp
-    .filter(e=>includeInactive || empEsActivo(e))
     .map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}${!empEsActivo(e)?' (inactivo)':''}</option>`)
     .join('');
 }
-/* Helper: <option> solo de empleados tipo Mesero ACTIVOS (para propinas) */
+/* Helper: <option> solo de empleados tipo Mesero — todos (con etiqueta para inactivos) */
 function meseroOptions(selected){
-  return S.emp.filter(e=>esMesero(e)&&empEsActivo(e)).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}</option>`).join('');
+  return S.emp.filter(esMesero).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}${!empEsActivo(e)?' (inactivo)':''}</option>`).join('');
 }
 function noEmpWarning(){
   return `<div class="card"><div class="empty">Primero registra empleados en el módulo <b>Empleados</b>.</div></div>`;
@@ -3566,7 +3567,7 @@ RENDERERS.calculo = function(){
     <div class="card">
       <div class="toolbar">
         ${periodSelector('c')}
-        <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados activos</option>${S.emp.filter(empEsActivo).map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
+        <div class="field"><label>Empleado</label><select id="cEmp"><option value="">Todos los empleados</option>${S.emp.map(e=>`<option value="${e.id}" ${e.id===calcEmpSel?'selected':''}>${e.nombre}${!empEsActivo(e)?' (inactivo)':''}</option>`).join('')}</select></div>
         <button class="btn btn-primary" id="cGen">Generar reporte</button>
         <button class="btn btn-green" id="cSaveHE" ${hasPendingConsiderarHE() ? '' : 'disabled'}>💾 Guardar horas extra</button>
       </div>
@@ -3611,7 +3612,7 @@ function renderCalculo(){
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena (1-15)':'2ª quincena (16-fin)'}`;
   let html=`<div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Periodo:</b> ${titulo}</div>`;
 
-  const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp.filter(empEsActivo);
+  const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp;
   emps.forEach(emp=>{
     const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
 
@@ -3788,7 +3789,7 @@ RENDERERS.consolidado = function(){
 function renderConsolidado(){
   const out=document.getElementById('consOut');
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
-  _consolidado = S.emp.filter(empEsActivo).map(emp=>{
+  _consolidado = S.emp.map(emp=>{
     const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
     const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
     // Sueldo transferencia = Total a pagar - Sueldo planilla
@@ -3875,8 +3876,7 @@ RENDERERS.boleta = function(){
   const el=document.getElementById('page-boleta');
   if(!S.emp.length){ el.innerHTML=`<div class="page-head"><div><h1>🧾 Boleta por empleado</h1></div></div>`+noEmpWarning(); return; }
   if(!boletaEmpSel || !S.emp.find(e=>e.id===boletaEmpSel)){
-    const primeroActivo = S.emp.find(empEsActivo);
-    boletaEmpSel = primeroActivo ? primeroActivo.id : (S.emp[0]?.id || null);
+    boletaEmpSel = S.emp[0]?.id || null;
   }
   el.innerHTML=`
     <div class="page-head"><div><h1>🧾 Boleta por empleado</h1><p>Detalle desagregado del pago de la quincena para enviar a cada empleado.</p></div></div>
@@ -4023,7 +4023,7 @@ function adminExport(){
   const wb=XLSX.utils.book_new();
   // Cada hoja conserva id/empleadoId para preservar las relaciones al reimportar.
   const sheets={
-    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora})),
+    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora})),
     Horarios:  S.hor.map(h=>({empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||''})),
     Descuentos:S.desc.map(d=>({id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||''})),
     PagosExtra:S.pago.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||''})),
@@ -6070,8 +6070,8 @@ function gsMatrixToObjects(values){
 
 function gsSerializeAll(){
   return {
-    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','sueldoQuincenal','sueldoPlanilla','sueldoHora'],
-      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora }))),
+    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora'],
+      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora }))),
     Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
       S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
     Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen'],
