@@ -3903,12 +3903,12 @@ window.insumoDel = function(id){
 };
 
 /* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
-// Rango por defecto: últimos 7 días (incluye hoy). Se inicializa una sola
+// Rango por defecto: últimos 3 días (hoy - 2 días hasta hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
 let invConsFilter = (function(){
-  const hoy = new Date(), hace6 = new Date(hoy.getTime() - 6*86400000);
+  const hoy = new Date(), hace2 = new Date(hoy.getTime() - 2*86400000);
   const fmt = d => d.toISOString().slice(0,10);
-  return { desde: fmt(hace6), hasta: fmt(hoy) };
+  return { desde: fmt(hace2), hasta: fmt(hoy) };
 })();
 // Tope de columnas de fecha que genera la matriz (cada fecha = 2 columnas).
 // Evita una tabla inmanejable si el usuario deja un rango muy amplio o vacío.
@@ -4038,7 +4038,7 @@ RENDERERS.inventarioConsolidado = function(){
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="invFHasta" value="${hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="invFClear">Últimos 7 días</button>
+        <button class="btn btn-ghost btn-sm" id="invFClear">Últimos 3 días</button>
       </div>
       <h2>Historial por insumo (${fechas.length} día${fechas.length===1?'':'s'}, ${S.insumos.length} insumo${S.insumos.length===1?'':'s'})</h2>
       <p class="hint" style="margin-top:0">
@@ -4065,8 +4065,8 @@ RENDERERS.inventarioConsolidado = function(){
   document.getElementById('invFDesde').onchange = applyF;
   document.getElementById('invFHasta').onchange = applyF;
   document.getElementById('invFClear').onclick = ()=>{
-    const hoy = new Date(), hace6 = new Date(hoy.getTime() - 6*86400000);
-    invConsFilter = { desde: hace6.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10) };
+    const hoy = new Date(), hace2 = new Date(hoy.getTime() - 2*86400000);
+    invConsFilter = { desde: hace2.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10) };
     RENDERERS.inventarioConsolidado();
   };
 };
@@ -4421,7 +4421,7 @@ RENDERERS.alertaInsumos = function(){
 // Stock final   = Salida de la fecha final.
 // Ya no hay selector de Momento: la Entrada siempre es el inventario inicial
 // y la Salida siempre es el inventario final (nueva estructura del módulo).
-let cotejoLicFechaIni = (()=>{ const d=new Date(); d.setDate(d.getDate()-4); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
+let cotejoLicFechaIni = (()=>{ const d=new Date(); d.setDate(d.getDate()-2); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
 let cotejoLicFechaFin = fechaHoy();
 
 RENDERERS.cotejoLicores = function(){
@@ -4800,8 +4800,8 @@ function stockBebidasExportar(){
 
 /* ─── 11D-3: Consolidado de Stock de Bebidas ─── */
 let consBebidasFilter = (()=>{
-  const hoy=new Date(), hace6=new Date(hoy.getTime()-6*86400000), fmt=d=>d.toISOString().slice(0,10);
-  return { desde:fmt(hace6), hasta:fmt(hoy), categoria:'', busqueda:'' };
+  const hoy=new Date(), hace2=new Date(hoy.getTime()-2*86400000), fmt=d=>d.toISOString().slice(0,10);
+  return { desde:fmt(hace2), hasta:fmt(hoy), categoria:'', busqueda:'' };
 })();
 const CONS_BEB_MAX_DIAS = 60;
 function consBebidasRangoEfectivo(){
@@ -4869,7 +4869,7 @@ RENDERERS.consolidadoStockBebidas = function(){
           ${CATEGORIAS_BEBIDAS.map(c=>`<option value="${c}" ${categoriaFiltro===c?'selected':''}>${c}</option>`).join('')}
         </select></div>
         <div class="field"><label>Buscar bebida</label><input id="consBebBusqueda" value="${consBebidasFilter.busqueda||''}" placeholder="Nombre…"></div>
-        <div class="field" style="align-self:end"><button class="btn btn-ghost btn-sm" id="consBebClear">Últimos 7 días</button></div>
+        <div class="field" style="align-self:end"><button class="btn btn-ghost btn-sm" id="consBebClear">Últimos 3 días</button></div>
       </div>
       <h2>Historial (${fechas.length} día${fechas.length===1?'':'s'}, ${bebidasFiltradas.length} bebida${bebidasFiltradas.length===1?'':'s'})</h2>
       ${(!hayDatos&&bebidasFiltradas.length) ? `<div class="empty">No hay registros de stock en el rango seleccionado.</div>` :
@@ -4892,8 +4892,8 @@ RENDERERS.consolidadoStockBebidas = function(){
   };
   ['consBebDesde','consBebHasta','consBebCat','consBebBusqueda'].forEach(id=>{ const e=document.getElementById(id); if(e) e.onchange=applyF; if(e&&e.tagName==='INPUT') e.oninput=applyF; });
   document.getElementById('consBebClear').onclick=()=>{
-    const hoy=new Date(), hace6=new Date(hoy.getTime()-6*86400000), fmt=d=>d.toISOString().slice(0,10);
-    consBebidasFilter={ desde:fmt(hace6), hasta:fmt(hoy), categoria:'', busqueda:'' };
+    const hoy=new Date(), hace2=new Date(hoy.getTime()-2*86400000), fmt=d=>d.toISOString().slice(0,10);
+    consBebidasFilter={ desde:fmt(hace2), hasta:fmt(hoy), categoria:'', busqueda:'' };
     RENDERERS.consolidadoStockBebidas();
   };
   document.getElementById('consBebExport').onclick=()=>{
