@@ -128,38 +128,47 @@
   /* Cotejo de Licores — tabla con scroll bidireccional, columna fija y encabezados pegajosos */
   .cotejo-outer{
     overflow:auto;
-    /* Max-height relativo a la ventana para que el scroll vertical active los sticky headers */
     max-height:calc(100vh - 240px);
     border-radius:0 0 10px 10px;
-    -webkit-overflow-scrolling:touch; /* scroll fluido en iOS */
+    -webkit-overflow-scrolling:touch;
+    /* Needed for sticky thead to work correctly */
+    position:relative;
   }
   .cotejo-table{
-    border-collapse:separate; /* separate es necesario para que sticky funcione con bordes */
+    border-collapse:separate; /* separate es necesario para sticky + bordes */
     border-spacing:0;
     font-size:11px;
-    table-layout:fixed; /* columnas con ancho fijo para evitar compresión */
-    width:max-content; /* ancho natural para el scroll horizontal */
+    table-layout:fixed;
+    width:max-content;
     min-width:100%;
   }
   .cotejo-table th,.cotejo-table td{
     border-right:1px solid var(--c-line);
     border-bottom:1px solid var(--c-line);
   }
-  /* Fila de encabezado 1 (fechas) — sticky top */
-  .cotejo-table thead tr:first-child th{
+  /* ── Encabezado fijo como BLOQUE ────────────────────────────────────────
+     Hacemos sticky el <thead> completo, no celdas individuales.
+     Esto garantiza que AMBAS filas (fecha+día y Entrada/Salida/Consumo)
+     se muevan juntas al hacer scroll vertical, sin depender de calcular
+     la altura exacta de la primera fila (que varía según contenido). */
+  .cotejo-table thead{
     position:sticky;
     top:0;
-    z-index:3;
+    z-index:4;
+    /* Sombra sutil para separar visualmente el encabezado de los datos */
+    box-shadow:0 2px 4px rgba(0,0,0,.08);
+  }
+  /* Fila 1: fecha + día — sigue siendo el primer row visual del encabezado */
+  .cotejo-table thead tr:first-child th{
     background:#ede9fe;
+    /* NO position:sticky individual: el <thead> ya lo gestiona */
   }
-  /* Fila de encabezado 2 (Entrada/Salida/Consumo) — sticky debajo de la primera fila */
+  /* Fila 2: Entrada / Salida / Consumo */
   .cotejo-table thead tr:last-child th{
-    position:sticky;
-    top:48px; /* altura de la fila de fechas (fecha + día de semana) */
-    z-index:3;
     background:#f5f3ff;
+    /* NO top:48px hardcodeado: el bloque <thead> se mantiene unido */
   }
-  /* Columna "Licor" fija a la izquierda — celdas de datos */
+  /* Columna "Licor" en body — sticky a la izquierda */
   .cotejo-col-licor{
     position:sticky;
     left:0;
@@ -168,28 +177,28 @@
     min-width:150px;
     max-width:180px;
     width:160px;
-    white-space:normal;      /* permite salto de línea */
+    white-space:normal;
     word-break:break-word;
     padding:4px 8px;
-    border-right:2px solid #c4b5fd !important; /* separador visual */
+    border-right:2px solid #c4b5fd !important;
     font-size:11px;
   }
-  /* Esquina superior izquierda — encabezado "Licor" fijo en top Y left */
+  /* Esquina superior izquierda — sticky LEFT (el thead ya lo fija arriba).
+     z-index mayor que el thead (4) para aparecer encima en scroll horizontal. */
   .cotejo-corner{
     position:sticky;
     left:0;
-    top:0;
-    z-index:5; /* sobre todo lo demás */
+    z-index:6;
     background:var(--panel);
     min-width:150px;
     max-width:180px;
     width:160px;
     border-right:2px solid #c4b5fd !important;
-    border-bottom:2px solid #c4b5fd !important;
+    border-bottom:1px solid var(--c-line);
     vertical-align:middle;
     padding:4px 8px;
   }
-  /* Columnas de datos (Entrada / Salida / Consumo) */
+  /* Columnas de datos */
   .cotejo-table td.num,.cotejo-table th.num{
     min-width:62px;
     max-width:80px;
@@ -197,11 +206,8 @@
     padding:3px 6px;
     white-space:nowrap;
   }
-  /* Columna Consumo acumulado */
+  /* Columna Consumo acumulado — dentro del thead sticky */
   .cotejo-acum-hdr{
-    position:sticky;
-    top:0;
-    z-index:3;
     background:#4c1d95;
     color:#fff;
     border-left:3px solid #4c1d95 !important;
