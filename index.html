@@ -228,9 +228,25 @@
     bottom:0;
     z-index:2;
   }
-  .cotejo-table tfoot .cotejo-col-licor{
-    z-index:3; /* sobre las celdas de datos */
-  }
+  /* Analítica Comercial */
+  .anal-outer{overflow:auto;max-height:calc(100vh - 240px);position:relative;border-radius:0 0 10px 10px;-webkit-overflow-scrolling:touch}
+  .anal-table{border-collapse:separate;border-spacing:0;font-size:11px;width:max-content;min-width:100%}
+  .anal-table th,.anal-table td{border-right:1px solid var(--c-line);border-bottom:1px solid var(--c-line)}
+  .anal-table thead{position:sticky;top:0;z-index:5;box-shadow:0 2px 6px rgba(0,0,0,.1)}
+  .anal-hdr-year{text-align:center;background:#4c1d95;color:#fff;font-weight:700;font-size:12px;padding:5px 4px}
+  .anal-hdr-mes{background:#f5f3ff;color:#6d28d9;font-size:10px;font-weight:600;padding:3px 6px;white-space:nowrap;min-width:38px}
+  .anal-hdr-subtotal{background:#ede9fe;color:#4c1d95;font-size:10px;font-weight:700;padding:3px 6px;white-space:nowrap;min-width:60px}
+  .anal-hdr-total{background:#1e1b4b;color:#fff;font-weight:700;white-space:nowrap;padding:4px 8px}
+  .anal-fix{position:sticky;background:#fff;z-index:2;padding:4px 8px;white-space:normal;word-break:break-word;font-size:11px;border-right:2px solid #e9d5ff}
+  .anal-table thead .anal-fix{background:#f8f7ff;z-index:6}
+  .anal-row:hover .anal-fix{background:#f5f3ff}
+  .anal-row:hover td:not(.anal-fix){background:rgba(109,40,217,.04)}
+  .anal-row-grupo{background:#f1ecfa}
+  .anal-row-grupo td{font-size:12px;padding:5px 10px;position:sticky;left:0;z-index:2;border-bottom:2px solid #c4b5fd}
+  .anal-subtotal{background:#faf5ff;font-weight:600;color:#4c1d95}
+  .anal-grand{background:#ede9fe;font-weight:700;color:#1e1b4b}
+  .anal-tfoot{font-weight:700;background:var(--panel);position:sticky;bottom:0;z-index:3;border-top:2px solid #c4b5fd}
+  .anal-table .num{text-align:right;padding:3px 6px;white-space:nowrap}
   /* Filas alternas (opcional, mejora lectura) */
   .cotejo-table tbody tr:nth-child(even) .cotejo-col-licor,
   .cotejo-table tbody tr.row-vac .cotejo-col-licor{
@@ -400,6 +416,7 @@
     <section class="page" id="page-consolidado"></section>
     <section class="page" id="page-boleta"></section>
     <section class="page" id="page-admin"></section>
+    <section class="page" id="page-consolidadoVentas"></section>
     <section class="page" id="page-produccion"></section>
     <section class="page" id="page-insumos"></section>
     <section class="page" id="page-inventarioConsolidado"></section>
@@ -1540,6 +1557,385 @@ RENDERERS.cuadrante = function(){
       document.body.appendChild(overlay);
     };
   });
+};
+
+/* ================================================================
+   MÓDULO: ANALÍTICA COMERCIAL
+   Lee hoja RAW de ESTADISTICAS RAW, transforma a OLAP en memoria
+   (y crea/escribe hoja FACTS en el mismo Spreadsheet), expone
+   dashboards analíticos. Solo para multiboxes.peru@gmail.com.
+   ================================================================ */
+const ANAL_SS_ID        = '1qZF_iFXnUDdAdKxlF5zuFmyHlVWEtHm8ojybyiPAu8Q';
+const ANAL_SHEET_RAW    = 'RAW';
+const ANAL_SHEET_FACTS  = 'FACTS';
+const K_ANAL_DATA       = 'anal_facts';
+const K_ANAL_META       = 'anal_meta';
+
+const ANAL_MESES_NUM = {
+  'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,
+  'JULIO':7,'AGOSTO':8,'SETIEMBRE':9,'SEPTIEMBRE':9,
+  'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12
+};
+const ANAL_MESES_ABREV = ['','Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Set','Oct','Nov','Dic'];
+
+let analiticaData = [];   // [{grupo,plato,precio,margen,año,mes,cantidad}] null=vacío en RAW
+let analiticaMeta = null; // {lastSync,productos,meses,registros,duracion}
+const _añoNow = new Date().getFullYear();
+let analFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12, grupo:'', plato:'', cantOp:'', cantVal:'' };
+let analSort   = { col:'grupo', dir:'asc' };
+
+function analLoadFromStorage(){
+  try{
+    const d=localStorage.getItem(K_ANAL_DATA), m=localStorage.getItem(K_ANAL_META);
+    if(d) analiticaData=JSON.parse(d);
+    if(m) analiticaMeta=JSON.parse(m);
+  }catch(e){ analiticaData=[]; analiticaMeta=null; }
+}
+analLoadFromStorage(); // carga al iniciar la app
+
+function analSaveToStorage(){
+  try{
+    localStorage.setItem(K_ANAL_DATA, JSON.stringify(analiticaData));
+    if(analiticaMeta) localStorage.setItem(K_ANAL_META, JSON.stringify(analiticaMeta));
+  }catch(e){ console.warn('[Analítica] Storage error:', e); }
+}
+
+// ── Sincronización RAW → OLAP ─────────────────────────────────────
+async function syncAnaliticaFromRAW(){
+  if(!isAuthorized()){ toast('Inicia sesión para sincronizar analítica','error'); return null; }
+  const t0=Date.now();
+  toast('Leyendo hoja RAW...','info');
+  try{
+    // 1) Leer RAW (hasta 500 filas, 60 columnas → suficiente para años futuros)
+    const resp = await gsApiFetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}/values/${ANAL_SHEET_RAW}!A1:BH500?valueRenderOption=UNFORMATTED_VALUE`
+    );
+    if(!resp.ok) throw new Error(`HTTP ${resp.status} al leer RAW`);
+    const {values:matrix=[]} = await resp.json();
+    if(!matrix.length) throw new Error('La hoja RAW está vacía');
+
+    // 2) Detectar columnas de meses (índice ≥ 4, formato "MES AÑO")
+    const hdrs = matrix[0];
+    const monthCols = [];
+    for(let i=4; i<hdrs.length; i++){
+      const h = String(hdrs[i]||'').trim().toUpperCase();
+      const mt = h.match(/^([A-ZÁÉÍÓÚ]+)\s+(\d{4})$/);
+      if(mt){ const mes=ANAL_MESES_NUM[mt[1]]; if(mes) monthCols.push({idx:i, año:+mt[2], mes, label:String(hdrs[i]).trim()}); }
+    }
+    if(!monthCols.length) throw new Error('No se encontraron columnas de meses en RAW (formato esperado: "JULIO 2025")');
+
+    // 3) Transformar filas → hechos normalizados
+    const facts=[]; const productosSet=new Set();
+    for(let r=1; r<matrix.length; r++){
+      const row=matrix[r];
+      if(!row||!row[1]) continue;
+      const grupo = String(row[0]||'').trim();
+      const plato = String(row[1]||'').trim();
+      if(!plato) continue;
+      const precio = analNumOrNull(row[2]);
+      const margen = analNumOrNull(row[3]);
+      productosSet.add(plato);
+      for(const col of monthCols){
+        const v = col.idx<row.length ? row[col.idx] : undefined;
+        facts.push({
+          grupo, plato, precio, margen, año:col.año, mes:col.mes,
+          cantidad:(v!==undefined&&v!==null&&v!=='') ? +v : null
+        });
+      }
+    }
+
+    analiticaData = facts;
+    analiticaMeta = {
+      lastSync: new Date().toISOString(),
+      productos: productosSet.size,
+      meses: monthCols.length,
+      registros: facts.filter(f=>f.cantidad!==null).length,
+      duracion: ((Date.now()-t0)/1000).toFixed(1)
+    };
+    analSaveToStorage();
+
+    // 4) Escribir hoja FACTS (best-effort; puede fallar si el SS no fue creado por la app)
+    analWriteFactsSheet(facts).catch(e=>console.warn('[Analítica] No se pudo escribir FACTS:', e.message));
+
+    const {productos, meses, registros, duracion} = analiticaMeta;
+    toast(`✅ Analítica actualizada · ${productos} productos · ${meses} meses · ${registros} registros con datos · ${duracion}s`,'success');
+    if(typeof RENDERERS.consolidadoVentas==='function') RENDERERS.consolidadoVentas();
+    return analiticaMeta;
+  }catch(e){
+    console.error('[Analítica] Sync error:', e);
+    toast(`Error al sincronizar analítica: ${e.message}`,'error');
+    return null;
+  }
+}
+
+function analNumOrNull(v){
+  if(v===undefined||v===null||v==='') return null;
+  const n=Number(String(v).replace(',','.').replace('%',''));
+  return isNaN(n)?null:n;
+}
+
+async function analWriteFactsSheet(facts){
+  // Verificar si la hoja FACTS existe y crearla si no
+  const metaResp = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}?fields=sheets.properties.title`);
+  if(metaResp.ok){
+    const {sheets=[]} = await metaResp.json();
+    if(!sheets.some(s=>s.properties.title===ANAL_SHEET_FACTS)){
+      const cr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}:batchUpdate`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({requests:[{addSheet:{properties:{title:ANAL_SHEET_FACTS}}}]})
+      });
+      if(!cr.ok) throw new Error(`No se pudo crear hoja ${ANAL_SHEET_FACTS}`);
+    }
+  }
+  // Limpiar
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}/values:batchClear`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ranges:[`${ANAL_SHEET_FACTS}!A:J`]})
+  });
+  // Escribir estructura OLAP normalizada
+  const matrix=[['Grupo','Plato','Precio','Margen','Año','Mes','MesNombre','Cantidad'],
+    ...facts.map(f=>[f.grupo,f.plato,f.precio??'',f.margen??'',f.año,f.mes,ANAL_MESES_ABREV[f.mes],f.cantidad??''])];
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}/values:batchUpdate`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({valueInputOption:'RAW', data:[{range:`${ANAL_SHEET_FACTS}!A1`, majorDimension:'ROWS', values:matrix}]})
+  });
+}
+
+// ── Helpers pivot ─────────────────────────────────────────────────
+function analBuildCols(filtered){
+  const colsSet=new Set();
+  filtered.forEach(r=>colsSet.add(`${r.año}-${String(r.mes).padStart(2,'0')}`));
+  const cols=[...colsSet].sort().map(k=>{const[añoS,mesS]=k.split('-');return{año:+añoS,mes:+mesS,key:k};});
+  const colsByAño={};
+  cols.forEach(c=>{(colsByAño[c.año]=colsByAño[c.año]||[]).push(c);});
+  const años=Object.keys(colsByAño).map(Number).sort();
+  return {cols, colsByAño, años};
+}
+function analBuildRowMap(filtered){
+  const m={};
+  filtered.forEach(r=>{
+    const k=r.grupo+'|||'+r.plato;
+    if(!m[k]) m[k]={grupo:r.grupo,plato:r.plato,precio:null,margen:null,vals:{}};
+    if(r.precio!==null) m[k].precio=r.precio;
+    if(r.margen!==null) m[k].margen=r.margen;
+    m[k].vals[`${r.año}-${String(r.mes).padStart(2,'0')}`]=r.cantidad;
+  });
+  return Object.values(m);
+}
+function analRowYearTotal(row,año,colsByAño){
+  return (colsByAño[año]||[]).reduce((s,c)=>{const v=row.vals[c.key];return(v!==null&&v!==undefined)?s+v:s;},0);
+}
+function analRowGrandTotal(row,cols){
+  return cols.reduce((s,c)=>{const v=row.vals[c.key];return(v!==null&&v!==undefined)?s+v:s;},0);
+}
+function analCellStyle(q){
+  if(q===null||q===undefined) return '';
+  if(q===0) return 'background:#fecaca;color:#991b1b;font-weight:700';
+  if(q<=5)  return 'background:#fce7f3;color:#9d174d';
+  return '';
+}
+function analMargenStyle(m,minM,maxM){
+  if(m===null) return '';
+  const t=(maxM>minM)?(m-minM)/(maxM-minM):0.5;
+  const hue=Math.round(t*120); // 0=rojo, 60=amarillo, 120=verde
+  return `color:hsl(${hue},80%,30%);font-weight:600`;
+}
+window.analToggleSort=function(col){
+  if(analSort.col===col) analSort.dir=analSort.dir==='asc'?'desc':'asc';
+  else{ analSort.col=col; analSort.dir='asc'; }
+  RENDERERS.consolidadoVentas();
+};
+
+// ── Renderer: Consolidado General de Ventas ───────────────────────
+RENDERERS.consolidadoVentas = function(){
+  const el=document.getElementById('page-consolidadoVentas');
+  if(!el) return;
+
+  const meta=analiticaMeta;
+  const metaStr=meta
+    ? `Última sincronización: ${fmtFecha(meta.lastSync.slice(0,10))} · ${meta.productos} productos · ${meta.meses} meses · ${meta.registros} registros`
+    : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
+
+  const añosDisp=[...new Set(analiticaData.map(r=>r.año))].sort();
+  const gruposDisp=[...new Set(analiticaData.map(r=>r.grupo).filter(Boolean))].sort();
+
+  // Filtrar
+  let filtered=analiticaData.filter(r=>{
+    const f=r.año*100+r.mes, d=analFilter.añoDesde*100+analFilter.mesDesde, h=analFilter.añoHasta*100+analFilter.mesHasta;
+    return f>=d&&f<=h&&
+      (!analFilter.grupo||r.grupo===analFilter.grupo)&&
+      (!analFilter.plato||r.plato.toLowerCase().includes(analFilter.plato.toLowerCase()));
+  });
+
+  const {cols,colsByAño,años}=analBuildCols(filtered);
+  let rows=analBuildRowMap(filtered);
+
+  // Filtro por cantidad total
+  if(analFilter.cantOp&&analFilter.cantVal!==''){
+    const cv=+analFilter.cantVal;
+    rows=rows.filter(row=>{
+      const gt=analRowGrandTotal(row,cols);
+      return analFilter.cantOp==='gt'?gt>cv:analFilter.cantOp==='lt'?gt<cv:gt===cv;
+    });
+  }
+
+  // Ordenar
+  const sd=analSort.dir==='asc'?1:-1;
+  rows.sort((a,b)=>{
+    if(analSort.col==='plato')  return sd*a.plato.localeCompare(b.plato);
+    if(analSort.col==='precio') return sd*((a.precio||0)-(b.precio||0));
+    if(analSort.col==='margen') return sd*((a.margen||0)-(b.margen||0));
+    if(analSort.col==='total')  return sd*(analRowGrandTotal(a,cols)-analRowGrandTotal(b,cols));
+    if(analSort.col.startsWith('year_')){
+      const año=+analSort.col.split('_')[1];
+      return sd*(analRowYearTotal(a,año,colsByAño)-analRowYearTotal(b,año,colsByAño));
+    }
+    return sd*(a.grupo.localeCompare(b.grupo)||a.plato.localeCompare(b.plato));
+  });
+
+  // Escala de color de margen
+  const margenes=rows.map(r=>r.margen).filter(m=>m!==null);
+  const minM=margenes.length?Math.min(...margenes):0, maxM=margenes.length?Math.max(...margenes):1;
+
+  // Helper de encabezado sortable
+  const si=(col)=>analSort.col===col?(analSort.dir==='asc'?'↑':'↓'):'<span style="opacity:.25">⇅</span>';
+  const sh=(col,lbl)=>`<span style="cursor:pointer;user-select:none;white-space:nowrap" onclick="analToggleSort('${col}')">${lbl}&nbsp;${si(col)}</span>`;
+
+  // Totales de columna
+  const colTot=(key)=>rows.reduce((s,r)=>{const v=r.vals[key];return(v!==null&&v!==undefined)?s+v:s;},0);
+  const colYearTot=(año)=>rows.reduce((s,r)=>s+analRowYearTotal(r,año,colsByAño),0);
+  const grandTotAll=rows.reduce((s,r)=>s+analRowGrandTotal(r,cols),0);
+
+  const nFixed=4, nCols=nFixed+cols.length+años.length+1;
+
+  // ── Encabezados (thead con 2 filas) ──
+  let hdr1=`<th rowspan="2" class="anal-fix" style="left:0;z-index:6;min-width:85px">${sh('grupo','GRUPO')}</th>`;
+  hdr1+=`<th rowspan="2" class="anal-fix" style="left:85px;z-index:6;min-width:160px">${sh('plato','PLATO')}</th>`;
+  hdr1+=`<th rowspan="2" class="anal-fix num" style="left:245px;z-index:6;min-width:70px">${sh('precio','PRECIO')}</th>`;
+  hdr1+=`<th rowspan="2" class="anal-fix num" style="left:315px;z-index:6;min-width:70px">${sh('margen','MARGEN')}</th>`;
+  años.forEach(año=>{
+    const n=(colsByAño[año]||[]).length+1;
+    hdr1+=`<th colspan="${n}" class="anal-hdr-year">${año}</th>`;
+  });
+  hdr1+=`<th rowspan="2" class="anal-hdr-total num" style="min-width:80px">${sh('total','TOTAL')}</th>`;
+
+  let hdr2='';
+  años.forEach(año=>{
+    (colsByAño[año]||[]).forEach(c=>{
+      hdr2+=`<th class="anal-hdr-mes num">${ANAL_MESES_ABREV[c.mes]}</th>`;
+    });
+    hdr2+=`<th class="anal-hdr-subtotal num">${sh('year_'+año,'Total '+año)}</th>`;
+  });
+
+  // ── Cuerpo ──
+  let prevGrupo=null, tbody='';
+  rows.forEach(row=>{
+    if(row.grupo!==prevGrupo){
+      tbody+=`<tr class="anal-row-grupo"><td colspan="${nCols}"><b>${row.grupo||'(sin grupo)'}</b></td></tr>`;
+      prevGrupo=row.grupo;
+    }
+    let cells='';
+    años.forEach(año=>{
+      (colsByAño[año]||[]).forEach(c=>{
+        const q=row.vals[c.key];
+        cells+=`<td class="num" style="${analCellStyle(q)}">${(q!==null&&q!==undefined)?q:''}</td>`;
+      });
+      const yt=analRowYearTotal(row,año,colsByAño);
+      cells+=`<td class="num anal-subtotal">${yt||''}</td>`;
+    });
+    const gt=analRowGrandTotal(row,cols);
+    cells+=`<td class="num anal-grand">${gt||''}</td>`;
+    const ms=analMargenStyle(row.margen,minM,maxM);
+    const mPct=row.margen!==null?(row.margen*100).toFixed(1)+'%':'—';
+    tbody+=`<tr class="anal-row">
+      <td class="anal-fix" style="left:0">${row.grupo}</td>
+      <td class="anal-fix" style="left:85px;${ms}" title="${row.plato}">${row.plato}</td>
+      <td class="anal-fix num" style="left:245px">S/${(row.precio||0).toFixed(2)}</td>
+      <td class="anal-fix num" style="left:315px">${mPct}</td>
+      ${cells}
+    </tr>`;
+  });
+
+  // ── Fila de totales ──
+  let totRow=`<td class="anal-fix anal-tfoot" colspan="2" style="left:0;z-index:3">Totales (${rows.length})</td>`;
+  totRow+=`<td class="anal-fix anal-tfoot num" style="left:245px"></td>`;
+  totRow+=`<td class="anal-fix anal-tfoot num" style="left:315px"></td>`;
+  años.forEach(año=>{
+    (colsByAño[año]||[]).forEach(c=>{
+      const t=colTot(c.key); totRow+=`<td class="num anal-tfoot">${t||''}</td>`;
+    });
+    const yt=colYearTot(año); totRow+=`<td class="num anal-tfoot anal-subtotal">${yt||''}</td>`;
+  });
+  totRow+=`<td class="num anal-tfoot anal-grand">${grandTotAll||''}</td>`;
+
+  // Opciones de selects
+  const mesOpts=(sel)=>Array.from({length:12},(_,i)=>`<option value="${i+1}" ${sel===i+1?'selected':''}>${ANAL_MESES_ABREV[i+1]}</option>`).join('');
+  const añoOpts=(sel)=>añosDisp.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
+  const grpOpts=`<option value="">Todos</option>`+gruposDisp.map(g=>`<option value="${g}" ${analFilter.grupo===g?'selected':''}>${g}</option>`).join('');
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📈 Consolidado General de Ventas</h1><p style="font-size:12px;color:var(--c-muted)">${metaStr}</p></div></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Desde</label><div style="display:flex;gap:4px">
+          <select id="anFM1" style="min-width:54px">${mesOpts(analFilter.mesDesde)}</select>
+          <select id="anFA1" style="min-width:70px">${añoOpts(analFilter.añoDesde)}</select>
+        </div></div>
+        <div class="field"><label>Hasta</label><div style="display:flex;gap:4px">
+          <select id="anFM2" style="min-width:54px">${mesOpts(analFilter.mesHasta)}</select>
+          <select id="anFA2" style="min-width:70px">${añoOpts(analFilter.añoHasta)}</select>
+        </div></div>
+        <div class="field"><label>Grupo</label><select id="anFGrupo">${grpOpts}</select></div>
+        <div class="field"><label>Plato</label><input id="anFPlato" value="${analFilter.plato}" placeholder="Buscar…" style="max-width:140px"></div>
+        <div class="field"><label>Cant. total</label><div style="display:flex;gap:4px">
+          <select id="anFOp" style="min-width:44px"><option value="">—</option>
+            <option value="gt" ${analFilter.cantOp==='gt'?'selected':''}>&gt;</option>
+            <option value="lt" ${analFilter.cantOp==='lt'?'selected':''}>&lt;</option>
+            <option value="eq" ${analFilter.cantOp==='eq'?'selected':''}>=</option>
+          </select>
+          <input id="anFVal" type="number" min="0" value="${analFilter.cantVal}" style="width:64px">
+        </div></div>
+        <button class="btn btn-ghost btn-sm" id="anFClear">🗑 Limpiar</button>
+      </div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      ${!analiticaData.length
+        ?`<div class="empty" style="padding:40px;text-align:center">Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b> para sincronizar.</div>`
+        :!rows.length
+          ?`<div class="empty" style="padding:30px">Ningún plato coincide con los filtros seleccionados.</div>`
+          :`<div class="anal-outer">
+              <table class="anal-table">
+                <thead><tr>${hdr1}</tr><tr>${hdr2}</tr></thead>
+                <tbody>${tbody}</tbody>
+                <tfoot><tr>${totRow}</tr></tfoot>
+              </table>
+            </div>
+            <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
+              <span style="background:#fecaca;padding:0 5px;border-radius:3px;font-size:11px">Rojo</span> ventas = 0 (producto existía) &nbsp;
+              <span style="background:#fce7f3;padding:0 5px;border-radius:3px;font-size:11px">Rosa</span> 1–5 ventas &nbsp;
+              Celda vacía = producto no existía ese mes. Nombre del plato: <span style="color:hsl(0,80%,30%)">rojo</span>=margen bajo → <span style="color:hsl(120,80%,30%)">verde</span>=margen alto.
+            </p>`}
+    </div>`;
+
+  const applyF=()=>{
+    analFilter={
+      añoDesde:+document.getElementById('anFA1').value, mesDesde:+document.getElementById('anFM1').value,
+      añoHasta:+document.getElementById('anFA2').value, mesHasta:+document.getElementById('anFM2').value,
+      grupo:document.getElementById('anFGrupo').value,
+      plato:document.getElementById('anFPlato').value,
+      cantOp:document.getElementById('anFOp').value,
+      cantVal:document.getElementById('anFVal').value
+    };
+    RENDERERS.consolidadoVentas();
+  };
+  ['anFM1','anFA1','anFM2','anFA2','anFGrupo','anFOp'].forEach(id=>{const el_=document.getElementById(id);if(el_)el_.onchange=applyF;});
+  const pEl=document.getElementById('anFPlato'), vEl=document.getElementById('anFVal');
+  if(pEl)pEl.oninput=applyF; if(vEl)vEl.oninput=applyF;
+  document.getElementById('anFClear').onclick=()=>{
+    analFilter={añoDesde:_añoNow,mesDesde:1,añoHasta:_añoNow,mesHasta:12,grupo:'',plato:'',cantOp:'',cantVal:''};
+    analSort={col:'grupo',dir:'asc'};
+    RENDERERS.consolidadoVentas();
+  };
 };
 
 let editEmpId = null;
@@ -3436,9 +3832,24 @@ RENDERERS.admin = function(){
       </div>
       <div id="admMsg"></div>
     </div>
-    ${gsControlsHTML()}`;
+    ${gsControlsHTML()}
+    <div class="card">
+      <h2>📈 Datos Analíticos</h2>
+      <p class="hint" style="margin-top:0">Lee la hoja <b>RAW</b> del Spreadsheet <code>ESTADISTICAS RAW</code>, la transforma en una estructura OLAP normalizada (tabla de hechos) y la almacena localmente para los módulos de Analítica.
+      ${analiticaMeta?`<br>Última sincronización: <b>${fmtFecha(analiticaMeta.lastSync.slice(0,10))}</b> · ${analiticaMeta.productos} productos · ${analiticaMeta.meses} meses · ${analiticaMeta.registros} registros · ${analiticaMeta.duracion}s`:'<br><b style="color:#dc2626">Sin datos. Sincroniza para habilitar los módulos de Analítica.</b>'}
+      </p>
+      <div class="actions"><button class="btn btn-primary" id="admSyncAnalytics">📊 Actualizar datos analíticos</button></div>
+    </div>`;
   document.getElementById('admExport').onclick=adminExport;
   document.getElementById('admImport').onclick=adminImport;
+  document.getElementById('admSyncAnalytics').onclick=async()=>{
+    const btn=document.getElementById('admSyncAnalytics');
+    if(!btn) return;
+    btn.disabled=true; btn.textContent='⏳ Sincronizando…';
+    await syncAnaliticaFromRAW();
+    btn.disabled=false; btn.textContent='📊 Actualizar datos analíticos';
+    RENDERERS.admin(); // refrescar para mostrar metadatos actualizados
+  };
   gsBindControls();
 };
 
@@ -5203,7 +5614,7 @@ const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.goo
 const ACCOUNT_ROLES = {
   'multiboxes.peru@gmail.com': {
     domain: 'planilla',
-    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin']
+    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin','consolidadoVentas']
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
@@ -5952,7 +6363,9 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-propinas', ico:'💵', label:'Propinas',
     modules:['propinas','propinasConsolidado'] },
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
-    modules:['calculo','consolidado','boleta'] }
+    modules:['calculo','consolidado','boleta'] },
+  { id:'anal',        ico:'📈', label:'Analítica',
+    modules:['consolidadoVentas'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -5970,7 +6383,9 @@ const NAV_MODULE_LABELS = {
   marcaciones:['📥','Carga de horas'], descuentos:['➖','Descuentos'],
   pagos:['➕','Pagos Extra'], libres:['🌴','Días Libres / Vacaciones'],
   propinas:['💵','Propinas'], propinasConsolidado:['🧮','Consolidado Propinas'],
-  calculo:['🧮','Cálculo Quincenal'], consolidado:['📊','Consolidado'], boleta:['🧾','Boleta por Empleado']
+  calculo:['🧮','Cálculo Quincenal'], consolidado:['📊','Consolidado'], boleta:['🧾','Boleta por Empleado'],
+  // Analítica
+  consolidadoVentas:['📈','Consolidado de Ventas']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
