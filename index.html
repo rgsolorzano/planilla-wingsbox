@@ -417,6 +417,7 @@
     <section class="page" id="page-boleta"></section>
     <section class="page" id="page-admin"></section>
     <section class="page" id="page-consolidadoVentas"></section>
+    <section class="page" id="page-gananciaGrupo"></section>
     <section class="page" id="page-produccion"></section>
     <section class="page" id="page-insumos"></section>
     <section class="page" id="page-inventarioConsolidado"></section>
@@ -1738,7 +1739,8 @@ function analMargenStyle(m,minM,maxM){
   if(m===null) return '';
   const t=(maxM>minM)?(m-minM)/(maxM-minM):0.5;
   const hue=Math.round(t*120); // 0=rojo, 60=amarillo, 120=verde
-  return `color:hsl(${hue},80%,30%);font-weight:600`;
+  // Fondo coloreado; texto oscuro para buena legibilidad
+  return `background:hsl(${hue},70%,80%);color:hsl(${hue},60%,20%);font-weight:600`;
 }
 window.analToggleSort=function(col){
   if(analSort.col===col) analSort.dir=analSort.dir==='asc'?'desc':'asc';
@@ -1846,7 +1848,7 @@ RENDERERS.consolidadoVentas = function(){
     const gt=analRowGrandTotal(row,cols);
     cells+=`<td class="num anal-grand">${gt||''}</td>`;
     const ms=analMargenStyle(row.margen,minM,maxM);
-    const mPct=row.margen!==null?(row.margen*100).toFixed(1)+'%':'—';
+    const mPct=row.margen!==null?row.margen.toFixed(1)+'%':'—';
     tbody+=`<tr class="anal-row">
       <td class="anal-fix" style="left:0">${row.grupo}</td>
       <td class="anal-fix" style="left:85px;${ms}" title="${row.plato}">${row.plato}</td>
@@ -1929,8 +1931,11 @@ RENDERERS.consolidadoVentas = function(){
     RENDERERS.consolidadoVentas();
   };
   ['anFM1','anFA1','anFM2','anFA2','anFGrupo','anFOp'].forEach(id=>{const el_=document.getElementById(id);if(el_)el_.onchange=applyF;});
+  // Debounce los inputs de texto para no re-renderizar con cada tecla (evita pérdida de foco)
   const pEl=document.getElementById('anFPlato'), vEl=document.getElementById('anFVal');
-  if(pEl)pEl.oninput=applyF; if(vEl)vEl.oninput=applyF;
+  let _analDebounce=null;
+  const applyFDebounced=()=>{ clearTimeout(_analDebounce); _analDebounce=setTimeout(applyF,350); };
+  if(pEl)pEl.oninput=applyFDebounced; if(vEl)vEl.oninput=applyFDebounced;
   document.getElementById('anFClear').onclick=()=>{
     analFilter={añoDesde:_añoNow,mesDesde:1,añoHasta:_añoNow,mesHasta:12,grupo:'',plato:'',cantOp:'',cantVal:''};
     analSort={col:'grupo',dir:'asc'};
@@ -1939,6 +1944,167 @@ RENDERERS.consolidadoVentas = function(){
 };
 
 let editEmpId = null;
+
+// ── Renderer: Ganancia por Grupo de Venta ────────────────────────────────
+let gananciaSort = { col:'grupo', dir:'asc' };
+let gananciaFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12 };
+
+window.gananciaToggleSort = function(col){
+  if(gananciaSort.col===col) gananciaSort.dir=gananciaSort.dir==='asc'?'desc':'asc';
+  else { gananciaSort.col=col; gananciaSort.dir='asc'; }
+  RENDERERS.gananciaGrupo();
+};
+
+RENDERERS.gananciaGrupo = function(){
+  const el=document.getElementById('page-gananciaGrupo');
+  if(!el) return;
+
+  const meta=analiticaMeta;
+  const metaStr=meta
+    ? `Última sincronización: ${fmtFecha(meta.lastSync.slice(0,10))} · ${meta.productos} productos · ${meta.meses} meses`
+    : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
+
+  const añosDisp=[...new Set(analiticaData.map(r=>r.año))].sort();
+
+  // ── Filtrar datos ──
+  const filtered=analiticaData.filter(r=>{
+    const f=r.año*100+r.mes;
+    return f>=(gananciaFilter.añoDesde*100+gananciaFilter.mesDesde) &&
+           f<=(gananciaFilter.añoHasta*100+gananciaFilter.mesHasta) &&
+           r.cantidad!==null && r.precio!==null && r.margen!==null;
+  });
+
+  // ── Columnas de meses ──
+  const {cols,colsByAño,años}=analBuildCols(filtered);
+
+  // ── Agregar ganancia por (grupo, mes) ──
+  // Ganancia = cantidad × precio × (margen/100)  — margen viene como % ej. 58.2
+  const ganMap={};   // ganMap[grupo][colKey] = ganancia acumulada
+  const grupoSet=new Set();
+  filtered.forEach(r=>{
+    const key=`${r.año}-${String(r.mes).padStart(2,'0')}`;
+    if(!ganMap[r.grupo]) ganMap[r.grupo]={};
+    ganMap[r.grupo][key]=(ganMap[r.grupo][key]||0) + r.cantidad * r.precio * (r.margen/100);
+    grupoSet.add(r.grupo);
+  });
+
+  // ── Construir filas ──
+  let rows=[...grupoSet].map(grupo=>({
+    grupo,
+    vals: Object.fromEntries(cols.map(c=>[c.key, ganMap[grupo]?.[c.key]||0]))
+  }));
+
+  // ── Funciones de totales ──
+  const rowYearTot=(row,año)=>(colsByAño[año]||[]).reduce((s,c)=>s+(row.vals[c.key]||0),0);
+  const rowGrandTot=row=>cols.reduce((s,c)=>s+(row.vals[c.key]||0),0);
+
+  // ── Ordenar ──
+  const sd=gananciaSort.dir==='asc'?1:-1;
+  rows.sort((a,b)=>{
+    if(gananciaSort.col==='grupo') return sd*a.grupo.localeCompare(b.grupo);
+    if(gananciaSort.col==='total') return sd*(rowGrandTot(a)-rowGrandTot(b));
+    if(gananciaSort.col.startsWith('year_')){ const año=+gananciaSort.col.split('_')[1]; return sd*(rowYearTot(a,año)-rowYearTot(b,año)); }
+    // col = colKey "2025-07"
+    return sd*((a.vals[gananciaSort.col]||0)-(b.vals[gananciaSort.col]||0));
+  });
+
+  const si=(col)=>gananciaSort.col===col?(gananciaSort.dir==='asc'?'↑':'↓'):'<span style="opacity:.25">⇅</span>';
+  const sh=(col,lbl)=>`<span style="cursor:pointer;user-select:none;white-space:nowrap" onclick="gananciaToggleSort('${col}')">${lbl}&nbsp;${si(col)}</span>`;
+
+  // ── Totales de columna ──
+  const colTot=(key)=>rows.reduce((s,r)=>s+(r.vals[key]||0),0);
+  const colYearTot=(año)=>rows.reduce((s,r)=>s+rowYearTot(r,año),0);
+  const grandTotAll=rows.reduce((s,r)=>s+rowGrandTot(r),0);
+  const money2=(v)=>`S/${v.toFixed(0)}`; // moneda sin decimales para claridad
+
+  const nCols=1+cols.length+años.length+1;
+
+  // ── Encabezado ──
+  let hdr1=`<th rowspan="2" class="anal-fix" style="left:0;z-index:6;min-width:130px">${sh('grupo','GRUPO')}</th>`;
+  años.forEach(año=>{ const n=(colsByAño[año]||[]).length+1; hdr1+=`<th colspan="${n}" class="anal-hdr-year">${año}</th>`; });
+  hdr1+=`<th rowspan="2" class="anal-hdr-total num">${sh('total','TOTAL')}</th>`;
+
+  let hdr2='';
+  años.forEach(año=>{
+    (colsByAño[año]||[]).forEach(c=>{ hdr2+=`<th class="anal-hdr-mes num">${sh(c.key,ANAL_MESES_ABREV[c.mes])}</th>`; });
+    hdr2+=`<th class="anal-hdr-subtotal num">${sh('year_'+año,'T'+año)}</th>`;
+  });
+
+  // ── Cuerpo ──
+  let tbody='';
+  rows.forEach(row=>{
+    let cells='';
+    años.forEach(año=>{
+      (colsByAño[año]||[]).forEach(c=>{ const v=row.vals[c.key]||0; cells+=`<td class="num">${v>0?money2(v):''}</td>`; });
+      const yt=rowYearTot(row,año); cells+=`<td class="num anal-subtotal">${yt>0?money2(yt):''}</td>`;
+    });
+    cells+=`<td class="num anal-grand">${money2(rowGrandTot(row))}</td>`;
+    tbody+=`<tr class="anal-row">
+      <td class="anal-fix" style="left:0"><b>${row.grupo}</b></td>
+      ${cells}
+    </tr>`;
+  });
+
+  // ── Fila Total ──
+  let totRow=`<td class="anal-fix anal-tfoot" style="left:0;z-index:3"><b>Total general</b></td>`;
+  años.forEach(año=>{
+    (colsByAño[año]||[]).forEach(c=>{ const t=colTot(c.key); totRow+=`<td class="num anal-tfoot">${t>0?money2(t):''}</td>`; });
+    const yt=colYearTot(año); totRow+=`<td class="num anal-tfoot anal-subtotal">${yt>0?money2(yt):''}</td>`;
+  });
+  totRow+=`<td class="num anal-tfoot anal-grand">${money2(grandTotAll)}</td>`;
+
+  const mesOpts=(sel)=>Array.from({length:12},(_,i)=>`<option value="${i+1}" ${sel===i+1?'selected':''}>${ANAL_MESES_ABREV[i+1]}</option>`).join('');
+  const añoOpts=(sel)=>añosDisp.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>💰 Ganancia por Grupo de Venta</h1>
+      <p style="font-size:12px;color:var(--c-muted)">${metaStr}</p></div></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Desde</label><div style="display:flex;gap:4px">
+          <select id="gFM1" style="min-width:54px">${mesOpts(gananciaFilter.mesDesde)}</select>
+          <select id="gFA1" style="min-width:70px">${añoOpts(gananciaFilter.añoDesde)}</select>
+        </div></div>
+        <div class="field"><label>Hasta</label><div style="display:flex;gap:4px">
+          <select id="gFM2" style="min-width:54px">${mesOpts(gananciaFilter.mesHasta)}</select>
+          <select id="gFA2" style="min-width:70px">${añoOpts(gananciaFilter.añoHasta)}</select>
+        </div></div>
+        <button class="btn btn-ghost btn-sm" id="gFClear" style="align-self:flex-end">🗑 Año actual</button>
+      </div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      ${!analiticaData.length
+        ?`<div class="empty" style="padding:40px;text-align:center">Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b>.</div>`
+        :!rows.length
+          ?`<div class="empty" style="padding:30px">Sin registros para el período seleccionado.</div>`
+          :`<div class="anal-outer">
+              <table class="anal-table">
+                <thead><tr>${hdr1}</tr><tr>${hdr2}</tr></thead>
+                <tbody>${tbody}</tbody>
+                <tfoot><tr>${totRow}</tr></tfoot>
+              </table>
+            </div>
+            <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
+              <b>Ganancia mensual = Cantidad vendida × Precio × Margen</b>.
+              Se excluyen productos sin precio o sin margen registrado.
+              Celdas vacías = no hubo ventas ese mes para ese grupo.
+            </p>`}
+    </div>`;
+
+  const applyGF=()=>{
+    gananciaFilter={
+      añoDesde:+document.getElementById('gFA1').value, mesDesde:+document.getElementById('gFM1').value,
+      añoHasta:+document.getElementById('gFA2').value, mesHasta:+document.getElementById('gFM2').value
+    };
+    RENDERERS.gananciaGrupo();
+  };
+  ['gFM1','gFA1','gFM2','gFA2'].forEach(id=>{const e=document.getElementById(id);if(e)e.onchange=applyGF;});
+  document.getElementById('gFClear').onclick=()=>{
+    gananciaFilter={añoDesde:_añoNow,mesDesde:1,añoHasta:_añoNow,mesHasta:12};
+    gananciaSort={col:'grupo',dir:'asc'};
+    RENDERERS.gananciaGrupo();
+  };
+};
 RENDERERS.empleados = function(){
   const el = document.getElementById('page-empleados');
   el.innerHTML = `
@@ -5614,7 +5780,7 @@ const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.goo
 const ACCOUNT_ROLES = {
   'multiboxes.peru@gmail.com': {
     domain: 'planilla',
-    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin','consolidadoVentas']
+    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin','consolidadoVentas','gananciaGrupo']
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
@@ -6365,7 +6531,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas'] }
+    modules:['consolidadoVentas','gananciaGrupo'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -6385,7 +6551,8 @@ const NAV_MODULE_LABELS = {
   propinas:['💵','Propinas'], propinasConsolidado:['🧮','Consolidado Propinas'],
   calculo:['🧮','Cálculo Quincenal'], consolidado:['📊','Consolidado'], boleta:['🧾','Boleta por Empleado'],
   // Analítica
-  consolidadoVentas:['📈','Consolidado de Ventas']
+  consolidadoVentas:['📈','Consolidado de Ventas'],
+  gananciaGrupo:['💰','Ganancia por Grupo']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
