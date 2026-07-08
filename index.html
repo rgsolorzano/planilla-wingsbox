@@ -482,6 +482,10 @@ function fechaHoy(){
   const d=new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
+function fechaAyer(){
+  const d=new Date(); d.setDate(d.getDate()-1);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 // syncPlanilla() fue eliminada — cada módulo llama a su propio wrapper de sincronización
 // (syncEmpleados, syncHorarios, syncMarcaciones, etc.) para garantizar aislamiento total.
 
@@ -3014,7 +3018,7 @@ window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.l
 let editPropItem=null;       // item en edición (formato unificado), null = modo "nueva propina"
 let propFilter={emp:'',desde:'',hasta:''};
 // Filas del formulario de "nueva propina" (no aplica en modo edición).
-let propDraftRows=[{tipo:'efectivo', monto:''}];
+let propDraftRows=[{tipo:'tarjeta', monto:''}];
 // Mesero/fecha seleccionados "en vivo" en el formulario de nueva propina (no aplica en
 // edición). Se usan para no perder la selección al agregar/quitar filas antes de guardar;
 // se reinician a null tras guardar (en ese punto manda lastPropina, que ya coincide).
@@ -3070,7 +3074,7 @@ RENDERERS.propinas = function(){
       <h2>Nueva propina</h2>
       <div class="form-grid">
         <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(propFormEmpleadoId!=null?propFormEmpleadoId:lastPropina.empleadoId)}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${propFormFecha!=null?propFormFecha:(lastPropina.fecha||hoy)}"></div>
+        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${propFormFecha!=null?propFormFecha:(lastPropina.fecha||fechaAyer())}"></div>
       </div>
       <h3 style="margin-top:14px">Propinas a registrar</h3>
       <p class="hint" style="margin-top:0">El mesero y la fecha de arriba se aplican a todas las filas. Agrega tantas filas como necesites (no hay límite).</p>
@@ -3121,7 +3125,7 @@ RENDERERS.propinas = function(){
     document.getElementById('prSave').onclick=propGuardarNuevo;
     document.getElementById('prRowAdd').onclick=()=>{
       propCapturarFilas();
-      propDraftRows.push({tipo:'efectivo', monto:''});
+      propDraftRows.push({tipo:'tarjeta', monto:''});
       RENDERERS.propinas();
       const tipos=document.querySelectorAll('.prRowTipo');
       if(tipos.length) tipos[tipos.length-1].focus();
@@ -3168,7 +3172,7 @@ function propGuardarNuevo(){
   // antes de presionar "Guardar" (sin pasar por "Agregar otra propina").
   propFormEmpleadoId = empleadoId;
   propFormFecha = fecha;
-  propDraftRows=[{tipo:'efectivo', monto:''}];
+  propDraftRows=[{tipo:'tarjeta', monto:''}];
   RENDERERS.propinas();
 }
 
