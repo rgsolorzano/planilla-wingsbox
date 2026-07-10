@@ -1586,7 +1586,31 @@ const ANAL_MESES_ABREV = ['','Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Se
 let analiticaData = [];   // [{grupo,plato,precio,margen,año,mes,cantidad}] null=vacío en RAW
 let analiticaMeta = null; // {lastSync,productos,meses,registros,duracion}
 const _añoNow = new Date().getFullYear();
+// ── Filtros por defecto basados en los datos disponibles ─────────────────
+// Usa los años REALES del OLAP en vez de hardcodear el año actual.
+// Esto evita que el filtro sea 2026 cuando los datos son de 2025.
+function analDefaultFilter(){
+  const años=[...new Set(analiticaData.map(r=>r.año))].sort();
+  return {
+    añoDesde: años.length ? años[0]       : _añoNow,
+    mesDesde: 1,
+    añoHasta: años.length ? años.at(-1)   : _añoNow,
+    mesHasta: 12,
+    grupo:'', plato:'', cantOp:'', cantVal:''
+  };
+}
+function gananciaDefaultFilter(){
+  const años=[...new Set(analiticaData.map(r=>r.año))].sort();
+  return {
+    añoDesde: años.length ? años[0]     : _añoNow,
+    mesDesde: 1,
+    añoHasta: años.length ? años.at(-1) : _añoNow,
+    mesHasta: 12
+  };
+}
+
 let analFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12, grupo:'', plato:'', cantOp:'', cantVal:'' };
+let gananciaFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12 };
 let analSort   = { col:'grupo', dir:'asc' };
 
 function analLoadFromStorage(){
@@ -1594,7 +1618,17 @@ function analLoadFromStorage(){
     const d=localStorage.getItem(K_ANAL_DATA), m=localStorage.getItem(K_ANAL_META);
     if(d) analiticaData=JSON.parse(d);
     if(m) analiticaMeta=JSON.parse(m);
-  }catch(e){ analiticaData=[]; analiticaMeta=null; }
+    // Resetear filtros para que coincidan con los datos disponibles,
+    // evitando que el filtro hardcodeado al año actual (ej. 2026) oculte
+    // datos de años anteriores (ej. 2025).
+    if(analiticaData.length){
+      analFilter     = analDefaultFilter();
+      gananciaFilter = gananciaDefaultFilter();
+    }
+  }catch(e){
+    console.warn('[Analítica] Error al cargar desde storage:', e);
+    analiticaData=[]; analiticaMeta=null;
+  }
 }
 analLoadFromStorage(); // carga al iniciar la app
 
@@ -1638,7 +1672,11 @@ async function syncAnaliticaFromRAW(){
       const plato = String(row[1]||'').trim();
       if(!plato) continue;
       const precio = analNumOrNull(row[2]);
-      const margen = analNumOrNull(row[3]);
+      // Normalizar margen: Google Sheets con formato % devuelve 0.582 (decimal),
+      // pero si se ingresó como número plain devuelve 58.2.
+      // Normalizamos a porcentaje entero (58.2) para consistencia interna.
+      const rawMargen = analNumOrNull(row[3]);
+      const margen = rawMargen===null ? null : (rawMargen>0 && rawMargen<1 ? rawMargen*100 : rawMargen);
       productosSet.add(plato);
       for(const col of monthCols){
         const v = col.idx<row.length ? row[col.idx] : undefined;
@@ -1658,6 +1696,11 @@ async function syncAnaliticaFromRAW(){
       duracion: ((Date.now()-t0)/1000).toFixed(1)
     };
     analSaveToStorage();
+    // Resetear filtros para mostrar todos los datos recién cargados
+    analFilter     = analDefaultFilter();
+    gananciaFilter = gananciaDefaultFilter();
+    console.log(`[Analítica] Sync completado. Años disponibles: ${[...new Set(facts.map(f=>f.año))].sort().join(', ')}`);
+    console.log(`[Analítica] Filtro aplicado: desde ${analFilter.añoDesde}/${analFilter.mesDesde} hasta ${analFilter.añoHasta}/${analFilter.mesHasta}`);
 
     // 4) Escribir hoja FACTS (best-effort; puede fallar si el SS no fue creado por la app)
     analWriteFactsSheet(facts).catch(e=>console.warn('[Analítica] No se pudo escribir FACTS:', e.message));
@@ -1763,6 +1806,8 @@ RENDERERS.consolidadoVentas = function(){
     : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
 
   const añosDisp=[...new Set(analiticaData.map(r=>r.año))].sort();
+  // Fallback: si no hay datos, mostrar al menos el año actual en los dropdowns
+  const añosParaFiltro = añosDisp.length ? añosDisp : [_añoNow];
   const gruposDisp=[...new Set(analiticaData.map(r=>r.grupo).filter(Boolean))].sort();
 
   // Filtrar
@@ -1876,7 +1921,7 @@ RENDERERS.consolidadoVentas = function(){
 
   // Opciones de selects
   const mesOpts=(sel)=>Array.from({length:12},(_,i)=>`<option value="${i+1}" ${sel===i+1?'selected':''}>${ANAL_MESES_ABREV[i+1]}</option>`).join('');
-  const añoOpts=(sel)=>añosDisp.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
+  const añoOpts=(sel)=>añosParaFiltro.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
   const grpOpts=`<option value="">Todos</option>`+gruposDisp.map(g=>`<option value="${g}" ${analFilter.grupo===g?'selected':''}>${g}</option>`).join('');
 
   el.innerHTML=`
@@ -1941,7 +1986,7 @@ RENDERERS.consolidadoVentas = function(){
   const applyFDebounced=()=>{ clearTimeout(_analDebounce); _analDebounce=setTimeout(applyF,350); };
   if(pEl)pEl.oninput=applyFDebounced; if(vEl)vEl.oninput=applyFDebounced;
   document.getElementById('anFClear').onclick=()=>{
-    analFilter={añoDesde:_añoNow,mesDesde:1,añoHasta:_añoNow,mesHasta:12,grupo:'',plato:'',cantOp:'',cantVal:''};
+    analFilter=analDefaultFilter();
     analSort={col:'grupo',dir:'asc'};
     RENDERERS.consolidadoVentas();
   };
@@ -1951,7 +1996,6 @@ let editEmpId = null;
 
 // ── Renderer: Ganancia por Grupo de Venta ────────────────────────────────
 let gananciaSort = { col:'grupo', dir:'asc' };
-let gananciaFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12 };
 
 window.gananciaToggleSort = function(col){
   if(gananciaSort.col===col) gananciaSort.dir=gananciaSort.dir==='asc'?'desc':'asc';
@@ -1969,6 +2013,7 @@ RENDERERS.gananciaGrupo = function(){
     : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
 
   const añosDisp=[...new Set(analiticaData.map(r=>r.año))].sort();
+  const añosParaFiltro=añosDisp.length?añosDisp:[_añoNow];
 
   // ── Filtrar datos ──
   const filtered=analiticaData.filter(r=>{
@@ -2058,7 +2103,7 @@ RENDERERS.gananciaGrupo = function(){
   totRow+=`<td class="num anal-tfoot anal-grand">${money2(grandTotAll)}</td>`;
 
   const mesOpts=(sel)=>Array.from({length:12},(_,i)=>`<option value="${i+1}" ${sel===i+1?'selected':''}>${ANAL_MESES_ABREV[i+1]}</option>`).join('');
-  const añoOpts=(sel)=>añosDisp.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
+  const añoOpts=(sel)=>añosParaFiltro.map(a=>`<option value="${a}" ${sel===a?'selected':''}>${a}</option>`).join('');
 
   el.innerHTML=`
     <div class="page-head"><div><h1>💰 Ganancia por Grupo de Venta</h1>
@@ -2104,7 +2149,7 @@ RENDERERS.gananciaGrupo = function(){
   };
   ['gFM1','gFA1','gFM2','gFA2'].forEach(id=>{const e=document.getElementById(id);if(e)e.onchange=applyGF;});
   document.getElementById('gFClear').onclick=()=>{
-    gananciaFilter={añoDesde:_añoNow,mesDesde:1,añoHasta:_añoNow,mesHasta:12};
+    gananciaFilter=gananciaDefaultFilter();
     gananciaSort={col:'grupo',dir:'asc'};
     RENDERERS.gananciaGrupo();
   };
