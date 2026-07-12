@@ -1058,15 +1058,26 @@ function normalizarMarcacionesMedianoche(){
       if(!mD.entradaReal || mD.salidaReal) continue;
 
       // ── Patrón principal: D+1 tiene una salidaReal huérfana en la ventana ──
-      // (scans correctamente tagueados Entrada/Salida, pero agrupados por
-      // fecha de calendario en vez de por continuidad de jornada).
+      // Se activa cuando el scan de salida fue asignado por fecha calendario al día
+      // siguiente (comportamiento pre-fix), pero pertenece a la jornada de D.
+      // Guarda: NO mover si D+1 tiene su propia entrada FUERA de la ventana
+      // (e.g. entradaReal='18:00'), lo que indica que D+1 tiene una jornada
+      // propia cuyos datos son suyos. En ese caso la salidaReal='00:xx' es el
+      // cierre legítimo de la jornada de D+1, no de la de D.
       const salMin1 = hmToMin(mD1.salidaReal);
       if(mD1.salidaReal && salMin1 !== null && salMin1 < VENTANA_MIN){
-        console.log(`[Medianoche] ${mD.fecha} sin salida + ${mD1.fecha} salida=${mD1.salidaReal} (huérfana, en ventana) → reasignando como salida del ${mD.fecha}`);
-        mD.salidaReal = mD1.salidaReal;
-        mD1.salidaReal = null; // D+1 conserva su propia entrada; su salida se resolverá con D+2
-        changed = true;
-        continue;
+        const ent1Min = hmToMin(mD1.entradaReal);
+        const d1TienePropiaJornada = mD1.entradaReal &&
+                                     ent1Min !== null &&
+                                     ent1Min >= VENTANA_MIN; // entrada fuera de la ventana → jornada real
+        if(!d1TienePropiaJornada){
+          console.log(`[Medianoche] ${mD.fecha} sin salida + ${mD1.fecha} salida=${mD1.salidaReal} (huérfana, en ventana) → reasignando como salida del ${mD.fecha}`);
+          mD.salidaReal = mD1.salidaReal;
+          mD1.salidaReal = null; // D+1 conserva su propia entrada si la tiene
+          if(!mD1.entradaReal) toRemove.add(mD1.id); // D+1 queda vacío → eliminar
+          changed = true;
+          continue;
+        }
       }
 
       // ── Patrón secundario: D+1 entradaReal cae en la ventana (sin salida propia) ──
@@ -1201,6 +1212,16 @@ function calcDia(emp, fecha){
   if(!libre && debeTrabajar && !esFalta){
     if(entradaReal) hTardOriginal = calcHorasTardanza(entradaReal, hor.entrada);
     if(salidaReal)  hSal  = calcHorasSalidaAnt(salidaReal, hor.salida);
+    // ── Corrección de cruce de medianoche ───────────────────────────────────
+    // Si el empleado trabajó ≥ horas programadas no puede haber salida anticipada:
+    // una salida registrada como 00:00 o 00:XX corresponde al día SIGUIENTE
+    // (medianoche real), no a las 00:00 del mismo día.
+    // Ejemplo: entrada 10:56, salida 00:00 (11/07) → 13h efectivas, 6h programadas
+    //   → calcHorasSalidaAnt('00:00', '17:00') daría 17h de "salida anticipada"
+    //   → con este guard: horasEf(13) >= horasProg(6) → hSal = 0 ✓
+    // La condición existente en calcHorasSalidaAnt cubre schedules que terminan
+    // después de las 22:00; este guard cubre todos los demás casos nocturnos.
+    if(hSal > 0 && horasEf >= horasProg) hSal = 0;
   }
   // Exoneración de tardanza del día (no afecta otros días/empleados).
   const exo = getExoneracionTardanza(emp.id, fecha);
