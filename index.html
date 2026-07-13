@@ -825,8 +825,11 @@ function inicioSemana(fecha){
 }
 // ¿El empleado tiene marcación de entrada ese día? (trabajó)
 function trabajoEseDia(empleadoId, fecha){
+  // Un día cuenta como trabajado si existe al menos una marcación (entrada o salida).
+  // Esto alinea el conteo de propinas con el Cálculo Quincenal, donde un día con
+  // "Falta marcación" (solo entrada o solo salida) sí cuenta como día de presencia.
   const m=getMarcacion(empleadoId, fecha);
-  return !!(m && m.entradaReal);
+  return !!(m && (m.entradaReal || m.salidaReal));
 }
 // Suma las propinas (por tipo) de un mesero en una fecha concreta.
 // Soporta múltiples registros (de cualquier formato) para el mismo mesero/fecha.
