@@ -4309,6 +4309,17 @@ RENDERERS.salonAdmin = function(){
     </div>`;
   document.getElementById('salonProdSave').onclick=salonProdSave;
   document.getElementById('salonProdClear').onclick=()=>{editSalonProdId=null;RENDERERS.salonAdmin();};
+  // Caja y Paquete son mutuamente excluyentes — marcar uno desmarca el otro automáticamente
+  document.querySelectorAll('.salonProdUnit').forEach(cb=>{
+    cb.onchange=function(){
+      if(!this.checked) return;
+      const excluye = this.value==='Caja'?'Paquete':this.value==='Paquete'?'Caja':null;
+      if(excluye){
+        const otro=document.querySelector(`.salonProdUnit[value="${excluye}"]`);
+        if(otro) otro.checked=false;
+      }
+    };
+  });
 };
 
 function salonProdSave(){
@@ -4316,6 +4327,7 @@ function salonProdSave(){
   const unidades=[...document.querySelectorAll('.salonProdUnit:checked')].map(cb=>cb.value);
   if(!nombre){document.getElementById('salonProdNombre').classList.add('invalid');toast('Ingresa el nombre del producto','error');return;}
   if(!unidades.length){toast('Selecciona al menos una unidad','error');return;}
+  if(unidades.includes('Caja')&&unidades.includes('Paquete')){toast('Caja y Paquete son excluyentes — selecciona solo una de las dos','error');return;}
   if(editSalonProdId){
     const p=S.salonProductos.find(x=>x.id===editSalonProdId);
     if(p){p.nombre=nombre;p.unidades=unidades;}
@@ -4413,41 +4425,37 @@ RENDERERS.consolidadoSalon = function(){
     return;
   }
   const fechas=rangoFechas(conSalonFilter.desde, conSalonFilter.hasta);
-  const unidades=salonUnidadesActivas();
+  const unidades=salonUnidadesActivas();          // globales: Bolsa, Caja, Paquete activas
   const DIAS3=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 
-  // "Días en cero" applies to Paquete y Caja, NOT Bolsa
-  const UNIDADES_CON_ZEROS = ['Caja','Paquete'];
+  // ¿Existe algún producto con Caja o Paquete? Solo entonces mostramos col "Días en 0"
+  const hasDiasCol = S.salonProductos.some(p=>p.unidades.includes('Caja')||p.unidades.includes('Paquete'));
+  const colsPerDate = unidades.length + (hasDiasCol ? 1 : 0);
 
-  // Para cada unidad en la lista activa, ¿muestra col "Días en cero"?
-  // Una unidad tiene esa columna si está en UNIDADES_CON_ZEROS
-  // Columnas por fecha: [unidad, (dias_en_cero_si_aplica), ...]
-  // Pre-calc col widths for each date group
-  const unidCols = unidades.map(u=>({u, hasDiasEnCero: UNIDADES_CON_ZEROS.includes(u)}));
-  const colsPerDate = unidCols.reduce((n,uc)=>n + (uc.hasDiasEnCero ? 2 : 1), 0);
+  // La unidad controladora de un producto: Caja XOR Paquete (excluyentes).
+  // Bolsa no tiene "Días en 0"; si el producto solo tiene Bolsa → null
+  function unidadControladora(p){ return p.unidades.find(u=>u==='Caja'||u==='Paquete')||null; }
 
-  // Pre-calc "días en cero" state for each (productoId, unidad) across all fechas in range
-  // State: counter resets to 0 when value > 0, increments when value === 0 (only explicit records count)
-  function calcDiasEnCero(productoId, fechas, unidad){
-    // Returns array of {cantidad, diasEnCero} indexed by fecha position
-    let cero = 0;
+  // Calcula dias en cero para cada fecha (solo días con registro explícito cuentan)
+  function calcDiasEnCero(productoId, unidad){
+    let cero=0;
     return fechas.map(f=>{
-      const r = getSalonStock(productoId, f, unidad);
-      if(r==null){ return {v:null, dz:null}; }   // sin registro → null (no cuenta)
-      if(r.cantidad > 0){ cero=0; return {v:r.cantidad, dz:0}; }
-      cero++;
-      return {v:0, dz:cero};
+      const r=getSalonStock(productoId,f,unidad);
+      if(r==null) return {v:null,dz:null};
+      if(r.cantidad>0){cero=0; return {v:r.cantidad,dz:0};}
+      cero++; return {v:0,dz:cero};
     });
   }
 
-  // Pre-calc all data to avoid redundant calls
-  const prodData = S.salonProductos.map(p=>{
-    const byUnidad={};
-    unidCols.forEach(({u})=>{
-      if(!p.unidades.includes(u)){ byUnidad[u]=null; return; }
-      byUnidad[u]= calcDiasEnCero(p.id, fechas, u);
+  // Pre-calcular datos por producto
+  const prodData=S.salonProductos.map(p=>{
+    const ctrlU=unidadControladora(p);
+    const byU={};
+    unidades.forEach(u=>{
+      if(!p.unidades.includes(u)){byU[u]=null;return;}
+      byU[u]=calcDiasEnCero(p.id,u);
     });
-    return {p, byUnidad};
+    return {p, byU, ctrlU};
   });
 
   // Headers
@@ -4459,41 +4467,46 @@ RENDERERS.consolidadoSalon = function(){
   }).join('');
 
   const hdrUnits=fechas.map(()=>
-    unidCols.map(({u,hasDiasEnCero})=>{
-      const uTh=`<th class="num" style="font-size:10px;font-weight:600;color:#15803d;background:#f0fdf4;border-left:2px solid #bbf7d0;white-space:nowrap">${u}</th>`;
-      if(!hasDiasEnCero) return uTh;
-      return uTh+`<th class="num" style="font-size:9px;font-weight:600;color:#92400e;background:#fffbeb;white-space:nowrap">Días en 0</th>`;
-    }).join('')
+    unidades.map(u=>`<th class="num" style="font-size:10px;font-weight:600;color:#15803d;background:#f0fdf4;border-left:2px solid #bbf7d0;white-space:nowrap">${u}</th>`).join('') +
+    (hasDiasCol?`<th class="num" style="font-size:9px;font-weight:600;color:#92400e;background:#fffbeb;white-space:nowrap">Días en 0</th>`:'')
   ).join('');
 
-  // Data rows
-  const filas=prodData.map(({p,byUnidad})=>`
+  // Filas de datos
+  const filas=prodData.map(({p,byU,ctrlU})=>`
     <tr>
       <td class="cotejo-col-licor" style="background:#fff;border-right:2px solid #bbf7d0">${p.nombre}</td>
-      ${fechas.map((_,fi)=>
-        unidCols.map(({u,hasDiasEnCero})=>{
-          if(!p.unidades.includes(u))
-            return `<td class="num" style="border-left:2px solid #bbf7d0;background:#fafffe;color:var(--c-muted);font-size:10px">—</td>`+
-                   (hasDiasEnCero?`<td class="num" style="background:#fafffe;color:var(--c-muted);font-size:10px">—</td>`:'');
-          const d=byUnidad[u][fi];
-          if(d.v===null){
-            return `<td class="num" style="border-left:2px solid #bbf7d0;font-size:11px"></td>`+
-                   (hasDiasEnCero?`<td class="num" style="background:#fff9f0;font-size:10px"></td>`:'');
+      ${fechas.map((_,fi)=>{
+        const unitCells=unidades.map(u=>{
+          if(!byU[u])
+            return `<td class="num" style="border-left:2px solid #bbf7d0;background:#fafffe;color:var(--c-muted);font-size:10px">—</td>`;
+          const d=byU[u][fi];
+          return d.v===null
+            ? `<td class="num" style="border-left:2px solid #bbf7d0;font-size:11px"></td>`
+            : `<td class="num" style="border-left:2px solid #bbf7d0;font-size:11px">${d.v}</td>`;
+        }).join('');
+
+        let dzCell='';
+        if(hasDiasCol){
+          if(!ctrlU){
+            dzCell=`<td class="num" style="background:#f9fafb;color:var(--c-muted);font-size:10px">—</td>`;
+          } else {
+            const d=byU[ctrlU][fi];
+            if(!d||d.v===null){
+              dzCell=`<td class="num" style="background:#fff9f0"></td>`;
+            } else {
+              const bg=d.dz>=1?'background:#fef3c7':'';
+              const tx=d.dz>=1?'color:#92400e;font-weight:700':'color:var(--c-muted)';
+              dzCell=`<td class="num" style="${bg};${tx};font-size:10px">${d.dz>=1?d.dz:''}</td>`;
+            }
           }
-          const invStyle=`border-left:2px solid #bbf7d0;font-size:11px`;
-          const invCell=`<td class="num" style="${invStyle}">${d.v}</td>`;
-          if(!hasDiasEnCero) return invCell;
-          const dzBg = d.dz>=1 ? 'background:#fef3c7' : '';
-          const dzColor = d.dz>=1 ? 'color:#92400e;font-weight:700' : 'color:var(--c-muted)';
-          const dzCell=`<td class="num" style="${dzBg};${dzColor};font-size:10px">${d.dz>=1?d.dz:''}</td>`;
-          return invCell+dzCell;
-        }).join('')
-      ).join('')}
+        }
+        return unitCells+dzCell;
+      }).join('')}
     </tr>`).join('');
 
   el.innerHTML=`
     <div class="page-head"><div><h1>📊 Consolidado Salón</h1>
-      <p>Evolución diaria del inventario. <b>Días en 0</b> (Paquete/Caja): días consecutivos con inventario en cero. Fondo <span style="background:#fef3c7;padding:0 4px;border-radius:3px">amarillo</span> = alerta.</p></div></div>
+      <p>Evolución diaria. <b>Días en 0</b>: días consecutivos con Caja o Paquete en 0 (registro explícito). Fondo <span style="background:#fef3c7;padding:0 4px;border-radius:3px">amarillo</span> = alerta.</p></div></div>
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="cSalonDesde" value="${conSalonFilter.desde}"></div>
@@ -4515,8 +4528,7 @@ RENDERERS.consolidadoSalon = function(){
         </table>
       </div>
       <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
-        Celdas vacías = sin registro. — = producto no usa esa unidad.
-        <b>Días en 0</b> se calcula solo para Paquete y Caja; se incrementa por días consecutivos con registro explícito de 0.
+        Celdas vacías = sin registro. — = producto no usa esa unidad. <b>Días en 0</b> solo aplica a Caja o Paquete; Bolsa no tiene contador.
       </p>
     </div>`;
 
