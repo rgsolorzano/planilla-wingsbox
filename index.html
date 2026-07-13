@@ -5079,7 +5079,7 @@ RENDERERS.cotejoLicores = function(){
   const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
   const fechas = rangoFechas(cotejoLicFechaIni, cotejoLicFechaFin);
 
-  // Para cada licor: calcular stock/consumo por día + consumo acumulado del período
+  // Para cada licor: calcular stock/consumo por día + consumo acumulado + consumo total
   const filasDatos = licoresOrdenados.map(lic=>{
     const dias = fechas.map(f=>{
       const r = getInvLicor(lic.id, f);
@@ -5090,10 +5090,21 @@ RENDERERS.cotejoLicores = function(){
       const consumo  = tieneEnt || tieneSal ? sEnt - sSal : null;
       return { sEnt, sSal, consumo, tieneEnt:!!tieneEnt, tieneSal:!!tieneSal };
     });
-    // Consumo acumulado = SUMA de los consumos diarios del período
+
+    // Consumo acumulado = SUMA de consumos diarios
     const acumulado = dias.reduce((s,d)=> d.consumo!==null ? s+d.consumo : s, 0);
     const tieneAcum = dias.some(d=>d.tieneEnt||d.tieneSal);
-    return { lic, dias, acumulado: tieneAcum ? acumulado : null, tieneAcum };
+
+    // Consumo Total = Entrada(fechaIni) - Salida(fechaFin)
+    const rIni = getInvLicor(lic.id, cotejoLicFechaIni);
+    const rFin = getInvLicor(lic.id, cotejoLicFechaFin);
+    const tieneEntIni = !!rIni && (rIni.entradaOzs||rIni.entradaBots);
+    const tieneSalFin = !!rFin && (rFin.salidaOzs||rFin.salidaBots);
+    const sEntIni = tieneEntIni ? stockLicor(lic.id, rIni, 'entrada') : null;
+    const sSalFin = tieneSalFin ? stockLicor(lic.id, rFin, 'salida')  : null;
+    const consumoTotal = (sEntIni!==null && sSalFin!==null) ? sEntIni - sSalFin : null;
+
+    return { lic, dias, acumulado: tieneAcum ? acumulado : null, tieneAcum, consumoTotal, sEntIni, sSalFin };
   });
 
   // Totales por columna de día
@@ -5104,9 +5115,11 @@ RENDERERS.cotejoLicores = function(){
     hasData: filasDatos.some(f=>f.dias[fi].tieneEnt||f.dias[fi].tieneSal),
   }));
   const totAcum = filasDatos.reduce((s,f)=> f.acumulado!==null ? s+f.acumulado : s, 0);
+  const totConsumoTotal = filasDatos.reduce((s,f)=> f.consumoTotal!==null ? s+f.consumoTotal : s, 0);
+  const hayAlgunConsumoTotal = filasDatos.some(f=>f.consumoTotal!==null);
   const licoresEvalFmt = filasDatos.filter(f=>f.tieneAcum).length;
 
-  // Encabezados: 3 columnas por fecha + 1 columna Consumo acumulado
+  // Encabezados: 3 columnas por fecha + Consumo acumulado + Consumo Total
   const DIAS_SEMANA_ES = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
   const hdrFechas = fechas.map(f=>{
     const dow = DIAS_SEMANA_ES[new Date(f+'T12:00:00').getDay()];
@@ -5120,6 +5133,10 @@ RENDERERS.cotejoLicores = function(){
     `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff">Consumo</th>`
   ).join('');
 
+  // Estilos de encabezados sticky con colores explícitos (no dependen de herencia)
+  const acumHdrStyle = `background:#4c1d95;color:#e9d5ff;border-left:3px solid #4c1d95;min-width:90px;padding:4px 6px;font-size:10px;font-weight:700;white-space:normal;word-break:break-word;text-align:center;vertical-align:middle`;
+  const totHdrStyle  = `background:#1e1b4b;color:#c7d2fe;border-left:3px solid #1e1b4b;min-width:100px;padding:4px 6px;font-size:10px;font-weight:700;white-space:normal;word-break:break-word;text-align:center;vertical-align:middle`;
+
   // Filas de datos
   const filasHTML = filasDatos.length ? filasDatos.map(f=>{
     const celdas = f.dias.map(d=>
@@ -5130,11 +5147,14 @@ RENDERERS.cotejoLicores = function(){
     const acumCell = f.acumulado!==null
       ? `<td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:${f.acumulado>0?'#059669':f.acumulado<0?'#dc2626':'inherit'}">${f.acumulado.toFixed(1)} oz</td>`
       : `<td class="num" style="border-left:3px solid #4c1d95">&#8212;</td>`;
+    const totalCell = f.consumoTotal!==null
+      ? `<td class="num" style="font-weight:700;border-left:3px solid #1e1b4b;color:${f.consumoTotal>0?'#059669':f.consumoTotal<0?'#dc2626':'inherit'}">${f.consumoTotal.toFixed(1)} oz</td>`
+      : `<td class="num" style="border-left:3px solid #1e1b4b;color:var(--c-muted)">&#8212;</td>`;
     const sinDatos = !f.tieneAcum && f.dias.every(d=>!d.tieneEnt&&!d.tieneSal);
     const cls = sinDatos ? 'row-vac' : '';
     const bg  = sinDatos ? '#f5f3ff' : '#fff';
-    return `<tr class="${cls}"><td class="cotejo-col-licor" style="background:${bg}">${f.lic.nombre}</td>${celdas}${acumCell}</tr>`;
-  }).join('') : `<tr><td colspan="${3*fechas.length+2}" class="empty">No hay licores registrados.</td></tr>`;
+    return `<tr class="${cls}"><td class="cotejo-col-licor" style="background:${bg}">${f.lic.nombre}</td>${celdas}${acumCell}${totalCell}</tr>`;
+  }).join('') : `<tr><td colspan="${3*fechas.length+3}" class="empty">No hay licores registrados.</td></tr>`;
 
   // Fila Total
   const totCeldas = totDias.map(t=>
@@ -5145,7 +5165,7 @@ RENDERERS.cotejoLicores = function(){
 
   el.innerHTML = `
     <div class="page-head"><div><h1>&#x1F4CA; Cotejo de Consumo de Licores</h1>
-      <p>Detalle d&#237;a a d&#237;a del stock de entrada, salida y consumo de cada licor. La columna <b>Consumo acumulado</b> compara la Entrada de la fecha inicial con la Salida de la fecha final.</p></div></div>
+      <p>Detalle d&#237;a a d&#237;a del stock de entrada, salida y consumo. <b>Consumo acumulado</b>: suma de consumos diarios. <b>Consumo total</b>: Entrada inicial &#8722; Salida final.</p></div></div>
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Fecha inicial</label><input type="date" id="cotLicIniF" value="${cotejoLicFechaIni}"></div>
@@ -5165,7 +5185,8 @@ RENDERERS.cotejoLicores = function(){
             <tr>
               <th class="cotejo-corner" rowspan="2">Licor</th>
               ${hdrFechas}
-              <th class="cotejo-acum-hdr" rowspan="2">Consumo<br>acumulado</th>
+              <th rowspan="2" style="${acumHdrStyle}">Consumo<br>acumulado</th>
+              <th rowspan="2" style="${totHdrStyle}">Consumo total<br><span style="font-weight:400;font-size:9px;opacity:.85">(Entrada ini. &#8722; Salida fin.)</span></th>
             </tr>
             <tr>${hdrSub}</tr>
           </thead>
@@ -5174,13 +5195,15 @@ RENDERERS.cotejoLicores = function(){
             <td class="cotejo-col-licor" style="font-weight:700;font-size:11px">Total</td>
             ${totCeldas}
             <td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:#4c1d95">${totAcum.toFixed(1)} oz</td>
+            <td class="num" style="font-weight:700;border-left:3px solid #1e1b4b;color:#1e1b4b">${hayAlgunConsumoTotal ? totConsumoTotal.toFixed(1)+' oz' : '&#8212;'}</td>
           </tr></tfoot>` : ''}
         </table>
       </div>
       <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
         <b>Stock = (Botellas &#215; Oz por botella) + Onzas</b> &#183;
         <b>Consumo diario = Entrada &#8722; Salida del mismo d&#237;a</b> &#183;
-        <b>Consumo acumulado = Entrada fecha inicial &#8722; Salida fecha final</b>.
+        <b>Consumo acumulado = suma de consumos diarios</b> &#183;
+        <b>Consumo total = Entrada fecha inicial &#8722; Salida fecha final</b>.
         Filas en gris: sin registros en ninguna fecha del per&#237;odo.
       </p>
     </div>`;
