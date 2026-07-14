@@ -2186,13 +2186,34 @@ RENDERERS.gananciaGrupo = function(){
     RENDERERS.gananciaGrupo();
   };
 };
+// ── Helper: horas semanales programadas según horario ───────────────────────
+function empHorasSemanales(empId){
+  return [0,1,2,3,4,5,6].reduce((s,d)=>{
+    const h=getHorario(empId,d);
+    if(!h||h.libre) return s;
+    const ent=hmToMin(h.entrada), sal=hmToMin(h.salida);
+    if(ent===null||sal===null) return s;
+    let diff=sal-ent; if(diff<0) diff+=1440;
+    return s+Math.round(diff/60*10)/10;
+  },0);
+}
+
 RENDERERS.empleados = function(){
   const el = document.getElementById('page-empleados');
+
+  // ── Computed values per employee ────────────────────────────────
+  const empCalc = e => {
+    const afp       = Number(e.afpComision)||0;
+    const hCierre   = Number(e.horasCierre)||0;
+    const sueldoTot = (e.sueldoQuincenal||0)*2 + afp;
+    const horasSem  = empHorasSemanales(e.id);
+    const horasTot  = horasSem + hCierre;
+    const sHoraCalc = horasTot>0 ? sueldoTot/horasTot : 0;
+    return { afp, hCierre, sueldoTot, horasSem, horasTot, sHoraCalc };
+  };
+
   el.innerHTML = `
-    <div class="page-head">
-      <div><h1>👥 Empleados</h1><p>Crea, edita y elimina al personal. Cada empleado tiene sueldo quincenal, sueldo planilla y sueldo por hora.</p></div>
-      <div class="actions"><button class="btn btn-green" id="empExport">⬇ Exportar Excel</button></div>
-    </div>
+    <div class="page-head"><div><h1>👥 Empleados</h1><p>Crea, edita y elimina al personal. Cada empleado tiene sueldo quincenal, sueldo planilla y sueldo por hora.</p></div></div>
     <div class="card">
       <h2 id="empFormTitle">Nuevo empleado</h2>
       <div class="form-grid">
@@ -2202,6 +2223,8 @@ RENDERERS.empleados = function(){
         <div class="field"><label>Sueldo quincenal *</label><input id="empSueldoQ" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Sueldo planilla *</label><input id="empSueldoP" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Sueldo por hora *</label><input id="empSueldoH" type="number" min="0" step="0.01" placeholder="0.00"></div>
+        <div class="field"><label>AFP + comisión</label><input id="empAFP" type="number" min="0" step="0.01" placeholder="0.00" title="Monto mensual de AFP y comisiones"></div>
+        <div class="field"><label>Horas cierre</label><input id="empHorasCierre" type="number" min="0" step="0.5" placeholder="0" title="Horas adicionales de cierre por semana"></div>
         <div class="field"><label>Modalidad</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empEsLibre"> Empleado libre (cobra por horas)</label></div>
         <div class="field"><label>Estado</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empActivo" checked> Activo</label></div>
       </div>
@@ -2215,21 +2238,41 @@ RENDERERS.empleados = function(){
       <h2>Lista de empleados (${S.emp.length})</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Nombre</th><th>Documento</th><th>Tipo</th><th class="num">Sueldo quincenal</th><th class="num">Sueldo planilla</th><th class="num">Sueldo/hora</th><th>Acciones</th></tr></thead>
+          <thead><tr>
+            <th>Nombre</th><th>Documento</th><th>Tipo</th>
+            <th class="num">S. Quincenal</th><th class="num">S. Planilla</th><th class="num">S./hora</th>
+            <th class="num">AFP+com.</th><th class="num">S. Total</th>
+            <th class="num">H. cierre</th><th class="num">H. semana</th><th class="num">H. total</th>
+            <th class="num">S./h calc</th>
+            <th>Acciones</th>
+          </tr></thead>
           <tbody>
-            ${S.emp.length? S.emp.map(e=>`
-              <tr style="${!empEsActivo(e)?'opacity:.55':''}">
-                <td>${e.nombre} ${empEsLibre(e)?'<span class="badge b-late" style="font-size:10px">Libre</span>':''} ${!empEsActivo(e)?'<span class="badge b-miss" style="font-size:10px">Inactivo</span>':''}</td><td>${e.documento}</td>
+            ${S.emp.length ? S.emp.map(e=>{
+              const c=empCalc(e);
+              const inact=!empEsActivo(e);
+              return `<tr>
+                <td style="${inact?'color:var(--c-muted)':''}">${e.nombre}
+                  ${empEsLibre(e)?'<span class="badge b-late" style="font-size:10px">Libre</span>':''}
+                  ${inact?'<span class="badge b-miss" style="font-size:10px">Inactivo</span>':''}
+                </td>
+                <td style="${inact?'color:var(--c-muted)':''}">${e.documento}</td>
                 <td><span class="badge ${esCocina(e)?'b-vac':empTipo(e)==='Caja'?'':'b-extra'}">${empTipo(e)}</span></td>
-                <td class="num">${money(e.sueldoQuincenal)}</td>
-                <td class="num">${money(e.sueldoPlanilla)}</td>
-                <td class="num">${money(e.sueldoHora)}</td>
-                <td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoQuincenal)}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoPlanilla)}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoHora)}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(c.afp)}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}"><b>${money(c.sueldoTot)}</b></td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${c.hCierre||'—'}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${c.horasSem}</td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}"><b>${c.horasTot}</b></td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(c.sHoraCalc)}</td>
+                <td style="white-space:nowrap">
                   <button class="btn-icon" onclick="empEdit('${e.id}')">✏️ Editar</button>
-                  <button class="btn-icon" onclick="empToggleActivo('${e.id}')" title="${empEsActivo(e)?'Marcar como Inactivo':'Reactivar empleado'}" style="opacity:${empEsActivo(e)?'.6':'1'}">${empEsActivo(e)?'🔕 Inactivar':'✅ Reactivar'}</button>
+                  <button class="btn-icon${inact?'':' b-warn'}" onclick="empToggleActivo('${e.id}')" title="${inact?'Reactivar empleado':'Marcar como Inactivo'}">${inact?'✅ Reactivar':'🔕 Inactivar'}</button>
                   <button class="btn-icon del" onclick="empDel('${e.id}')">🗑️ Eliminar</button>
                 </td>
-              </tr>`).join('') : `<tr><td colspan="7" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
+              </tr>`;}).join('')
+            : `<tr><td colspan="13" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -2237,7 +2280,6 @@ RENDERERS.empleados = function(){
 
   document.getElementById('empSave').onclick = empSave;
   document.getElementById('empClear').onclick = empClearForm;
-  document.getElementById('empExport').onclick = exportarEmpleadosExcel;
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
     if(e){
@@ -2247,6 +2289,8 @@ RENDERERS.empleados = function(){
       document.getElementById('empEsLibre').checked=empEsLibre(e);
       document.getElementById('empActivo').checked=empEsActivo(e);
       empSueldoQ.value=e.sueldoQuincenal; empSueldoP.value=e.sueldoPlanilla; empSueldoH.value=e.sueldoHora;
+      document.getElementById('empAFP').value=e.afpComision||'';
+      document.getElementById('empHorasCierre').value=e.horasCierre||'';
     }
   }
 };
@@ -2257,6 +2301,8 @@ function empSave(){
   const esLibre=document.getElementById('empEsLibre').checked;
   const activo=document.getElementById('empActivo').checked;
   const sq=parseFloat(empSueldoQ.value), sp=parseFloat(empSueldoP.value), sh=parseFloat(empSueldoH.value);
+  const afpComision=parseFloat(document.getElementById('empAFP').value)||0;
+  const horasCierre=parseFloat(document.getElementById('empHorasCierre').value)||0;
   // validación de campos obligatorios
   let ok=true;
   [['empNombre',nombre],['empDoc',doc]].forEach(([id,v])=>{ const f=document.getElementById(id); f.classList.toggle('invalid',!v); if(!v)ok=false; });
@@ -2267,12 +2313,12 @@ function empSave(){
 
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
-    Object.assign(e,{nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    Object.assign(e,{nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,afpComision,horasCierre});
     save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
     syncEmpleados();
   }else{
     const id=uid();
-    S.emp.push({id,nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh});
+    S.emp.push({id,nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,afpComision,horasCierre});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
@@ -4104,7 +4150,7 @@ function adminExport(){
   const wb=XLSX.utils.book_new();
   // Cada hoja conserva id/empleadoId para preservar las relaciones al reimportar.
   const sheets={
-    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora})),
+    Empleados: S.emp.map(e=>({id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, horasCierre:e.horasCierre||0})),
     Horarios:  S.hor.map(h=>({empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||''})),
     Descuentos:S.desc.map(d=>({id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||''})),
     PagosExtra:S.pago.map(p=>({id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||''})),
@@ -4139,7 +4185,8 @@ function adminImport(){
         tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
         activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
-        sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
+        sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0,
+        afpComision:Number(r.afpComision)||0, horasCierre:Number(r.horasCierre)||0 }));
       S.hor = (hor||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
         entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
@@ -6535,8 +6582,8 @@ function gsMatrixToObjects(values){
 
 function gsSerializeAll(){
   return {
-    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora'],
-      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora }))),
+    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora','afpComision','horasCierre'],
+      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, horasCierre:e.horasCierre||0 }))),
     Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
       S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
     Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen'],
@@ -6839,7 +6886,8 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         tipo:(TIPOS_EMP.includes(String(r.tipo))?String(r.tipo):'Mesero'),
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
         activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
-        sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0 }));
+        sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0,
+        afpComision:Number(r.afpComision)||0, horasCierre:Number(r.horasCierre)||0 }));
       S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
         entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
