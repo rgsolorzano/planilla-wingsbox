@@ -97,12 +97,14 @@
   .table-wrap{overflow-x:auto;border:1px solid var(--c-line);border-radius:10px}
   /* ── Tablas de entrada diaria (Producción, Inv. Salón, Inv. Licores, etc.) */
   .table-wrap table{font-size:10px;min-width:max-content;width:100%;background:#fff}
-  .table-wrap table th{font-size:11px;white-space:nowrap;background:#f1ecfa;color:#4c1d95}
-  .table-wrap table td{font-size:10px;background:#fff;color:#111827}
-  /* Inputs compactos: evita columnas anchas */
+  /* Columnas no-primera: centradas; columnas numéricas: ancho acotado */
+  .table-wrap table th{font-size:11px;white-space:nowrap;background:#f1ecfa;color:#4c1d95;text-align:center}
+  .table-wrap table td{font-size:10px;background:#fff;color:#111827;text-align:center}
+  .table-wrap table th.num,.table-wrap table td.num{max-width:90px;min-width:58px;text-align:center}
+  /* Inputs: llenan su celda (no la expanden) */
   .table-wrap table td input[type="number"],
   .table-wrap table td input[type="text"]{
-    width:78px;min-width:56px;max-width:88px;box-sizing:border-box;font-size:10px
+    width:100%;min-width:52px;max-width:84px;box-sizing:border-box;font-size:10px;text-align:center
   }
   /* ── Primera columna fija: morado oscuro + texto blanco ────────────────────
      Mismo aspecto que la primera columna del módulo Consolidado Salón.        */
@@ -130,11 +132,11 @@
     border-right:1px solid var(--c-line);border-bottom:1px solid var(--c-line);
     padding:3px 6px;white-space:nowrap
   }
-  .mx-table th{font-size:11px;vertical-align:middle;background:#f1ecfa;color:#4c1d95}
-  .mx-table td{background:#fff;color:#111827}
+  .mx-table th{font-size:11px;vertical-align:middle;background:#f1ecfa;color:#4c1d95;text-align:center}
+  .mx-table td{background:#fff;color:#111827;text-align:center}
   /* Inputs compactos en mx-table */
   .mx-table td input[type="number"],.mx-table td input[type="text"]{
-    width:78px;min-width:56px;max-width:88px;box-sizing:border-box;font-size:10px
+    width:100%;min-width:52px;max-width:84px;box-sizing:border-box;font-size:10px;text-align:center
   }
   .mx-table thead{position:sticky;top:0;z-index:5;box-shadow:0 2px 4px rgba(0,0,0,.08)}
   .mx-table tfoot td{
@@ -160,7 +162,7 @@
     z-index:3;background:#2e1065;color:#e9d5ff;font-weight:700
   }
   .mx-table tbody tr:hover .mx-fix{background:#2e1065}
-  .mx-table td.num,.mx-table th.num{text-align:right;padding:3px 6px;white-space:nowrap}
+  .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
   .mx-table tbody tr:hover td:not(.mx-fix){background:#faf8fe}
   /* ── Responsive ≤ 768px ─────────────────────────────────────────────────── */
   @media(max-width:768px){
@@ -5430,8 +5432,8 @@ RENDERERS.invDiarioLicores = function(){
         <thead>
           <tr>
             <th rowspan="2">Licor</th>
-            <th colspan="2" style="text-align:center;background:#e9d5ff;color:#6b21a8">🔓 Entrada</th>
-            <th colspan="2" style="text-align:center;background:#dbeafe;color:#1e40af">🔒 Salida</th>
+            <th colspan="2" style="text-align:center;background:#e9d5ff">🔓 Entrada</th>
+            <th colspan="2" style="text-align:center;background:#dbeafe">🔒 Salida</th>
           </tr>
           <tr>
             <th class="num">Onzas</th><th class="num">Botellas</th>
