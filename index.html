@@ -2242,11 +2242,11 @@ RENDERERS.empleados = function(){
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>Nombre</th><th>Documento</th><th>Tipo</th>
-            <th class="num">S. Quincenal</th><th class="num">S. Planilla</th><th class="num">S./hora</th>
+            <th>Nombre</th><th>Tipo</th>
+            <th class="num">S. Quincenal</th><th class="num">S. Planilla</th>
             <th class="num">AFP+com.</th><th class="num">Ajuste</th><th class="num">S. Total</th>
             <th class="num">H. cierre</th><th class="num">H. semana</th><th class="num">H. total</th>
-            <th class="num">S./h calc</th>
+            <th class="num">S./hora</th><th class="num">S./h calc</th>
             <th>Acciones</th>
           </tr></thead>
           <tbody>
@@ -2260,17 +2260,16 @@ RENDERERS.empleados = function(){
                   ${empEsLibre(e)?'<span class="badge b-late" style="font-size:10px">Libre</span>':''}
                   ${inact?'<span class="badge b-miss" style="font-size:10px">Inactivo</span>':''}
                 </td>
-                <td style="${inact?'color:var(--c-muted)':''}">${e.documento}</td>
                 <td><span class="badge ${esCocina(e)?'b-vac':empTipo(e)==='Caja'?'':'b-extra'}">${empTipo(e)}</span></td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoQuincenal)}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoPlanilla)}</td>
-                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoHora)}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(c.afp)}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${c.ajuste?money(c.ajuste):'—'}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}"><b>${sueldoTotDisplay}</b></td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${c.hCierre||'—'}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${c.horasSem}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}"><b>${c.horasTot}</b></td>
+                <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(e.sueldoHora)}</td>
                 <td class="num" style="${inact?'color:var(--c-muted)':''}">${money(c.sHoraCalc)}</td>
                 <td style="white-space:nowrap">
                   <button class="btn-icon" onclick="empEdit('${e.id}')">✏️ Editar</button>
@@ -2278,7 +2277,7 @@ RENDERERS.empleados = function(){
                   <button class="btn-icon del" onclick="empDel('${e.id}')">🗑️ Eliminar</button>
                 </td>
               </tr>`;}).join('')
-            : `<tr><td colspan="14" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
+            : `<tr><td colspan="13" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
           </tbody>
         </table>
       </div>
