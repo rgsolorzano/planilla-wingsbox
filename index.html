@@ -163,9 +163,9 @@
   .mx-table tfoot .mx-fix{
     z-index:3;background:#2e1065;color:#e9d5ff;font-weight:700
   }
-  .mx-table tbody tr:hover .mx-fix{background:#2e1065}
+  .mx-table tbody tr:hover .mx-fix{background:#1e1b4b}  /* NO hover change — consolidados son solo lectura */
   .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
-  .mx-table tbody tr:hover td:not(.mx-fix){background:#faf8fe}
+  .mx-table tbody tr:hover td:not(.mx-fix){background:#fff}  /* sin hover en consolidados */
   /* ── Responsive ≤ 768px ─────────────────────────────────────────────────── */
   @media(max-width:768px){
     .table-wrap table th,.table-wrap table td{padding:2px 4px;font-size:10px}
@@ -180,12 +180,24 @@
   table{width:100%;border-collapse:collapse;font-size:13px;background:#fff}
   th,td{padding:9px 11px;text-align:left;border-bottom:1px solid var(--c-line);white-space:nowrap}
   th{background:#f1ecfa;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--c-muted)}
+  /* Hover solo en tablas de edición, no en consolidados de solo lectura */
   tbody tr:hover{background:#faf8fe}
+  #page-inventarioConsolidado tr:hover td,
+  #page-consolidadoStockBebidas tr:hover td,
+  #page-consolidadoSalon tr:hover td,
+  #page-alertaInsumos tr:hover td,
+  #page-cotejoLicores tr:hover td,
+  #page-consolidadoCaja tr:hover td{ background:inherit !important }
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   tfoot td{font-weight:700;background:#f1ecfa}
   /* Consolidado de Inventario: alertas (mismos colores que .b-miss) */
-  .inv-cell-alerta{background:#fee2e2}
+  /* Alerta de cierre anómalo o stock bajo — !important necesario porque
+     .mx-table td{background:#fff} tiene mayor especificidad */
+  .inv-cell-alerta{background:#fee2e2 !important}
   .inv-cell-alerta input{color:#991b1b;font-weight:700}
+  .mx-table .inv-cell-alerta,.table-wrap .inv-cell-alerta{
+    background:#fee2e2 !important;color:#991b1b
+  }
   .inv-matrix th small{display:block}
   .inv-matrix thead th{vertical-align:top}
   .inv-del-dia-btn{margin-top:6px;font-size:11px;padding:3px 8px;white-space:nowrap}
@@ -5435,12 +5447,12 @@ RENDERERS.invDiarioLicores = function(){
         <thead>
           <tr>
             <th rowspan="2">Licor</th>
-            <th colspan="2" style="text-align:center;background:#e9d5ff">🔓 Entrada</th>
-            <th colspan="2" style="text-align:center;background:#dbeafe">🔒 Salida</th>
+            <th colspan="2" style="text-align:center;background:#e9d5ff;color:#6b21a8">🔓 Entrada</th>
+            <th colspan="2" style="text-align:center;background:#d8b4fe;color:#6b21a8">🔒 Salida</th>
           </tr>
           <tr>
-            <th class="num">Onzas</th><th class="num">Botellas</th>
-            <th class="num">Onzas</th><th class="num">Botellas</th>
+            <th class="num" style="color:#4c1d95">Onzas</th><th class="num" style="color:#4c1d95">Botellas</th>
+            <th class="num" style="color:#4c1d95">Onzas</th><th class="num" style="color:#4c1d95">Botellas</th>
           </tr>
         </thead>
         <tbody>${filas}</tbody>
