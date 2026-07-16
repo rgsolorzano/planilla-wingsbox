@@ -5148,7 +5148,9 @@ function evaluarAlertasInsumo(insumo){
     const c = consumoUltimos3Dias(insumo.id);
     if(c){
       const umbral = insumoUmbralConsumo(insumo);
-      out.consumo = { activa: c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
+      // Consumo negativo = inconsistencia de datos (producción no registrada), no alerta real.
+      // Solo alertar cuando consumo ≥ 0 y sea menor al umbral esperado.
+      out.consumo = { activa: c.consumo >= 0 && c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
     }
   }
   if(insumoAlertaMinimo(insumo)){
