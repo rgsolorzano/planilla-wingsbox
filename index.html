@@ -5157,8 +5157,10 @@ function evaluarAlertasInsumo(insumo){
     const u = ultimoRegistroInsumo(insumo.id);
     if(u){
       const umbral = insumoUmbralMinimo(insumo);
-      const cierre = numProp(u.cierre);
-      out.minimo = { activa: cierre < umbral, valor: cierre, umbral, fecha: u.fecha };
+      // Inventario real del día = Producción + Cierre (no solo el Cierre)
+      // Ejemplo: Producción=1404, Cierre=0 → inventario=1404, no es alerta si umbral=500
+      const inventario = numProp(u.produccion) + numProp(u.cierre);
+      out.minimo = { activa: inventario < umbral, valor: inventario, umbral, fecha: u.fecha };
     }
   }
   return out;
@@ -5599,10 +5601,10 @@ RENDERERS.alertaInsumos = function(){
   const filasHTML = filas.map(r=>{
     const badges = [];
     if(r.consumoAlerta) badges.push(`<span class="badge b-miss" title="Consumo acumulado de 3 días: ${r.ev.consumo.valor.toFixed(1)} ${r.ins.unidad} (umbral: ${r.ev.consumo.umbral} ${r.ins.unidad})">📉 Consumo bajo</span>`);
-    if(r.minimoAlerta)  badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Último inventario: ${r.ev.minimo.valor} ${r.ins.unidad} (mínimo: ${r.ev.minimo.umbral} ${r.ins.unidad})">📦 Stock mínimo</span>`);
+    if(r.minimoAlerta)  badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Inventario del día (Prod+Cierre): ${r.ev.minimo.valor} ${r.ins.unidad} (mínimo: ${r.ev.minimo.umbral} ${r.ins.unidad})">📦 Stock mínimo</span>`);
     const valores = [];
     if(r.consumoAlerta) valores.push(`Consumo 3d: <b style="color:#991b1b">${r.ev.consumo.valor.toFixed(1)}</b> / ${r.ev.consumo.umbral} ${r.ins.unidad}`);
-    if(r.minimoAlerta)  valores.push(`Último inv.: <b style="color:#991b1b">${r.ev.minimo.valor}</b> / ${r.ev.minimo.umbral} ${r.ins.unidad}`);
+    if(r.minimoAlerta)  valores.push(`Inventario: <b style="color:#991b1b">${r.ev.minimo.valor}</b> / ${r.ev.minimo.umbral} ${r.ins.unidad}`);
     const fechaRef = r.minimoAlerta ? r.ev.minimo.fecha : (r.consumoAlerta ? r.ev.consumo.fecha : '');
     return `<tr>
       <td><b>${r.ins.nombre}</b></td>
