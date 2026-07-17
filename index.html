@@ -4088,10 +4088,19 @@ function renderConsolidado(){
       <h2>Consolidado · ${titulo}</h2>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Empleado</th><th class="num">Sueldo base</th><th class="num">H. trabajadas</th><th class="num">H. programadas</th>
-          <th class="num">H. extra</th><th class="num">Pago h. extra</th><th class="num">Desc. auto</th>
-          <th class="num">Desc. manual</th><th class="num">Pagos extra</th><th class="num">Bono puntualidad</th>
-          <th class="num">Sueldo planilla</th><th class="num">Sueldo transferencia</th><th class="num">Total a pagar</th>
+          <th style="min-width:120px">Empleado</th>
+          <th class="num" style="white-space:normal;min-width:68px">Sueldo<br>Base</th>
+          <th class="num" style="white-space:normal;min-width:60px">H.<br>Trab.</th>
+          <th class="num" style="white-space:normal;min-width:60px">H.<br>Prog.</th>
+          <th class="num" style="white-space:normal;min-width:52px">H.<br>Extra</th>
+          <th class="num" style="white-space:normal;min-width:64px">Pago<br>H.Extra</th>
+          <th class="num" style="white-space:normal;min-width:62px">Desc.<br>Auto</th>
+          <th class="num" style="white-space:normal;min-width:62px">Desc.<br>Manual</th>
+          <th class="num" style="white-space:normal;min-width:62px">Pagos<br>Extra</th>
+          <th class="num" style="white-space:normal;min-width:80px">Bono<br>Puntualidad</th>
+          <th class="num" style="white-space:normal;min-width:68px">Sueldo<br>Planilla</th>
+          <th class="num" style="white-space:normal;min-width:70px">Sueldo<br>Transfer.</th>
+          <th class="num" style="white-space:normal;min-width:64px">Total<br>a Pagar</th>
         </tr></thead>
         <tbody>${_consolidado.map(c=>`<tr>
           <td>${c.nombre}${c.esLibre?` <span class="badge b-late">Libre</span><br><small style="color:var(--c-muted)">${money(c.sueldoHora)}/h × ${c.horasEf}h</small>`:''}</td>
@@ -6753,7 +6762,7 @@ function gsMatrixToObjects(values){
 function gsSerializeAll(){
   return {
     Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora','afpComision','ajustePlanilla','horasCierre','fechaIngreso','visible'],
-      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, ajustePlanilla:e.ajustePlanilla||0, horasCierre:e.horasCierre||0 }))),
+      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, ajustePlanilla:e.ajustePlanilla||0, horasCierre:e.horasCierre||0, fechaIngreso:e.fechaIngreso||'', visible:empEsVisible(e)?1:0 }))),
     Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
       S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
     Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen'],
