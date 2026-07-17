@@ -3970,10 +3970,21 @@ function renderCalculo(){
       <div class="emp-title">👤 ${emp.nombre} <small style="color:var(--c-muted);font-weight:400">(${emp.documento})</small></div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Fecha</th><th>Ent. real</th><th>Sal. real</th><th class="num">H. efectivas</th>
-          <th class="num">H. programadas</th><th class="num">H. extra</th><th>Considerar hora extra</th><th class="num">Desc. auto</th>
-          <th>Exon. tardanza</th><th class="num">Desc. manual</th><th class="num">Pagos extra</th><th>Detalle descuento</th>
-          <th>Detalle pago</th><th class="num">Total día</th><th>Estado</th>
+          <th style="min-width:90px;white-space:normal">Fecha</th>
+          <th style="min-width:60px;white-space:normal">Ent.<br>Real</th>
+          <th style="min-width:60px;white-space:normal">Sal.<br>Real</th>
+          <th class="num" style="min-width:58px;white-space:normal">H.<br>Efect.</th>
+          <th class="num" style="min-width:58px;white-space:normal">H.<br>Prog.</th>
+          <th class="num" style="min-width:52px;white-space:normal">H.<br>Extra</th>
+          <th style="min-width:100px;white-space:normal">Considerar<br>Hora Extra</th>
+          <th class="num" style="min-width:68px;white-space:normal">Desc.<br>Auto</th>
+          <th style="min-width:72px;white-space:normal">Exon.<br>Tardanza</th>
+          <th class="num" style="min-width:68px;white-space:normal">Desc.<br>Manual</th>
+          <th class="num" style="min-width:68px;white-space:normal">Pagos<br>Extra</th>
+          <th style="min-width:100px;white-space:normal">Detalle<br>Descuento</th>
+          <th style="min-width:80px;white-space:normal">Detalle<br>Pago</th>
+          <th class="num" style="min-width:68px;white-space:normal">Total<br>Día</th>
+          <th style="min-width:80px;white-space:normal">Estado</th>
         </tr></thead>
         <tbody>${filas}</tbody>
       </table></div>
