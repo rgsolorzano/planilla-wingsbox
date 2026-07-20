@@ -5162,7 +5162,7 @@ function ultimoRegistroInsumo(insumoId){
 // o no hay datos suficientes para evaluarla (no es lo mismo que "no en alerta").
 // ---------------------------------------------------------------------
 function evaluarAlertasInsumo(insumo){
-  const out = { consumo:null, minimo:null };
+  const out = { consumo:null, minimo:null, anomalia:null };
 
   if(insumoAlertaConsumo(insumo)){
     const c = consumoUltimos3Dias(insumo.id);
@@ -5178,10 +5178,20 @@ function evaluarAlertasInsumo(insumo){
     if(u){
       const umbral = insumoUmbralMinimo(insumo);
       // Inventario real del día = Producción + Cierre (no solo el Cierre)
-      // Ejemplo: Producción=1404, Cierre=0 → inventario=1404, no es alerta si umbral=500
       const inventario = numProp(u.produccion) + numProp(u.cierre);
       out.minimo = { activa: inventario < umbral, valor: inventario, umbral, fecha: u.fecha };
     }
+  }
+  // Anomalía de cierre: celda de cierre sube >2% sin producción ese día.
+  // Fuente de verdad compartida con el Consolidado de Inventario.
+  // Se evalúa en los últimos 3 días para detectar anomalías recientes.
+  const hoyStr = fechaHoy();
+  const hace3 = new Date(hoyStr+'T12:00:00'); hace3.setDate(hace3.getDate()-2);
+  const fechas3d = rangoFechas(hace3.toISOString().slice(0,10), hoyStr);
+  const fechaAnom = fechas3d.find(f=>incrementoAnormal(insumo.id, f));
+  if(fechaAnom){
+    const r = getProduccion(insumo.id, fechaAnom);
+    out.anomalia = { activa: true, valor: numProp(r?.cierre), fecha: fechaAnom };
   }
   return out;
 }
@@ -5203,18 +5213,13 @@ RENDERERS.inventarioConsolidado = function(){
   const { desde, hasta, fechas } = invRangoEfectivo();
   const reg = (insumoId, fecha) => getProduccion(insumoId, fecha);
 
-  // ── Detección de anomalías por insumo ─────────────────────────────────────
-  // Un insumo tiene anomalía si cumple cualquiera de:
-  //   A) Al menos una celda de Cierre resaltada en el rango (incremento >2% sin producción)
-  //   B) Alerta de consumo activa (evaluarAlertasInsumo, basada en últimos 3 días de toda la historia)
-  //   C) Alerta por mínimo activa (evaluarAlertasInsumo)
-  // Nota: A se evalúa DENTRO del rango seleccionado; B y C son globales (sin rango).
+  // ── Detección de anomalías — fuente única de verdad: evaluarAlertasInsumo ──
+  // evaluarAlertasInsumo ahora incluye incrementoAnormal (últimos 3 días),
+  // consumo bajo y stock mínimo. Así Consolidado y Alerta de Insumos
+  // usan exactamente la misma lógica.
   function insumeTieneAnomalia(ins){
-    // A: celda resaltada dentro del rango
-    if(fechas.some(f=>incrementoAnormal(ins.id,f))) return true;
-    // B y C: alertas configuradas
     const ev = evaluarAlertasInsumo(ins);
-    return (ev.consumo?.activa || ev.minimo?.activa) || false;
+    return ev.consumo?.activa || ev.minimo?.activa || ev.anomalia?.activa || false;
   }
 
   const soloAnom = !!invConsFilter.soloAnomalias;
@@ -5583,7 +5588,7 @@ function invLicoresExportar(){
    S.produccion, por lo que refleja cualquier cambio de inmediato.
    ================================================================ */
 // Estado del filtro de alertas — persiste entre renders
-let alertaInsumosFilter = 'todas'; // 'todas' | 'consumo' | 'minimo' | 'ambas'
+let alertaInsumosFilter = 'todas'; // 'todas' | 'consumo' | 'minimo' | 'anomalia' | 'ambas'
 window.alertaSetFilter = function(v){ alertaInsumosFilter = v; RENDERERS.alertaInsumos(); };
 
 RENDERERS.alertaInsumos = function(){
@@ -5595,37 +5600,42 @@ RENDERERS.alertaInsumos = function(){
     return;
   }
 
-  // Evalúa ambas reglas para cada insumo y arma UNA fila por insumo
+  // Evalúa las tres reglas para cada insumo — fuente única de verdad
   const filasTodas = [];
   S.insumos.forEach(ins=>{
     const ev = evaluarAlertasInsumo(ins);
-    const consumoAlerta = ev.consumo && ev.consumo.activa;
-    const minimoAlerta  = ev.minimo  && ev.minimo.activa;
-    if(!consumoAlerta && !minimoAlerta) return;
+    const consumoAlerta  = ev.consumo?.activa;
+    const minimoAlerta   = ev.minimo?.activa;
+    const anomaliaAlerta = ev.anomalia?.activa;
+    if(!consumoAlerta && !minimoAlerta && !anomaliaAlerta) return;
     let gravedad = 0;
-    if(consumoAlerta) gravedad = Math.max(gravedad, (ev.consumo.umbral - ev.consumo.valor) / (ev.consumo.umbral||1));
-    if(minimoAlerta)  gravedad = Math.max(gravedad, (ev.minimo.umbral - ev.minimo.valor) / (ev.minimo.umbral||1));
-    filasTodas.push({ ins, ev, consumoAlerta, minimoAlerta, gravedad });
+    if(consumoAlerta)  gravedad = Math.max(gravedad, (ev.consumo.umbral - ev.consumo.valor) / (ev.consumo.umbral||1));
+    if(minimoAlerta)   gravedad = Math.max(gravedad, (ev.minimo.umbral - ev.minimo.valor) / (ev.minimo.umbral||1));
+    if(anomaliaAlerta) gravedad = Math.max(gravedad, 0.5); // gravedad media
+    filasTodas.push({ ins, ev, consumoAlerta, minimoAlerta, anomaliaAlerta, gravedad });
   });
   filasTodas.sort((a,b)=> b.gravedad - a.gravedad);
 
-  // Aplicar filtro seleccionado
+  // Aplicar filtro
   const f = alertaInsumosFilter;
   const filas = filasTodas.filter(r=>{
-    if(f==='consumo') return r.consumoAlerta;
-    if(f==='minimo')  return r.minimoAlerta;
-    if(f==='ambas')   return r.consumoAlerta && r.minimoAlerta;
-    return true; // 'todas'
+    if(f==='consumo')  return r.consumoAlerta;
+    if(f==='minimo')   return r.minimoAlerta;
+    if(f==='anomalia') return r.anomaliaAlerta;
+    if(f==='ambas')    return r.consumoAlerta && r.minimoAlerta;
+    return true;
   });
 
   const filasHTML = filas.map(r=>{
     const badges = [];
-    if(r.consumoAlerta) badges.push(`<span class="badge b-miss" title="Consumo acumulado de 3 días: ${r.ev.consumo.valor.toFixed(1)} ${r.ins.unidad} (umbral: ${r.ev.consumo.umbral} ${r.ins.unidad})">📉 Consumo bajo</span>`);
-    if(r.minimoAlerta)  badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Inventario del día (Prod+Cierre): ${r.ev.minimo.valor} ${r.ins.unidad} (mínimo: ${r.ev.minimo.umbral} ${r.ins.unidad})">📦 Stock mínimo</span>`);
+    if(r.consumoAlerta)  badges.push(`<span class="badge b-miss" title="Consumo 3d: ${r.ev.consumo.valor.toFixed(1)} ${r.ins.unidad} (umbral: ${r.ev.consumo.umbral})">📉 Consumo bajo</span>`);
+    if(r.minimoAlerta)   badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Inventario: ${r.ev.minimo.valor} ${r.ins.unidad} (mínimo: ${r.ev.minimo.umbral})">📦 Stock mínimo</span>`);
+    if(r.anomaliaAlerta) badges.push(`<span class="badge b-miss" style="background:#fee2e2;color:#991b1b" title="Cierre subió >2% sin producción el ${fmtFecha(r.ev.anomalia.fecha)}">⚠ Cierre anómalo</span>`);
     const valores = [];
-    if(r.consumoAlerta) valores.push(`Consumo 3d: <b style="color:#991b1b">${r.ev.consumo.valor.toFixed(1)}</b> / ${r.ev.consumo.umbral} ${r.ins.unidad}`);
-    if(r.minimoAlerta)  valores.push(`Inventario: <b style="color:#991b1b">${r.ev.minimo.valor}</b> / ${r.ev.minimo.umbral} ${r.ins.unidad}`);
-    const fechaRef = r.minimoAlerta ? r.ev.minimo.fecha : (r.consumoAlerta ? r.ev.consumo.fecha : '');
+    if(r.consumoAlerta)  valores.push(`Consumo 3d: <b style="color:#991b1b">${r.ev.consumo.valor.toFixed(1)}</b> / ${r.ev.consumo.umbral} ${r.ins.unidad}`);
+    if(r.minimoAlerta)   valores.push(`Inventario: <b style="color:#991b1b">${r.ev.minimo.valor}</b> / ${r.ev.minimo.umbral} ${r.ins.unidad}`);
+    if(r.anomaliaAlerta) valores.push(`Cierre: <b style="color:#991b1b">${r.ev.anomalia.valor}</b> ${r.ins.unidad} (incremento sin producción)`);
+    const fechaRef = r.anomaliaAlerta ? r.ev.anomalia.fecha : r.minimoAlerta ? r.ev.minimo.fecha : (r.consumoAlerta ? r.ev.consumo.fecha : '');
     return `<tr>
       <td><b>${r.ins.nombre}</b></td>
       <td><span class="badge b-free">${r.ins.unidad}</span></td>
@@ -5635,35 +5645,26 @@ RENDERERS.alertaInsumos = function(){
     </tr>`;
   }).join('');
 
-  // Botones de filtro
-  const bts = [['todas','Todas'],['consumo','Consumo bajo'],['minimo','Stock mínimo'],['ambas','Ambas']];
+  // Contadores para cada filtro
+  const cnt = {
+    todas:   filasTodas.length,
+    consumo: filasTodas.filter(r=>r.consumoAlerta).length,
+    minimo:  filasTodas.filter(r=>r.minimoAlerta).length,
+    anomalia:filasTodas.filter(r=>r.anomaliaAlerta).length,
+    ambas:   filasTodas.filter(r=>r.consumoAlerta&&r.minimoAlerta).length,
+  };
+  const bts = [['todas','Todas'],['consumo','Consumo bajo'],['minimo','Stock mínimo'],['anomalia','Cierre anómalo'],['ambas','Ambas alertas']];
   const filtroHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
-    ${bts.map(([v,lbl])=>`<button
-      class="btn btn-sm ${f===v?'btn-primary':'btn-ghost'}"
-      onclick="alertaSetFilter('${v}')">${lbl}</button>`).join('')}
-  </div>`;
-
-  // Contadores por tipo para mostrar en los botones
-  const nTodas   = filasTodas.length;
-  const nConsumo = filasTodas.filter(r=>r.consumoAlerta).length;
-  const nMinimo  = filasTodas.filter(r=>r.minimoAlerta).length;
-  const nAmbas   = filasTodas.filter(r=>r.consumoAlerta&&r.minimoAlerta).length;
-  const cuentas  = {todas:nTodas, consumo:nConsumo, minimo:nMinimo, ambas:nAmbas};
-
-  const filtroConCuentas = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
-    ${bts.map(([v,lbl])=>`<button
-      class="btn btn-sm ${f===v?'btn-primary':'btn-ghost'}"
-      onclick="alertaSetFilter('${v}')"
-      style="font-size:12px">${lbl} <span style="font-size:10px;opacity:.75">(${cuentas[v]})</span></button>`).join('')}
+    ${bts.map(([v,lbl])=>`<button class="btn btn-sm ${f===v?'btn-primary':'btn-ghost'}" onclick="alertaSetFilter('${v}')" style="font-size:12px">${lbl} <span style="font-size:10px;opacity:.75">(${cnt[v]})</span></button>`).join('')}
   </div>`;
 
   el.innerHTML = `
-    <div class="page-head"><div><h1>🔔 Alerta de Insumos</h1><p>Vista consolidada de insumos con consumo bajo o stock por debajo del mínimo configurado. Se actualiza automáticamente con cada cambio en Producción o en la configuración de Insumos.</p></div></div>
+    <div class="page-head"><div><h1>🔔 Alerta de Insumos</h1><p>Vista consolidada de insumos con consumo bajo, stock mínimo o cierre anómalo. Se actualiza automáticamente con cada cambio en Producción o en la configuración de Insumos.</p></div></div>
     <div class="card">
       ${filasTodas.length===0
         ? `<div class="empty" style="padding:32px;text-align:center;color:#15803d;font-weight:600">✅ No existen alertas de inventario en este momento.</div>`
         : `<h2>Insumos en alerta (${filas.length})</h2>
-           ${filtroConCuentas}
+           ${filtroHTML}
            ${filas.length===0
              ? `<div class="empty" style="padding:20px;text-align:center">No hay insumos con el filtro seleccionado.</div>`
              : `<div class="table-wrap"><table>
@@ -6083,6 +6084,7 @@ let consBebidasFilter = (()=>{
   const hoy=new Date(), hace2=new Date(hoy.getTime()-2*86400000), fmt=d=>d.toISOString().slice(0,10);
   return { desde:fmt(hace2), hasta:fmt(hoy), categoria:'', busqueda:'' };
 })();
+let consBebidasSoloAlertas = false; // filtro "Mostrar solo alertas"
 const CONS_BEB_MAX_DIAS = 60;
 function consBebidasRangoEfectivo(){
   const hoy=fechaHoy();
@@ -6097,10 +6099,18 @@ RENDERERS.consolidadoStockBebidas = function(){
   const { desde, hasta, fechas } = consBebidasRangoEfectivo();
   const categoriaFiltro = consBebidasFilter.categoria;
   const busqueda = (consBebidasFilter.busqueda||'').toLowerCase();
-  const bebidasFiltradas = S.bebidasCat.filter(b=>
+  const bebidasBase = S.bebidasCat.filter(b=>
     (!categoriaFiltro || b.categoria===categoriaFiltro) &&
     (!busqueda || b.nombre.toLowerCase().includes(busqueda))
   ).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
+  // Filtro "solo alertas": bebidas cuyo stock < mínimo en alguna fecha del rango
+  const bebidasFiltradas = consBebidasSoloAlertas
+    ? bebidasBase.filter(b=>{
+        const minimo = b.stockMinimo!=null ? Number(b.stockMinimo) : null;
+        if(minimo===null) return false; // sin mínimo configurado → no aplica
+        return fechas.some(f=>{ const r=getStockBebida(b.id,f); return r!=null && Number(r.stock)<minimo; });
+      })
+    : bebidasBase;
   const hayDatos = bebidasFiltradas.some(b=>fechas.some(f=>getStockBebida(b.id,f)));
 
   // Encabezados: 2 columnas por fecha (Inventario + Botellas vacías)
@@ -6149,6 +6159,10 @@ RENDERERS.consolidadoStockBebidas = function(){
         </select></div>
         <div class="field"><label>Buscar bebida</label><input id="consBebBusqueda" value="${consBebidasFilter.busqueda||''}" placeholder="Nombre…"></div>
         <div class="field" style="align-self:end"><button class="btn btn-ghost btn-sm" id="consBebClear">Últimos 3 días</button></div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;align-self:flex-end;padding-bottom:4px">
+          <input type="checkbox" id="consBebSoloAlertas" ${consBebidasSoloAlertas?'checked':''} style="width:16px;height:16px;cursor:pointer">
+          <span style="font-size:13px;font-weight:500">Mostrar solo alertas</span>
+        </label>
       </div>
       <h2>Historial (${fechas.length} día${fechas.length===1?'':'s'}, ${bebidasFiltradas.length} bebida${bebidasFiltradas.length===1?'':'s'})</h2>
       ${(!hayDatos&&bebidasFiltradas.length) ? `<div class="empty">No hay registros de stock en el rango seleccionado.</div>` :
@@ -6170,6 +6184,7 @@ RENDERERS.consolidadoStockBebidas = function(){
     RENDERERS.consolidadoStockBebidas();
   };
   ['consBebDesde','consBebHasta','consBebCat','consBebBusqueda'].forEach(id=>{ const e=document.getElementById(id); if(e) e.onchange=applyF; if(e&&e.tagName==='INPUT') e.oninput=applyF; });
+  document.getElementById('consBebSoloAlertas').onchange=()=>{ consBebidasSoloAlertas=document.getElementById('consBebSoloAlertas').checked; RENDERERS.consolidadoStockBebidas(); };
   document.getElementById('consBebClear').onclick=()=>{
     const hoy=new Date(), hace2=new Date(hoy.getTime()-2*86400000), fmt=d=>d.toISOString().slice(0,10);
     consBebidasFilter={ desde:fmt(hace2), hasta:fmt(hoy), categoria:'', busqueda:'' };
