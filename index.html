@@ -4773,14 +4773,25 @@ document.getElementById('btnSeed').onclick=()=>{
 document.getElementById('btnWipe').onclick=()=>{
   const role = currentRole();
   const domain = role ? role.domain : 'planilla';
-  const msg = domain==='inventario'
-    ? 'Esto borrará TODOS los insumos y registros de producción del inventario. ¿Continuar?'
-    : 'Esto borrará TODOS los datos de planilla (empleados, horarios, marcaciones, propinas, etc). ¿Continuar?';
+  const isCombined = domain === 'planilla+inventario';
+  const msg = isCombined
+    ? 'Esto borrará TODOS los datos (planilla e inventario). ¿Continuar?'
+    : domain==='inventario'
+      ? 'Esto borrará TODOS los insumos y registros de producción del inventario. ¿Continuar?'
+      : 'Esto borrará TODOS los datos de planilla (empleados, horarios, marcaciones, propinas, etc). ¿Continuar?';
   if(confirm(msg)){
-    dominioKeys(domain).forEach(k=>localStorage.removeItem(k));
+    if(isCombined){
+      dominioKeys('planilla').forEach(k=>localStorage.removeItem(k));
+      dominioKeys('inventario').forEach(k=>localStorage.removeItem(k));
+    } else {
+      dominioKeys(domain).forEach(k=>localStorage.removeItem(k));
+    }
     if(domain==='planilla'){ CONSIDERAR_HE={}; calcPendingHE={}; EXO_TARD={}; }
     reloadState();
-    if(domain==='inventario') limpiarEstadoDominio('planilla'); else if(role) limpiarEstadoDominio('inventario');
+    if(!isCombined){
+      if(domain==='inventario') limpiarEstadoDominio('planilla');
+      else if(role) limpiarEstadoDominio('inventario');
+    }
     toast('Datos borrados','warn'); goto(currentPage);
   }
 };
@@ -7139,13 +7150,17 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     }
 
     reloadState();
-    // Tras recargar todo desde localStorage, se vuelve a aislar en memoria el
-    // dominio que no corresponde al rol actual (mismo criterio que authGrant).
+    // Tras recargar todo desde localStorage, aislar el dominio opuesto SOLO si
+    // el rol tiene un único dominio. Para el rol combinado (planilla+inventario)
+    // NO limpiar ningún dominio; ambos conviven simultáneamente en memoria.
     const role = currentRole();
-    if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
-    else if(role) limpiarEstadoDominio('inventario');
+    const isCombined = role && role.domain === 'planilla+inventario';
+    if(!isCombined){
+      if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
+      else if(role) limpiarEstadoDominio('inventario');
+    }
     gsState.lastSync = new Date();
-    toast(auto? 'Datos sincronizados al iniciar sesión' : 'Datos cargados desde Google Sheets','success');
+    if(!auto) toast('Datos cargados desde Google Sheets','success');
     gsUpdateSyncStatus('Datos cargados ('+gsState.email+').','success');
     goto(currentPage);
   }catch(err){
