@@ -4762,7 +4762,7 @@ function dominioKeys(domain){
 }
 document.getElementById('btnSeed').onclick=()=>{
   const role = currentRole();
-  if(role && role.domain==='inventario'){
+  if(role && (role.domain==='inventario' || role.domain==='planilla+inventario')){
     if(confirm('Esto reemplazará la lista de insumos y licores de ejemplo (no afecta los registros históricos ya guardados). ¿Continuar?')){
       seedInsumos(true); seedLicores(true); seedBebidasCat(true); reloadState(); limpiarEstadoDominio('planilla'); toast('Catálogos de ejemplo recargados','success'); goto(currentPage);
     }
@@ -4790,7 +4790,7 @@ function aplicarTextosFooterPorRol(){
   const role = currentRole();
   const seedBtn = document.getElementById('btnSeed'), wipeBtn = document.getElementById('btnWipe');
   if(!seedBtn || !wipeBtn) return;
-  if(role && role.domain==='inventario'){
+  if(role && (role.domain==='inventario' || role.domain==='planilla+inventario')){
     seedBtn.textContent = 'Recargar catálogos de ejemplo';
     wipeBtn.textContent = 'Borrar datos de inventario';
   }else{
@@ -6496,29 +6496,40 @@ const GOOGLE_CLIENT_ID = '809499583884-4st99bjc39crnrbhuc1p2ncjp7dnnohp.apps.goo
 // estática puede evitar sin un backend propio.
 const ACCOUNT_ROLES = {
   'multiboxes.peru@gmail.com': {
-    domain: 'planilla',
-    modules: ['empleados','horarios','cuadrante','marcaciones','propinas','propinasConsolidado','descuentos','pagos','libres','calculo','consolidado','boleta','admin','consolidadoVentas','gananciaGrupo']
+    domain: 'planilla+inventario',   // acceso completo a ambos dominios
+    planillaDomain: 'planilla',
+    inventarioDomain: 'inventario',
+    // Spreadsheet de inventario compartido por wingsbox.oficial@gmail.com
+    // (otorgado con permisos de Editor)
+    inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
+    modules: [
+      // ── PLANILLA ──────────────────────────────────────────────────────────
+      'empleados','horarios','cuadrante','marcaciones','propinas',
+      'propinasConsolidado','descuentos','pagos','libres','calculo',
+      'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo',
+      // ── INVENTARIO ────────────────────────────────────────────────────────
+      'produccion','insumos','inventarioConsolidado','alertaInsumos',
+      'syncInventario','licores','invDiarioLicores','cotejoLicores',
+      'bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas',
+      'efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon'
+    ]
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
     modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon']
   }
 };
-// Scopes: openid/email/profile para identificar al usuario (login) +
-// drive.file (mínimo) para que cada cuenta cree/lea/escriba SU PROPIO
-// spreadsheet de almacenamiento (uno para planilla, otro para inventario) +
-// spreadsheets.readonly para poder LEER otros spreadsheets que la cuenta ya
-// posee/puede ver (p.ej. las respuestas de un Google Form), algo que
-// drive.file NO permite: ese scope solo da acceso a archivos creados por
-// esta app o abiertos explícitamente con ella (vía Picker/"Abrir con"), NO a
-// cualquier archivo del usuario por más que se conozca su ID. Por eso la
-// sincronización de marcaciones (ver MÓDULO 3) necesita este scope extra.
-// IMPORTANTE: al agregar este scope, cada cuenta autorizada debe volver a
-// iniciar sesión una vez (Google pedirá el nuevo permiso) y, si el proyecto de
-// Google Cloud está en modo "Testing", confirmar que el scope esté habilitado
-// en la pantalla de consentimiento (mismo paso ya documentado arriba para
-// drive.file), y que AMBAS cuentas estén en la lista de "usuarios de prueba".
-const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly';
+// ── OAuth scope ──────────────────────────────────────────────────────────────
+// Se usa 'spreadsheets' (lectura + escritura en cualquier spreadsheet al que el
+// usuario tenga acceso de Editor). Este scope reemplaza la combinación anterior
+// drive.file + spreadsheets.readonly:
+//   • drive.file solo cubre archivos creados por LA MISMA sesión de la app →
+//     multiboxes.peru NO podría escribir en el spreadsheet de wingsbox.oficial
+//     aunque tenga permiso de Editor en Drive.
+//   • 'spreadsheets' sí permite escribir en spreadsheets compartidos con Editor.
+// ACCIÓN REQUERIDA: los usuarios deben cerrar sesión y volver a entrar una vez
+// para que Google solicite el nuevo permiso.
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadsheets';
 // Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
 // (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
 // inicia sesión (por eso queda en su propio Drive).
@@ -7297,6 +7308,39 @@ const NAV_MODULE_LABELS = {
 // (pl-* vs inv-*) para que coexistan sin conflicto en este mismo objeto.
 let navGroupState = {};
 
+// ── Grupos para el dominio COMBINADO (multiboxes = planilla + inventario) ──
+// Se construyen dos super-secciones con los mismos grupos de cada dominio.
+function buildCombinedNavHtml(activePage, suppressAutoOpen, role){
+  const sections = [
+    { label:'📋 PLANILLA',   groups: NAV_GROUPS_PLANILLA   },
+    { label:'📦 INVENTARIO', groups: NAV_GROUPS_INVENTARIO  }
+  ];
+  let html = '';
+  sections.forEach(sec=>{
+    let secHtml = '';
+    sec.groups.forEach(g=>{
+      const modulos = g.modules.filter(m=>!role || role.modules.includes(m));
+      if(!modulos.length) return;
+      const hayActivo = modulos.includes(activePage);
+      if(hayActivo && !suppressAutoOpen) navGroupState[g.id] = true;
+      const isOpen = !!navGroupState[g.id];
+      secHtml += `<div class="nav-group ${isOpen?'open':''} ${hayActivo?'has-active':''}" data-group="${g.id}">
+        <button class="nav-group-header" data-toggle-group="${g.id}">
+          <span>${g.ico}</span><span>${g.label}</span><span class="nav-chevron">▶</span>
+        </button>
+        <div class="nav-group-body">
+          ${modulos.map(m=>{ const [ico,lbl]=NAV_MODULE_LABELS[m]||['','?']; return `<button data-page="${m}" class="${m===activePage?'active':''}"><span class="ico">${ico}</span>${lbl}</button>`; }).join('')}
+        </div>
+      </div>`;
+    });
+    if(secHtml){
+      html += `<div class="nav-section-header" style="padding:10px 16px 4px;font-size:10px;font-weight:800;letter-spacing:.1em;color:#a78bfa;text-transform:uppercase;opacity:.8">${sec.label}</div>`;
+      html += secHtml;
+    }
+  });
+  return html;
+}
+
 // Renderiza el menú accordion para el dominio activo.
 // Elige automáticamente los grupos de Planilla o Inventario según el rol conectado.
 // Si no hay rol (sin sesión), muestra los grupos de planilla por defecto.
@@ -7305,8 +7349,14 @@ let navGroupState = {};
 function renderNavAccordion(activePage, suppressAutoOpen){
   const role = currentRole();
   const domain = role ? role.domain : 'planilla';
-  const groups = domain === 'inventario' ? NAV_GROUPS_INVENTARIO : NAV_GROUPS_PLANILLA;
   const nav = document.getElementById('nav');
+
+  if(domain === 'planilla+inventario'){
+    nav.innerHTML = buildCombinedNavHtml(activePage, suppressAutoOpen, role);
+    return;
+  }
+
+  const groups = domain === 'inventario' ? NAV_GROUPS_INVENTARIO : NAV_GROUPS_PLANILLA;
   let html = '';
   groups.forEach(g=>{
     // Filtra módulos que el rol permite ver (sin rol: muestra todos del grupo)
@@ -7399,26 +7449,35 @@ function authGrant(viaLogin){
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
 
   const role = currentRole();
-  // Recarga todo desde localStorage (no afecta lo persistido) y luego vacía
-  // en memoria el dominio que NO corresponde a esta cuenta, para que sus
-  // datos no queden cargados durante esta sesión (ver limpiarEstadoDominio).
+  const domain = role ? role.domain : 'planilla';
+  const isCombined = domain === 'planilla+inventario';
+
   reloadState();
-  if(role && role.domain==='inventario') limpiarEstadoDominio('planilla');
-  else limpiarEstadoDominio('inventario');
+  // Para dominio combinado: cargar ambos; para dominios únicos: limpiar el otro
+  if(!isCombined){
+    if(domain==='inventario') limpiarEstadoDominio('planilla');
+    else limpiarEstadoDominio('inventario');
+  }
+  // Si el rol trae un spreadsheet de inventario hardcodeado, guardarlo para que
+  // gsEnsureSpreadsheet('inventario') lo encuentre sin buscar/crear.
+  if(role && role.inventarioGsheetId){
+    localStorage.setItem(K.gsheetIdInv, role.inventarioGsheetId);
+  }
 
   aplicarPermisosNav();
   aplicarTextosFooterPorRol();
   goto(moduloPermitido(currentPage) ? currentPage : paginaPorDefecto());
 
-  const domain = role ? role.domain : 'planilla';
-  // Sincronización automática en DOS situaciones:
-  //   1) Login explícito (viaLogin=true): el usuario presionó "Iniciar sesión".
-  //   2) Restauración de sesión en recarga de página (viaLogin=false): F5 / reapertura.
-  // En ambos casos Google Sheets es la fuente de verdad; los datos locales se
-  // actualizan con lo que haya en la hoja. Esto NO ocurre al navegar entre módulos
-  // ni al cambiar de pestaña dentro de la app (esos flujos no pasan por authGrant).
-  const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
-  ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
+  if(isCombined){
+    // Sincronizar ambos dominios en paralelo
+    const ensurePl  = gsEnsureSpreadsheet('planilla').catch(()=>{});
+    const ensureInv = gsEnsureSpreadsheet('inventario').catch(()=>{});
+    ensurePl.then(()=>  gsLoadFromSheets('planilla',  {auto:true})).catch(()=>{});
+    ensureInv.then(()=> gsLoadFromSheets('inventario', {auto:true})).catch(()=>{});
+  } else {
+    const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
+    ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
+  }
   gsRenderControls();
 }
 
