@@ -6708,6 +6708,16 @@ async function gsEnsureSpreadsheet(domain='planilla'){
   // 1) Reutilizar el id guardado para esta cuenta/dispositivo
   const saved = localStorage.getItem(cfg.gsheetIdKey);
   if(saved){
+    // Si el spreadsheet viene hardcodeado desde el rol (ej: multiboxes accediendo
+    // al Spreadsheet de inventario de Wingsbox), confiar directamente en él sin
+    // verificar vía Drive (el scope 'spreadsheets' no incluye Drive API, y además
+    // el archivo no pertenece al Drive del usuario → la búsqueda fallará).
+    const role = currentRole();
+    const isHardcoded = domain==='inventario' && role && role.inventarioGsheetId && saved===role.inventarioGsheetId;
+    if(isHardcoded){
+      gsState.spreadsheetId = saved;
+      return saved;
+    }
     const ok = await gsVerifySpreadsheet(saved);
     if(ok){ gsState.spreadsheetId = saved; return saved; }
     localStorage.removeItem(cfg.gsheetIdKey);
@@ -6758,14 +6768,16 @@ async function gsCreateSpreadsheet(domain='planilla'){
 /* Asegura que todas las hojas existan (por si el spreadsheet es antiguo) */
 async function gsEnsureSheetsExist(domain='planilla'){
   const cfg = gsDomainCfg(domain);
-  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+'?fields=sheets.properties.title');
+  // Usar el ID específico del dominio (no gsState.spreadsheetId que puede ser del otro dominio)
+  const domainId = localStorage.getItem(cfg.gsheetIdKey) || gsState.spreadsheetId;
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(domainId)+'?fields=sheets.properties.title');
   if(!r.ok) throw new Error('No se pudo leer el spreadsheet');
   const j = await r.json();
   const existing = new Set((j.sheets||[]).map(s=>s.properties.title));
   const missing = cfg.sheets.filter(n=>!existing.has(n));
   if(!missing.length) return;
   const requests = missing.map(name=>({ addSheet:{ properties:{ title:name } } }));
-  const br = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(gsState.spreadsheetId)+':batchUpdate', {
+  const br = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(domainId)+':batchUpdate', {
     method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ requests })
   });
   if(!br.ok) throw new Error('No se pudieron crear las hojas faltantes');
@@ -6878,7 +6890,11 @@ async function gsSaveToSheets(domain='planilla'){
     await gsEnsureSpreadsheet(domain);
     await gsEnsureSheetsExist(domain);
     const data = domain==='inventario' ? gsSerializeInventario() : gsSerializeAll();
-    const id = encodeURIComponent(gsState.spreadsheetId);
+    // Usar el ID específico del dominio para evitar la condición de carrera cuando
+    // ambos dominios operan en paralelo (gsState.spreadsheetId es compartido).
+    const cfg = gsDomainCfg(domain);
+    const domainSheetId = localStorage.getItem(cfg.gsheetIdKey) || gsState.spreadsheetId;
+    const id = encodeURIComponent(domainSheetId);
 
     // 1) Limpiar todas las hojas
     // Rango A:AZ para cubrir hojas con más de 26 columnas (EfectivoCaja tiene 28)
