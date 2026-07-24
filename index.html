@@ -6510,9 +6510,14 @@ const ACCOUNT_ROLES = {
     domain: 'planilla+inventario',   // acceso completo a ambos dominios
     planillaDomain: 'planilla',
     inventarioDomain: 'inventario',
-    // Spreadsheet de inventario compartido por wingsbox.oficial@gmail.com
-    // (otorgado con permisos de Editor)
+    // Spreadsheet oficial de INVENTARIOS. Pertenece a wingsbox.oficial@gmail.com
+    // pero está compartido con multiboxes.peru con permisos de Editor.
+    // NUNCA se debe crear un Spreadsheet nuevo ni buscarlo por nombre.
     inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
+    // Spreadsheet oficial de PLANILLA. Pertenece a multiboxes.peru@gmail.com.
+    // Es el ÚNICO spreadsheet válido para todos los módulos de Planilla.
+    // NUNCA se debe crear un Spreadsheet nuevo ni buscarlo por nombre.
+    planillaGsheetId: '1MzZEQ6sje9TOJhgo6eJiAzPTeSuP84If84moz5Cq6fw',
     modules: [
       // ── PLANILLA ──────────────────────────────────────────────────────────
       'empleados','horarios','cuadrante','marcaciones','propinas',
@@ -6527,6 +6532,10 @@ const ACCOUNT_ROLES = {
   },
   'wingsbox.oficial@gmail.com': {
     domain: 'inventario',
+    // Mismo Spreadsheet de INVENTARIOS que usa multiboxes.peru (esta cuenta es
+    // la propietaria del archivo). Es el ÚNICO spreadsheet válido para todos
+    // los módulos de Inventario: NUNCA se debe crear uno nuevo ni buscar por nombre.
+    inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
     modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon']
   }
 };
@@ -6549,15 +6558,11 @@ const ACCOUNT_ROLES = {
 // encontrar el Spreadsheet existente → crea uno nuevo vacío → batchGet devuelve [] →
 // byName['Insumos']=[] (truthy) → no hay error, sync "exitosa" pero 0 registros.
 const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.metadata.readonly';
-// Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
-// (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
-// inicia sesión (por eso queda en su propio Drive).
+// NOTA: para las cuentas autorizadas (ACCOUNT_ROLES) los Spreadsheets se
+// resuelven SIEMPRE por el ID fijo definido en el rol (inventarioGsheetId /
+// planillaGsheetId); nunca por nombre. Los nombres de abajo solo quedan como
+// respaldo histórico para un rol hipotético sin ID fijo.
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
-// Nombre fijo del spreadsheet de almacenamiento del dominio "inventario"
-// (wingsbox.oficial@gmail.com). Mismo mecanismo: se busca/crea por nombre la
-// primera vez que esa cuenta usa el módulo Producción, así el spreadsheet
-// queda creado y es propiedad de esa cuenta (cumple el requisito de que el
-// inventario se almacene en un Spreadsheet de Wingsbox.oficial@gmail.com).
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
 const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario'];
@@ -6722,26 +6727,53 @@ function gsDomainCfg(domain){
     : { fileName: GS_FILE_NAME, sheets: GS_SHEETS, gsheetIdKey: K.gsheetId };
 }
 
+// ID de Spreadsheet FIJO (hardcodeado) que el rol de la cuenta conectada define
+// para un dominio de datos. Es la ÚNICA fuente de verdad para las cuentas
+// autorizadas: si el rol trae un ID para el dominio, jamás se busca por nombre
+// ni se crea un spreadsheet nuevo para ese dominio. Devuelve null si el rol no
+// define ID para ese dominio (fallback histórico por nombre, hoy sin uso para
+// las cuentas autorizadas).
+function roleGsheetId(role, domain){
+  if(!role) return null;
+  if(domain==='inventario') return role.inventarioGsheetId || null;
+  if(domain==='planilla')   return role.planillaGsheetId   || null;
+  return null;
+}
+
 async function gsEnsureSpreadsheet(domain='planilla'){
   const cfg = gsDomainCfg(domain);
+  // 0) ID fijo definido por el rol de la cuenta: fuente de verdad absoluta.
+  //    Nunca se busca por nombre ni se crea un archivo nuevo en este caso;
+  //    además se corrige cualquier ID distinto que haya quedado en localStorage.
+  const hardId = roleGsheetId(currentRole(), domain);
+  if(hardId){
+    if(localStorage.getItem(cfg.gsheetIdKey) !== hardId){
+      localStorage.setItem(cfg.gsheetIdKey, hardId);
+    }
+    gsState.spreadsheetId = hardId;
+    console.log('[GS] Usando Spreadsheet fijo del rol para domain='+domain+': '+hardId);
+    return hardId;
+  }
   const saved = localStorage.getItem(cfg.gsheetIdKey);
   if(saved){
-    const role = currentRole();
-    const isHardcoded = domain==='inventario' && role && role.inventarioGsheetId && saved===role.inventarioGsheetId;
-    if(isHardcoded){
-      gsState.spreadsheetId = saved;
-      console.log('[GS] Usando Spreadsheet hardcodeado para domain='+domain+': '+saved);
-      return saved;
-    }
     const ok = await gsVerifySpreadsheet(saved);
     if(ok){
       gsState.spreadsheetId = saved;
       console.log('[GS] Spreadsheet verificado OK domain='+domain+': '+saved);
       return saved;
     }
-    console.warn('[GS] Spreadsheet guardado no verificó. Buscando nuevo. ID fue: '+saved);
+    console.warn('[GS] Spreadsheet guardado no verificó. ID fue: '+saved);
+    // Para INVENTARIO: nunca eliminar el ID guardado sin confirmación.
+    // Si no verificó puede ser un problema de permisos temporal.
+    // Para PLANILLA: limpiar y buscar otro.
+    if(domain==='inventario'){
+      // No limpiar: mejor mantener el ID y fallar claramente que perder la referencia.
+      gsState.spreadsheetId = saved;
+      return saved; // gsSaveSheet/gsLoadFromSheets mostrarán el error HTTP real
+    }
     localStorage.removeItem(cfg.gsheetIdKey);
   }
+  // 2) Buscar por nombre en Drive
   const found = await gsFindSpreadsheetByName(domain);
   if(found){
     gsState.spreadsheetId = found;
@@ -6749,10 +6781,21 @@ async function gsEnsureSpreadsheet(domain='planilla'){
     console.log('[GS] Spreadsheet encontrado en Drive domain='+domain+': '+found);
     return found;
   }
+  // 3) Creación automática: SOLO para planilla (esperada para usuarios nuevos).
+  //    NUNCA para inventario: el Spreadsheet de inventario es un archivo externo/compartido
+  //    con un ID fijo. Crear uno nuevo generaría un duplicado vacío ilegible.
+  if(domain==='inventario'){
+    const msg = 'No se encontró el Spreadsheet de Inventarios. Verifica que la cuenta tenga acceso al archivo correcto (ID configurado en el sistema). No se creará un archivo nuevo para evitar duplicados.';
+    console.error('[GS]', msg);
+    gsUpdateSyncStatus(msg, 'error');
+    toast(msg, 'error');
+    return null;
+  }
+  // Para planilla: crear nuevo si no existe (flujo de primer uso)
   const created = await gsCreateSpreadsheet(domain);
   gsState.spreadsheetId = created;
   localStorage.setItem(cfg.gsheetIdKey, created);
-  console.warn('[GS] Spreadsheet NO encontrado en Drive. Creado nuevo vacío domain='+domain+': '+created+' — si tenías datos, entra con la cuenta que los creó para recuperar el ID correcto.');
+  console.log('[GS] Spreadsheet planilla nuevo creado: '+created);
   return created;
 }
 
@@ -7571,10 +7614,21 @@ function authGrant(viaLogin){
     if(domain==='inventario') limpiarEstadoDominio('planilla');
     else limpiarEstadoDominio('inventario');
   }
-  // Si el rol trae un spreadsheet de inventario hardcodeado, guardarlo para que
-  // gsEnsureSpreadsheet('inventario') lo encuentre sin buscar/crear.
-  if(role && role.inventarioGsheetId){
-    localStorage.setItem(K.gsheetIdInv, role.inventarioGsheetId);
+  // Si el rol trae Spreadsheets fijos (hardcodeados), guardarlos/forzarlos como
+  // los únicos IDs válidos de cada dominio. Esto sobrescribe cualquier ID
+  // incorrecto que haya quedado en localStorage de una sesión anterior (p.ej.
+  // el ID de un Spreadsheet creado accidentalmente o buscado por nombre).
+  // El ID fijo del rol es siempre la fuente de verdad.
+  if(role){
+    [ ['inventario', role.inventarioGsheetId, K.gsheetIdInv],
+      ['planilla',   role.planillaGsheetId,   K.gsheetId   ] ].forEach(([dom, fixedId, key])=>{
+      if(!fixedId) return;
+      const storedId = localStorage.getItem(key);
+      if(storedId && storedId !== fixedId){
+        console.warn('[Auth] Detectado ID de '+dom+' diferente al configurado. Corrigiendo:', storedId, '→', fixedId);
+      }
+      localStorage.setItem(key, fixedId);
+    });
   }
 
   aplicarPermisosNav();
