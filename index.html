@@ -6540,7 +6540,15 @@ const ACCOUNT_ROLES = {
 //   • 'spreadsheets' sí permite escribir en spreadsheets compartidos con Editor.
 // ACCIÓN REQUERIDA: los usuarios deben cerrar sesión y volver a entrar una vez
 // para que Google solicite el nuevo permiso.
-const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadsheets';
+// ── OAuth scopes ──────────────────────────────────────────────────────────────
+// spreadsheets:          lectura + escritura en cualquier Spreadsheet con acceso Editor
+//                        (necesario para que multiboxes.peru escriba en el sheet de Wingsbox)
+// drive.metadata.readonly: solo listado de nombres e IDs de archivos en Drive del usuario
+//                        (mínimo necesario para gsFindSpreadsheetByName en dispositivos nuevos)
+// SIN drive.metadata.readonly → en un dispositivo sin localStorage el código no puede
+// encontrar el Spreadsheet existente → crea uno nuevo vacío → batchGet devuelve [] →
+// byName['Insumos']=[] (truthy) → no hay error, sync "exitosa" pero 0 registros.
+const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.metadata.readonly';
 // Nombre fijo del spreadsheet de almacenamiento del dominio "planilla"
 // (multiboxes.peru@gmail.com). Se busca/crea por nombre, en la cuenta que
 // inicia sesión (por eso queda en su propio Drive).
@@ -6716,30 +6724,35 @@ function gsDomainCfg(domain){
 
 async function gsEnsureSpreadsheet(domain='planilla'){
   const cfg = gsDomainCfg(domain);
-  // 1) Reutilizar el id guardado para esta cuenta/dispositivo
   const saved = localStorage.getItem(cfg.gsheetIdKey);
   if(saved){
-    // Si el spreadsheet viene hardcodeado desde el rol (ej: multiboxes accediendo
-    // al Spreadsheet de inventario de Wingsbox), confiar directamente en él sin
-    // verificar vía Drive (el scope 'spreadsheets' no incluye Drive API, y además
-    // el archivo no pertenece al Drive del usuario → la búsqueda fallará).
     const role = currentRole();
     const isHardcoded = domain==='inventario' && role && role.inventarioGsheetId && saved===role.inventarioGsheetId;
     if(isHardcoded){
       gsState.spreadsheetId = saved;
+      console.log('[GS] Usando Spreadsheet hardcodeado para domain='+domain+': '+saved);
       return saved;
     }
     const ok = await gsVerifySpreadsheet(saved);
-    if(ok){ gsState.spreadsheetId = saved; return saved; }
+    if(ok){
+      gsState.spreadsheetId = saved;
+      console.log('[GS] Spreadsheet verificado OK domain='+domain+': '+saved);
+      return saved;
+    }
+    console.warn('[GS] Spreadsheet guardado no verificó. Buscando nuevo. ID fue: '+saved);
     localStorage.removeItem(cfg.gsheetIdKey);
   }
-  // 2) Buscar por nombre en Drive (archivos creados por esta app, también desde otros dispositivos)
   const found = await gsFindSpreadsheetByName(domain);
-  if(found){ gsState.spreadsheetId = found; localStorage.setItem(cfg.gsheetIdKey, found); return found; }
-  // 3) Crear uno nuevo (queda como propiedad de la cuenta que inicia sesión)
+  if(found){
+    gsState.spreadsheetId = found;
+    localStorage.setItem(cfg.gsheetIdKey, found);
+    console.log('[GS] Spreadsheet encontrado en Drive domain='+domain+': '+found);
+    return found;
+  }
   const created = await gsCreateSpreadsheet(domain);
   gsState.spreadsheetId = created;
   localStorage.setItem(cfg.gsheetIdKey, created);
+  console.warn('[GS] Spreadsheet NO encontrado en Drive. Creado nuevo vacío domain='+domain+': '+created+' — si tenías datos, entra con la cuenta que los creó para recuperar el ID correcto.');
   return created;
 }
 
@@ -6776,7 +6789,36 @@ async function gsCreateSpreadsheet(domain='planilla'){
   return j.spreadsheetId;
 }
 
-/* Asegura que todas las hojas existan (por si el spreadsheet es antiguo) */
+// Normaliza un valor de fecha proveniente de Google Sheets a formato ISO YYYY-MM-DD.
+// GS puede devolver:
+//   - Número serial (p.ej. 46228 para 2026-07-22) si la celda está formateada como Date
+//   - String en formato local (DD/MM/YYYY, M/D/YYYY, etc.) con dateTimeRenderOption=FORMATTED_STRING
+//   - String ISO directamente si se guardó con valueInputOption=RAW y la celda es texto
+function normFechaGS(v){
+  if(v===null||v===undefined||v==='') return '';
+  const n=Number(v);
+  // Serial GS/Excel: días desde 1899-12-30. 25569 = días de 1899-12-30 a 1970-01-01.
+  // Motivo del bug: datos guardados antes de usar valueInputOption='RAW' hacen que GS
+  // interprete la fecha string como serial numérico. UNFORMATTED_VALUE devuelve el serial;
+  // FORMATTED_STRING devuelve "22/07/2026" (locale Perú). Ambos casos quedan cubiertos aquí.
+  if(!isNaN(n)&&n>40000&&n<100000){
+    const d=new Date((n-25569)*86400000);
+    return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
+  }
+  const s=String(v).trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // ya es ISO
+  // N/N/YYYY — puede ser DD/MM/YYYY (América Latina) o M/D/YYYY (EE.UU.)
+  // Desambiguación: si el 2.° número > 12 no puede ser mes → formato M/D/YYYY
+  const dd=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if(dd){
+    const b=Number(dd[2]);
+    if(b>12) return `${dd[3]}-${dd[1].padStart(2,'0')}-${dd[2].padStart(2,'0')}`; // M/D/YYYY
+    return `${dd[3]}-${dd[2].padStart(2,'0')}-${dd[1].padStart(2,'0')}`;           // DD/MM/YYYY
+  }
+  const ym=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if(ym) return `${ym[1]}-${ym[2].padStart(2,'0')}-${ym[3].padStart(2,'0')}`;
+  return s;
+}
 async function gsEnsureSheetsExist(domain='planilla'){
   const cfg = gsDomainCfg(domain);
   // Usar el ID específico del dominio (no gsState.spreadsheetId que puede ser del otro dominio)
@@ -7030,33 +7072,63 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     if(!confirm(confirmMsg)) return;
   }
   try{
+    const t0 = Date.now();
     gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
     if(!auto) toast('Cargando últimos datos…','info');
     const id = await gsEnsureSpreadsheet(domain);
     if(!id){ if(!auto) toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
-    // Rango A:AZ (52 cols) en lugar de A:Z (26) para leer correctamente hojas
-    // con más de 26 columnas. EfectivoCaja tiene 28 columnas (hasta AB = cl10);
-    // con A:Z las columnas AA (cl9=S/100) y AB (cl10=S/200) del Cierre quedaban
-    // fuera del rango y siempre se leían como vacías → bug de persistencia.
+    console.log('[Sync] Inicio carga domain='+domain+' id='+id+' user='+gsState.email);
+
     const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:AZ')).join('&');
-    // UNFORMATTED_VALUE: devuelve los números como números reales (sin separadores de
-    // miles ni moneda del locale), evitando que Number() falle y los sueldos queden en 0.
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
-    if(!r.ok) throw new Error('No se pudieron leer los datos');
+
+    if(!r.ok){
+      // Detectar error de autorización específicamente (puede indicar token sin scope correcto)
+      if(r.status===401||r.status===403){
+        const errJson = await r.json().catch(()=>({}));
+        const msg = 'Sin autorización para leer el Spreadsheet ('+r.status+'). Cierra sesión y vuelve a iniciar para otorgar los permisos necesarios.';
+        console.error('[Sync] Auth error', r.status, errJson);
+        gsUpdateSyncStatus(msg,'error');
+        if(!auto) toast(msg,'error');
+        return;
+      }
+      throw new Error('HTTP '+r.status+' al leer hojas de Google Sheets');
+    }
+
     const j = await r.json();
     const byName = {};
+    const rowsPerSheet = {};
     (j.valueRanges||[]).forEach(vr=>{
       const name = (vr.range||'').split('!')[0].replace(/^'|'$/g,'');
       byName[name] = gsMatrixToObjects(vr.values);
+      rowsPerSheet[name] = byName[name].length;
     });
 
+    console.log('[Sync] Hojas leídas ('+domain+'):', JSON.stringify(rowsPerSheet), '| ms='+(Date.now()-t0));
+
     if(domain==='inventario'){
-      if(!byName['Insumos']){
-        // En modo automático, una hoja recién creada (sin datos todavía) no es
-        // un error: simplemente no hay nada que sincronizar todavía.
-        if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de insumos.','warn'); }
-        else gsUpdateSyncStatus('Sin datos previos en Google Sheets.','info');
+      // Validación clave: si la hoja Insumos no existe (null/undefined) o tiene 0 filas
+      // y YA tenemos insumos en memoria, es probable que el Spreadsheet sea incorrecto
+      // (nuevo vacío creado por error en dispositivo sin localStorage).
+      const insumosGS = byName['Insumos'];
+      if(!insumosGS){
+        if(!auto){ toast('No se encontró la hoja "Insumos" en el Spreadsheet.','error'); gsUpdateSyncStatus('La hoja Insumos no existe en el Spreadsheet.','error'); }
+        else gsUpdateSyncStatus('Sin datos previos en Google Sheets (Insumos vacío).','info');
+        return;
+      }
+      if(insumosGS.length===0 && S.insumos.length>0){
+        // Spreadsheet vacío mientras el estado local tiene datos → sospecha de Spreadsheet incorrecto
+        const msg = 'Advertencia: el Spreadsheet ('+id.slice(0,8)+'…) no tiene registros pero la app sí tiene datos en memoria. Puede estar apuntando al Spreadsheet equivocado. Sincronización cancelada para evitar pérdida de datos.';
+        console.warn('[Sync] Probable Spreadsheet incorrecto:', msg);
+        gsUpdateSyncStatus(msg,'warn');
+        if(!auto) toast(msg,'warn');
+        return;
+      }
+      if(insumosGS.length===0 && !auto){
+        // Auto=false y hoja vacía: el usuario pidió sincronizar pero el sheet está vacío
+        gsUpdateSyncStatus('El Spreadsheet no tiene registros de insumos. ID: '+id,'warn');
+        toast('El Spreadsheet no tiene datos de insumos (puede ser un archivo recién creado).','warn');
         return;
       }
       // Compatibilidad: si la hoja no tiene estas columnas (o vienen en blanco),
@@ -7076,7 +7148,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // la traducción de compatibilidad dentro de migrarCamposInsumo).
         tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
       }));
-      S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:String(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
+      S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
       S.invLicores = (byName['InvLicores']||[]).map(r=>{
         // Compatibilidad: si la hoja aún tiene el formato antiguo (con campo 'momento'),
@@ -7092,9 +7164,9 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false'),
         nroBotellasVacias: (r.nroBotellasVacias!==undefined&&r.nroBotellasVacias!==null&&r.nroBotellasVacias!=='') ? Number(r.nroBotellasVacias) : null,
         stockMinimo: (r.stockMinimo!==undefined&&r.stockMinimo!==null&&r.stockMinimo!=='') ? Number(r.stockMinimo) : null }));
-      S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:String(r.fecha), stock:Number(r.stock)||0 }));
+      S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:normFechaGS(r.fecha), stock:Number(r.stock)||0 }));
       S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
-        id:String(r.id||uid()), fecha:String(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
+        id:String(r.id||uid()), fecha:normFechaGS(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
         apBolsa:Number(r.apBolsa)||0,
         apQtys:DENOMINACIONES.map((_,i)=>Number(r['ap'+i])||0),
         clBolsa:Number(r.clBolsa)||0,
@@ -7113,16 +7185,24 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       }
       S.salonInventario = (byName['SalonInventario']||[]).map(r=>({
         id:String(r.id||uid()), productoId:String(r.productoId||''),
-        fecha:String(r.fecha||''), unidad:String(r.unidad||''),
+        fecha:normFechaGS(r.fecha), unidad:String(r.unidad||''),
         cantidad:Number(r.cantidad)||0
       }));
       save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
-        if(!auto){ toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('La hoja no tiene datos de empleados.','warn'); }
+        if(!auto){ toast('El Spreadsheet no tiene datos de empleados.','error'); gsUpdateSyncStatus('Hoja Empleados sin datos. ID: '+id,'warn'); }
         else gsUpdateSyncStatus('Sin datos previos en Google Sheets.','info');
         return;
       }
+      if(byName['Empleados'].length===0 && S.emp.length>0 && !auto){
+        const msg = 'El Spreadsheet ('+id.slice(0,8)+'…) no tiene empleados pero la app sí. Sincronización cancelada para evitar pérdida de datos.';
+        console.warn('[Sync]', msg);
+        gsUpdateSyncStatus(msg,'warn');
+        toast(msg,'warn');
+        return;
+      }
+      console.log('[Sync] Planilla: '+byName['Empleados'].length+' empleados, '+((byName['Marcaciones']||[]).length)+' marcaciones');
 
       // Reconstruir el estado (misma lógica de tipos que adminImport)
       S.emp = byName['Empleados'].map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), documento:String(r.documento||'').trim(),
@@ -7150,9 +7230,6 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     }
 
     reloadState();
-    // Tras recargar todo desde localStorage, aislar el dominio opuesto SOLO si
-    // el rol tiene un único dominio. Para el rol combinado (planilla+inventario)
-    // NO limpiar ningún dominio; ambos conviven simultáneamente en memoria.
     const role = currentRole();
     const isCombined = role && role.domain === 'planilla+inventario';
     if(!isCombined){
@@ -7160,8 +7237,13 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       else if(role) limpiarEstadoDominio('inventario');
     }
     gsState.lastSync = new Date();
-    if(!auto) toast('Datos cargados desde Google Sheets','success');
-    gsUpdateSyncStatus('Datos cargados ('+gsState.email+').','success');
+    const totalRows = Object.values(rowsPerSheet).reduce((s,n)=>s+n,0);
+    const resumen = domain==='inventario'
+      ? `${S.insumos.length} insumos, ${S.produccion.length} registros de producción, ${S.bebidasCat.length} bebidas`
+      : `${S.emp.length} empleados, ${S.mar.length} marcaciones, ${S.prop.length} propinas`;
+    console.log('[Sync] Carga completada. '+resumen+' | total filas GS: '+totalRows+' | '+(Date.now()-t0)+'ms');
+    if(!auto) toast('Datos cargados desde Google Sheets ('+resumen+')','success');
+    gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
     goto(currentPage);
   }catch(err){
     console.error(err);
