@@ -783,9 +783,10 @@ function reloadState(){
   S.bebidasCat=load(K.bebidasCat);
   S.stockBebidas=load(K.stockBebidas);
   S.efectivoCaja=load(K.efectivoCaja);
-  S.salonProductos=load(K.salonProductos);
+  S.salonProductos=salonNormalizarCatalogo(load(K.salonProductos));
   S.salonInventario=load(K.salonInventario);
-  if(!S.salonProductos.length && !localStorage.getItem(K.seedSalon)) seedSalonProductos();
+  if(!S.salonProductos.length && !localStorage.getItem(K.seedSalon)) seedSalonProductos(true);
+  salonSanearInventario(); // invariantes: sin huérfanos, sin duplicados, sin unidades inválidas
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
 // corresponde al rol de la cuenta conectada. Así, durante una sesión de
@@ -4437,21 +4438,71 @@ function seedData(){
    ================================================================ */
 
 const SALON_UNIDADES_ORD = ['Bolsa','Caja','Paquete'];
+// Catálogo inicial con IDs FIJOS e inmutables (NO uid()): un re-seed en
+// cualquier dispositivo/sesión produce SIEMPRE los mismos IDs. Esta es la
+// corrección de la causa raíz de los registros huérfanos: cada re-seed
+// anterior generaba IDs aleatorios nuevos y todo el inventario ya guardado
+// quedaba apuntando a IDs de productos que dejaban de existir.
 const SALON_PRODUCTOS_INICIALES = [
-  ['Guantes',            ['Paquete']],
-  ['Mostaza',            ['Caja','Bolsa']],
-  ['Ketchup',            ['Caja','Bolsa']],
-  ['Mayonesa',           ['Bolsa','Caja']],
-  ['Removedores negros', ['Caja','Bolsa']],
-  ['Cañas grandes',      ['Paquete']],
-  ['Cañas pequeñas',     ['Paquete']],
+  ['salp_guantes',        'Guantes',            ['Paquete']],
+  ['salp_mostaza',        'Mostaza',            ['Bolsa','Caja']],
+  ['salp_ketchup',        'Ketchup',            ['Bolsa','Caja']],
+  ['salp_mayonesa',       'Mayonesa',           ['Bolsa','Caja']],
+  ['salp_removedores',    'Removedores negros', ['Bolsa','Caja']],
+  ['salp_canas_grandes',  'Cañas grandes',      ['Paquete']],
+  ['salp_canas_pequenas', 'Cañas pequeñas',     ['Paquete']],
 ];
 
 // ── Seed inicial ──────────────────────────────────────────────────
-function seedSalonProductos(){
-  S.salonProductos = SALON_PRODUCTOS_INICIALES.map(([nombre,unidades])=>({id:uid(),nombre,unidades}));
+// sincronizar=true: además de persistir en localStorage, sube el catálogo a la
+// hoja SalonProductos del Spreadsheet, para que NUNCA quede vacía mientras
+// exista inventario (la hoja vacía era el otro origen de los huérfanos: el
+// catálogo solo vivía en localStorage y cada dispositivo re-sembraba el suyo).
+function seedSalonProductos(sincronizar){
+  S.salonProductos = SALON_PRODUCTOS_INICIALES.map(([id,nombre,unidades])=>({id,nombre,unidades:unidades.slice()}));
   save(K.salonProductos, S.salonProductos);
   localStorage.setItem(K.seedSalon,'1');
+  if(sincronizar && isAuthorized()) syncSalonProductos();
+}
+
+// ── Capa de integridad ────────────────────────────────────────────
+// Normaliza un catálogo: ids y nombres válidos, unidades reconocidas en orden
+// canónico (Bolsa, Caja, Paquete) y sin productos duplicados por id.
+function salonNormalizarCatalogo(list){
+  const porId = new Map();
+  (list||[]).forEach(p=>{
+    if(!p || !p.id || !String(p.nombre||'').trim()) return;
+    const unidades = SALON_UNIDADES_ORD.filter(u=>(p.unidades||[]).includes(u));
+    if(!unidades.length) return;
+    porId.set(String(p.id), { id:String(p.id), nombre:String(p.nombre).trim(), unidades });
+  });
+  return [...porId.values()];
+}
+// Depura S.salonInventario garantizando los tres invariantes del módulo:
+//  1) sin huérfanos: todo productoId debe existir en el catálogo;
+//  2) sin registros de unidades que el producto no usa;
+//  3) sin duplicados por (productoId, fecha, unidad) — se conserva el último.
+// Devuelve cuántos registros inválidos eliminó. Si el catálogo está vacío no
+// toca nada (sin catálogo no es posible juzgar qué registro es huérfano).
+function salonSanearInventario(persistir=true){
+  if(!S.salonProductos.length) return 0;
+  const unidadesDe = new Map(S.salonProductos.map(p=>[p.id, new Set(p.unidades)]));
+  const porClave = new Map();
+  let invalidos = 0;
+  (S.salonInventario||[]).forEach(r=>{
+    if(!r || !r.productoId || !r.fecha || !r.unidad){ invalidos++; return; }
+    const unidades = unidadesDe.get(r.productoId);
+    if(!unidades || !unidades.has(r.unidad)){ invalidos++; return; }
+    const clave = r.productoId+'|'+r.fecha+'|'+r.unidad;
+    if(porClave.has(clave)) invalidos++; // duplicado: gana el último
+    porClave.set(clave, r);
+  });
+  if(invalidos>0){
+    S.salonInventario = [...porClave.values()];
+    if(persistir) save(K.salonInventario, S.salonInventario);
+    console.warn('[Salón] Saneamiento: '+invalidos+' registro(s) huérfano(s), duplicado(s) o inválido(s) eliminados del inventario.');
+  }
+  return invalidos;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -4529,13 +4580,28 @@ RENDERERS.salonAdmin = function(){
 
 function salonProdSave(){
   const nombre=document.getElementById('salonProdNombre').value.trim();
-  const unidades=[...document.querySelectorAll('.salonProdUnit:checked')].map(cb=>cb.value);
+  const unidades=SALON_UNIDADES_ORD.filter(u=>[...document.querySelectorAll('.salonProdUnit:checked')].some(cb=>cb.value===u));
   if(!nombre){document.getElementById('salonProdNombre').classList.add('invalid');toast('Ingresa el nombre del producto','error');return;}
   if(!unidades.length){toast('Selecciona al menos una unidad','error');return;}
   if(unidades.includes('Caja')&&unidades.includes('Paquete')){toast('Caja y Paquete son excluyentes — selecciona solo una de las dos','error');return;}
+  // Evitar productos duplicados por nombre (insensible a mayúsculas).
+  const dup=S.salonProductos.find(p=>p.nombre.toLowerCase()===nombre.toLowerCase() && p.id!==editSalonProdId);
+  if(dup){toast('Ya existe un producto llamado "'+dup.nombre+'"','error');return;}
   if(editSalonProdId){
     const p=S.salonProductos.find(x=>x.id===editSalonProdId);
-    if(p){p.nombre=nombre;p.unidades=unidades;}
+    if(!p){editSalonProdId=null;toast('El producto ya no existe','error');RENDERERS.salonAdmin();return;}
+    // Integridad: si se quita una unidad que ya tiene inventario registrado,
+    // esos registros quedarían huérfanos de unidad. Se confirma con el usuario
+    // y se eliminan en el MISMO flujo (cambio atómico: catálogo + inventario).
+    const quitadas=p.unidades.filter(u=>!unidades.includes(u));
+    const afectados=quitadas.length? S.salonInventario.filter(r=>r.productoId===p.id && quitadas.includes(r.unidad)).length : 0;
+    if(afectados>0 && !confirm('Al quitar la(s) unidad(es) '+quitadas.join(', ')+' de "'+p.nombre+'" se eliminarán también '+afectados+' registro(s) de inventario asociados a esa(s) unidad(es). ¿Continuar?')) return;
+    p.nombre=nombre; p.unidades=unidades;
+    if(afectados>0){
+      S.salonInventario=S.salonInventario.filter(r=>!(r.productoId===p.id && quitadas.includes(r.unidad)));
+      save(K.salonInventario,S.salonInventario);
+      syncSalonInventario();
+    }
     editSalonProdId=null;toast('Producto actualizado','success');
   }else{
     S.salonProductos.push({id:uid(),nombre,unidades});
@@ -4546,13 +4612,22 @@ function salonProdSave(){
   RENDERERS.salonAdmin();
 }
 window.salonProdEdit=function(id){editSalonProdId=id;RENDERERS.salonAdmin();};
+// Eliminación en cascada CONSCIENTE: nunca puede quedar inventario huérfano.
+// Si el producto tiene registros, se informa cuántos y se eliminan junto con
+// el producto en el mismo flujo, sincronizando AMBAS hojas.
 window.salonProdDel=function(id){
-  if(!confirm('¿Eliminar este producto? Se perderán sus registros de inventario.')) return;
-  S.salonProductos=S.salonProductos.filter(p=>p.id!==id);
+  const p=S.salonProductos.find(x=>x.id===id);
+  if(!p) return;
+  const asociados=S.salonInventario.filter(r=>r.productoId===id).length;
+  const msg=asociados>0
+    ? '"'+p.nombre+'" tiene '+asociados+' registro(s) de inventario. Eliminar el producto borrará también esos registros (no quedará ningún dato huérfano). ¿Continuar?'
+    : '¿Eliminar el producto "'+p.nombre+'"?';
+  if(!confirm(msg)) return;
+  S.salonProductos=S.salonProductos.filter(x=>x.id!==id);
   S.salonInventario=S.salonInventario.filter(r=>r.productoId!==id);
   save(K.salonProductos,S.salonProductos); save(K.salonInventario,S.salonInventario);
   syncSalonProductos(); syncSalonInventario();
-  toast('Producto eliminado','warn');
+  toast('Producto eliminado'+(asociados?' junto con '+asociados+' registro(s) de inventario':''),'warn');
   RENDERERS.salonAdmin();
 };
 
@@ -4598,18 +4673,27 @@ RENDERERS.invDiarioSalon = function(){
     salonFecha=e.target.value||salonFecha; RENDERERS.invDiarioSalon();
   };
   document.getElementById('salonGuardar').onclick=function(){
-    let n=0;
+    const fecha=salonFecha;
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast('Selecciona una fecha válida','error');return;}
+    const unidadesDe=new Map(S.salonProductos.map(p=>[p.id,new Set(p.unidades)]));
+    let nuevos=0, actualizados=0;
     document.querySelectorAll('.salon-inp').forEach(inp=>{
-      if(inp.value.trim()==='') return;
+      if(inp.value.trim()==='') return; // vacío = sin registro (no se guarda ni se borra)
       const productoId=inp.dataset.prod, unidad=inp.dataset.unit;
+      // Guardas de integridad: jamás crear registros para productos inexistentes
+      // ni para unidades que el producto no usa (aunque el DOM haya sido alterado
+      // o el catálogo haya cambiado en otra pestaña entre render y guardado).
+      const unidades=unidadesDe.get(productoId);
+      if(!unidades || !unidades.has(unidad)) return;
       const cantidad=Math.max(0,Number(inp.value)||0);
-      let r=getSalonStock(productoId,salonFecha,unidad);
-      if(r){r.cantidad=cantidad;}else{S.salonInventario.push({id:uid(),productoId,fecha:salonFecha,unidad,cantidad});}
-      n++;
+      const r=getSalonStock(productoId,fecha,unidad);
+      if(r){ if(r.cantidad!==cantidad){r.cantidad=cantidad;} actualizados++; }
+      else { S.salonInventario.push({id:uid(),productoId,fecha,unidad,cantidad}); nuevos++; }
     });
+    salonSanearInventario(false); // red de seguridad final: dedupe por (producto, fecha, unidad)
     save(K.salonInventario,S.salonInventario);
     syncSalonInventario();
-    toast(`Inventario de salón guardado (${n} registro${n!==1?'s':''})`, 'success');
+    toast(`Inventario de salón guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
     RENDERERS.invDiarioSalon();
   };
 };
@@ -7215,22 +7299,38 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         clBolsa:Number(r.clBolsa)||0,
         clQtys:DENOMINACIONES.map((_,i)=>Number(r['cl'+i])||0)
       }));
-      // Salón: catálogo y registros diarios
-      if(byName['SalonProductos'] && byName['SalonProductos'].length){
-        S.salonProductos = byName['SalonProductos'].map(r=>({
-          id:String(r.id||uid()), nombre:String(r.nombre||'').trim(),
-          unidades: String(r.unidades||'').split(',').map(u=>u.trim()).filter(Boolean)
-        }));
+      // ── Salón: catálogo y registros diarios ────────────────────────────────
+      // El catálogo de la hoja SalonProductos es la FUENTE DE VERDAD cuando
+      // tiene filas: así todos los dispositivos/cuentas comparten los mismos
+      // IDs de producto y el inventario nunca queda huérfano.
+      const salonProdGS = salonNormalizarCatalogo((byName['SalonProductos']||[]).map(r=>({
+        id:String(r.id||'').trim(), nombre:String(r.nombre||'').trim(),
+        unidades:String(r.unidades||'').split(',').map(u=>u.trim()).filter(Boolean)
+      })));
+      if(salonProdGS.length){
+        S.salonProductos = salonProdGS;
         save(K.salonProductos, S.salonProductos);
         localStorage.setItem(K.seedSalon,'1');
-      } else if(!S.salonProductos.length && !localStorage.getItem(K.seedSalon)){
-        seedSalonProductos();
+      } else if(S.salonProductos.length){
+        // Hoja SalonProductos vacía pero hay catálogo local: se REPARA la hoja
+        // subiendo el catálogo local, en lugar de descartarlo y re-sembrar con
+        // IDs nuevos (comportamiento anterior que dejaba huérfano al inventario).
+        console.warn('[Salón] Hoja SalonProductos vacía; reparando con el catálogo local ('+S.salonProductos.length+' productos).');
+        syncSalonProductos();
+      } else {
+        // Ni hoja ni catálogo local: sembrar con IDs FIJOS y subirlo a la hoja
+        // para que SalonProductos nunca vuelva a quedar vacía.
+        seedSalonProductos(true);
       }
       S.salonInventario = (byName['SalonInventario']||[]).map(r=>({
         id:String(r.id||uid()), productoId:String(r.productoId||''),
         fecha:normFechaGS(r.fecha), unidad:String(r.unidad||''),
         cantidad:Number(r.cantidad)||0
       }));
+      // Depurar huérfanos/duplicados que pudieran venir de la hoja; si se
+      // eliminó algo, reflejar la limpieza en el Spreadsheet para que la hoja
+      // SalonInventario nunca conserve productoId inexistentes.
+      if(salonSanearInventario() > 0) syncSalonInventario();
       save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
