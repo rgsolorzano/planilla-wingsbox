@@ -512,6 +512,8 @@
     <section class="page" id="page-admin"></section>
     <section class="page" id="page-consolidadoVentas"></section>
     <section class="page" id="page-gananciaGrupo"></section>
+    <section class="page" id="page-evolucionVentas"></section>
+    <section class="page" id="page-estadisticasDiaSemana"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
     <section class="page" id="page-consolidadoSalon"></section>
@@ -2307,6 +2309,425 @@ RENDERERS.gananciaGrupo = function(){
     RENDERERS.gananciaGrupo();
   };
 };
+/* ================================================================
+   MÓDULO: ANALÍTICA DE VENTAS (CAJA)
+   Fuente: Spreadsheet de ventas de multiboxes.peru@gmail.com,
+   pestaña CAJA (SOLO LECTURA — jamás se modifica).
+   Solo se consideran filas cuya Columna C = "WB".
+   Columnas usadas (posiciones fijas según especificación):
+     A=Fecha, D=N° ventas, AA=Efectivo, AB=Bancos, AC=Rappi,
+     AD=PedidosYa, AE+AF=DIDI, AG=Tarjetas, AH=Mercado Pago.
+   Optimización: al sincronizar, las filas crudas se PRE-AGREGAN a un
+   registro por día (facts) que se cachea en localStorage y se copia
+   (best-effort) a la pestaña auxiliar VENTAS_FACTS del mismo
+   Spreadsheet. Los dashboards solo operan sobre los facts diarios
+   (≤ ~366 registros/año), nunca sobre las filas crudas.
+   ================================================================ */
+const VENTAS_SS_ID       = '1xaXmIizPSPPu9UCewuVBe0avJNaqyrSijoYzogFteJ0';
+const VENTAS_SHEET_RAW   = 'CAJA';         // solo lectura
+const VENTAS_SHEET_FACTS = 'VENTAS_FACTS'; // tab auxiliar (escrito solo por la app)
+const K_VENTAS_DATA = 'ventas_facts';
+const K_VENTAS_META = 'ventas_meta';
+// Índices 0-based de las columnas según la especificación (A=0):
+const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:26, bancos:27, rappi:28, pedidosya:29, didi1:30, didi2:31, tarjetas:32, mercadopago:33 };
+const VENTAS_MEDIOS = [
+  ['efectivo','Efectivo'], ['bancos','Bancos'], ['rappi','Rappi'], ['pedidosya','PedidosYa'],
+  ['didi','DIDI'], ['tarjetas','Tarjetas'], ['mercadopago','Mercado Pago']
+];
+
+let ventasFacts = [];  // [{fecha:'YYYY-MM-DD', n, efectivo, bancos, rappi, pedidosya, didi, tarjetas, mercadopago, total}]
+let ventasMeta  = null;
+let ventasAutoSyncIntentado = false; // un intento de auto-sync por sesión
+
+function ventasLoadFromStorage(){
+  try{
+    const d=localStorage.getItem(K_VENTAS_DATA), m=localStorage.getItem(K_VENTAS_META);
+    if(d) ventasFacts=JSON.parse(d);
+    if(m) ventasMeta=JSON.parse(m);
+  }catch(e){ ventasFacts=[]; ventasMeta=null; }
+}
+ventasLoadFromStorage();
+function ventasSaveToStorage(){
+  try{
+    localStorage.setItem(K_VENTAS_DATA, JSON.stringify(ventasFacts));
+    localStorage.setItem(K_VENTAS_META, JSON.stringify(ventasMeta));
+  }catch(e){ console.warn('[Ventas] No se pudo cachear en localStorage:', e); }
+}
+
+// Sincroniza desde la pestaña CAJA (lectura), pre-agrega por día y cachea.
+async function ventasSync(){
+  if(!isAuthorized()){ toast('Inicia sesión para sincronizar las ventas.','error'); return null; }
+  const t0=Date.now();
+  try{
+    gsUpdateSyncStatus('Sincronizando ventas (CAJA)…','info');
+    const r = await gsApiFetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AH50000')}?valueRenderOption=UNFORMATTED_VALUE`
+    );
+    if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas. Verifica la cuenta conectada.');
+    if(r.status===404) throw new Error('No se encontró el Spreadsheet de ventas o la pestaña CAJA.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña CAJA.');
+    const j = await r.json();
+    const filas = j.values||[];
+    // Verificación de estructura: se reporta (sin fallar) lo observado en la hoja.
+    console.log('[Ventas] CAJA: '+filas.length+' filas leídas. Fila 1 (posible encabezado):', JSON.stringify((filas[0]||[]).slice(0,5)));
+
+    const porDia = new Map();
+    let leidas=0, wb=0, descartadas=0;
+    filas.forEach(row=>{
+      if(!row || !row.length) return;
+      leidas++;
+      // Solo registros de la marca WB (Columna C), insensible a mayúsculas/espacios.
+      if(String(row[VENTAS_COL.filtro]??'').trim().toUpperCase()!=='WB') return;
+      const fecha = normFechaGS(row[VENTAS_COL.fecha]);
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ descartadas++; return; } // encabezados o fechas ilegibles
+      wb++;
+      const num = v => { const n=analNumOrNull(v); return n===null?0:n; };
+      let f = porDia.get(fecha);
+      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, mercadopago:0, total:0}; porDia.set(fecha,f); }
+      f.n           += num(row[VENTAS_COL.nVentas]);
+      f.efectivo    += num(row[VENTAS_COL.efectivo]);
+      f.bancos      += num(row[VENTAS_COL.bancos]);
+      f.rappi       += num(row[VENTAS_COL.rappi]);
+      f.pedidosya   += num(row[VENTAS_COL.pedidosya]);
+      f.didi        += num(row[VENTAS_COL.didi1]) + num(row[VENTAS_COL.didi2]);
+      f.tarjetas    += num(row[VENTAS_COL.tarjetas]);
+      f.mercadopago += num(row[VENTAS_COL.mercadopago]);
+    });
+    porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.mercadopago; });
+    ventasFacts = [...porDia.values()].sort((a,b)=>a.fecha<b.fecha?-1:1);
+    ventasMeta = {
+      lastSync:new Date().toISOString(), filas:leidas, filasWB:wb, dias:ventasFacts.length,
+      duracion:((Date.now()-t0)/1000).toFixed(1)
+    };
+    ventasSaveToStorage();
+    ventasMensualCache = { clave:null, datos:null }; // invalidar agregados memorizados
+    // Tab auxiliar (best-effort): NUNCA toca CAJA ni el resto del Spreadsheet.
+    ventasWriteFactsSheet().catch(e=>console.warn('[Ventas] No se pudo escribir '+VENTAS_SHEET_FACTS+':', e.message));
+    console.log('[Ventas] Sync OK: '+wb+' filas WB → '+ventasFacts.length+' días. Descartadas sin fecha: '+descartadas);
+    toast(`✅ Ventas actualizadas · ${wb} registros WB · ${ventasFacts.length} días · ${ventasMeta.duracion}s`,'success');
+    gsUpdateSyncStatus('Ventas sincronizadas.','success');
+    return ventasMeta;
+  }catch(e){
+    console.error('[Ventas] Sync error:', e);
+    toast('Error al sincronizar ventas: '+e.message,'error');
+    gsUpdateSyncStatus('Error al sincronizar ventas.','error');
+    return null;
+  }
+}
+
+// Escribe los facts diarios en la pestaña auxiliar VENTAS_FACTS (la crea si falta).
+async function ventasWriteFactsSheet(){
+  const metaResp = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}?fields=sheets.properties.title`);
+  if(metaResp.ok){
+    const {sheets=[]} = await metaResp.json();
+    if(!sheets.some(s=>s.properties.title===VENTAS_SHEET_FACTS)){
+      const cr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}:batchUpdate`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({requests:[{addSheet:{properties:{title:VENTAS_SHEET_FACTS}}}]})
+      });
+      if(!cr.ok) throw new Error('No se pudo crear la hoja '+VENTAS_SHEET_FACTS);
+    }
+  }
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:K']})
+  });
+  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','MercadoPago','Total'],
+    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.mercadopago,f.total])];
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({valueInputOption:'RAW', data:[{range:VENTAS_SHEET_FACTS+'!A1', majorDimension:'ROWS', values:matrix}]})
+  });
+}
+
+// ── Helpers comunes ───────────────────────────────────────────────
+function ventasUlt12Meses(){
+  const hoy=new Date();
+  const d=new Date(hoy.getFullYear(), hoy.getMonth()-11, 1);
+  const fmt=x=>x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
+  return {desde:fmt(d), hasta:fmt(hoy)};
+}
+function ventasEnRango(desde,hasta){
+  return ventasFacts.filter(f=>f.fecha>=desde && f.fecha<=hasta);
+}
+const fmtSoles = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{maximumFractionDigits:0});
+const fmtSolesDec = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
+// Heatmap rojo→amarillo→verde con escala automática por cuadro.
+function ventasHeatStyle(v,min,max){
+  if(v===null||v===undefined) return 'background:#fafafa;color:#d1d5db';
+  const t=(max>min)?(v-min)/(max-min):0.5;
+  const hue=Math.round(t*120);
+  return `background:hsl(${hue},78%,78%);color:hsl(${hue},65%,18%);font-weight:600`;
+}
+function ventasSinDatosHTML(){
+  return `<div class="empty" style="padding:40px;text-align:center">Sin datos de ventas.
+    Presiona <b>🔄 Actualizar ventas</b> para sincronizar desde la pestaña CAJA.</div>`;
+}
+// Meses (YYYY-MM) contenidos en un rango de fechas, en orden.
+function ventasMesesDeRango(desde,hasta){
+  const out=[]; let [y,m]=desde.split('-').map(Number); const [yF,mF]=hasta.split('-').map(Number);
+  while(y<yF || (y===yF&&m<=mF)){ out.push(y+'-'+String(m).padStart(2,'0')); m++; if(m>12){m=1;y++;} }
+  return out;
+}
+
+/* ================================================================
+   DASHBOARD 1 — EVOLUCIÓN DE VENTAS
+   ================================================================ */
+let evFilter = Object.assign({agrup:'dia', medio:'todos'}, ventasUlt12Meses());
+
+// Serie temporal: puntos {key,label,monto,cant} agrupados por día o por mes.
+function evBuildSerie(){
+  const datos=ventasEnRango(evFilter.desde, evFilter.hasta);
+  const medio=evFilter.medio;
+  const montoDe=f=> medio==='todos' ? f.total : (f[medio]||0);
+  if(evFilter.agrup==='dia'){
+    return datos.map(f=>({key:f.fecha, label:fmtFechaCorta(f.fecha), monto:montoDe(f), cant:f.n}));
+  }
+  const porMes=new Map();
+  datos.forEach(f=>{
+    const k=f.fecha.slice(0,7);
+    const p=porMes.get(k)||{key:k, monto:0, cant:0};
+    p.monto+=montoDe(f); p.cant+=f.n; porMes.set(k,p);
+  });
+  return [...porMes.values()].sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
+}
+
+function evChartSVG(serie){
+  const W=940,H=380,mL=72,mR=64,mT=18,mB=52;
+  const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
+  const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+  const maxM=Math.max(1,...serie.map(p=>p.monto))*1.08;
+  const maxC=Math.max(1,...serie.map(p=>p.cant))*1.08;
+  const YM=v=> mT+ih-(v/maxM)*ih;
+  const YC=v=> mT+ih-(v/maxC)*ih;
+  const path=(fy,campo)=>serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+fy(p[campo]).toFixed(1)).join(' ');
+  // Gridlines + ticks de ambos ejes
+  let grid='';
+  for(let g=0; g<=4; g++){
+    const y=mT+ih-g*ih/4;
+    grid+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e9e7f5" stroke-width="1"/>`+
+      `<text x="${mL-8}" y="${y+4}" text-anchor="end" font-size="10" fill="#7c3aed">${fmtSoles(maxM*g/4)}</text>`+
+      `<text x="${W-mR+8}" y="${y+4}" text-anchor="start" font-size="10" fill="#059669">${Math.round(maxC*g/4)}</text>`;
+  }
+  // Etiquetas X (máx ~12 visibles)
+  const paso=Math.max(1,Math.ceil(n/12));
+  let xlab='';
+  serie.forEach((p,i)=>{
+    if(i%paso && i!==n-1) return;
+    xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`;
+  });
+  const puntos=(fy,campo,color)=>serie.map((p,i)=>
+    `<circle cx="${X(i).toFixed(1)}" cy="${fy(p[campo]).toFixed(1)}" r="3" fill="${color}"><title>${p.label} — ${campo==='monto'?fmtSolesDec(p.monto):p.cant+' ventas'}</title></circle>`).join('');
+  return `
+  <div style="position:relative" id="evChartWrap">
+    <svg id="evSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+      ${grid}
+      <line id="evGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
+      <path d="${path(YM,'monto')}" fill="none" stroke="#7c3aed" stroke-width="2.4"/>
+      <path d="${path(YC,'cant')}" fill="none" stroke="#059669" stroke-width="2.4" stroke-dasharray="6 3"/>
+      ${puntos(YM,'monto','#7c3aed')}${puntos(YC,'cant','#059669')}
+      ${xlab}
+      <line x1="${mL}" y1="${mT+ih}" x2="${W-mR}" y2="${mT+ih}" stroke="#c7c3e0"/>
+    </svg>
+    <div id="evTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:6px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
+  </div>
+  <div style="display:flex;gap:18px;padding:6px 4px;font-size:12px">
+    <span><span style="display:inline-block;width:22px;height:3px;background:#7c3aed;vertical-align:middle;margin-right:6px"></span>Monto total (S/)</span>
+    <span><span style="display:inline-block;width:22px;height:3px;background:#059669;vertical-align:middle;margin-right:6px;border-bottom:1px dashed #059669"></span>Cantidad de ventas</span>
+  </div>`;
+}
+
+RENDERERS.evolucionVentas = function(){
+  const el=document.getElementById('page-evolucionVentas');
+  if(!el) return;
+  if(!ventasFacts.length && !ventasAutoSyncIntentado && isAuthorized()){
+    ventasAutoSyncIntentado=true;
+    ventasSync().then(()=>{ if(currentPage==='evolucionVentas') RENDERERS.evolucionVentas(); });
+  }
+  const serie=evBuildSerie();
+  const totM=serie.reduce((s,p)=>s+p.monto,0), totC=serie.reduce((s,p)=>s+p.cant,0);
+  const metaStr=ventasMeta
+    ? `Última sincronización: ${fmtFecha(ventasMeta.lastSync.slice(0,10))} · ${ventasMeta.filasWB} registros WB · ${ventasMeta.dias} días`
+    : 'Sin sincronizar todavía.';
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📉 Evolución de Ventas</h1>
+      <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p></div>
+      <button class="btn btn-primary" id="evSync">🔄 Actualizar ventas</button></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap">
+        <div class="field"><label>Desde</label><input type="date" id="evDesde" value="${evFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="evHasta" value="${evFilter.hasta}"></div>
+        <div class="field"><label>Agrupar por</label>
+          <select id="evAgrup"><option value="dia" ${evFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="mes" ${evFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
+        <div class="field"><label>Medio de pago</label>
+          <select id="evMedio"><option value="todos" ${evFilter.medio==='todos'?'selected':''}>Todos</option>
+            ${VENTAS_MEDIOS.map(([k,lbl])=>`<option value="${k}" ${evFilter.medio===k?'selected':''}>${lbl}</option>`).join('')}
+          </select></div>
+        <button class="btn btn-ghost btn-sm" id="evReset" style="align-self:flex-end">Últimos 12 meses</button>
+      </div>
+      <p class="hint">Al elegir un medio de pago, la línea de <b>monto</b> muestra solo ese medio; la línea de <b>cantidad de ventas</b> siempre representa el total de ventas.</p>
+    </div>
+    <div class="card">
+      ${serie.length? evChartSVG(serie) : (ventasFacts.length?`<div class="empty">Sin datos en el rango seleccionado.</div>`:ventasSinDatosHTML())}
+    </div>
+    <div class="summary">
+      <div class="item"><div class="l">${evFilter.medio==='todos'?'Ingreso total':'Ingreso · '+(VENTAS_MEDIOS.find(m=>m[0]===evFilter.medio)||['',''])[1]}</div><div class="v">${fmtSoles(totM)}</div></div>
+      <div class="item"><div class="l">Cantidad de ventas</div><div class="v">${totC.toLocaleString('es-PE')}</div></div>
+      <div class="item"><div class="l">Ticket promedio del rango</div><div class="v">${totC?fmtSolesDec(totM/totC):'—'}</div></div>
+    </div>`;
+  document.getElementById('evSync').onclick=async function(){
+    this.disabled=true; this.textContent='Sincronizando…';
+    await ventasSync();
+    RENDERERS.evolucionVentas();
+  };
+  const apply=()=>{
+    const d=document.getElementById('evDesde').value, h=document.getElementById('evHasta').value;
+    if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+    if(d) evFilter.desde=d; if(h) evFilter.hasta=h;
+    evFilter.agrup=document.getElementById('evAgrup').value;
+    evFilter.medio=document.getElementById('evMedio').value;
+    RENDERERS.evolucionVentas();
+  };
+  ['evDesde','evHasta','evAgrup','evMedio'].forEach(id=>{document.getElementById(id).onchange=apply;});
+  document.getElementById('evReset').onclick=()=>{ evFilter=Object.assign({agrup:evFilter.agrup, medio:evFilter.medio}, ventasUlt12Meses()); RENDERERS.evolucionVentas(); };
+  // Tooltip interactivo: punto más cercano al cursor
+  const svg=document.getElementById('evSvg');
+  if(svg && serie.length){
+    const tip=document.getElementById('evTip'), guide=document.getElementById('evGuide');
+    const W=940, mL=72, mR=64, iw=W-mL-mR, n=serie.length;
+    const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+    svg.onmousemove=e=>{
+      const rect=svg.getBoundingClientRect();
+      const vx=(e.clientX-rect.left)/rect.width*W;
+      let i=Math.round((vx-mL)/(n>1?iw/(n-1):1)); i=Math.max(0,Math.min(n-1,i));
+      const p=serie[i];
+      guide.style.display='block'; guide.setAttribute('x1',X(i)); guide.setAttribute('x2',X(i));
+      tip.innerHTML=`<b>${p.label}</b><br>Monto: ${fmtSolesDec(p.monto)}<br>Ventas: ${p.cant.toLocaleString('es-PE')}`;
+      tip.style.display='block';
+      const px=X(i)/W*rect.width;
+      tip.style.left=Math.min(rect.width-170, Math.max(0, px+10))+'px';
+      tip.style.top='8px';
+    };
+    svg.onmouseleave=()=>{ tip.style.display='none'; guide.style.display='none'; };
+  }
+};
+
+/* ================================================================
+   DASHBOARD 2 — ESTADÍSTICAS POR DÍA DE LA SEMANA
+   Tres cuadros (venta total, promedio de N° de ventas, ticket
+   promedio) que comparten el mismo rango de fechas.
+   ================================================================ */
+let edsFilter = ventasUlt12Meses();
+// Memoización de la agregación mensual: se recalcula solo si cambia el rango
+// o tras una sincronización (invalidación en ventasSync()).
+let ventasMensualCache = { clave:null, datos:null };
+
+const EDS_DIAS = [ [1,'Lunes'],[2,'Martes'],[3,'Miércoles'],[4,'Jueves'],[5,'Viernes'],[6,'Sábado'],[0,'Domingo'] ];
+
+// Agrega los facts diarios por (día de semana, mes): {sumMonto, sumN, dias}
+function edsAgregado(){
+  const clave=edsFilter.desde+'|'+edsFilter.hasta+'|'+ventasFacts.length+'|'+(ventasMeta?ventasMeta.lastSync:'');
+  if(ventasMensualCache.clave===clave) return ventasMensualCache.datos;
+  const meses=ventasMesesDeRango(edsFilter.desde, edsFilter.hasta);
+  const celdas=new Map(); // 'dow|YYYY-MM' → {sumMonto,sumN,dias}
+  ventasEnRango(edsFilter.desde, edsFilter.hasta).forEach(f=>{
+    const dow=new Date(f.fecha+'T12:00:00').getDay();
+    const k=dow+'|'+f.fecha.slice(0,7);
+    const c=celdas.get(k)||{sumMonto:0,sumN:0,dias:0};
+    c.sumMonto+=f.total; c.sumN+=f.n; c.dias++;
+    celdas.set(k,c);
+  });
+  const datos={meses, celdas};
+  ventasMensualCache={clave, datos};
+  return datos;
+}
+
+function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear){
+  // Recolectar valores para la escala automática del heatmap de ESTE cuadro
+  const vals=[];
+  const matriz=EDS_DIAS.map(([dow,nombre])=>{
+    const fila=meses.map(mk=>{
+      const c=celdas.get(dow+'|'+mk);
+      const v=c?calcular(c):null;
+      if(v!==null) vals.push(v);
+      return v;
+    });
+    return {nombre, fila};
+  });
+  const min=vals.length?Math.min(...vals):0, max=vals.length?Math.max(...vals):0;
+  const hdr=meses.map(mk=>`<th class="num" style="white-space:nowrap;font-size:11px">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`).join('');
+  const filas=matriz.map(({nombre,fila})=>`
+    <tr><td style="font-weight:600;white-space:nowrap">${nombre}</td>
+      ${fila.map(v=>`<td class="num" style="${ventasHeatStyle(v,min,max)};font-size:12px">${v===null?'':formatear(v)}</td>`).join('')}
+    </tr>`).join('');
+  return `
+    <div class="card" style="margin-bottom:16px">
+      <h2>${titulo}</h2>
+      <p class="hint" style="margin-top:0">${subt}</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Día</th>${hdr}</tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>
+    </div>`;
+}
+
+RENDERERS.estadisticasDiaSemana = function(){
+  const el=document.getElementById('page-estadisticasDiaSemana');
+  if(!el) return;
+  if(!ventasFacts.length && !ventasAutoSyncIntentado && isAuthorized()){
+    ventasAutoSyncIntentado=true;
+    ventasSync().then(()=>{ if(currentPage==='estadisticasDiaSemana') RENDERERS.estadisticasDiaSemana(); });
+  }
+  const metaStr=ventasMeta
+    ? `Última sincronización: ${fmtFecha(ventasMeta.lastSync.slice(0,10))} · ${ventasMeta.filasWB} registros WB · ${ventasMeta.dias} días`
+    : 'Sin sincronizar todavía.';
+  let cuadros;
+  if(!ventasFacts.length){
+    cuadros=`<div class="card">${ventasSinDatosHTML()}</div>`;
+  } else {
+    const {meses, celdas}=edsAgregado();
+    cuadros =
+      edsCuadroHTML('1 · Venta total por día de la semana',
+        'Monto total vendido (todos los medios de pago) por día de la semana en cada mes.',
+        meses, celdas, c=>c.sumMonto, v=>fmtSoles(v)) +
+      edsCuadroHTML('2 · Promedio de número de ventas',
+        'Promedio del N° de ventas por día de la semana en cada mes (p. ej. promedio de todos los lunes del mes). Se muestra el promedio, no el total.',
+        meses, celdas, c=>c.dias? c.sumN/c.dias : null, v=>v.toLocaleString('es-PE',{maximumFractionDigits:1})) +
+      edsCuadroHTML('3 · Ticket promedio',
+        'Venta total ÷ N° total de ventas por día de la semana en cada mes (no es promedio de promedios diarios).',
+        meses, celdas, c=>c.sumN? c.sumMonto/c.sumN : null, v=>fmtSolesDec(v));
+  }
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🗓️ Estadísticas por Día de la Semana</h1>
+      <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p></div>
+      <button class="btn btn-primary" id="edsSync">🔄 Actualizar ventas</button></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="edsDesde" value="${edsFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="edsHasta" value="${edsFilter.hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="edsReset" style="align-self:flex-end">Últimos 12 meses</button>
+      </div>
+      <p class="hint">Los tres cuadros comparten este rango y se recalculan juntos. Heatmap: <span style="background:hsl(0,78%,78%);padding:0 6px;border-radius:3px">bajo</span> <span style="background:hsl(60,78%,78%);padding:0 6px;border-radius:3px">medio</span> <span style="background:hsl(120,78%,78%);padding:0 6px;border-radius:3px">alto</span> — escala automática según los valores de cada cuadro.</p>
+    </div>
+    ${cuadros}`;
+  document.getElementById('edsSync').onclick=async function(){
+    this.disabled=true; this.textContent='Sincronizando…';
+    await ventasSync();
+    RENDERERS.estadisticasDiaSemana();
+  };
+  const apply=()=>{
+    const d=document.getElementById('edsDesde').value, h=document.getElementById('edsHasta').value;
+    if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+    if(d) edsFilter.desde=d; if(h) edsFilter.hasta=h;
+    RENDERERS.estadisticasDiaSemana(); // recalcula los tres cuadros simultáneamente
+  };
+  ['edsDesde','edsHasta'].forEach(id=>{document.getElementById(id).onchange=apply;});
+  document.getElementById('edsReset').onclick=()=>{ edsFilter=ventasUlt12Meses(); RENDERERS.estadisticasDiaSemana(); };
+};
+/* ── FIN MÓDULO ANALÍTICA DE VENTAS ── */
+
 // ── Helper: horas semanales programadas según horario ───────────────────────
 function empHorasSemanales(empId){
   return [0,1,2,3,4,5,6].reduce((s,d)=>{
@@ -6606,7 +7027,7 @@ const ACCOUNT_ROLES = {
       // ── PLANILLA ──────────────────────────────────────────────────────────
       'empleados','horarios','cuadrante','marcaciones','propinas',
       'propinasConsolidado','descuentos','pagos','libres','calculo',
-      'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo',
+      'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana',
       // ── INVENTARIO ────────────────────────────────────────────────────────
       'produccion','insumos','inventarioConsolidado','alertaInsumos',
       'syncInventario','licores','invDiarioLicores','cotejoLicores',
@@ -7534,7 +7955,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas','gananciaGrupo'] }
+    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -7557,7 +7978,9 @@ const NAV_MODULE_LABELS = {
   calculo:['🧮','Cálculo Quincenal'], consolidado:['📊','Consolidado'], boleta:['🧾','Boleta por Empleado'],
   // Analítica
   consolidadoVentas:['📈','Consolidado de Ventas'],
-  gananciaGrupo:['💰','Ganancia por Grupo']
+  gananciaGrupo:['💰','Ganancia por Grupo'],
+  evolucionVentas:['📉','Evolución de Ventas'],
+  estadisticasDiaSemana:['🗓️','Estadísticas por Día']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
