@@ -514,6 +514,7 @@
     <section class="page" id="page-gananciaGrupo"></section>
     <section class="page" id="page-evolucionVentas"></section>
     <section class="page" id="page-estadisticasDiaSemana"></section>
+    <section class="page" id="page-flujoCaja"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
     <section class="page" id="page-consolidadoSalon"></section>
@@ -2329,7 +2330,7 @@ const VENTAS_SHEET_FACTS = 'VENTAS_FACTS'; // tab auxiliar (escrito solo por la 
 const K_VENTAS_DATA = 'ventas_facts';
 const K_VENTAS_META = 'ventas_meta';
 // Índices 0-based de las columnas según la especificación (A=0):
-const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:26, bancos:27, rappi:28, pedidosya:29, didi1:30, didi2:31, tarjetas:32, mercadopago:33 };
+const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:26, bancos:27, rappi:28, pedidosya:29, didi1:30, didi2:31, tarjetas:32, mercadopago:33, ingresoDia:34 };
 const VENTAS_MEDIOS = [
   ['efectivo','Efectivo'], ['bancos','Bancos'], ['rappi','Rappi'], ['pedidosya','PedidosYa'],
   ['didi','DIDI'], ['tarjetas','Tarjetas'], ['mercadopago','Mercado Pago']
@@ -2361,7 +2362,7 @@ async function ventasSync(){
   try{
     gsUpdateSyncStatus('Sincronizando ventas (CAJA)…','info');
     const r = await gsApiFetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AH50000')}?valueRenderOption=UNFORMATTED_VALUE`
+      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AI50000')}?valueRenderOption=UNFORMATTED_VALUE`
     );
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas. Verifica la cuenta conectada.');
     if(r.status===404) throw new Error('No se encontró el Spreadsheet de ventas o la pestaña CAJA.');
@@ -2383,7 +2384,7 @@ async function ventasSync(){
       wb++;
       const num = v => { const n=analNumOrNull(v); return n===null?0:n; };
       let f = porDia.get(fecha);
-      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, mercadopago:0, total:0}; porDia.set(fecha,f); }
+      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, mercadopago:0, total:0, ing:0}; porDia.set(fecha,f); }
       f.n           += num(row[VENTAS_COL.nVentas]);
       f.efectivo    += num(row[VENTAS_COL.efectivo]);
       f.bancos      += num(row[VENTAS_COL.bancos]);
@@ -2392,6 +2393,7 @@ async function ventasSync(){
       f.didi        += num(row[VENTAS_COL.didi1]) + num(row[VENTAS_COL.didi2]);
       f.tarjetas    += num(row[VENTAS_COL.tarjetas]);
       f.mercadopago += num(row[VENTAS_COL.mercadopago]);
+      f.ing         += num(row[VENTAS_COL.ingresoDia]); // Ingreso del día (col. AI) — usado por Flujo de Caja
     });
     porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.mercadopago; });
     ventasFacts = [...porDia.values()].sort((a,b)=>a.fecha<b.fecha?-1:1);
@@ -2432,8 +2434,8 @@ async function ventasWriteFactsSheet(){
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:K']})
   });
-  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','MercadoPago','Total'],
-    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.mercadopago,f.total])];
+  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','MercadoPago','Total','IngresoDia'],
+    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.mercadopago,f.total,f.ing||0])];
   await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({valueInputOption:'RAW', data:[{range:VENTAS_SHEET_FACTS+'!A1', majorDimension:'ROWS', values:matrix}]})
@@ -2732,6 +2734,271 @@ RENDERERS.estadisticasDiaSemana = function(){
   document.getElementById('edsReset').onclick=()=>{ edsFilter=ventasUlt12Meses(); RENDERERS.estadisticasDiaSemana(); };
 };
 /* ── FIN MÓDULO ANALÍTICA DE VENTAS ── */
+
+/* ================================================================
+   MÓDULO: FLUJO DE CAJA (Analítica)
+   Ingresos: tab CAJA (col. C="WB"), Fecha=A, Ingreso del día=AI —
+     reutiliza los facts diarios de ventasSync() (campo `ing`).
+   Egresos:  tab COMPRAS (col. K="WB"), Fecha de afectación=B,
+     Tipo de gasto=F (dinámico, sin catálogo fijo), Monto=I.
+   Ambos tabs son SOLO LECTURA; lo procesado se cachea en localStorage
+   y se copia (best-effort) al tab auxiliar COMPRAS_FACTS.
+   ================================================================ */
+const COMPRAS_SHEET_RAW   = 'COMPRAS';       // solo lectura
+const COMPRAS_SHEET_FACTS = 'COMPRAS_FACTS'; // tab auxiliar (escrito solo por la app)
+const K_COMPRAS_DATA = 'compras_facts';
+const K_COMPRAS_META = 'compras_meta';
+// Índices 0-based según especificación: B=1 fecha, F=5 tipo, I=8 monto, K=10 filtro
+const COMPRAS_COL = { fecha:1, tipo:5, monto:8, filtro:10 };
+
+let comprasFacts = [];  // [{fecha:'YYYY-MM-DD', tipo, monto}] agregado por (día, tipo)
+let comprasMeta  = null;
+let flujoAutoSyncIntentado = false;
+
+function comprasLoadFromStorage(){
+  try{
+    const d=localStorage.getItem(K_COMPRAS_DATA), m=localStorage.getItem(K_COMPRAS_META);
+    if(d) comprasFacts=JSON.parse(d);
+    if(m) comprasMeta=JSON.parse(m);
+  }catch(e){ comprasFacts=[]; comprasMeta=null; }
+}
+comprasLoadFromStorage();
+
+// Sincroniza egresos desde COMPRAS: filtra K="WB" y pre-agrega por (día, tipo).
+async function comprasSync(){
+  if(!isAuthorized()){ toast('Inicia sesión para sincronizar las compras.','error'); return null; }
+  const t0=Date.now();
+  try{
+    gsUpdateSyncStatus('Sincronizando egresos (COMPRAS)…','info');
+    const r = await gsApiFetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(COMPRAS_SHEET_RAW+'!A1:K50000')}?valueRenderOption=UNFORMATTED_VALUE`
+    );
+    if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas/compras.');
+    if(r.status===404) throw new Error('No se encontró la pestaña COMPRAS en el Spreadsheet.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña COMPRAS.');
+    const j=await r.json();
+    const filas=j.values||[];
+    console.log('[Flujo] COMPRAS: '+filas.length+' filas leídas. Fila 1 (posible encabezado):', JSON.stringify((filas[0]||[]).slice(0,11)));
+    const porClave=new Map(); // 'fecha|tipo' → monto acumulado
+    let wb=0, descartadas=0;
+    const num=v=>{const n=analNumOrNull(v);return n===null?0:n;};
+    filas.forEach(row=>{
+      if(!row||!row.length) return;
+      if(String(row[COMPRAS_COL.filtro]??'').trim().toUpperCase()!=='WB') return;
+      const fecha=normFechaGS(row[COMPRAS_COL.fecha]);
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ descartadas++; return; }
+      wb++;
+      // Tipo de gasto DINÁMICO desde la columna F (sin catálogo fijo).
+      const tipo=String(row[COMPRAS_COL.tipo]??'').trim() || 'Sin clasificar';
+      const k=fecha+'|'+tipo;
+      porClave.set(k,(porClave.get(k)||0)+num(row[COMPRAS_COL.monto]));
+    });
+    comprasFacts=[...porClave.entries()].map(([k,monto])=>{
+      const i=k.indexOf('|');
+      return {fecha:k.slice(0,i), tipo:k.slice(i+1), monto};
+    }).sort((a,b)=>a.fecha<b.fecha?-1:1);
+    comprasMeta={ lastSync:new Date().toISOString(), filasWB:wb,
+      registros:comprasFacts.length, tipos:new Set(comprasFacts.map(f=>f.tipo)).size,
+      duracion:((Date.now()-t0)/1000).toFixed(1) };
+    try{
+      localStorage.setItem(K_COMPRAS_DATA, JSON.stringify(comprasFacts));
+      localStorage.setItem(K_COMPRAS_META, JSON.stringify(comprasMeta));
+    }catch(e){ console.warn('[Flujo] No se pudo cachear compras:', e); }
+    flujoCache={clave:null,datos:null};
+    comprasWriteFactsSheet().catch(e=>console.warn('[Flujo] No se pudo escribir '+COMPRAS_SHEET_FACTS+':', e.message));
+    console.log('[Flujo] Sync COMPRAS OK: '+wb+' filas WB → '+comprasFacts.length+' registros (día,tipo), '+comprasMeta.tipos+' tipos. Sin fecha: '+descartadas);
+    return comprasMeta;
+  }catch(e){
+    console.error('[Flujo] Sync COMPRAS error:', e);
+    toast('Error al sincronizar compras: '+e.message,'error');
+    return null;
+  }
+}
+
+// Tab auxiliar con los egresos agregados (best-effort; jamás toca COMPRAS).
+async function comprasWriteFactsSheet(){
+  const metaResp=await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}?fields=sheets.properties.title`);
+  if(metaResp.ok){
+    const {sheets=[]}=await metaResp.json();
+    if(!sheets.some(s=>s.properties.title===COMPRAS_SHEET_FACTS)){
+      const cr=await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}:batchUpdate`,{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({requests:[{addSheet:{properties:{title:COMPRAS_SHEET_FACTS}}}]})
+      });
+      if(!cr.ok) throw new Error('No se pudo crear la hoja '+COMPRAS_SHEET_FACTS);
+    }
+  }
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ranges:[COMPRAS_SHEET_FACTS+'!A:C']})
+  });
+  const matrix=[['Fecha','Tipo','Monto'], ...comprasFacts.map(f=>[f.fecha,f.tipo,f.monto])];
+  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({valueInputOption:'RAW',data:[{range:COMPRAS_SHEET_FACTS+'!A1',majorDimension:'ROWS',values:matrix}]})
+  });
+}
+
+// Sincroniza ambas fuentes del flujo (CAJA con col. AI + COMPRAS).
+async function flujoSync(){
+  const a=await ventasSync();   // ingresos (y dashboards de ventas)
+  const b=await comprasSync();  // egresos
+  flujoCache={clave:null,datos:null};
+  if(a&&b) toast('✅ Flujo de caja actualizado','success');
+  return a&&b;
+}
+
+// ── Filtro y agregación ───────────────────────────────────────────
+function flujoAnioActual(){
+  const y=new Date().getFullYear();
+  return {desde:y+'-01-01', hasta:y+'-12-31'};
+}
+let fcFilter = flujoAnioActual();
+let flujoCache = {clave:null, datos:null};
+
+// Estructura EXTENSIBLE de conceptos de ingreso: para agregar un concepto
+// futuro basta añadir {id,label,valorMes:(mes,D)=>número} a este arreglo.
+const FLUJO_INGRESOS = [
+  { id:'reales', label:'Ingresos reales', valorMes:(mes,D)=> D.ingresosMes.get(mes)||0 }
+];
+
+function flujoDatos(){
+  const clave=fcFilter.desde+'|'+fcFilter.hasta+'|'+(ventasMeta?ventasMeta.lastSync:'')+'|'+(comprasMeta?comprasMeta.lastSync:'');
+  if(flujoCache.clave===clave) return flujoCache.datos;
+  const meses=ventasMesesDeRango(fcFilter.desde, fcFilter.hasta);
+  // Ingresos por mes (col. AI de CAJA, ya agregada por día en ventasFacts.ing)
+  const ingresosMes=new Map();
+  ventasEnRango(fcFilter.desde, fcFilter.hasta).forEach(f=>{
+    const mk=f.fecha.slice(0,7);
+    ingresosMes.set(mk,(ingresosMes.get(mk)||0)+(f.ing||0));
+  });
+  // Egresos por (tipo, mes) — tipos dinámicos según los datos
+  const egresosTipoMes=new Map(); // tipo → Map(mes→monto)
+  const totalTipo=new Map();      // tipo → total del rango (para ordenar)
+  const egresosMes=new Map();     // mes → total egresos
+  comprasFacts.forEach(f=>{
+    if(f.fecha<fcFilter.desde || f.fecha>fcFilter.hasta) return;
+    const mk=f.fecha.slice(0,7);
+    let m=egresosTipoMes.get(f.tipo);
+    if(!m){ m=new Map(); egresosTipoMes.set(f.tipo,m); }
+    m.set(mk,(m.get(mk)||0)+f.monto);
+    totalTipo.set(f.tipo,(totalTipo.get(f.tipo)||0)+f.monto);
+    egresosMes.set(mk,(egresosMes.get(mk)||0)+f.monto);
+  });
+  // Tipos ordenados por gasto total del rango (mayor primero)
+  const tipos=[...egresosTipoMes.keys()].sort((a,b)=>(totalTipo.get(b)||0)-(totalTipo.get(a)||0));
+  const D={meses, ingresosMes, egresosTipoMes, tipos, egresosMes};
+  // Ganancia neta mensual = ingresos del mes − total egresos del mes
+  D.ingresoTotalMes = mes => FLUJO_INGRESOS.reduce((s,c)=>s+c.valorMes(mes,D),0);
+  const gananciaMes=new Map();
+  meses.forEach(mk=>gananciaMes.set(mk, D.ingresoTotalMes(mk)-(egresosMes.get(mk)||0)));
+  D.gananciaMes=gananciaMes;
+  D.acumulada=meses.reduce((s,mk)=>s+gananciaMes.get(mk),0);
+  flujoCache={clave, datos:D};
+  return D;
+}
+
+// ── Renderer ──────────────────────────────────────────────────────
+RENDERERS.flujoCaja = function(){
+  const el=document.getElementById('page-flujoCaja');
+  if(!el) return;
+  // Auto-sync inicial (o si el cache de ventas es previo a la columna AI)
+  const faltaAI = ventasFacts.length && ventasFacts.some(f=>f.ing===undefined);
+  if((!comprasFacts.length || !ventasFacts.length || faltaAI) && !flujoAutoSyncIntentado && isAuthorized()){
+    flujoAutoSyncIntentado=true;
+    flujoSync().then(()=>{ if(currentPage==='flujoCaja') RENDERERS.flujoCaja(); });
+  }
+  const D=flujoDatos();
+  const mesActual=fechaHoy().slice(0,7);
+  const hayDatos=ventasFacts.length||comprasFacts.length;
+  const metaStr=(ventasMeta&&comprasMeta)
+    ? `Última sincronización: ${fmtFecha((comprasMeta.lastSync>ventasMeta.lastSync?ventasMeta:comprasMeta).lastSync.slice(0,10))} · ${comprasMeta.tipos} tipos de gasto`
+    : 'Sin sincronizar todavía.';
+
+  // Estilos de columna: el MES ACTUAL se resalta (fondo ámbar + cabecera destacada)
+  const esActual=mk=>mk===mesActual;
+  const thMes=mk=>`<th class="num" style="white-space:nowrap;font-size:11px;${esActual(mk)?'background:#fde68a;color:#78350f;border-bottom:3px solid #f59e0b':''}">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`;
+  const tdStyle=(mk,extra='')=>`style="${esActual(mk)?'background:#fff7ed;':''}font-size:12px;${extra}"`;
+
+  const filaValores=(fnValor,extra='',fmt=fmtSoles)=>D.meses.map(mk=>{
+    const v=fnValor(mk);
+    return `<td class="num" ${tdStyle(mk,extra)}>${fmt(v)}</td>`;
+  }).join('');
+  const seccion=(titulo)=>`<tr><td colspan="${D.meses.length+1}" style="background:#ede9fe;color:#4c1d95;font-weight:700;font-size:12px;padding:6px 10px">${titulo}</td></tr>`;
+
+  // INGRESOS (estructura extensible)
+  const filasIngresos=FLUJO_INGRESOS.map(c=>`
+    <tr><td style="white-space:nowrap;padding-left:18px">${c.label}</td>${filaValores(mk=>c.valorMes(mk,D))}</tr>`).join('');
+  // EGRESOS dinámicos por tipo (columna F)
+  const filasEgresos=D.tipos.map(tipo=>{
+    const m=D.egresosTipoMes.get(tipo);
+    return `<tr><td style="white-space:nowrap;padding-left:18px">${tipo}</td>${filaValores(mk=>m.get(mk)||0)}</tr>`;
+  }).join('') || `<tr><td colspan="${D.meses.length+1}" class="empty" style="padding:14px">Sin egresos en el rango.</td></tr>`;
+
+  const gnColor=v=> v>=0 ? 'color:#166534' : 'color:#b91c1c';
+  const filaGanancia=`<tr>
+    <td style="font-weight:800;background:#f0fdf4;border-top:2px solid #86efac">Ganancia neta</td>
+    ${D.meses.map(mk=>{const v=D.gananciaMes.get(mk)||0;
+      return `<td class="num" style="${esActual(mk)?'background:#fff7ed;':'background:#f0fdf4;'}border-top:2px solid #86efac;font-weight:800;${gnColor(v)};font-size:12px">${fmtSoles(v)}</td>`;}).join('')}
+  </tr>`;
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>💵 Flujo de Caja</h1>
+      <p>Ingresos: CAJA col. AI (solo WB) · Egresos: COMPRAS col. I por tipo (col. F, solo WB). ${metaStr}</p></div>
+      <button class="btn btn-primary" id="fcSync">🔄 Actualizar datos</button></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="fcDesde" value="${fcFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="fcHasta" value="${fcFilter.hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="fcReset" style="align-self:flex-end">Año actual</button>
+      </div>
+    </div>
+    <div class="summary">
+      <div class="item"><div class="l">Ingresos del rango</div><div class="v">${fmtSoles(D.meses.reduce((s,mk)=>s+D.ingresoTotalMes(mk),0))}</div></div>
+      <div class="item"><div class="l">Egresos del rango</div><div class="v">${fmtSoles(D.meses.reduce((s,mk)=>s+(D.egresosMes.get(mk)||0),0))}</div></div>
+      <div class="item" style="background:${D.acumulada>=0?'#dcfce7':'#fee2e2'};border:2px solid ${D.acumulada>=0?'#16a34a':'#dc2626'};border-radius:10px">
+        <div class="l" style="font-weight:700">Ganancia neta acumulada</div>
+        <div class="v" style="${gnColor(D.acumulada)};font-weight:800">${fmtSoles(D.acumulada)}</div></div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      ${hayDatos?`
+      <div class="cotejo-outer">
+        <table class="cotejo-table">
+          <thead><tr><th class="cotejo-corner">Concepto</th>${D.meses.map(thMes).join('')}</tr></thead>
+          <tbody>
+            ${seccion('INGRESOS')}
+            ${filasIngresos}
+            ${seccion('EGRESOS')}
+            ${filasEgresos}
+            <tr><td style="font-weight:700;border-top:1px solid var(--c-line)">Total egresos</td>
+              ${filaValores(mk=>D.egresosMes.get(mk)||0,'font-weight:700;border-top:1px solid var(--c-line)')}</tr>
+            ${filaGanancia}
+          </tbody>
+        </table>
+      </div>
+      <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
+        La columna resaltada corresponde al mes actual. Los tipos de gasto se generan automáticamente desde la columna F de COMPRAS, ordenados por gasto total del rango.
+      </p>`:
+      `<div class="empty" style="padding:40px;text-align:center">Sin datos. Presiona <b>🔄 Actualizar datos</b> para sincronizar CAJA y COMPRAS.</div>`}
+    </div>`;
+
+  document.getElementById('fcSync').onclick=async function(){
+    this.disabled=true; this.textContent='Sincronizando…';
+    await flujoSync();
+    RENDERERS.flujoCaja();
+  };
+  const apply=()=>{
+    const d=document.getElementById('fcDesde').value, h=document.getElementById('fcHasta').value;
+    if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+    if(d) fcFilter.desde=d; if(h) fcFilter.hasta=h;
+    RENDERERS.flujoCaja(); // recalcula todos los meses y oculta los fuera de rango
+  };
+  ['fcDesde','fcHasta'].forEach(id=>{document.getElementById(id).onchange=apply;});
+  document.getElementById('fcReset').onclick=()=>{ fcFilter=flujoAnioActual(); RENDERERS.flujoCaja(); };
+};
+/* ── FIN MÓDULO FLUJO DE CAJA ── */
+
+
 
 // ── Helper: horas semanales programadas según horario ───────────────────────
 function empHorasSemanales(empId){
@@ -7032,7 +7299,7 @@ const ACCOUNT_ROLES = {
       // ── PLANILLA ──────────────────────────────────────────────────────────
       'empleados','horarios','cuadrante','marcaciones','propinas',
       'propinasConsolidado','descuentos','pagos','libres','calculo',
-      'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana',
+      'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja',
       // ── INVENTARIO ────────────────────────────────────────────────────────
       'produccion','insumos','inventarioConsolidado','alertaInsumos',
       'syncInventario','licores','invDiarioLicores','cotejoLicores',
@@ -7960,7 +8227,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana'] }
+    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -7985,7 +8252,8 @@ const NAV_MODULE_LABELS = {
   consolidadoVentas:['📈','Consolidado de Ventas'],
   gananciaGrupo:['💰','Ganancia por Grupo'],
   evolucionVentas:['📉','Evolución de Ventas'],
-  estadisticasDiaSemana:['🗓️','Estadísticas por Día']
+  estadisticasDiaSemana:['🗓️','Estadísticas por Día'],
+  flujoCaja:['💵','Flujo de Caja']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
