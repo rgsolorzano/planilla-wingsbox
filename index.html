@@ -2872,9 +2872,8 @@ function flujoDatos(){
     const mk=f.fecha.slice(0,7);
     ingresosMes.set(mk,(ingresosMes.get(mk)||0)+(f.ing||0));
   });
-  // Egresos por (tipo, mes) — tipos dinámicos según los datos
+  // Egresos por (tipo, mes) — el pivote respeta el rango seleccionado
   const egresosTipoMes=new Map(); // tipo → Map(mes→monto)
-  const totalTipo=new Map();      // tipo → total del rango (para ordenar)
   const egresosMes=new Map();     // mes → total egresos
   comprasFacts.forEach(f=>{
     if(f.fecha<fcFilter.desde || f.fecha>fcFilter.hasta) return;
@@ -2882,18 +2881,23 @@ function flujoDatos(){
     let m=egresosTipoMes.get(f.tipo);
     if(!m){ m=new Map(); egresosTipoMes.set(f.tipo,m); }
     m.set(mk,(m.get(mk)||0)+f.monto);
-    totalTipo.set(f.tipo,(totalTipo.get(f.tipo)||0)+f.monto);
     egresosMes.set(mk,(egresosMes.get(mk)||0)+f.monto);
   });
-  // Tipos ordenados por gasto total del rango (mayor primero)
-  const tipos=[...egresosTipoMes.keys()].sort((a,b)=>(totalTipo.get(b)||0)-(totalTipo.get(a)||0));
-  const D={meses, ingresosMes, egresosTipoMes, tipos, egresosMes};
+  // Filas de EGRESOS: TODOS los tipos históricos del Spreadsheet, en orden
+  // ALFABÉTICO estable (A→Z), independiente del rango y de meses en cero.
+  const tipos=[...new Set(comprasFacts.map(f=>f.tipo))]
+    .sort((a,b)=>a.localeCompare(b,'es',{sensitivity:'base'}));
+  // Indicadores superiores HISTÓRICOS: usan toda la información disponible,
+  // sin aplicar el filtro de fechas (el filtro solo afecta la tabla).
+  const histIngresos=ventasFacts.reduce((s,f)=>s+(f.ing||0),0);
+  const histEgresos =comprasFacts.reduce((s,f)=>s+f.monto,0);
+  const D={meses, ingresosMes, egresosTipoMes, tipos, egresosMes,
+           histIngresos, histEgresos, histGanancia:histIngresos-histEgresos};
   // Ganancia neta mensual = ingresos del mes − total egresos del mes
   D.ingresoTotalMes = mes => FLUJO_INGRESOS.reduce((s,c)=>s+c.valorMes(mes,D),0);
   const gananciaMes=new Map();
   meses.forEach(mk=>gananciaMes.set(mk, D.ingresoTotalMes(mk)-(egresosMes.get(mk)||0)));
   D.gananciaMes=gananciaMes;
-  D.acumulada=meses.reduce((s,mk)=>s+gananciaMes.get(mk),0);
   flujoCache={clave, datos:D};
   return D;
 }
@@ -2931,7 +2935,7 @@ RENDERERS.flujoCaja = function(){
     <tr><td style="white-space:nowrap;padding-left:18px">${c.label}</td>${filaValores(mk=>c.valorMes(mk,D))}</tr>`).join('');
   // EGRESOS dinámicos por tipo (columna F)
   const filasEgresos=D.tipos.map(tipo=>{
-    const m=D.egresosTipoMes.get(tipo);
+    const m=D.egresosTipoMes.get(tipo)||new Map(); // tipo histórico sin datos en el rango → fila en ceros
     return `<tr><td style="white-space:nowrap;padding-left:18px">${tipo}</td>${filaValores(mk=>m.get(mk)||0)}</tr>`;
   }).join('') || `<tr><td colspan="${D.meses.length+1}" class="empty" style="padding:14px">Sin egresos en el rango.</td></tr>`;
 
@@ -2954,12 +2958,13 @@ RENDERERS.flujoCaja = function(){
       </div>
     </div>
     <div class="summary">
-      <div class="item"><div class="l">Ingresos del rango</div><div class="v">${fmtSoles(D.meses.reduce((s,mk)=>s+D.ingresoTotalMes(mk),0))}</div></div>
-      <div class="item"><div class="l">Egresos del rango</div><div class="v">${fmtSoles(D.meses.reduce((s,mk)=>s+(D.egresosMes.get(mk)||0),0))}</div></div>
-      <div class="item" style="background:${D.acumulada>=0?'#dcfce7':'#fee2e2'};border:2px solid ${D.acumulada>=0?'#16a34a':'#dc2626'};border-radius:10px">
+      <div class="item"><div class="l">Ingresos totales (histórico)</div><div class="v">${fmtSoles(D.histIngresos)}</div></div>
+      <div class="item"><div class="l">Egresos totales (histórico)</div><div class="v">${fmtSoles(D.histEgresos)}</div></div>
+      <div class="item" style="background:${D.histGanancia>=0?'#dcfce7':'#fee2e2'};border:2px solid ${D.histGanancia>=0?'#16a34a':'#dc2626'};border-radius:10px">
         <div class="l" style="font-weight:700">Ganancia neta acumulada</div>
-        <div class="v" style="${gnColor(D.acumulada)};font-weight:800">${fmtSoles(D.acumulada)}</div></div>
+        <div class="v" style="${gnColor(D.histGanancia)};font-weight:800">${fmtSoles(D.histGanancia)}</div></div>
     </div>
+    <p class="hint" style="margin:2px 4px 10px">Los tres indicadores superiores usan <b>todo el histórico</b> del Spreadsheet (no dependen del filtro de fechas); el filtro solo afecta la tabla.</p>
     <div class="card" style="padding:0;overflow:hidden">
       ${hayDatos?`
       <div class="cotejo-outer">
@@ -2977,7 +2982,7 @@ RENDERERS.flujoCaja = function(){
         </table>
       </div>
       <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
-        La columna resaltada corresponde al mes actual. Los tipos de gasto se generan automáticamente desde la columna F de COMPRAS, ordenados por gasto total del rango.
+        La columna resaltada corresponde al mes actual. Los tipos de gasto se generan automáticamente desde la columna F de COMPRAS y se muestran en orden alfabético (A→Z), estable en todas las consultas.
       </p>`:
       `<div class="empty" style="padding:40px;text-align:center">Sin datos. Presiona <b>🔄 Actualizar datos</b> para sincronizar CAJA y COMPRAS.</div>`}
     </div>`;
