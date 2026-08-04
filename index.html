@@ -2626,9 +2626,11 @@ let ventasMensualCache = { clave:null, datos:null };
 
 const EDS_DIAS = [ [1,'Lunes'],[2,'Martes'],[3,'Miércoles'],[4,'Jueves'],[5,'Viernes'],[6,'Sábado'],[0,'Domingo'] ];
 
-// Agrega los facts diarios por (día de semana, mes): {sumMonto, sumN, dias}
-// y calcula las OCURRENCIAS CALENDARIO de cada día de la semana en cada mes
-// (recortadas al rango seleccionado), usadas como divisor del Cuadro 1.
+// Agrega los facts diarios por (día de semana, mes): {sumMonto, sumN, dias}.
+// "dias" cuenta ÚNICAMENTE fechas con registro real en la columna A del tab
+// CAJA (los facts provienen solo de filas existentes; jamás se generan fechas
+// artificiales). Es el denominador de los promedios: un día sin operación no
+// existe en la fuente y por tanto no incrementa el divisor.
 function edsAgregado(){
   const clave=edsFilter.desde+'|'+edsFilter.hasta+'|'+ventasFacts.length+'|'+(ventasMeta?ventasMeta.lastSync:'');
   if(ventasMensualCache.clave===clave) return ventasMensualCache.datos;
@@ -2641,22 +2643,7 @@ function edsAgregado(){
     c.sumMonto+=f.total; c.sumN+=f.n; c.dias++;
     celdas.set(k,c);
   });
-  // Ocurrencias calendario: cuántos lunes/martes/… tiene cada mes del rango.
-  // Para meses completos coincide con el calendario (p. ej. 4 lunes en Set-2025);
-  // en meses parcialmente incluidos se cuentan solo los días dentro del rango.
-  const ocurrencias=new Map(); // 'dow|YYYY-MM' → n
-  meses.forEach(mk=>{
-    const [y,m]=mk.split('-').map(Number);
-    const ultimo=new Date(y, m, 0).getDate();
-    for(let d=1; d<=ultimo; d++){
-      const fecha=mk+'-'+String(d).padStart(2,'0');
-      if(fecha<edsFilter.desde || fecha>edsFilter.hasta) continue;
-      const dow=new Date(fecha+'T12:00:00').getDay();
-      const k=dow+'|'+mk;
-      ocurrencias.set(k,(ocurrencias.get(k)||0)+1);
-    }
-  });
-  const datos={meses, celdas, ocurrencias};
+  const datos={meses, celdas};
   ventasMensualCache={clave, datos};
   return datos;
 }
@@ -2704,13 +2691,11 @@ RENDERERS.estadisticasDiaSemana = function(){
   if(!ventasFacts.length){
     cuadros=`<div class="card">${ventasSinDatosHTML()}</div>`;
   } else {
-    const {meses, celdas, ocurrencias}=edsAgregado();
+    const {meses, celdas}=edsAgregado();
     cuadros =
       edsCuadroHTML('1 · Venta total por día de la semana',
-        'Promedio de venta por ocurrencia: monto total del día de la semana en el mes ÷ cantidad de veces que ese día ocurre en el mes (p. ej. S/ 4,000 en 4 lunes → S/ 1,000).',
-        meses, celdas,
-        (c,dow,mk)=>{ const occ=ocurrencias.get(dow+'|'+mk)||0; return occ? c.sumMonto/occ : null; },
-        v=>fmtSoles(v)) +
+        'Promedio de venta por ocurrencia registrada: monto total del día de la semana en el mes ÷ días de ese tipo CON registro en CAJA (p. ej. S/ 3,900 en 3 lunes operados → S/ 1,300; los días sin operación no cuentan).',
+        meses, celdas, c=>c.dias? c.sumMonto/c.dias : null, v=>fmtSoles(v)) +
       edsCuadroHTML('2 · Promedio de número de ventas',
         'Promedio del N° de ventas por día de la semana en cada mes (p. ej. promedio de todos los lunes del mes), redondeado siempre hacia arriba.',
         meses, celdas, c=>c.dias? c.sumN/c.dias : null, v=>Math.ceil(v-1e-9).toLocaleString('es-PE')) +
