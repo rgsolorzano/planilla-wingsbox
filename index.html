@@ -2477,6 +2477,33 @@ function ventasMesesDeRango(desde,hasta){
    ================================================================ */
 let evFilter = Object.assign({agrup:'dia', medio:'todos'}, ventasUlt12Meses());
 
+// Proyección del cierre del MES EN CURSO (solo aplica en agrupación por mes).
+// Fórmula: (ingresos acumulados / días trabajados transcurridos) × total de
+// días trabajados estimado del mes.
+// "Día trabajado" = fecha que existe en CAJA con ingreso total > 0 (los días
+// en 0 representan no-operación y no cuentan). El TOTAL de días trabajados no
+// usa días calendario: se estima con el promedio de días trabajados de los
+// últimos 3 meses COMPLETOS con registros en CAJA (patrón real de operación),
+// y nunca es menor a los días ya transcurridos del mes.
+function evProyeccionMesActual(montoDe, hoyISO){
+  const hoy = hoyISO || fechaHoy();
+  const mk = hoy.slice(0,7);
+  const trabajados = ventasFacts.filter(f=>f.fecha.slice(0,7)===mk && (f.total||0)>0);
+  if(!trabajados.length) return null;
+  const acum = trabajados.reduce((s,f)=>s+montoDe(f),0);
+  const [y,m] = mk.split('-').map(Number);
+  const prev=[];
+  for(let i=1; i<=6 && prev.length<3; i++){
+    const dt=new Date(y, (m-1)-i, 1);
+    const pk=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0');
+    const c=ventasFacts.filter(f=>f.fecha.slice(0,7)===pk && (f.total||0)>0).length;
+    if(c>0) prev.push(c);
+  }
+  const estimado = prev.length ? Math.round(prev.reduce((a,b)=>a+b,0)/prev.length) : trabajados.length;
+  const totalDias = Math.max(estimado, trabajados.length);
+  return { valor:(acum/trabajados.length)*totalDias, transcurridos:trabajados.length, totalDias };
+}
+
 // Serie temporal: puntos {key,label,monto,cant} agrupados por día o por mes.
 function evBuildSerie(){
   const datos=ventasEnRango(evFilter.desde, evFilter.hasta);
@@ -2491,19 +2518,30 @@ function evBuildSerie(){
     const p=porMes.get(k)||{key:k, monto:0, cant:0};
     p.monto+=montoDe(f); p.cant+=f.n; porMes.set(k,p);
   });
-  return [...porMes.values()].sort((a,b)=>a.key<b.key?-1:1)
+  const serie=[...porMes.values()].sort((a,b)=>a.key<b.key?-1:1)
     .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
+  // Serie de PROYECCIÓN: meses cerrados = valor real exacto; solo el mes en
+  // curso lleva el valor proyectado. Se recalcula en cada render/actualización.
+  const mkHoy=fechaHoy().slice(0,7);
+  const proy=evProyeccionMesActual(montoDe);
+  serie.forEach(p=>{
+    p.esProy = !!(proy && p.key===mkHoy);
+    p.proy   = p.esProy ? proy.valor : p.monto;
+    if(p.esProy) p.proyInfo = proy;
+  });
+  return serie;
 }
 
 function evChartSVG(serie){
   const W=940,H=380,mL=72,mR=64,mT=18,mB=52;
   const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
   const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
-  const maxM=Math.max(1,...serie.map(p=>p.monto))*1.08;
+  const maxM=Math.max(1,...serie.map(p=>Math.max(p.monto, p.proy??p.monto)))*1.08;
   const maxC=Math.max(1,...serie.map(p=>p.cant))*1.08;
   const YM=v=> mT+ih-(v/maxM)*ih;
   const YC=v=> mT+ih-(v/maxC)*ih;
-  const path=(fy,campo)=>serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+fy(p[campo]).toFixed(1)).join(' ');
+  const path=(fy,campo)=>serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+fy(p[campo]??p.monto).toFixed(1)).join(' ');
+  const hayProy=serie.some(p=>p.esProy && Math.abs(p.proy-p.monto)>1e-9);
   // Gridlines + ticks de ambos ejes
   let grid='';
   for(let g=0; g<=4; g++){
@@ -2526,6 +2564,8 @@ function evChartSVG(serie){
     <svg id="evSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
       ${grid}
       <line id="evGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
+      ${hayProy?`<path d="${path(YM,'proy')}" fill="none" stroke="#7c3aed" stroke-width="2" opacity="0.35" stroke-dasharray="2 4"/>`+
+        serie.map((p,i)=>p.esProy&&Math.abs(p.proy-p.monto)>1e-9?`<circle cx="${X(i).toFixed(1)}" cy="${YM(p.proy).toFixed(1)}" r="4" fill="#fff" stroke="#7c3aed" stroke-width="2" opacity="0.6"><title>Proyección cierre ${p.label} — ${fmtSolesDec(p.proy)} (${p.proyInfo.transcurridos} de ${p.proyInfo.totalDias} días trabajados)</title></circle>`:'').join(''):''}
       <path d="${path(YM,'monto')}" fill="none" stroke="#7c3aed" stroke-width="2.4"/>
       <path d="${path(YC,'cant')}" fill="none" stroke="#059669" stroke-width="2.4" stroke-dasharray="6 3"/>
       ${puntos(YM,'monto','#7c3aed')}${puntos(YC,'cant','#059669')}
@@ -2537,6 +2577,7 @@ function evChartSVG(serie){
   <div style="display:flex;gap:18px;padding:6px 4px;font-size:12px">
     <span><span style="display:inline-block;width:22px;height:3px;background:#7c3aed;vertical-align:middle;margin-right:6px"></span>Monto total (S/)</span>
     <span><span style="display:inline-block;width:22px;height:3px;background:#059669;vertical-align:middle;margin-right:6px;border-bottom:1px dashed #059669"></span>Cantidad de ventas</span>
+    ${hayProy?`<span style="opacity:.75"><span style="display:inline-block;width:22px;height:0;border-top:2px dotted #7c3aed;opacity:.55;vertical-align:middle;margin-right:6px"></span>Proyección del mes en curso</span>`:''}
   </div>`;
 }
 
@@ -2606,7 +2647,8 @@ RENDERERS.evolucionVentas = function(){
       let i=Math.round((vx-mL)/(n>1?iw/(n-1):1)); i=Math.max(0,Math.min(n-1,i));
       const p=serie[i];
       guide.style.display='block'; guide.setAttribute('x1',X(i)); guide.setAttribute('x2',X(i));
-      tip.innerHTML=`<b>${p.label}</b><br>Monto: ${fmtSolesDec(p.monto)}<br>Ventas: ${p.cant.toLocaleString('es-PE')}`;
+      tip.innerHTML=`<b>${p.label}</b><br>Monto: ${fmtSolesDec(p.monto)}<br>Ventas: ${p.cant.toLocaleString('es-PE')}`+
+        (p.esProy&&Math.abs(p.proy-p.monto)>1e-9?`<br><span style="opacity:.85">Proyección cierre: ${fmtSolesDec(p.proy)} · ${p.proyInfo.transcurridos}/${p.proyInfo.totalDias} días trab.</span>`:'');
       tip.style.display='block';
       const px=X(i)/W*rect.width;
       tip.style.left=Math.min(rect.width-170, Math.max(0, px+10))+'px';
