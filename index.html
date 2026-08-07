@@ -185,6 +185,7 @@
   #page-inventarioConsolidado tr:hover td,
   #page-consolidadoStockBebidas tr:hover td,
   #page-consolidadoSalon tr:hover td,
+  #page-consolidadoMenaje tr:hover td,
   #page-alertaInsumos tr:hover td,
   #page-cotejoLicores tr:hover td,
   #page-consolidadoCaja tr:hover td{ background:inherit !important }
@@ -517,6 +518,9 @@
     <section class="page" id="page-flujoCaja"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
+    <section class="page" id="page-menajeAdmin"></section>
+    <section class="page" id="page-invDiarioMenaje"></section>
+    <section class="page" id="page-consolidadoMenaje"></section>
     <section class="page" id="page-consolidadoSalon"></section>
     <section class="page" id="page-produccion"></section>
     <section class="page" id="page-insumos"></section>
@@ -555,7 +559,9 @@ const K = {
   // Módulo Control de Efectivo en Caja (inventario)
   efectivoCaja:'pl_efectivoCaja',
   // Módulo Inventario Salón
-  salonProductos:'inv_salon_prod', salonInventario:'inv_salon_stock', seedSalon:'inv_salon_seedDone'
+  salonProductos:'inv_salon_prod', salonInventario:'inv_salon_stock', seedSalon:'inv_salon_seedDone',
+  // Módulo Inventario Menaje
+  menajeArticulos:'inv_menaje_art', menajeInventario:'inv_menaje_stock', seedMenaje:'inv_menaje_seedDone'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -773,7 +779,7 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados
@@ -790,6 +796,10 @@ function reloadState(){
   S.salonInventario=load(K.salonInventario);
   if(!S.salonProductos.length && !localStorage.getItem(K.seedSalon)) seedSalonProductos(true);
   salonSanearInventario(); // invariantes: sin huérfanos, sin duplicados, sin unidades inválidas
+  S.menajeArticulos=menajeNormalizarCatalogo(load(K.menajeArticulos));
+  S.menajeInventario=load(K.menajeInventario);
+  if(!S.menajeArticulos.length && !localStorage.getItem(K.seedMenaje)) seedMenajeArticulos(true);
+  menajeSanearInventario(); // invariantes: sin huérfanos, sin duplicados, enteros
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
 // corresponde al rol de la cuenta conectada. Así, durante una sesión de
@@ -5603,8 +5613,297 @@ RENDERERS.consolidadoSalon = function(){
 
 /* ── FIN MÓDULO SALÓN ── */
 
+/* ================================================================
+   MÓDULO: INVENTARIO DE MENAJE (solo cuenta wingsbox.oficial)
+   Misma arquitectura que Salón: catálogo con IDs FIJOS, capa de
+   integridad (sin huérfanos/duplicados), hojas propias en el
+   Spreadsheet de Inventario (MenajeArticulos / MenajeInventario) y
+   sincronización independiente. Diferencia única: todos los
+   artículos usan una sola unidad ("Unidad") y cantidades ENTERAS.
+   ================================================================ */
+// Catálogo inicial con IDs fijos e inmutables (mismo principio que Salón:
+// un re-seed en cualquier dispositivo produce siempre los mismos IDs).
+const MENAJE_ARTICULOS_INICIALES = [
+  ['menj_cucharas',          'Cucharas'],
+  ['menj_tenedores',         'Tenedores'],
+  ['menj_cuchillos',         'Cuchillos'],
+  ['menj_cucharas_largas',   'Cucharas largas'],
+  ['menj_pilotines_peq',     'Pilotines pequeños'],
+  ['menj_pilotines_gra',     'Pilotines grandes'],
+  ['menj_platitos',          'Platitos'],
+  ['menj_platos_grandes',    'Platos grandes'],
+  ['menj_bowls',             'Bowls'],
+  ['menj_cremeros',          'Cremeros'],
+  ['menj_vasos',             'Vasos'],
+  ['menj_jarras',            'Jarras'],
+  ['menj_copas_tinto',       'Copas tinto'],
+  ['menj_copas_vino',        'Copas vino'],
+  ['menj_copas_cerveza',     'Copas cerveza'],
+  ['menj_copas_margarita',   'Copas margarita'],
+  ['menj_copas_gintonic',    'Copas gintonic'],
+  ['menj_vasos_chilcano',    'Vasos chilcano'],
+  ['menj_vasos_pisco',       'Vasos pisco'],
+];
+
+// ── Seed inicial ──────────────────────────────────────────────────
+function seedMenajeArticulos(sincronizar){
+  S.menajeArticulos = MENAJE_ARTICULOS_INICIALES.map(([id,nombre])=>({id,nombre}));
+  save(K.menajeArticulos, S.menajeArticulos);
+  localStorage.setItem(K.seedMenaje,'1');
+  if(sincronizar && isAuthorized()) syncMenajeArticulos();
+}
+
+// ── Capa de integridad ────────────────────────────────────────────
+function menajeNormalizarCatalogo(list){
+  const porId=new Map();
+  (list||[]).forEach(a=>{
+    if(!a || !a.id || !String(a.nombre||'').trim()) return;
+    porId.set(String(a.id), {id:String(a.id), nombre:String(a.nombre).trim()});
+  });
+  return [...porId.values()];
+}
+// Invariantes: sin huérfanos (articuloId existe), sin duplicados por
+// (articuloId, fecha) — gana el último — y cantidades enteras ≥ 0.
+function menajeSanearInventario(persistir=true){
+  if(!S.menajeArticulos.length) return 0;
+  const ids=new Set(S.menajeArticulos.map(a=>a.id));
+  const porClave=new Map();
+  let invalidos=0;
+  (S.menajeInventario||[]).forEach(r=>{
+    if(!r || !r.articuloId || !r.fecha || !ids.has(r.articuloId)){ invalidos++; return; }
+    const clave=r.articuloId+'|'+r.fecha;
+    if(porClave.has(clave)) invalidos++;
+    r.cantidad=Math.max(0, Math.round(Number(r.cantidad)||0)); // solo enteros
+    porClave.set(clave, r);
+  });
+  if(invalidos>0){
+    S.menajeInventario=[...porClave.values()];
+    if(persistir) save(K.menajeInventario, S.menajeInventario);
+    console.warn('[Menaje] Saneamiento: '+invalidos+' registro(s) huérfano(s)/duplicado(s)/inválido(s) eliminados.');
+  }
+  return invalidos;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────
+function getMenajeStock(articuloId, fecha){
+  return S.menajeInventario.find(r=>r.articuloId===articuloId && r.fecha===fecha);
+}
+
+// ── Sync (independiente de otros módulos) ─────────────────────────
+function syncMenajeArticulos()  { _syncSheet('inventario','MenajeArticulos', 'MenajeArticulos', S.menajeArticulos.length); }
+function syncMenajeInventario() { _syncSheet('inventario','MenajeInventario','MenajeInventario',S.menajeInventario.length); }
+
+// ── Estado de edición ─────────────────────────────────────────────
+let editMenajeArtId = null;
+let menajeFecha = fechaHoy();
+
+// ── RENDERER: Administración — Menaje ─────────────────────────────
+RENDERERS.menajeAdmin = function(){
+  const el=document.getElementById('page-menajeAdmin');
+  if(!el) return;
+  const art=editMenajeArtId ? S.menajeArticulos.find(a=>a.id===editMenajeArtId) : null;
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🍽️ Administración — Menaje</h1>
+      <p>Catálogo de artículos de menaje. Todos usan una única unidad: <b>Unidad</b>.</p></div></div>
+    <div class="card">
+      <h2>${art?'Editar artículo':'Nuevo artículo'}</h2>
+      <div class="form-grid">
+        <div class="field"><label>Nombre *</label>
+          <input id="menajeArtNombre" placeholder="Ej: Cucharas" value="${art?art.nombre:''}"></div>
+        <div class="field"><label>Unidad de medida</label>
+          <input value="Unidad" disabled style="background:#f8f7ff;color:var(--c-muted)"></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="menajeArtSave">💾 Guardar</button>
+        <button class="btn btn-ghost" id="menajeArtClear">Limpiar</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Artículos (${S.menajeArticulos.length})</h2>
+      ${S.menajeArticulos.length?`
+        <div class="table-wrap"><table>
+          <thead><tr><th>Artículo</th><th>Unidad</th><th>Acciones</th></tr></thead>
+          <tbody>${S.menajeArticulos.map(a=>`
+            <tr><td>${a.nombre}</td>
+              <td><span class="badge b-free">Unidad</span></td>
+              <td><button class="btn-icon" onclick="menajeArtEdit('${a.id}')">✏️ Editar</button>
+                  <button class="btn-icon del" onclick="menajeArtDel('${a.id}')">🗑️ Eliminar</button></td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>`:
+        `<div class="empty">No hay artículos. Agrega el primero arriba.</div>`}
+    </div>`;
+  document.getElementById('menajeArtSave').onclick=menajeArtSave;
+  document.getElementById('menajeArtClear').onclick=()=>{editMenajeArtId=null;RENDERERS.menajeAdmin();};
+};
+
+function menajeArtSave(){
+  const nombre=document.getElementById('menajeArtNombre').value.trim();
+  if(!nombre){document.getElementById('menajeArtNombre').classList.add('invalid');toast('Ingresa el nombre del artículo','error');return;}
+  const dup=S.menajeArticulos.find(a=>a.nombre.toLowerCase()===nombre.toLowerCase() && a.id!==editMenajeArtId);
+  if(dup){toast('Ya existe un artículo llamado "'+dup.nombre+'"','error');return;}
+  if(editMenajeArtId){
+    const a=S.menajeArticulos.find(x=>x.id===editMenajeArtId);
+    if(!a){editMenajeArtId=null;toast('El artículo ya no existe','error');RENDERERS.menajeAdmin();return;}
+    a.nombre=nombre;
+    editMenajeArtId=null;toast('Artículo actualizado','success');
+  }else{
+    S.menajeArticulos.push({id:uid(),nombre});
+    toast('Artículo creado','success');
+  }
+  save(K.menajeArticulos,S.menajeArticulos);
+  syncMenajeArticulos();
+  RENDERERS.menajeAdmin();
+}
+window.menajeArtEdit=function(id){editMenajeArtId=id;RENDERERS.menajeAdmin();};
+// Eliminación en cascada consciente: nunca queda inventario huérfano.
+window.menajeArtDel=function(id){
+  const a=S.menajeArticulos.find(x=>x.id===id);
+  if(!a) return;
+  const asociados=S.menajeInventario.filter(r=>r.articuloId===id).length;
+  const msg=asociados>0
+    ? '"'+a.nombre+'" tiene '+asociados+' registro(s) de inventario. Eliminar el artículo borrará también esos registros (no quedará ningún dato huérfano). ¿Continuar?'
+    : '¿Eliminar el artículo "'+a.nombre+'"?';
+  if(!confirm(msg)) return;
+  S.menajeArticulos=S.menajeArticulos.filter(x=>x.id!==id);
+  S.menajeInventario=S.menajeInventario.filter(r=>r.articuloId!==id);
+  save(K.menajeArticulos,S.menajeArticulos); save(K.menajeInventario,S.menajeInventario);
+  syncMenajeArticulos(); syncMenajeInventario();
+  toast('Artículo eliminado'+(asociados?' junto con '+asociados+' registro(s)':''),'warn');
+  RENDERERS.menajeAdmin();
+};
+
+// ── RENDERER: Inventario Menaje (registro diario) ─────────────────
+RENDERERS.invDiarioMenaje = function(){
+  const el=document.getElementById('page-invDiarioMenaje');
+  if(!el) return;
+  if(!S.menajeArticulos.length){
+    el.innerHTML=`<div class="page-head"><div><h1>📋 Inventario Menaje</h1></div></div>
+      <div class="card"><div class="empty">No hay artículos configurados. Ve a <b>Menaje</b> para agregarlos.</div></div>`;
+    return;
+  }
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📋 Inventario Menaje</h1><p>Registro diario del inventario de menaje (cantidades enteras).</p></div></div>
+    <div class="card">
+      <div class="field"><label>Fecha</label>
+        <input type="date" id="menajeFechaInp" value="${menajeFecha}"></div>
+    </div>
+    <div class="card">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Artículo</th><th class="num">Unidades</th></tr></thead>
+        <tbody>${S.menajeArticulos.map(a=>{
+          const r=getMenajeStock(a.id, menajeFecha);
+          return `<tr><td>${a.nombre}</td>
+            <td class="num"><input type="number" min="0" step="1" inputmode="numeric" class="menaje-inp"
+              data-art="${a.id}" value="${r!=null?r.cantidad:''}" placeholder="0" style="min-width:70px"></td>
+          </tr>`;}).join('')}
+        </tbody>
+      </table></div>
+      <div class="actions"><button class="btn btn-primary" id="menajeGuardar">💾 Guardar</button></div>
+      <p class="hint">Un registro por artículo y fecha. Solo cantidades enteras; los campos vacíos no se guardan.</p>
+    </div>`;
+
+  document.getElementById('menajeFechaInp').onchange=e=>{
+    menajeFecha=e.target.value||menajeFecha; RENDERERS.invDiarioMenaje();
+  };
+  document.getElementById('menajeGuardar').onclick=function(){
+    const fecha=menajeFecha;
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast('Selecciona una fecha válida','error');return;}
+    const ids=new Set(S.menajeArticulos.map(a=>a.id));
+    let nuevos=0, actualizados=0;
+    document.querySelectorAll('.menaje-inp').forEach(inp=>{
+      if(inp.value.trim()==='') return; // vacío = sin registro
+      const articuloId=inp.dataset.art;
+      if(!ids.has(articuloId)) return; // guarda de integridad
+      const cantidad=Math.max(0, Math.round(Number(inp.value)||0)); // solo enteros
+      const r=getMenajeStock(articuloId,fecha);
+      if(r){ if(r.cantidad!==cantidad){r.cantidad=cantidad;} actualizados++; }
+      else { S.menajeInventario.push({id:uid(),articuloId,fecha,cantidad}); nuevos++; }
+    });
+    menajeSanearInventario(false); // red de seguridad: dedupe por (artículo, fecha)
+    save(K.menajeInventario,S.menajeInventario);
+    syncMenajeInventario();
+    toast(`Inventario de menaje guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
+    RENDERERS.invDiarioMenaje();
+  };
+};
+
+// ── RENDERER: Consolidado Menaje ──────────────────────────────────
+let conMenajeFilter=(()=>{
+  const hoy=new Date(), h=new Date(hoy); h.setDate(h.getDate()-6);
+  const fmt=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  return {desde:fmt(h), hasta:fmt(hoy)};
+})();
+
+RENDERERS.consolidadoMenaje = function(){
+  const el=document.getElementById('page-consolidadoMenaje');
+  if(!el) return;
+  if(!S.menajeArticulos.length){
+    el.innerHTML=`<div class="page-head"><div><h1>📊 Consolidado Menaje</h1></div></div>
+      <div class="card"><div class="empty">No hay artículos configurados.</div></div>`;
+    return;
+  }
+  const fechas=rangoFechas(conMenajeFilter.desde, conMenajeFilter.hasta);
+  const DIAS3=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+  const hdrFechas=fechas.map(f=>{
+    const dow=DIAS3[new Date(f+'T12:00:00').getDay()];
+    return `<th class="num" style="text-align:center;background:#f0fdf4;border-left:2px solid #bbf7d0;padding:4px 6px;white-space:nowrap">
+      <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
+      <div style="font-weight:400;font-size:10px;color:#15803d">${dow}</div></th>`;
+  }).join('');
+  const filas=S.menajeArticulos.map(a=>`
+    <tr>
+      <td class="cotejo-col-licor" style="background:#fff;border-right:2px solid #bbf7d0">${a.nombre}</td>
+      ${fechas.map(f=>{
+        const r=getMenajeStock(a.id,f);
+        return `<td class="num" style="border-left:2px solid #bbf7d0;font-size:11px;text-align:right">${r!=null?r.cantidad:''}</td>`;
+      }).join('')}
+    </tr>`).join('');
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📊 Consolidado Menaje</h1>
+      <p>Evolución diaria del inventario de menaje (una columna por fecha).</p></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="cMenajeDesde" value="${conMenajeFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="cMenajeHasta" value="${conMenajeFilter.hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="cMenajeClear" style="align-self:flex-end">Últimos 7 días</button>
+      </div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div class="cotejo-outer">
+        <table class="cotejo-table">
+          <thead><tr>
+            <th class="cotejo-corner" style="background:#f0fdf4">Artículo</th>
+            ${hdrFechas}
+          </tr></thead>
+          <tbody>${filas||`<tr><td class="empty" colspan="100">Sin datos.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
+        Celdas vacías = sin registro para esa fecha.
+      </p>
+    </div>`;
+  ['cMenajeDesde','cMenajeHasta'].forEach(id=>{
+    document.getElementById(id).onchange=()=>{
+      const d=document.getElementById('cMenajeDesde').value;
+      const h=document.getElementById('cMenajeHasta').value;
+      if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+      if(d) conMenajeFilter.desde=d; if(h) conMenajeFilter.hasta=h;
+      RENDERERS.consolidadoMenaje();
+    };
+  });
+  document.getElementById('cMenajeClear').onclick=()=>{
+    const hoy=new Date(), h2=new Date(hoy); h2.setDate(h2.getDate()-6);
+    const fmt=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    conMenajeFilter={desde:fmt(h2),hasta:fmt(hoy)};
+    RENDERERS.consolidadoMenaje();
+  };
+};
+/* ── FIN MÓDULO MENAJE ── */
+
+
 function dominioKeys(domain){
-  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat, K.efectivoCaja, K.salonProductos, K.salonInventario, K.seedSalon]);
+  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat, K.efectivoCaja, K.salonProductos, K.salonInventario, K.seedSalon, K.menajeArticulos, K.menajeInventario, K.seedMenaje]);
   return domain==='inventario' ? Array.from(invKeys) : Object.values(K).filter(k=>!invKeys.has(k));
 }
 document.getElementById('btnSeed').onclick=()=>{
@@ -7383,7 +7682,7 @@ const ACCOUNT_ROLES = {
     // la propietaria del archivo). Es el ÚNICO spreadsheet válido para todos
     // los módulos de Inventario: NUNCA se debe crear uno nuevo ni buscar por nombre.
     inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
-    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon']
+    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon','menajeAdmin','invDiarioMenaje','consolidadoMenaje']
   }
 };
 // ── OAuth scope ──────────────────────────────────────────────────────────────
@@ -7412,7 +7711,7 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -7796,6 +8095,8 @@ function gsSerializeInventario(){
     StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
     SalonProductos: gsRowsToMatrix(['id','nombre','unidades'], S.salonProductos.map(p=>({...p, unidades:p.unidades.join(',')}))),
     SalonInventario: gsRowsToMatrix(['id','productoId','fecha','unidad','cantidad'], S.salonInventario),
+    MenajeArticulos: gsRowsToMatrix(['id','nombre'], S.menajeArticulos),
+    MenajeInventario: gsRowsToMatrix(['id','articuloId','fecha','cantidad'], S.menajeInventario),
     EfectivoCaja: (()=>{
       // Serialización plana: id,fecha,turno,responsable + ap_bolsa,ap0..ap10 + cl_bolsa,cl0..cl10
       const hdr = ['id','fecha','turno','responsable','apBolsa',
@@ -8094,7 +8395,26 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       // eliminó algo, reflejar la limpieza en el Spreadsheet para que la hoja
       // SalonInventario nunca conserve productoId inexistentes.
       if(salonSanearInventario() > 0) syncSalonInventario();
-      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario);
+      // ── Menaje: catálogo y registros diarios (mismo patrón que Salón) ─────
+      const menajeArtGS = menajeNormalizarCatalogo((byName['MenajeArticulos']||[]).map(r=>({
+        id:String(r.id||'').trim(), nombre:String(r.nombre||'').trim()
+      })));
+      if(menajeArtGS.length){
+        S.menajeArticulos = menajeArtGS;
+        save(K.menajeArticulos, S.menajeArticulos);
+        localStorage.setItem(K.seedMenaje,'1');
+      } else if(S.menajeArticulos.length){
+        console.warn('[Menaje] Hoja MenajeArticulos vacía; reparando con el catálogo local ('+S.menajeArticulos.length+' artículos).');
+        syncMenajeArticulos();
+      } else {
+        seedMenajeArticulos(true);
+      }
+      S.menajeInventario = (byName['MenajeInventario']||[]).map(r=>({
+        id:String(r.id||uid()), articuloId:String(r.articuloId||''),
+        fecha:normFechaGS(r.fecha), cantidad:Math.max(0,Math.round(Number(r.cantidad)||0))
+      }));
+      if(menajeSanearInventario() > 0) syncMenajeInventario();
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
         if(!auto){ toast('El Spreadsheet no tiene datos de empleados.','error'); gsUpdateSyncStatus('Hoja Empleados sin datos. ID: '+id,'warn'); }
@@ -8277,11 +8597,11 @@ const PLANILLA_NAV_HTML = document.getElementById('nav').innerHTML; // fallback 
 // ── Grupos accordion del dominio INVENTARIO (Wingsbox) ──
 const NAV_GROUPS_INVENTARIO = [
   { id:'inv-admin',  ico:'📂', label:'Administración y Configuración',
-    modules:['insumos','licores','bebidasAdmin','salonAdmin','syncInventario'] },
+    modules:['insumos','licores','bebidasAdmin','salonAdmin','menajeAdmin','syncInventario'] },
   { id:'inv-diario', ico:'📝', label:'Registro Diario',
-    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon'] },
+    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje'] },
   { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
-    modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon'] },
+    modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon','consolidadoMenaje'] },
   { id:'inv-caja',   ico:'💰', label:'Caja',
     modules:['efectivoCaja','consolidadoCaja'] }
 ];
@@ -8309,6 +8629,7 @@ const NAV_MODULE_LABELS = {
   inventarioConsolidado:['📈','Consolidado de Inventario'], alertaInsumos:['🔔','Alerta de Insumos'], cotejoLicores:['📊','Cotejo Licores'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'], consolidadoSalon:['📊','Consolidado Salón'],
   salonAdmin:['🛎️','Salón'], invDiarioSalon:['📋','Inv. Salón'],
+  menajeAdmin:['🍽️','Menaje'], invDiarioMenaje:['📋','Inventario Menaje'], consolidadoMenaje:['📊','Consolidado Menaje'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'],
   efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja'],
   // Planilla
