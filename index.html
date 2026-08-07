@@ -2330,10 +2330,15 @@ const VENTAS_SHEET_FACTS = 'VENTAS_FACTS'; // tab auxiliar (escrito solo por la 
 const K_VENTAS_DATA = 'ventas_facts';
 const K_VENTAS_META = 'ventas_meta';
 // Índices 0-based de las columnas según la especificación (A=0):
-const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:26, bancos:27, rappi:28, pedidosya:29, didi1:30, didi2:31, tarjetas:32, mercadopago:33, ingresoDia:34 };
+// Estructura del tab CAJA vigente desde ago-2026 (se insertó una columna antes
+// de los medios de pago y se agregó Izipay): Efectivo=AB, Bancos=AC, Rappi=AD,
+// PedidosYa=AE, DIDI=AF+AG, Tarjetas=AH, Izipay=AI (nuevo), MercadoPago=AJ,
+// Ingreso total del día=AK. Índices 0-based (A=0).
+const VENTAS_FACTS_VERSION = 2; // versión del esquema de facts cacheados
+const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:27, bancos:28, rappi:29, pedidosya:30, didi1:31, didi2:32, tarjetas:33, izipay:34, mercadopago:35, ingresoDia:36 };
 const VENTAS_MEDIOS = [
   ['efectivo','Efectivo'], ['bancos','Bancos'], ['rappi','Rappi'], ['pedidosya','PedidosYa'],
-  ['didi','DIDI'], ['tarjetas','Tarjetas'], ['mercadopago','Mercado Pago']
+  ['didi','DIDI'], ['tarjetas','Tarjetas'], ['izipay','Izipay'], ['mercadopago','Mercado Pago']
 ];
 
 let ventasFacts = [];  // [{fecha:'YYYY-MM-DD', n, efectivo, bancos, rappi, pedidosya, didi, tarjetas, mercadopago, total}]
@@ -2362,7 +2367,7 @@ async function ventasSync(){
   try{
     gsUpdateSyncStatus('Sincronizando ventas (CAJA)…','info');
     const r = await gsApiFetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AI50000')}?valueRenderOption=UNFORMATTED_VALUE`
+      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AK50000')}?valueRenderOption=UNFORMATTED_VALUE`
     );
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas. Verifica la cuenta conectada.');
     if(r.status===404) throw new Error('No se encontró el Spreadsheet de ventas o la pestaña CAJA.');
@@ -2384,7 +2389,7 @@ async function ventasSync(){
       wb++;
       const num = v => { const n=analNumOrNull(v); return n===null?0:n; };
       let f = porDia.get(fecha);
-      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, mercadopago:0, total:0, ing:0}; porDia.set(fecha,f); }
+      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, izipay:0, mercadopago:0, total:0, ing:0}; porDia.set(fecha,f); }
       f.n           += num(row[VENTAS_COL.nVentas]);
       f.efectivo    += num(row[VENTAS_COL.efectivo]);
       f.bancos      += num(row[VENTAS_COL.bancos]);
@@ -2392,14 +2397,15 @@ async function ventasSync(){
       f.pedidosya   += num(row[VENTAS_COL.pedidosya]);
       f.didi        += num(row[VENTAS_COL.didi1]) + num(row[VENTAS_COL.didi2]);
       f.tarjetas    += num(row[VENTAS_COL.tarjetas]);
+      f.izipay      += num(row[VENTAS_COL.izipay]);
       f.mercadopago += num(row[VENTAS_COL.mercadopago]);
       f.ing         += num(row[VENTAS_COL.ingresoDia]); // Ingreso del día (col. AI) — usado por Flujo de Caja
     });
-    porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.mercadopago; });
+    porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.izipay+f.mercadopago; });
     ventasFacts = [...porDia.values()].sort((a,b)=>a.fecha<b.fecha?-1:1);
     ventasMeta = {
       lastSync:new Date().toISOString(), filas:leidas, filasWB:wb, dias:ventasFacts.length,
-      duracion:((Date.now()-t0)/1000).toFixed(1)
+      duracion:((Date.now()-t0)/1000).toFixed(1), version:VENTAS_FACTS_VERSION
     };
     ventasSaveToStorage();
     ventasMensualCache = { clave:null, datos:null }; // invalidar agregados memorizados
@@ -2432,10 +2438,10 @@ async function ventasWriteFactsSheet(){
   }
   await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:K']})
+    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:L']})
   });
-  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','MercadoPago','Total','IngresoDia'],
-    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.mercadopago,f.total,f.ing||0])];
+  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','Izipay','MercadoPago','Total','IngresoDia'],
+    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.izipay||0,f.mercadopago,f.total,f.ing||0])];
   await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({valueInputOption:'RAW', data:[{range:VENTAS_SHEET_FACTS+'!A1', majorDimension:'ROWS', values:matrix}]})
@@ -2584,7 +2590,8 @@ function evChartSVG(serie){
 RENDERERS.evolucionVentas = function(){
   const el=document.getElementById('page-evolucionVentas');
   if(!el) return;
-  if(!ventasFacts.length && !ventasAutoSyncIntentado && isAuthorized()){
+  const cacheDesactualizado = ventasFacts.length && (!ventasMeta || ventasMeta.version!==VENTAS_FACTS_VERSION);
+  if((!ventasFacts.length || cacheDesactualizado) && !ventasAutoSyncIntentado && isAuthorized()){
     ventasAutoSyncIntentado=true;
     ventasSync().then(()=>{ if(currentPage==='evolucionVentas') RENDERERS.evolucionVentas(); });
   }
@@ -2724,7 +2731,8 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear){
 RENDERERS.estadisticasDiaSemana = function(){
   const el=document.getElementById('page-estadisticasDiaSemana');
   if(!el) return;
-  if(!ventasFacts.length && !ventasAutoSyncIntentado && isAuthorized()){
+  const cacheDesactualizado = ventasFacts.length && (!ventasMeta || ventasMeta.version!==VENTAS_FACTS_VERSION);
+  if((!ventasFacts.length || cacheDesactualizado) && !ventasAutoSyncIntentado && isAuthorized()){
     ventasAutoSyncIntentado=true;
     ventasSync().then(()=>{ if(currentPage==='estadisticasDiaSemana') RENDERERS.estadisticasDiaSemana(); });
   }
@@ -2948,9 +2956,9 @@ function flujoDatos(){
 RENDERERS.flujoCaja = function(){
   const el=document.getElementById('page-flujoCaja');
   if(!el) return;
-  // Auto-sync inicial (o si el cache de ventas es previo a la columna AI)
-  const faltaAI = ventasFacts.length && ventasFacts.some(f=>f.ing===undefined);
-  if((!comprasFacts.length || !ventasFacts.length || faltaAI) && !flujoAutoSyncIntentado && isAuthorized()){
+  // Auto-sync inicial (o si el cache de ventas es de un esquema anterior al vigente)
+  const cacheDesactualizado = ventasFacts.length && (!ventasMeta || ventasMeta.version!==VENTAS_FACTS_VERSION);
+  if((!comprasFacts.length || !ventasFacts.length || cacheDesactualizado) && !flujoAutoSyncIntentado && isAuthorized()){
     flujoAutoSyncIntentado=true;
     flujoSync().then(()=>{ if(currentPage==='flujoCaja') RENDERERS.flujoCaja(); });
   }
