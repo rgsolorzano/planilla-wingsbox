@@ -2990,6 +2990,20 @@ RENDERERS.flujoCaja = function(){
   }).join('') || `<tr><td colspan="${D.meses.length+1}" class="empty" style="padding:14px">Sin egresos en el rango.</td></tr>`;
 
   const gnColor=v=> v>=0 ? 'color:#166534' : 'color:#b91c1c';
+  // Indicador general: % del gasto en "Insumos" sobre los "Ingresos reales" de
+  // cada mes, ubicado antes del bloque INGRESOS. La fila de egresos "Insumos"
+  // se localiza sin distinguir mayúsculas/acentos; con ingreso 0 se muestra "—"
+  // (sin división entre cero). Respeta el rango y se recalcula con cada sync.
+  const tiposInsumos=D.tipos.filter(t=>t.localeCompare('Insumos','es',{sensitivity:'base'})===0);
+  const insumosDeMes=mk=>tiposInsumos.reduce((s,t)=>s+((D.egresosTipoMes.get(t)||new Map()).get(mk)||0),0);
+  const filaRatio=`<tr>
+    <td style="font-weight:700;background:#fefce8;border-bottom:2px solid #fde047;white-space:nowrap">Ratio Insumos / Ingresos</td>
+    ${D.meses.map(mk=>{
+      const ing=D.ingresosMes.get(mk)||0;
+      const txt=ing>0 ? ((insumosDeMes(mk)/ing)*100).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2})+'%' : '—';
+      return `<td class="num" style="${esActual(mk)?'background:#fff7ed;':'background:#fefce8;'}border-bottom:2px solid #fde047;font-weight:700;font-size:12px">${txt}</td>`;
+    }).join('')}
+  </tr>`;
   const filaGanancia=`<tr>
     <td style="font-weight:800;background:#f0fdf4;border-top:2px solid #86efac">Ganancia neta</td>
     ${D.meses.map(mk=>{const v=D.gananciaMes.get(mk)||0;
@@ -3021,6 +3035,7 @@ RENDERERS.flujoCaja = function(){
         <table class="cotejo-table">
           <thead><tr><th class="cotejo-corner">Concepto</th>${D.meses.map(thMes).join('')}</tr></thead>
           <tbody>
+            ${filaRatio}
             ${seccion('INGRESOS')}
             ${filasIngresos}
             ${seccion('EGRESOS')}
