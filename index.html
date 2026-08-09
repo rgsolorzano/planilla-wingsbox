@@ -574,9 +574,10 @@ const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
 const TIPOS_LIBRE = ['Día libre','Vacaciones'];
 const TIPOS_EMP = ['Mesero','Cocina','Caja'];
 // Tipos de propina admitidos por fila en el formulario de ingreso (formato nuevo).
-const TIPOS_PROPINA = ['efectivo','yape','plin','tarjeta'];
-const TIPO_PROPINA_LABEL = { efectivo:'Efectivo', yape:'Yape', plin:'Plin', tarjeta:'Tarjeta' };
-const TIPO_PROPINA_BADGE = { efectivo:'b-extra', yape:'b-free', plin:'b-vac', tarjeta:'b-late' };
+// Orden = orden del dropdown de registro: Tarjeta, Izipay, Yape, Efectivo, Plin
+const TIPOS_PROPINA = ['tarjeta','izipay','yape','efectivo','plin'];
+const TIPO_PROPINA_LABEL = { tarjeta:'Tarjeta', izipay:'Izipay', yape:'Yape', efectivo:'Efectivo', plin:'Plin' };
+const TIPO_PROPINA_BADGE = { tarjeta:'b-late', izipay:'b-disc', yape:'b-free', efectivo:'b-extra', plin:'b-vac' };
 
 /* ---------- Helpers de localStorage ---------- */
 const load = (k)=>{ try{ return JSON.parse(localStorage.getItem(k)) || []; }catch(e){ return []; } };
@@ -863,7 +864,7 @@ function redondearAMenos1Decimal(v){ return Math.floor((Number(v)||0)*10)/10; }
 
 /* ---------- Capa de normalización de propinas (multi-formato) ----------
    Formato NUEVO (a partir de esta versión, un registro = una propina):
-     { id, empleadoId, fecha, tipo:'efectivo'|'yape'|'plin'|'tarjeta', monto }
+     { id, empleadoId, fecha, tipo:'tarjeta'|'izipay'|'yape'|'efectivo'|'plin', monto }
    Formato ANTIGUO (registros creados antes de soportar múltiples filas):
      { id, empleadoId, fecha, efectivo, yape, plin, tarjeta }
    Todas las funciones de cálculo siguen aceptando ambos formatos sin distinción,
@@ -874,10 +875,12 @@ function propMonto(p, tipo){
   if(!p) return 0;
   return esPropinaNueva(p) ? (p.tipo===tipo ? numProp(p.monto) : 0) : numProp(p[tipo]);
 }
-// Total base de propinas: solo la tarjeta se multiplica por 0.98.
-// Acepta un registro individual (nuevo o antiguo) o un objeto acumulado {efectivo,yape,plin,tarjeta}.
+// Total base de propinas: SOLO la tarjeta se multiplica por 0.98; Izipay, Yape,
+// Efectivo y Plin entran al 100% del monto registrado.
+// Acepta un registro individual (nuevo o antiguo) o un objeto acumulado
+// {efectivo,yape,plin,tarjeta,izipay}.
 function calcularTotalBasePropinas(p){
-  return propMonto(p,'efectivo')+propMonto(p,'yape')+propMonto(p,'plin')+(propMonto(p,'tarjeta')*0.98);
+  return propMonto(p,'efectivo')+propMonto(p,'yape')+propMonto(p,'plin')+propMonto(p,'izipay')+(propMonto(p,'tarjeta')*0.98);
 }
 // Aplana S.prop (formato nuevo y antiguo) en "items" atómicos, uno por propina individual.
 // Un registro antiguo con varios tipos > 0 genera varios items; uno nuevo genera exactamente 1.
@@ -939,7 +942,7 @@ function filaPropinaAEstado(r){
       tipo: TIPOS_PROPINA.includes(tipo)?tipo:'efectivo', monto:numProp(r.monto) };
   }
   return { id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
-    efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta) };
+    efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta), izipay:numProp(r.izipay) };
 }
 // Mesero: 60% del total base (redondeado hacia abajo a 1 decimal).
 function calcularPropinaMesero(totalBaseMesero){ return redondearAMenos1Decimal(totalBaseMesero*0.60); }
@@ -977,8 +980,8 @@ function trabajoEseDia(empleadoId, fecha){
 // Soporta múltiples registros (de cualquier formato) para el mismo mesero/fecha.
 function propinasMeseroFecha(empleadoId, fecha){
   return S.prop.filter(p=>p.empleadoId===empleadoId && p.fecha===fecha)
-    .reduce((a,p)=>({ efectivo:a.efectivo+propMonto(p,'efectivo'), yape:a.yape+propMonto(p,'yape'), plin:a.plin+propMonto(p,'plin'), tarjeta:a.tarjeta+propMonto(p,'tarjeta') }),
-      {efectivo:0,yape:0,plin:0,tarjeta:0});
+    .reduce((a,p)=>({ efectivo:a.efectivo+propMonto(p,'efectivo'), yape:a.yape+propMonto(p,'yape'), plin:a.plin+propMonto(p,'plin'), tarjeta:a.tarjeta+propMonto(p,'tarjeta'), izipay:a.izipay+propMonto(p,'izipay') }),
+      {efectivo:0,yape:0,plin:0,tarjeta:0,izipay:0});
 }
 
 /* ---------- Utilidades de tiempo y fecha ---------- */
@@ -4124,7 +4127,7 @@ RENDERERS.propinas = function(){
         </tbody>
       </table></div>
       <div class="actions"><button class="btn btn-ghost btn-sm" id="prRowAdd">+ Agregar otra propina</button></div>
-      <p class="hint" style="margin-top:8px">Total base por propina = monto (efectivo/yape/plin) o monto × 0.98 (tarjeta).</p>
+      <p class="hint" style="margin-top:8px">Total base por propina = monto × 0.98 (Tarjeta) o el 100% del monto (Izipay, Yape, Efectivo, Plin).</p>
       <div class="actions">
         <button class="btn btn-primary" id="prSave">Guardar propina${propDraftRows.length>1?'s':''}</button>
       </div>
@@ -4277,11 +4280,12 @@ function calcularConsolidadoPropinas(lunes){
   dias.forEach(f=>{
     S.prop.filter(p=>p.fecha===f).forEach(p=>{
       const e=S.emp.find(x=>x.id===p.empleadoId); if(!e||!esMesero(e)) return;
-      if(!meseroAcc[p.empleadoId]) meseroAcc[p.empleadoId]={efectivo:0,yape:0,plin:0,tarjeta:0};
+      if(!meseroAcc[p.empleadoId]) meseroAcc[p.empleadoId]={efectivo:0,yape:0,plin:0,tarjeta:0,izipay:0};
       meseroAcc[p.empleadoId].efectivo+=propMonto(p,'efectivo');
       meseroAcc[p.empleadoId].yape+=propMonto(p,'yape');
       meseroAcc[p.empleadoId].plin+=propMonto(p,'plin');
       meseroAcc[p.empleadoId].tarjeta+=propMonto(p,'tarjeta');
+      meseroAcc[p.empleadoId].izipay+=propMonto(p,'izipay');
     });
   });
   const meseros=Object.entries(meseroAcc).map(([id,t])=>{
@@ -4323,14 +4327,14 @@ function calcularConsolidadoPropinas(lunes){
 
   // --- Propinas por día y por tipo (para validación de tarjeta y el resumen
   //     semanal por medio de pago). Se reutiliza el mismo bucle/filtro que ya
-  //     calculaba solo tarjeta, ahora acumulando también efectivo/yape/plin.
+  //     calculaba solo tarjeta, ahora acumulando también efectivo/yape/plin/izipay.
   const tarjetaPorDia=dias.map(f=>{
-    let efectivo=0, yape=0, plin=0, tarjeta=0;
+    let efectivo=0, yape=0, plin=0, tarjeta=0, izipay=0;
     S.prop.filter(p=>p.fecha===f).forEach(p=>{
       const e=S.emp.find(x=>x.id===p.empleadoId); if(!e||!esMesero(e)) return;
-      efectivo+=propMonto(p,'efectivo'); yape+=propMonto(p,'yape'); plin+=propMonto(p,'plin'); tarjeta+=propMonto(p,'tarjeta');
+      efectivo+=propMonto(p,'efectivo'); yape+=propMonto(p,'yape'); plin+=propMonto(p,'plin'); tarjeta+=propMonto(p,'tarjeta'); izipay+=propMonto(p,'izipay');
     });
-    return { fecha:f, propTarjeta:tarjeta, efectivo, yape, plin };
+    return { fecha:f, propTarjeta:tarjeta, efectivo, yape, plin, izipay };
   });
 
   return { lunes, domingo, dias, meseros, cocina, avisosCocina, baseSemana, pagadoMeseros, pagadoCocina, pagadoTotal, diferenciaTotal, tarjetaPorDia };
@@ -4428,12 +4432,14 @@ function renderPropinasConsolidado(){
     return `<tr>
       <td>${fmtFecha(t.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(t.fecha)].slice(0,3)}</small></td>
       <td class="num">${money(tarjetaPagada)}</td>
+      <td class="num">${money(t.izipay||0)}</td>
       <td class="num">${money(t.yape)}</td>
       <td class="num">${money(t.efectivo)}</td>
       <td class="num">${money(t.plin)}</td>
     </tr>`;
   }).join('');
   const totalTarjetaPagadaSemana=r.tarjetaPorDia.reduce((s,t)=>s+(t.propTarjeta*0.98),0);
+  const totalIzipaySemana=r.tarjetaPorDia.reduce((s,t)=>s+(t.izipay||0),0);
   const totalYapeSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.yape,0);
   const totalEfectivoSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.efectivo,0);
   const totalPlinSemana=r.tarjetaPorDia.reduce((s,t)=>s+t.plin,0);
@@ -4468,11 +4474,11 @@ function renderPropinasConsolidado(){
 
     <div class="card">
       <h2>Resumen semanal de propinas</h2>
-      <p class="hint" style="margin-top:0">Monto diario por medio de pago, agrupado por fecha. Tarjeta muestra el neto (propinas de tarjeta × 0.98); Yape, Efectivo y Plin se muestran sin descuentos. Se actualiza automáticamente al agregar, editar o eliminar propinas, y al restaurar/importar/sincronizar datos.</p>
+      <p class="hint" style="margin-top:0">Monto diario por medio de pago, agrupado por fecha. Tarjeta muestra el neto (propinas de tarjeta × 0.98); Izipay, Yape, Efectivo y Plin se muestran sin descuentos (100% del monto). Se actualiza automáticamente al agregar, editar o eliminar propinas, y al restaurar/importar/sincronizar datos.</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th class="num">Tarjeta</th><th class="num">Yape</th><th class="num">Efectivo</th><th class="num">Plin</th></tr></thead>
-        <tbody>${resumenRows || `<tr><td colspan="5" class="empty">Sin propinas esta semana.</td></tr>`}</tbody>
-        <tfoot><tr><td>Total semana</td><td class="num">${money(totalTarjetaPagadaSemana)}</td><td class="num">${money(totalYapeSemana)}</td><td class="num">${money(totalEfectivoSemana)}</td><td class="num">${money(totalPlinSemana)}</td></tr></tfoot>
+        <thead><tr><th>Fecha</th><th class="num">Tarjeta</th><th class="num">Izipay</th><th class="num">Yape</th><th class="num">Efectivo</th><th class="num">Plin</th></tr></thead>
+        <tbody>${resumenRows || `<tr><td colspan="6" class="empty">Sin propinas esta semana.</td></tr>`}</tbody>
+        <tfoot><tr><td>Total semana</td><td class="num">${money(totalTarjetaPagadaSemana)}</td><td class="num">${money(totalIzipaySemana)}</td><td class="num">${money(totalYapeSemana)}</td><td class="num">${money(totalEfectivoSemana)}</td><td class="num">${money(totalPlinSemana)}</td></tr></tfoot>
       </table></div>
     </div>
 
