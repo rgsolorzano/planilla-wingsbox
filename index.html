@@ -2682,16 +2682,18 @@ let ventasMensualCache = { clave:null, datos:null };
 const EDS_DIAS = [ [1,'Lunes'],[2,'Martes'],[3,'Miércoles'],[4,'Jueves'],[5,'Viernes'],[6,'Sábado'],[0,'Domingo'] ];
 
 // Agrega los facts diarios por (día de semana, mes): {sumMonto, sumN, dias}.
-// "dias" cuenta ÚNICAMENTE fechas con registro real en la columna A del tab
-// CAJA (los facts provienen solo de filas existentes; jamás se generan fechas
-// artificiales). Es el denominador de los promedios: un día sin operación no
-// existe en la fuente y por tanto no incrementa el divisor.
+// REGLA GLOBAL DEL MÓDULO: solo participan los días con VENTA TOTAL > 0.
+// Un día con venta 0 (p. ej. una fecha del mes en curso aún sin ventas que ya
+// existe en CAJA) no es un día de bajo desempeño sino un día NO VÁLIDO, y se
+// excluye por completo: no entra en promedios, ticket, heatmaps, "Promedio del
+// mes", la variación vs. mes anterior ni el conteo de días operados.
 function edsAgregado(){
   const clave=edsFilter.desde+'|'+edsFilter.hasta+'|'+ventasFacts.length+'|'+(ventasMeta?ventasMeta.lastSync:'');
   if(ventasMensualCache.clave===clave) return ventasMensualCache.datos;
   const meses=ventasMesesDeRango(edsFilter.desde, edsFilter.hasta);
   const celdas=new Map(); // 'dow|YYYY-MM' → {sumMonto,sumN,dias}
   ventasEnRango(edsFilter.desde, edsFilter.hasta).forEach(f=>{
+    if((f.total||0)<=0) return; // día sin venta: excluido de TODOS los cálculos
     const dow=new Date(f.fecha+'T12:00:00').getDay();
     const k=dow+'|'+f.fecha.slice(0,7);
     const c=celdas.get(k)||{sumMonto:0,sumN:0,dias:0};
@@ -2755,12 +2757,19 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExt
   const min=vals.length?Math.min(...vals):0, max=vals.length?Math.max(...vals):0;
   const {mkAct, mkAnt}=edsMesActualYAnterior();
   const valorDe=(dow,mk)=>{ const c=celdas.get(dow+'|'+mk); return c?calcular(c,dow,mk):null; };
+  const mesActEnRango=meses.includes(mkAct);
+  // Ocurrencias VÁLIDAS del día de la semana en el mes en curso: días con
+  // venta > 0 según CAJA (celdas ya excluye los días en 0), no el calendario.
+  const diasMesActual=dow=>{ const c=celdas.get(dow+'|'+mkAct); return c?c.dias:0; };
+  const diasCell=n=>`<td class="num" style="font-size:12px;font-weight:600;color:#4b5563;border-left:1px solid var(--c-line)">${mesActEnRango? n : '—'}</td>`;
   const hdr=meses.map(mk=>`<th class="num" style="white-space:nowrap;font-size:11px">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`).join('')
-    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:2px solid var(--c-line)">Var. vs mes ant.</th>`;
+    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:2px solid var(--c-line)">Var. vs mes ant.</th>`
+    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:1px solid var(--c-line)">Días mes actual</th>`;
   const filas=matriz.map(({dow,nombre,fila})=>`
     <tr><td style="font-weight:600;white-space:nowrap">${nombre}</td>
       ${fila.map(v=>`<td class="num" style="${ventasHeatStyle(v,min,max)};font-size:12px">${v===null?'':formatear(v)}</td>`).join('')}
       ${edsVarCell(valorDe(dow,mkAct), valorDe(dow,mkAnt))}
+      ${diasCell(diasMesActual(dow))}
     </tr>`).join('');
   // Fila extra opcional (p. ej. "Promedio del mes"): fuera de la escala del
   // heatmap, con su propia celda de variación bajo la misma regla.
@@ -2770,6 +2779,8 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExt
         return `<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;font-weight:700;font-size:12px">${v===null||v===undefined?'':formatear(v)}</td>`;}).join('')}
       ${(()=>{const ec=edsVarCell(filaExtra.valor(mkAct), filaExtra.valor(mkAnt));
         return ec.replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
+      ${(()=>{const totalDias=EDS_DIAS.reduce((s,[dow])=>s+diasMesActual(dow),0);
+        return diasCell(totalDias).replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
     </tr>`:'';
   return `
     <div class="card" style="margin-bottom:16px">
@@ -2800,14 +2811,14 @@ RENDERERS.estadisticasDiaSemana = function(){
     const {meses, celdas, promMes}=edsAgregado();
     cuadros =
       edsCuadroHTML('1 · Venta total por día de la semana',
-        'Promedio de venta por ocurrencia registrada: monto total del día de la semana en el mes ÷ días de ese tipo CON registro en CAJA (p. ej. S/ 3,900 en 3 lunes operados → S/ 1,300; los días sin operación no cuentan).',
+        'Promedio de venta por ocurrencia válida: monto total del día de la semana en el mes ÷ días de ese tipo con venta > 0 en CAJA (p. ej. S/ 3,900 en 3 lunes operados → S/ 1,300). Los días con venta 0 se excluyen de todos los cálculos.',
         meses, celdas, c=>c.dias? c.sumMonto/c.dias : null, v=>fmtSoles(v),
         { label:'Promedio del mes', valor:mk=>promMes.get(mk)??null }) +
       edsCuadroHTML('2 · Promedio de número de ventas',
-        'Promedio del N° de ventas por día de la semana en cada mes (p. ej. promedio de todos los lunes del mes), redondeado siempre hacia arriba.',
+        'Promedio del N° de ventas por día de la semana en cada mes (solo días con venta > 0), redondeado siempre hacia arriba.',
         meses, celdas, c=>c.dias? c.sumN/c.dias : null, v=>Math.ceil(v-1e-9).toLocaleString('es-PE')) +
       edsCuadroHTML('3 · Ticket promedio',
-        'Venta total ÷ N° total de ventas por día de la semana en cada mes (no es promedio de promedios diarios).',
+        'Venta total ÷ N° total de ventas por día de la semana en cada mes (solo días con venta > 0; no es promedio de promedios diarios).',
         meses, celdas, c=>c.sumN? c.sumMonto/c.sumN : null,
         v=>'S/ '+v.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1}));
   }
