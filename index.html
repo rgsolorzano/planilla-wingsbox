@@ -2497,29 +2497,20 @@ function ventasMesesDeRango(desde,hasta){
 let evFilter = Object.assign({agrup:'dia', medio:'todos'}, ventasUlt12Meses());
 
 // Proyección del cierre del MES EN CURSO (solo aplica en agrupación por mes).
-// Fórmula: (ingresos acumulados / días trabajados transcurridos) × total de
-// días trabajados estimado del mes.
-// "Día trabajado" = fecha que existe en CAJA con ingreso total > 0 (los días
-// en 0 representan no-operación y no cuentan). El TOTAL de días trabajados no
-// usa días calendario: se estima con el promedio de días trabajados de los
-// últimos 3 meses COMPLETOS con registros en CAJA (patrón real de operación),
-// y nunca es menor a los días ya transcurridos del mes.
+// Fórmula: (ingresos acumulados / días efectivamente trabajados) × días de
+// operación PREVISTOS para el mes.
+// - Días trabajados: fechas del mes con ingreso total > 0.
+// - Días previstos: TODAS las fechas del mes en curso existentes en el tab
+//   CAJA (incluidas las futuras aún en 0), sin usar 30, 31 ni ningún número
+//   fijo: la fuente es exclusivamente la información real de CAJA.
 function evProyeccionMesActual(montoDe, hoyISO){
   const hoy = hoyISO || fechaHoy();
   const mk = hoy.slice(0,7);
-  const trabajados = ventasFacts.filter(f=>f.fecha.slice(0,7)===mk && (f.total||0)>0);
+  const delMes = ventasFacts.filter(f=>f.fecha.slice(0,7)===mk);
+  const trabajados = delMes.filter(f=>(f.total||0)>0);
   if(!trabajados.length) return null;
   const acum = trabajados.reduce((s,f)=>s+montoDe(f),0);
-  const [y,m] = mk.split('-').map(Number);
-  const prev=[];
-  for(let i=1; i<=6 && prev.length<3; i++){
-    const dt=new Date(y, (m-1)-i, 1);
-    const pk=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0');
-    const c=ventasFacts.filter(f=>f.fecha.slice(0,7)===pk && (f.total||0)>0).length;
-    if(c>0) prev.push(c);
-  }
-  const estimado = prev.length ? Math.round(prev.reduce((a,b)=>a+b,0)/prev.length) : trabajados.length;
-  const totalDias = Math.max(estimado, trabajados.length);
+  const totalDias = delMes.length; // fechas de operación del mes según CAJA
   return { valor:(acum/trabajados.length)*totalDias, transcurridos:trabajados.length, totalDias };
 }
 
@@ -2707,13 +2698,50 @@ function edsAgregado(){
     c.sumMonto+=f.total; c.sumN+=f.n; c.dias++;
     celdas.set(k,c);
   });
-  const datos={meses, celdas};
+  // "Promedio del mes" (Cuadro 1): para MESES CERRADOS = venta total del mes ÷ 30
+  // (divisor fijo pedido por especificación, sin importar 28/29/30/31 días);
+  // para el MES EN CURSO = suma de días con venta > 0 ÷ cantidad de esos días
+  // (los días sin venta o en 0 no reducen el promedio).
+  const mkHoy=fechaHoy().slice(0,7);
+  const promMes=new Map();
+  meses.forEach(mk=>{
+    const delMes=ventasEnRango(edsFilter.desde, edsFilter.hasta).filter(f=>f.fecha.slice(0,7)===mk);
+    if(!delMes.length){ promMes.set(mk,null); return; }
+    if(mk===mkHoy){
+      const conVenta=delMes.filter(f=>(f.total||0)>0);
+      promMes.set(mk, conVenta.length? conVenta.reduce((s,f)=>s+f.total,0)/conVenta.length : null);
+    }else{
+      promMes.set(mk, delMes.reduce((s,f)=>s+f.total,0)/30);
+    }
+  });
+  const datos={meses, celdas, promMes};
   ventasMensualCache={clave, datos};
   return datos;
 }
 
-function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear){
+// Celda de variación % mes en curso vs mes anterior: (actual/anterior)−1.
+// Verde si sube, rojo si baja, neutro en 0; "—" si el mes anterior es 0,
+// vacío o inexistente (no se divide entre cero).
+function edsVarCell(vAct, vAnt){
+  if(vAnt===null||vAnt===undefined||vAnt===0||vAct===null||vAct===undefined)
+    return `<td class="num" style="font-size:12px;color:#9ca3af;border-left:2px solid var(--c-line)">—</td>`;
+  const pct=(vAct/vAnt-1)*100;
+  const neutro=Math.abs(pct)<0.05; // se mostraría como 0.0%
+  const col=neutro?'#6b7280':(pct>0?'#15803d':'#b91c1c');
+  const signo=pct>0?'+':'';
+  return `<td class="num" style="font-size:12px;font-weight:700;color:${col};border-left:2px solid var(--c-line)">${signo}${pct.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1})}%</td>`;
+}
+// Mes en curso y su mes inmediatamente anterior (claves YYYY-MM)
+function edsMesActualYAnterior(){
+  const mkAct=fechaHoy().slice(0,7);
+  const [y,m]=mkAct.split('-').map(Number);
+  const d=new Date(y,(m-1)-1,1);
+  return { mkAct, mkAnt:d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0') };
+}
+
+function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExtra){
   // Recolectar valores para la escala automática del heatmap de ESTE cuadro
+  // (solo las filas de días; la fila extra no altera la escala del heatmap)
   const vals=[];
   const matriz=EDS_DIAS.map(([dow,nombre])=>{
     const fila=meses.map(mk=>{
@@ -2722,21 +2750,34 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear){
       if(v!==null) vals.push(v);
       return v;
     });
-    return {nombre, fila};
+    return {dow, nombre, fila};
   });
   const min=vals.length?Math.min(...vals):0, max=vals.length?Math.max(...vals):0;
-  const hdr=meses.map(mk=>`<th class="num" style="white-space:nowrap;font-size:11px">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`).join('');
-  const filas=matriz.map(({nombre,fila})=>`
+  const {mkAct, mkAnt}=edsMesActualYAnterior();
+  const valorDe=(dow,mk)=>{ const c=celdas.get(dow+'|'+mk); return c?calcular(c,dow,mk):null; };
+  const hdr=meses.map(mk=>`<th class="num" style="white-space:nowrap;font-size:11px">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`).join('')
+    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:2px solid var(--c-line)">Var. vs mes ant.</th>`;
+  const filas=matriz.map(({dow,nombre,fila})=>`
     <tr><td style="font-weight:600;white-space:nowrap">${nombre}</td>
       ${fila.map(v=>`<td class="num" style="${ventasHeatStyle(v,min,max)};font-size:12px">${v===null?'':formatear(v)}</td>`).join('')}
+      ${edsVarCell(valorDe(dow,mkAct), valorDe(dow,mkAnt))}
     </tr>`).join('');
+  // Fila extra opcional (p. ej. "Promedio del mes"): fuera de la escala del
+  // heatmap, con su propia celda de variación bajo la misma regla.
+  const extra=filaExtra?`
+    <tr><td style="font-weight:800;white-space:nowrap;background:#eef2ff;border-top:2px solid #c7d2fe">${filaExtra.label}</td>
+      ${meses.map(mk=>{const v=filaExtra.valor(mk);
+        return `<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;font-weight:700;font-size:12px">${v===null||v===undefined?'':formatear(v)}</td>`;}).join('')}
+      ${(()=>{const ec=edsVarCell(filaExtra.valor(mkAct), filaExtra.valor(mkAnt));
+        return ec.replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
+    </tr>`:'';
   return `
     <div class="card" style="margin-bottom:16px">
       <h2>${titulo}</h2>
       <p class="hint" style="margin-top:0">${subt}</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Día</th>${hdr}</tr></thead>
-        <tbody>${filas}</tbody>
+        <tbody>${filas}${extra}</tbody>
       </table></div>
     </div>`;
 }
@@ -2756,11 +2797,12 @@ RENDERERS.estadisticasDiaSemana = function(){
   if(!ventasFacts.length){
     cuadros=`<div class="card">${ventasSinDatosHTML()}</div>`;
   } else {
-    const {meses, celdas}=edsAgregado();
+    const {meses, celdas, promMes}=edsAgregado();
     cuadros =
       edsCuadroHTML('1 · Venta total por día de la semana',
         'Promedio de venta por ocurrencia registrada: monto total del día de la semana en el mes ÷ días de ese tipo CON registro en CAJA (p. ej. S/ 3,900 en 3 lunes operados → S/ 1,300; los días sin operación no cuentan).',
-        meses, celdas, c=>c.dias? c.sumMonto/c.dias : null, v=>fmtSoles(v)) +
+        meses, celdas, c=>c.dias? c.sumMonto/c.dias : null, v=>fmtSoles(v),
+        { label:'Promedio del mes', valor:mk=>promMes.get(mk)??null }) +
       edsCuadroHTML('2 · Promedio de número de ventas',
         'Promedio del N° de ventas por día de la semana en cada mes (p. ej. promedio de todos los lunes del mes), redondeado siempre hacia arriba.',
         meses, celdas, c=>c.dias? c.sumN/c.dias : null, v=>Math.ceil(v-1e-9).toLocaleString('es-PE')) +
