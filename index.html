@@ -1765,7 +1765,7 @@ function analDefaultFilter(){
     mesDesde: 1,
     añoHasta: años.length ? años.at(-1)   : _añoNow,
     mesHasta: 12,
-    grupo:'', plato:'', cantOp:'', cantVal:''
+    grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual'
   };
 }
 function gananciaDefaultFilter(){
@@ -1778,7 +1778,7 @@ function gananciaDefaultFilter(){
   };
 }
 
-let analFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12, grupo:'', plato:'', cantOp:'', cantVal:'' };
+let analFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12, grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual' };
 let gananciaFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12 };
 let analSort   = { col:'grupo', dir:'asc' };
 
@@ -1958,6 +1958,49 @@ function analMargenStyle(m,minM,maxM){
   // Fondo coloreado; texto oscuro para buena legibilidad
   return `background:hsl(${hue},70%,80%);color:hsl(${hue},60%,20%);font-weight:600`;
 }
+// Clave YYYY-MM del mes calendario ACTUAL, determinada dinámicamente
+// (nunca hardcodeada a un mes concreto).
+function analMesActualKey(){
+  const d=new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+}
+// Valor sobre el que se evalúa el filtro "Cant. total" según su ámbito:
+// - 'mesActual': cantidad vendida del mes calendario en curso; si el plato no
+//   tiene ventas ese mes (o la celda no existe en el rango) cuenta como 0.
+// - 'total': TOTAL general acumulado (comportamiento previo del filtro).
+function analCantFiltroValor(row, cols){
+  if((analFilter.cantAmbito||'mesActual')==='total') return analRowGrandTotal(row,cols);
+  const v=row.vals[analMesActualKey()];
+  return (v===null||v===undefined)?0:v;
+}
+// Comparador de filas del consolidado. REGLA FUNDAMENTAL: los grupos jamás se
+// mezclan — el orden alfabético de grupos es fijo (salvo el toggle del propio
+// encabezado GRUPO, que solo invierte el orden de los bloques) — y el criterio
+// activo (único a la vez) se aplica de forma independiente DENTRO de cada
+// grupo, con desempate estable por nombre de plato. Solo lectura: nunca
+// modifica filas ni cálculos.
+function analCompareRows(a,b,cols,colsByAño){
+  const sd=analSort.dir==='asc'?1:-1;
+  const g=(a.grupo||'').localeCompare(b.grupo||'');
+  if(g!==0) return analSort.col==='grupo' ? sd*g : g;
+  if(analSort.col==='grupo') return a.plato.localeCompare(b.plato);
+  let c=0;
+  if(analSort.col==='plato')       c=a.plato.localeCompare(b.plato);
+  else if(analSort.col==='precio') c=(a.precio||0)-(b.precio||0);
+  else if(analSort.col==='margen') c=(a.margen||0)-(b.margen||0);
+  else if(analSort.col==='total')  c=analRowGrandTotal(a,cols)-analRowGrandTotal(b,cols);
+  else if(analSort.col.startsWith('year_')){
+    const año=+analSort.col.split('_')[1];
+    c=analRowYearTotal(a,año,colsByAño)-analRowYearTotal(b,año,colsByAño);
+  }
+  else if(analSort.col.startsWith('mes_')){
+    const key=analSort.col.slice(4);
+    const va=a.vals[key], vb=b.vals[key];
+    c=((va===null||va===undefined)?0:va)-((vb===null||vb===undefined)?0:vb);
+  }
+  return sd*c || a.plato.localeCompare(b.plato);
+}
+
 window.analToggleSort=function(col){
   if(analSort.col===col) analSort.dir=analSort.dir==='asc'?'desc':'asc';
   else{ analSort.col=col; analSort.dir='asc'; }
@@ -1990,28 +2033,17 @@ RENDERERS.consolidadoVentas = function(){
   const {cols,colsByAño,años}=analBuildCols(filtered);
   let rows=analBuildRowMap(filtered);
 
-  // Filtro por cantidad total
+  // Filtro por cantidad (según ámbito: mes calendario en curso o total general)
   if(analFilter.cantOp&&analFilter.cantVal!==''){
     const cv=+analFilter.cantVal;
     rows=rows.filter(row=>{
-      const gt=analRowGrandTotal(row,cols);
-      return analFilter.cantOp==='gt'?gt>cv:analFilter.cantOp==='lt'?gt<cv:gt===cv;
+      const v=analCantFiltroValor(row,cols);
+      return analFilter.cantOp==='gt'?v>cv:analFilter.cantOp==='lt'?v<cv:v===cv;
     });
   }
 
-  // Ordenar
-  const sd=analSort.dir==='asc'?1:-1;
-  rows.sort((a,b)=>{
-    if(analSort.col==='plato')  return sd*a.plato.localeCompare(b.plato);
-    if(analSort.col==='precio') return sd*((a.precio||0)-(b.precio||0));
-    if(analSort.col==='margen') return sd*((a.margen||0)-(b.margen||0));
-    if(analSort.col==='total')  return sd*(analRowGrandTotal(a,cols)-analRowGrandTotal(b,cols));
-    if(analSort.col.startsWith('year_')){
-      const año=+analSort.col.split('_')[1];
-      return sd*(analRowYearTotal(a,año,colsByAño)-analRowYearTotal(b,año,colsByAño));
-    }
-    return sd*(a.grupo.localeCompare(b.grupo)||a.plato.localeCompare(b.plato));
-  });
+  // Ordenar: grupos siempre intactos; criterio único aplicado dentro de cada grupo
+  rows.sort((a,b)=>analCompareRows(a,b,cols,colsByAño));
 
   // Escala de color de margen
   const margenes=rows.map(r=>r.margen).filter(m=>m!==null);
@@ -2042,7 +2074,7 @@ RENDERERS.consolidadoVentas = function(){
   let hdr2='';
   años.forEach(año=>{
     (colsByAño[año]||[]).forEach(c=>{
-      hdr2+=`<th class="anal-hdr-mes num">${ANAL_MESES_ABREV[c.mes]}</th>`;
+      hdr2+=`<th class="anal-hdr-mes num">${sh('mes_'+c.key, ANAL_MESES_ABREV[c.mes])}</th>`;
     });
     hdr2+=`<th class="anal-hdr-subtotal num">${sh('year_'+año,'Total '+año)}</th>`;
   });
@@ -2108,6 +2140,10 @@ RENDERERS.consolidadoVentas = function(){
         <div class="field"><label>Grupo</label><select id="anFGrupo">${grpOpts}</select></div>
         <div class="field"><label>Plato</label><input id="anFPlato" value="${analFilter.plato}" placeholder="Buscar…" style="max-width:140px"></div>
         <div class="field"><label>Cant. total</label><div style="display:flex;gap:4px">
+          <select id="anFAmbito" style="min-width:104px" title="Sobre qué valor se evalúa la condición">
+            <option value="mesActual" ${(analFilter.cantAmbito||'mesActual')==='mesActual'?'selected':''}>Mes en curso</option>
+            <option value="total" ${analFilter.cantAmbito==='total'?'selected':''}>Total</option>
+          </select>
           <select id="anFOp" style="min-width:44px"><option value="">—</option>
             <option value="gt" ${analFilter.cantOp==='gt'?'selected':''}>&gt;</option>
             <option value="lt" ${analFilter.cantOp==='lt'?'selected':''}>&lt;</option>
@@ -2144,11 +2180,12 @@ RENDERERS.consolidadoVentas = function(){
       grupo:document.getElementById('anFGrupo').value,
       plato:document.getElementById('anFPlato').value,
       cantOp:document.getElementById('anFOp').value,
-      cantVal:document.getElementById('anFVal').value
+      cantVal:document.getElementById('anFVal').value,
+      cantAmbito:document.getElementById('anFAmbito').value
     };
     RENDERERS.consolidadoVentas();
   };
-  ['anFM1','anFA1','anFM2','anFA2','anFGrupo','anFOp'].forEach(id=>{const el_=document.getElementById(id);if(el_)el_.onchange=applyF;});
+  ['anFM1','anFA1','anFM2','anFA2','anFGrupo','anFOp','anFAmbito'].forEach(id=>{const el_=document.getElementById(id);if(el_)el_.onchange=applyF;});
   // Debounce los inputs de texto para no re-renderizar con cada tecla (evita pérdida de foco)
   const pEl=document.getElementById('anFPlato'), vEl=document.getElementById('anFVal');
   let _analDebounce=null;
