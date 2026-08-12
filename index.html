@@ -2384,7 +2384,17 @@ const K_VENTAS_META = 'ventas_meta';
 // de los medios de pago y se agregó Izipay): Efectivo=AB, Bancos=AC, Rappi=AD,
 // PedidosYa=AE, DIDI=AF+AG, Tarjetas=AH, Izipay=AI (nuevo), MercadoPago=AJ,
 // Ingreso total del día=AK. Índices 0-based (A=0).
-const VENTAS_FACTS_VERSION = 2; // versión del esquema de facts cacheados
+const VENTAS_FACTS_VERSION = 3; // versión del esquema de facts cacheados
+// Columnas de INGRESO BRUTO de CAJA (análisis de composición — NO confundir
+// con las columnas de medios de pago AB..AJ usadas por los demás cálculos):
+// F=Efectivo, G=Yape, H=Plin, I=Izipay, J=Rappi, K=PedidosYa, N=Tarjeta,
+// O=MercadoPago, P=Ingreso total bruto. Índices 0-based.
+const VENTAS_COL_BRUTO = { efectivo:5, yape:6, plin:7, izipay:8, rappi:9, pedidosya:10, tarjeta:13, mercadopago:14, total:15 };
+const BRUTO_MEDIOS = [
+  ['efectivo','Efectivo','#f59e0b'], ['yape','Yape','#7c3aed'], ['plin','Plin','#06b6d4'],
+  ['izipay','Izipay','#dc2626'], ['rappi','Rappi','#ea580c'], ['pedidosya','Pedidos Ya','#be185d'],
+  ['tarjeta','Tarjeta','#2563eb'], ['mercadopago','Mercado Pago','#059669']
+];
 const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:27, bancos:28, rappi:29, pedidosya:30, didi1:31, didi2:32, tarjetas:33, izipay:34, mercadopago:35, ingresoDia:36 };
 const VENTAS_MEDIOS = [
   ['efectivo','Efectivo'], ['bancos','Bancos'], ['rappi','Rappi'], ['pedidosya','PedidosYa'],
@@ -2439,7 +2449,8 @@ async function ventasSync(){
       wb++;
       const num = v => { const n=analNumOrNull(v); return n===null?0:n; };
       let f = porDia.get(fecha);
-      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, izipay:0, mercadopago:0, total:0, ing:0}; porDia.set(fecha,f); }
+      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, izipay:0, mercadopago:0, total:0, ing:0,
+        bruto:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0,total:0}}; porDia.set(fecha,f); }
       f.n           += num(row[VENTAS_COL.nVentas]);
       f.efectivo    += num(row[VENTAS_COL.efectivo]);
       f.bancos      += num(row[VENTAS_COL.bancos]);
@@ -2449,7 +2460,9 @@ async function ventasSync(){
       f.tarjetas    += num(row[VENTAS_COL.tarjetas]);
       f.izipay      += num(row[VENTAS_COL.izipay]);
       f.mercadopago += num(row[VENTAS_COL.mercadopago]);
-      f.ing         += num(row[VENTAS_COL.ingresoDia]); // Ingreso del día (col. AI) — usado por Flujo de Caja
+      f.ing         += num(row[VENTAS_COL.ingresoDia]); // Ingreso del día (col. AK) — usado por Flujo de Caja
+      // Ingresos BRUTOS (cols. F..P) — usados solo por el gráfico de composición
+      Object.keys(VENTAS_COL_BRUTO).forEach(k=>{ f.bruto[k]+=num(row[VENTAS_COL_BRUTO[k]]); });
     });
     porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.izipay+f.mercadopago; });
     ventasFacts = [...porDia.values()].sort((a,b)=>a.fecha<b.fecha?-1:1);
@@ -2488,10 +2501,12 @@ async function ventasWriteFactsSheet(){
   }
   await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:L']})
+    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:V']})
   });
-  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','Izipay','MercadoPago','Total','IngresoDia'],
-    ...ventasFacts.map(f=>[f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.izipay||0,f.mercadopago,f.total,f.ing||0])];
+  const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','Izipay','MercadoPago','Total','IngresoDia',
+      'BrutoEfectivo','BrutoYape','BrutoPlin','BrutoIzipay','BrutoRappi','BrutoPedidosYa','BrutoTarjeta','BrutoMercadoPago','BrutoTotal'],
+    ...ventasFacts.map(f=>{const b=f.bruto||{};return [f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.izipay||0,f.mercadopago,f.total,f.ing||0,
+      b.efectivo||0,b.yape||0,b.plin||0,b.izipay||0,b.rappi||0,b.pedidosya||0,b.tarjeta||0,b.mercadopago||0,b.total||0];})];
   await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({valueInputOption:'RAW', data:[{range:VENTAS_SHEET_FACTS+'!A1', majorDimension:'ROWS', values:matrix}]})
@@ -2531,7 +2546,7 @@ function ventasMesesDeRango(desde,hasta){
 /* ================================================================
    DASHBOARD 1 — EVOLUCIÓN DE VENTAS
    ================================================================ */
-let evFilter = Object.assign({agrup:'dia', medio:'todos'}, ventasUlt12Meses());
+let evFilter = Object.assign({agrup:'mes', medio:'todos'}, ventasUlt12Meses());
 
 // Proyección del cierre del MES EN CURSO (solo aplica en agrupación por mes).
 // Fórmula: (ingresos acumulados / días efectivamente trabajados) × días de
@@ -2628,6 +2643,75 @@ function evChartSVG(serie){
   </div>`;
 }
 
+/* ── Composición de INGRESOS BRUTOS (análisis nuevo; cols. F..P de CAJA) ──
+   Gráfico independiente dentro de Evolución de Ventas, con filtros PROPIOS:
+   Desde/Hasta (default últimos 12 meses), Agrupar por (default Día) y Tipo de
+   ingreso (default Todos = 8 líneas). Los períodos con ingreso bruto total = 0
+   se tratan como AUSENCIA de información (no aparecen como 0%). */
+let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUlt12Meses());
+
+// Puntos {key,label, brutos:{medio→monto}, total} por día o mes del rango,
+// EXCLUYENDO períodos con total bruto = 0 (evita divisiones entre cero).
+// Mensual: primero SUMA los brutos del mes y recién ahí se calcula el %
+// (SUM(medio)/SUM(total)); nunca se promedian porcentajes diarios.
+function evbBuildSerie(){
+  const enRango=ventasEnRango(evbFilter.desde, evbFilter.hasta).filter(f=>f.bruto);
+  if(evbFilter.agrup==='dia'){
+    return enRango.filter(f=>(f.bruto.total||0)>0).map(f=>({
+      key:f.fecha, label:fmtFechaCorta(f.fecha), brutos:f.bruto, total:f.bruto.total
+    }));
+  }
+  const porMes=new Map();
+  enRango.forEach(f=>{
+    const mk=f.fecha.slice(0,7);
+    let p=porMes.get(mk);
+    if(!p){ p={key:mk, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; porMes.set(mk,p); }
+    BRUTO_MEDIOS.forEach(([k])=>{ p.brutos[k]+=f.bruto[k]||0; });
+    p.total+=f.bruto.total||0;
+  });
+  return [...porMes.values()].filter(p=>p.total>0).sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
+}
+
+const evbPct=(p,medio)=> p.total>0 ? (p.brutos[medio]||0)/p.total*100 : null;
+const fmtPct1=v=>v.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1})+'%';
+
+function evbChartSVG(serie, medios){
+  const W=940,H=360,mL=52,mR=16,mT=14,mB=50;
+  const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
+  const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+  const maxP=Math.min(100, Math.max(10, ...serie.flatMap(p=>medios.map(([k])=>evbPct(p,k)||0)))*1.1);
+  const Y=v=> mT+ih-(v/maxP)*ih;
+  let grid='';
+  for(let g=0; g<=4; g++){
+    const v=maxP*g/4, y=Y(v);
+    grid+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e9e7f5"/>`+
+      `<text x="${mL-8}" y="${y+4}" text-anchor="end" font-size="10" fill="#6b7280">${v.toFixed(0)}%</text>`;
+  }
+  const paso=Math.max(1,Math.ceil(n/12));
+  let xlab='';
+  serie.forEach((p,i)=>{ if(i%paso && i!==n-1) return;
+    xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`; });
+  const lineas=medios.map(([k,,color])=>{
+    const d=serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(evbPct(p,k)).toFixed(1)).join(' ');
+    const circ=(n<=62||medios.length===1)? serie.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(evbPct(p,k)).toFixed(1)}" r="2.4" fill="${color}"/>`).join('') : '';
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.9"/>`+circ;
+  }).join('');
+  return `
+  <div style="position:relative">
+    <svg id="evbSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+      ${grid}
+      <line id="evbGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
+      ${lineas}${xlab}
+      <line x1="${mL}" y1="${mT+ih}" x2="${W-mR}" y2="${mT+ih}" stroke="#c7c3e0"/>
+    </svg>
+    <div id="evbTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:7px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 4px;font-size:12px">
+    ${medios.map(([,lbl,color])=>`<span><span style="display:inline-block;width:18px;height:3px;background:${color};vertical-align:middle;margin-right:5px"></span>${lbl}</span>`).join('')}
+  </div>`;
+}
+
 RENDERERS.evolucionVentas = function(){
   const el=document.getElementById('page-evolucionVentas');
   if(!el) return;
@@ -2667,6 +2751,26 @@ RENDERERS.evolucionVentas = function(){
       <div class="item"><div class="l">${evFilter.medio==='todos'?'Ingreso total':'Ingreso · '+(VENTAS_MEDIOS.find(m=>m[0]===evFilter.medio)||['',''])[1]}</div><div class="v">${fmtSoles(totM)}</div></div>
       <div class="item"><div class="l">Cantidad de ventas</div><div class="v">${totC.toLocaleString('es-PE')}</div></div>
       <div class="item"><div class="l">Ticket promedio del rango</div><div class="v">${totC?fmtSolesDec(totM/totC):'—'}</div></div>
+    </div>
+    <div class="card">
+      <h2>🧮 Composición de ingresos brutos (%)</h2>
+      <p class="hint" style="margin-top:0">Participación de cada medio sobre el ingreso bruto total (cols. F..P de CAJA, solo registros WB). Filtros independientes del gráfico principal. Los períodos con ingreso bruto total en 0 no se grafican.</p>
+      <div class="toolbar" style="flex-wrap:wrap">
+        <div class="field"><label>Desde</label><input type="date" id="evbDesde" value="${evbFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="evbHasta" value="${evbFilter.hasta}"></div>
+        <div class="field"><label>Agrupar por</label>
+          <select id="evbAgrup"><option value="dia" ${evbFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="mes" ${evbFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
+        <div class="field"><label>Tipo de ingreso</label>
+          <select id="evbTipo"><option value="todos" ${evbFilter.tipo==='todos'?'selected':''}>Todos</option>
+            ${BRUTO_MEDIOS.map(([k,lbl])=>`<option value="${k}" ${evbFilter.tipo===k?'selected':''}>${lbl}</option>`).join('')}
+          </select></div>
+        <button class="btn btn-ghost btn-sm" id="evbReset" style="align-self:flex-end">Últimos 12 meses</button>
+      </div>
+      ${(()=>{ const s=evbBuildSerie();
+        if(!s.length) return `<div class="empty">Sin datos brutos en el rango. Si acabas de actualizar la app, presiona 🔄 Actualizar ventas.</div>`;
+        const medios=evbFilter.tipo==='todos'? BRUTO_MEDIOS : BRUTO_MEDIOS.filter(([k])=>k===evbFilter.tipo);
+        return evbChartSVG(s, medios); })()}
     </div>`;
   document.getElementById('evSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
@@ -2703,6 +2807,44 @@ RENDERERS.evolucionVentas = function(){
       tip.style.top='8px';
     };
     svg.onmouseleave=()=>{ tip.style.display='none'; guide.style.display='none'; };
+  }
+  // ── Filtros del gráfico de composición (independientes de evFilter) ──
+  const applyB=()=>{
+    const d=document.getElementById('evbDesde').value, h=document.getElementById('evbHasta').value;
+    if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+    if(d) evbFilter.desde=d; if(h) evbFilter.hasta=h;
+    evbFilter.agrup=document.getElementById('evbAgrup').value;
+    evbFilter.tipo=document.getElementById('evbTipo').value;
+    RENDERERS.evolucionVentas(); // evFilter (gráfico principal) permanece intacto
+  };
+  ['evbDesde','evbHasta','evbAgrup','evbTipo'].forEach(id=>{const e=document.getElementById(id); if(e) e.onchange=applyB;});
+  const rB=document.getElementById('evbReset');
+  if(rB) rB.onclick=()=>{ evbFilter=Object.assign({agrup:evbFilter.agrup, tipo:evbFilter.tipo}, ventasUlt12Meses()); RENDERERS.evolucionVentas(); };
+  // Tooltip: período, cada medio visible con monto bruto, total bruto y %
+  const svgB=document.getElementById('evbSvg');
+  if(svgB){
+    const serieB=evbBuildSerie();
+    if(serieB.length){
+      const mediosB=evbFilter.tipo==='todos'? BRUTO_MEDIOS : BRUTO_MEDIOS.filter(([k])=>k===evbFilter.tipo);
+      const tipB=document.getElementById('evbTip'), guideB=document.getElementById('evbGuide');
+      const W=940, mL=52, mR=16, iw=W-mL-mR, n=serieB.length;
+      const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+      svgB.onmousemove=e=>{
+        const rect=svgB.getBoundingClientRect();
+        const vx=(e.clientX-rect.left)/rect.width*W;
+        let i=Math.round((vx-mL)/(n>1?iw/(n-1):1)); i=Math.max(0,Math.min(n-1,i));
+        const p=serieB[i];
+        guideB.style.display='block'; guideB.setAttribute('x1',X(i)); guideB.setAttribute('x2',X(i));
+        const filasT=[...mediosB].sort((a,b)=>(evbPct(p,b[0])||0)-(evbPct(p,a[0])||0))
+          .map(([k,lbl,color])=>`<span style="color:${color}">●</span> ${lbl}: ${fmtSolesDec(p.brutos[k]||0)} · ${fmtPct1(evbPct(p,k)||0)}`).join('<br>');
+        tipB.innerHTML=`<b>${p.label}</b><br>${filasT}<br><span style="opacity:.8">Ingreso bruto total: ${fmtSolesDec(p.total)}</span>`;
+        tipB.style.display='block';
+        const px=X(i)/W*rect.width;
+        tipB.style.left=Math.min(rect.width-220, Math.max(0, px+10))+'px';
+        tipB.style.top='6px';
+      };
+      svgB.onmouseleave=()=>{ tipB.style.display='none'; guideB.style.display='none'; };
+    }
   }
 };
 
@@ -2753,7 +2895,17 @@ function edsAgregado(){
       promMes.set(mk, delMes.reduce((s,f)=>s+f.total,0)/30);
     }
   });
-  const datos={meses, celdas, promMes};
+  // "Ticket promedio del mes" (Cuadro 3): monto total del mes ÷ N° total de
+  // ventas del mes, calculado sobre los TOTALES reales (jamás promediando los
+  // tickets de los días de la semana ni tickets diarios). Solo días con
+  // venta > 0, como todo el módulo; sin ventas en el mes → null (celda vacía).
+  const ticketMes=new Map();
+  meses.forEach(mk=>{
+    let sm=0, sn=0;
+    EDS_DIAS.forEach(([dow])=>{ const c=celdas.get(dow+'|'+mk); if(c){ sm+=c.sumMonto; sn+=c.sumN; } });
+    ticketMes.set(mk, sn>0 ? sm/sn : null);
+  });
+  const datos={meses, celdas, promMes, ticketMes};
   ventasMensualCache={clave, datos};
   return datos;
 }
@@ -2845,7 +2997,7 @@ RENDERERS.estadisticasDiaSemana = function(){
   if(!ventasFacts.length){
     cuadros=`<div class="card">${ventasSinDatosHTML()}</div>`;
   } else {
-    const {meses, celdas, promMes}=edsAgregado();
+    const {meses, celdas, promMes, ticketMes}=edsAgregado();
     cuadros =
       edsCuadroHTML('1 · Venta total por día de la semana',
         'Promedio de venta por ocurrencia válida: monto total del día de la semana en el mes ÷ días de ese tipo con venta > 0 en CAJA (p. ej. S/ 3,900 en 3 lunes operados → S/ 1,300). Los días con venta 0 se excluyen de todos los cálculos.',
@@ -2857,7 +3009,8 @@ RENDERERS.estadisticasDiaSemana = function(){
       edsCuadroHTML('3 · Ticket promedio',
         'Venta total ÷ N° total de ventas por día de la semana en cada mes (solo días con venta > 0; no es promedio de promedios diarios).',
         meses, celdas, c=>c.sumN? c.sumMonto/c.sumN : null,
-        v=>'S/ '+v.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1}));
+        v=>'S/ '+v.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1}),
+        { label:'Ticket promedio del mes', valor:mk=>ticketMes.get(mk)??null });
   }
   el.innerHTML=`
     <div class="page-head"><div><h1>🗓️ Estadísticas por Día de la Semana</h1>
@@ -3015,16 +3168,30 @@ const FLUJO_INGRESOS = [
   { id:'reales', label:'Ingresos reales', valorMes:(mes,D)=> D.ingresosMes.get(mes)||0 }
 ];
 
+// Resumen mensual de ingresos (CAJA col. AK) y egresos (COMPRAS) para un
+// rango dado. ÚNICA fuente de la Ganancia Neta mensual: la usan tanto la
+// tabla del flujo como el gráfico de evolución, garantizando que siempre
+// coincidan (misma fórmula: ganancia = ingresos del mes − egresos del mes).
+function flujoResumenMensual(desde, hasta){
+  const ingresosMes=new Map();
+  ventasEnRango(desde, hasta).forEach(f=>{
+    const mk=f.fecha.slice(0,7);
+    ingresosMes.set(mk,(ingresosMes.get(mk)||0)+(f.ing||0));
+  });
+  const egresosMesR=new Map();
+  comprasFacts.forEach(f=>{
+    if(f.fecha<desde || f.fecha>hasta) return;
+    const mk=f.fecha.slice(0,7);
+    egresosMesR.set(mk,(egresosMesR.get(mk)||0)+f.monto);
+  });
+  return {ingresosMes, egresosMes:egresosMesR};
+}
+
 function flujoDatos(){
   const clave=fcFilter.desde+'|'+fcFilter.hasta+'|'+(ventasMeta?ventasMeta.lastSync:'')+'|'+(comprasMeta?comprasMeta.lastSync:'');
   if(flujoCache.clave===clave) return flujoCache.datos;
   const meses=ventasMesesDeRango(fcFilter.desde, fcFilter.hasta);
-  // Ingresos por mes (col. AI de CAJA, ya agregada por día en ventasFacts.ing)
-  const ingresosMes=new Map();
-  ventasEnRango(fcFilter.desde, fcFilter.hasta).forEach(f=>{
-    const mk=f.fecha.slice(0,7);
-    ingresosMes.set(mk,(ingresosMes.get(mk)||0)+(f.ing||0));
-  });
+  const {ingresosMes}=flujoResumenMensual(fcFilter.desde, fcFilter.hasta);
   // Egresos por (tipo, mes) — el pivote respeta el rango seleccionado
   const egresosTipoMes=new Map(); // tipo → Map(mes→monto)
   const egresosMes=new Map();     // mes → total egresos
@@ -3053,6 +3220,59 @@ function flujoDatos(){
   D.gananciaMes=gananciaMes;
   flujoCache={clave, datos:D};
   return D;
+}
+
+// ── Gráfico de evolución de Ganancia Neta ─────────────────────────
+// Filtro PROPIO e independiente del filtro de la tabla (fcFilter):
+// cambiar uno jamás modifica el otro. Default: año calendario actual.
+let fcgFilter = flujoAnioActual();
+
+function flujoGananciaSerie(){
+  const meses=ventasMesesDeRango(fcgFilter.desde, fcgFilter.hasta);
+  const {ingresosMes, egresosMes}=flujoResumenMensual(fcgFilter.desde, fcgFilter.hasta);
+  return meses.map(mk=>({
+    key:mk, label:ANAL_MESES_ABREV[+mk.slice(5)]+' '+mk.slice(2,4),
+    ing:ingresosMes.get(mk)||0, egr:egresosMes.get(mk)||0,
+    gan:(ingresosMes.get(mk)||0)-(egresosMes.get(mk)||0)
+  }));
+}
+
+// SVG de líneas con soporte de valores negativos (línea de cero visible).
+function flujoGananciaSVG(serie){
+  const W=940,H=300,mL=84,mR=20,mT=16,mB=44;
+  const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
+  const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+  let maxV=Math.max(0,...serie.map(p=>p.gan)), minV=Math.min(0,...serie.map(p=>p.gan));
+  if(maxV===minV){ maxV+=1; minV-=1; }
+  const pad=(maxV-minV)*0.08; maxV+=pad; minV-=pad;
+  const Y=v=> mT+ih-((v-minV)/(maxV-minV))*ih;
+  const path=serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(p.gan).toFixed(1)).join(' ');
+  let grid='';
+  for(let g=0; g<=4; g++){
+    const v=minV+(maxV-minV)*g/4, y=Y(v);
+    grid+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e9e7f5"/>`+
+      `<text x="${mL-8}" y="${y+4}" text-anchor="end" font-size="10" fill="#6b7280">${fmtSoles(v)}</text>`;
+  }
+  const y0=Y(0);
+  const paso=Math.max(1,Math.ceil(n/12));
+  let xlab='';
+  serie.forEach((p,i)=>{ if(i%paso && i!==n-1) return;
+    xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`; });
+  const puntos=serie.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(p.gan).toFixed(1)}" r="3.4" fill="${p.gan>=0?'#16a34a':'#dc2626'}">
+    <title>${p.label}
+Ingresos: ${fmtSolesDec(p.ing)}
+Egresos: ${fmtSolesDec(p.egr)}
+Ganancia neta: ${fmtSolesDec(p.gan)}</title></circle>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+    ${grid}
+    <line x1="${mL}" y1="${y0}" x2="${W-mR}" y2="${y0}" stroke="#9ca3af" stroke-width="1.4" stroke-dasharray="5 4"/>
+    <path d="${path}" fill="none" stroke="#7c3aed" stroke-width="2.4"/>
+    ${puntos}${xlab}
+  </svg>
+  <div style="display:flex;gap:16px;padding:6px 4px;font-size:12px">
+    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#16a34a;vertical-align:middle;margin-right:5px"></span>Mes con ganancia</span>
+    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc2626;vertical-align:middle;margin-right:5px"></span>Mes con pérdida</span>
+  </div>`;
 }
 
 // ── Renderer ──────────────────────────────────────────────────────
@@ -3153,7 +3373,27 @@ RENDERERS.flujoCaja = function(){
         La columna resaltada corresponde al mes actual. Los tipos de gasto se generan automáticamente desde la columna F de COMPRAS y se muestran en orden alfabético (A→Z), estable en todas las consultas.
       </p>`:
       `<div class="empty" style="padding:40px;text-align:center">Sin datos. Presiona <b>🔄 Actualizar datos</b> para sincronizar CAJA y COMPRAS.</div>`}
+    </div>
+    <div class="card">
+      <h2>📈 Evolución de Ganancia Neta</h2>
+      <p class="hint" style="margin-top:0">Misma Ganancia Neta mensual de la tabla (ingresos − egresos). Este rango es <b>independiente</b> del filtro de la tabla.</p>
+      <div class="toolbar">
+        <div class="field"><label>Desde</label><input type="date" id="fcgDesde" value="${fcgFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="fcgHasta" value="${fcgFilter.hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="fcgReset" style="align-self:flex-end">Año actual</button>
+      </div>
+      ${hayDatos? flujoGananciaSVG(flujoGananciaSerie()) : `<div class="empty">Sin datos para graficar.</div>`}
     </div>`;
+
+  ['fcgDesde','fcgHasta'].forEach(id=>{
+    document.getElementById(id).onchange=()=>{
+      const d=document.getElementById('fcgDesde').value, h=document.getElementById('fcgHasta').value;
+      if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+      if(d) fcgFilter.desde=d; if(h) fcgFilter.hasta=h;
+      RENDERERS.flujoCaja(); // fcFilter (tabla) permanece intacto
+    };
+  });
+  document.getElementById('fcgReset').onclick=()=>{ fcgFilter=flujoAnioActual(); RENDERERS.flujoCaja(); };
 
   document.getElementById('fcSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
