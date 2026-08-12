@@ -2514,12 +2514,15 @@ async function ventasWriteFactsSheet(){
 }
 
 // ── Helpers comunes ───────────────────────────────────────────────
-function ventasUlt12Meses(){
+// Rango MÓVIL de los últimos n meses hasta HOY (no meses calendario completos).
+// Utilidad única reutilizada por todos los filtros de fecha de Analítica.
+function ventasUltNMeses(n){
   const hoy=new Date();
-  const d=new Date(hoy.getFullYear(), hoy.getMonth()-11, 1);
+  const d=new Date(hoy.getFullYear(), hoy.getMonth()-n, hoy.getDate());
   const fmt=x=>x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
   return {desde:fmt(d), hasta:fmt(hoy)};
 }
+function ventasUlt12Meses(){ return ventasUltNMeses(12); }
 function ventasEnRango(desde,hasta){
   return ventasFacts.filter(f=>f.fecha>=desde && f.fecha<=hasta);
 }
@@ -2648,7 +2651,7 @@ function evChartSVG(serie){
    Desde/Hasta (default últimos 12 meses), Agrupar por (default Día) y Tipo de
    ingreso (default Todos = 8 líneas). Los períodos con ingreso bruto total = 0
    se tratan como AUSENCIA de información (no aparecen como 0%). */
-let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUlt12Meses());
+let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUltNMeses(2));
 
 // Puntos {key,label, brutos:{medio→monto}, total} por día o mes del rango,
 // EXCLUYENDO períodos con total bruto = 0 (evita divisiones entre cero).
@@ -2676,6 +2679,15 @@ function evbBuildSerie(){
 const evbPct=(p,medio)=> p.total>0 ? (p.brutos[medio]||0)/p.total*100 : null;
 const fmtPct1=v=>v.toLocaleString('es-PE',{minimumFractionDigits:1,maximumFractionDigits:1})+'%';
 
+// Promedio de los porcentajes VÁLIDOS actualmente visibles en el gráfico
+// (respeta rango y agrupación; la serie ya excluye períodos con total bruto 0).
+// Devuelve null si no aplica (p. ej. "Todos" o sin puntos).
+function evbPromedioMedio(serie, medio){
+  if(!medio || medio==='todos' || !serie.length) return null;
+  const vals=serie.map(p=>evbPct(p,medio)).filter(v=>v!==null && v!==undefined);
+  return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
+}
+
 function evbChartSVG(serie, medios){
   const W=940,H=360,mL=52,mR=16,mT=14,mB=50;
   const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
@@ -2692,6 +2704,16 @@ function evbChartSVG(serie, medios){
   let xlab='';
   serie.forEach((p,i)=>{ if(i%paso && i!==n-1) return;
     xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`; });
+  // Línea horizontal punteada del promedio: solo cuando hay UN medio elegido.
+  const medioUnico = medios.length===1 ? medios[0] : null;
+  const prom = medioUnico ? evbPromedioMedio(serie, medioUnico[0]) : null;
+  const promLinea = (prom!==null && prom<=maxP) ? (()=>{ const y=Y(prom);
+    return `<g id="evbProm">
+      <line x1="${mL}" y1="${y.toFixed(1)}" x2="${W-mR}" y2="${y.toFixed(1)}" stroke="${medioUnico[2]}" stroke-width="1.6" stroke-dasharray="7 5" opacity="0.75"/>
+      <rect x="${mL}" y="${(y-7).toFixed(1)}" width="${iw}" height="14" fill="transparent" style="pointer-events:all;cursor:default"
+        data-prom="${fmtPct1(prom)}" data-medio="${medioUnico[1]}"/>
+      <text x="${W-mR-4}" y="${(y-5).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="${medioUnico[2]}">Prom. ${fmtPct1(prom)}</text>
+    </g>`; })() : '';
   const lineas=medios.map(([k,,color])=>{
     const d=serie.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(evbPct(p,k)).toFixed(1)).join(' ');
     const circ=(n<=62||medios.length===1)? serie.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(evbPct(p,k)).toFixed(1)}" r="2.4" fill="${color}"/>`).join('') : '';
@@ -2702,7 +2724,7 @@ function evbChartSVG(serie, medios){
     <svg id="evbSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
       ${grid}
       <line id="evbGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
-      ${lineas}${xlab}
+      ${promLinea}${lineas}${xlab}
       <line x1="${mL}" y1="${mT+ih}" x2="${W-mR}" y2="${mT+ih}" stroke="#c7c3e0"/>
     </svg>
     <div id="evbTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:7px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
@@ -2765,7 +2787,7 @@ RENDERERS.evolucionVentas = function(){
           <select id="evbTipo"><option value="todos" ${evbFilter.tipo==='todos'?'selected':''}>Todos</option>
             ${BRUTO_MEDIOS.map(([k,lbl])=>`<option value="${k}" ${evbFilter.tipo===k?'selected':''}>${lbl}</option>`).join('')}
           </select></div>
-        <button class="btn btn-ghost btn-sm" id="evbReset" style="align-self:flex-end">Últimos 12 meses</button>
+        <button class="btn btn-ghost btn-sm" id="evbReset" style="align-self:flex-end">Últimos 2 meses</button>
       </div>
       ${(()=>{ const s=evbBuildSerie();
         if(!s.length) return `<div class="empty">Sin datos brutos en el rango. Si acabas de actualizar la app, presiona 🔄 Actualizar ventas.</div>`;
@@ -2819,7 +2841,7 @@ RENDERERS.evolucionVentas = function(){
   };
   ['evbDesde','evbHasta','evbAgrup','evbTipo'].forEach(id=>{const e=document.getElementById(id); if(e) e.onchange=applyB;});
   const rB=document.getElementById('evbReset');
-  if(rB) rB.onclick=()=>{ evbFilter=Object.assign({agrup:evbFilter.agrup, tipo:evbFilter.tipo}, ventasUlt12Meses()); RENDERERS.evolucionVentas(); };
+  if(rB) rB.onclick=()=>{ evbFilter=Object.assign({agrup:evbFilter.agrup, tipo:evbFilter.tipo}, ventasUltNMeses(2)); RENDERERS.evolucionVentas(); };
   // Tooltip: período, cada medio visible con monto bruto, total bruto y %
   const svgB=document.getElementById('evbSvg');
   if(svgB){
@@ -2843,6 +2865,19 @@ RENDERERS.evolucionVentas = function(){
         tipB.style.left=Math.min(rect.width-220, Math.max(0, px+10))+'px';
         tipB.style.top='6px';
       };
+      // Tooltip inmediato de la línea de promedio (mismo div flotante, sin <title>)
+      const zonaProm=svgB.querySelector('#evbProm rect');
+      if(zonaProm){
+        zonaProm.onmouseenter=e=>{
+          const rect=svgB.getBoundingClientRect();
+          tipB.innerHTML=`<b>Promedio ${zonaProm.dataset.medio}</b><br>${zonaProm.dataset.prom}`;
+          tipB.style.display='block';
+          tipB.style.left=Math.min(rect.width-180, Math.max(0,(e.clientX-rect.left)+10))+'px';
+          tipB.style.top='6px';
+          e.stopPropagation();
+        };
+        zonaProm.onmousemove=e=>{ e.stopPropagation(); };
+      }
       svgB.onmouseleave=()=>{ tipB.style.display='none'; guideB.style.display='none'; };
     }
   }
@@ -3155,11 +3190,7 @@ async function flujoSync(){
 }
 
 // ── Filtro y agregación ───────────────────────────────────────────
-function flujoAnioActual(){
-  const y=new Date().getFullYear();
-  return {desde:y+'-01-01', hasta:y+'-12-31'};
-}
-let fcFilter = flujoAnioActual();
+let fcFilter = ventasUltNMeses(12);
 let flujoCache = {clave:null, datos:null};
 
 // Estructura EXTENSIBLE de conceptos de ingreso: para agregar un concepto
@@ -3225,7 +3256,7 @@ function flujoDatos(){
 // ── Gráfico de evolución de Ganancia Neta ─────────────────────────
 // Filtro PROPIO e independiente del filtro de la tabla (fcFilter):
 // cambiar uno jamás modifica el otro. Default: año calendario actual.
-let fcgFilter = flujoAnioActual();
+let fcgFilter = ventasUltNMeses(12);
 
 function flujoGananciaSerie(){
   const meses=ventasMesesDeRango(fcgFilter.desde, fcgFilter.hasta);
@@ -3258,17 +3289,17 @@ function flujoGananciaSVG(serie){
   let xlab='';
   serie.forEach((p,i)=>{ if(i%paso && i!==n-1) return;
     xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`; });
-  const puntos=serie.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(p.gan).toFixed(1)}" r="3.4" fill="${p.gan>=0?'#16a34a':'#dc2626'}">
-    <title>${p.label}
-Ingresos: ${fmtSolesDec(p.ing)}
-Egresos: ${fmtSolesDec(p.egr)}
-Ganancia neta: ${fmtSolesDec(p.gan)}</title></circle>`).join('');
-  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+  const puntos=serie.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(p.gan).toFixed(1)}" r="3.4" fill="${p.gan>=0?'#16a34a':'#dc2626'}"/>`).join('');
+  return `<div style="position:relative">
+  <svg id="fcgSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
     ${grid}
+    <line id="fcgGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
     <line x1="${mL}" y1="${y0}" x2="${W-mR}" y2="${y0}" stroke="#9ca3af" stroke-width="1.4" stroke-dasharray="5 4"/>
     <path d="${path}" fill="none" stroke="#7c3aed" stroke-width="2.4"/>
     ${puntos}${xlab}
   </svg>
+  <div id="fcgTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:6px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
+  </div>
   <div style="display:flex;gap:16px;padding:6px 4px;font-size:12px">
     <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#16a34a;vertical-align:middle;margin-right:5px"></span>Mes con ganancia</span>
     <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc2626;vertical-align:middle;margin-right:5px"></span>Mes con pérdida</span>
@@ -3341,7 +3372,7 @@ RENDERERS.flujoCaja = function(){
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="fcDesde" value="${fcFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="fcHasta" value="${fcFilter.hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="fcReset" style="align-self:flex-end">Año actual</button>
+        <button class="btn btn-ghost btn-sm" id="fcReset" style="align-self:flex-end">Últimos 12 meses</button>
       </div>
     </div>
     <div class="summary">
@@ -3380,7 +3411,7 @@ RENDERERS.flujoCaja = function(){
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="fcgDesde" value="${fcgFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="fcgHasta" value="${fcgFilter.hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="fcgReset" style="align-self:flex-end">Año actual</button>
+        <button class="btn btn-ghost btn-sm" id="fcgReset" style="align-self:flex-end">Últimos 12 meses</button>
       </div>
       ${hayDatos? flujoGananciaSVG(flujoGananciaSerie()) : `<div class="empty">Sin datos para graficar.</div>`}
     </div>`;
@@ -3393,7 +3424,32 @@ RENDERERS.flujoCaja = function(){
       RENDERERS.flujoCaja(); // fcFilter (tabla) permanece intacto
     };
   });
-  document.getElementById('fcgReset').onclick=()=>{ fcgFilter=flujoAnioActual(); RENDERERS.flujoCaja(); };
+  document.getElementById('fcgReset').onclick=()=>{ fcgFilter=ventasUltNMeses(12); RENDERERS.flujoCaja(); };
+  // Tooltip inmediato: misma interacción que el gráfico principal de Evolución
+  // de Ventas (div flotante + seguimiento del cursor al punto más cercano),
+  // sin <title> nativo (que provoca el retardo del navegador).
+  const svgG=document.getElementById('fcgSvg');
+  if(svgG){
+    const serieG=flujoGananciaSerie();
+    if(serieG.length){
+      const tipG=document.getElementById('fcgTip'), guideG=document.getElementById('fcgGuide');
+      const W=940, mL=84, mR=20, iw=W-mL-mR, n=serieG.length;
+      const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+      svgG.onmousemove=e=>{
+        const rect=svgG.getBoundingClientRect();
+        const vx=(e.clientX-rect.left)/rect.width*W;
+        let i=Math.round((vx-mL)/(n>1?iw/(n-1):1)); i=Math.max(0,Math.min(n-1,i));
+        const p=serieG[i];
+        guideG.style.display='block'; guideG.setAttribute('x1',X(i)); guideG.setAttribute('x2',X(i));
+        tipG.innerHTML=`<b>${p.label}</b><br>Ingresos: ${fmtSolesDec(p.ing)}<br>Egresos: ${fmtSolesDec(p.egr)}<br><span style="color:${p.gan>=0?'#86efac':'#fca5a5'}">Ganancia neta: ${fmtSolesDec(p.gan)}</span>`;
+        tipG.style.display='block';
+        const px=X(i)/W*rect.width;
+        tipG.style.left=Math.min(rect.width-190, Math.max(0, px+10))+'px';
+        tipG.style.top='6px';
+      };
+      svgG.onmouseleave=()=>{ tipG.style.display='none'; guideG.style.display='none'; };
+    }
+  }
 
   document.getElementById('fcSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
@@ -3407,7 +3463,7 @@ RENDERERS.flujoCaja = function(){
     RENDERERS.flujoCaja(); // recalcula todos los meses y oculta los fuera de rango
   };
   ['fcDesde','fcHasta'].forEach(id=>{document.getElementById(id).onchange=apply;});
-  document.getElementById('fcReset').onclick=()=>{ fcFilter=flujoAnioActual(); RENDERERS.flujoCaja(); };
+  document.getElementById('fcReset').onclick=()=>{ fcFilter=ventasUltNMeses(12); RENDERERS.flujoCaja(); };
 };
 /* ── FIN MÓDULO FLUJO DE CAJA ── */
 
