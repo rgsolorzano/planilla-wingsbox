@@ -1739,6 +1739,8 @@ RENDERERS.cuadrante = function(){
    (y crea/escribe hoja FACTS en el mismo Spreadsheet), expone
    dashboards analíticos. Solo para multiboxes.peru@gmail.com.
    ================================================================ */
+// Mismo spreadsheet ANALYTICS/PROCESSED (ver ANALITICA_PROC_SS_ID más abajo):
+// aquí viven las tablas procesadas del Consolidado General de Ventas.
 const ANAL_SS_ID        = '1qZF_iFXnUDdAdKxlF5zuFmyHlVWEtHm8ojybyiPAu8Q';
 const ANAL_SHEET_RAW    = 'RAW';
 const ANAL_SHEET_FACTS  = 'FACTS';
@@ -1892,30 +1894,11 @@ function analNumOrNull(v){
 }
 
 async function analWriteFactsSheet(facts){
-  // Verificar si la hoja FACTS existe y crearla si no
-  const metaResp = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}?fields=sheets.properties.title`);
-  if(metaResp.ok){
-    const {sheets=[]} = await metaResp.json();
-    if(!sheets.some(s=>s.properties.title===ANAL_SHEET_FACTS)){
-      const cr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}:batchUpdate`,{
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({requests:[{addSheet:{properties:{title:ANAL_SHEET_FACTS}}}]})
-      });
-      if(!cr.ok) throw new Error(`No se pudo crear hoja ${ANAL_SHEET_FACTS}`);
-    }
-  }
-  // Limpiar
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}/values:batchClear`,{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ranges:[`${ANAL_SHEET_FACTS}!A:J`]})
-  });
-  // Escribir estructura OLAP normalizada
+  // Estructura OLAP normalizada. Se persiste con el helper común, que fuerza
+  // el spreadsheet ANALYTICS y nunca escribe en el de datos crudos.
   const matrix=[['Grupo','Plato','Precio','Margen','Año','Mes','MesNombre','Cantidad'],
     ...facts.map(f=>[f.grupo,f.plato,f.precio??'',f.margen??'',f.año,f.mes,ANAL_MESES_ABREV[f.mes],f.cantidad??''])];
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${ANAL_SS_ID}/values:batchUpdate`,{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({valueInputOption:'RAW', data:[{range:`${ANAL_SHEET_FACTS}!A1`, majorDimension:'ROWS', values:matrix}]})
-  });
+  return analiticaWriteProcessedSheet(ANAL_SHEET_FACTS, matrix, 'A:J');
 }
 
 // ── Helpers pivot ─────────────────────────────────────────────────
@@ -2374,9 +2357,70 @@ RENDERERS.gananciaGrupo = function(){
    Spreadsheet. Los dashboards solo operan sobre los facts diarios
    (≤ ~366 registros/año), nunca sobre las filas crudas.
    ================================================================ */
-const VENTAS_SS_ID       = '1xaXmIizPSPPu9UCewuVBe0avJNaqyrSijoYzogFteJ0';
-const VENTAS_SHEET_RAW   = 'CAJA';         // solo lectura
-const VENTAS_SHEET_FACTS = 'VENTAS_FACTS'; // tab auxiliar (escrito solo por la app)
+/* ────────────────────────────────────────────────────────────────
+   ARQUITECTURA DE ALMACENAMIENTO DE ANALÍTICA
+   Separación estricta entre datos crudos y datos procesados:
+
+     RAW (solo LECTURA)  →  procesamiento  →  ANALYTICS (lectura/escritura)  →  dashboards
+
+   · ANALITICA_RAW_SS_ID: fuente de datos ORIGINALES (CAJA, COMPRAS, …).
+     La app NUNCA crea, modifica ni escribe pestañas aquí; solo lee.
+   · ANALITICA_PROC_SS_ID: ÚNICO destino de toda tabla generada por la app
+     para ANALÍTICA (FACTS, auxiliares, intermedias, agregadas, caches).
+
+   Toda pestaña procesada nueva debe escribirse con
+   analiticaWriteProcessedSheet(), que fuerza ANALITICA_PROC_SS_ID: así
+   ninguna función puede volver a contaminar el archivo RAW por descuido.
+   ──────────────────────────────────────────────────────────────── */
+const ANALITICA_RAW_SS_ID  = '1xaXmIizPSPPu9UCewuVBe0avJNaqyrSijoYzogFteJ0'; // RAW / SOURCE DATA
+const ANALITICA_PROC_SS_ID = '1qZF_iFXnUDdAdKxlF5zuFmyHlVWEtHm8ojybyiPAu8Q'; // ANALYTICS / PROCESSED DATA
+// Alias histórico: se conserva apuntando SOLO al RAW para lecturas de fuentes
+// originales. Jamás debe usarse como destino de escritura.
+const VENTAS_SS_ID       = ANALITICA_RAW_SS_ID;
+const VENTAS_SHEET_RAW   = 'CAJA';         // pestaña RAW: solo lectura
+const VENTAS_SHEET_FACTS = 'VENTAS_FACTS'; // tabla procesada → ANALITICA_PROC_SS_ID
+
+// Lee un rango de una pestaña del spreadsheet RAW (solo lectura).
+async function analiticaFetchRaw(rango){
+  return gsApiFetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${ANALITICA_RAW_SS_ID}/values/${encodeURIComponent(rango)}?valueRenderOption=UNFORMATTED_VALUE`
+  );
+}
+
+// Escribe (creando si hace falta) una pestaña PROCESADA en el spreadsheet de
+// ANALÍTICA. Es el único camino permitido para persistir tablas derivadas.
+// Sin fallback: si el spreadsheet de analítica falla (permisos, acceso,
+// creación, escritura), se lanza el error para que quede registrado — nunca
+// se reintenta contra el spreadsheet RAW.
+async function analiticaWriteProcessedSheet(nombreHoja, matrix, rangoLimpieza){
+  const SS = ANALITICA_PROC_SS_ID;
+  if(SS === ANALITICA_RAW_SS_ID)
+    throw new Error('Configuración inválida: el spreadsheet de ANALÍTICA no puede ser el de datos crudos.');
+  const metaResp = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SS}?fields=sheets.properties.title`);
+  if(metaResp.status===403) throw new Error('Sin permiso sobre el Spreadsheet de ANALÍTICA ('+SS+'). Compártelo con la cuenta conectada como Editor.');
+  if(metaResp.status===404) throw new Error('No se encontró el Spreadsheet de ANALÍTICA ('+SS+'). Verifica el ID configurado.');
+  if(!metaResp.ok) throw new Error('HTTP '+metaResp.status+' al acceder al Spreadsheet de ANALÍTICA.');
+  const {sheets=[]} = await metaResp.json();
+  if(!sheets.some(s=>s.properties.title===nombreHoja)){
+    const cr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SS}:batchUpdate`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({requests:[{addSheet:{properties:{title:nombreHoja}}}]})
+    });
+    if(!cr.ok) throw new Error('No se pudo crear la pestaña '+nombreHoja+' en el Spreadsheet de ANALÍTICA (HTTP '+cr.status+').');
+  }
+  const clr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SS}/values:batchClear`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ranges:[nombreHoja+'!'+rangoLimpieza]})
+  });
+  if(!clr.ok) throw new Error('No se pudo limpiar '+nombreHoja+' en el Spreadsheet de ANALÍTICA (HTTP '+clr.status+').');
+  const wr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SS}/values:batchUpdate`,{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({valueInputOption:'RAW', data:[{range:nombreHoja+'!A1', majorDimension:'ROWS', values:matrix}]})
+  });
+  if(!wr.ok) throw new Error('No se pudo escribir '+nombreHoja+' en el Spreadsheet de ANALÍTICA (HTTP '+wr.status+').');
+  console.log('[Analítica] Tabla procesada "'+nombreHoja+'" actualizada en '+SS+' ('+(matrix.length-1)+' filas).');
+  return true;
+}
 const K_VENTAS_DATA = 'ventas_facts';
 const K_VENTAS_META = 'ventas_meta';
 // Índices 0-based de las columnas según la especificación (A=0):
@@ -2426,9 +2470,7 @@ async function ventasSync(){
   const t0=Date.now();
   try{
     gsUpdateSyncStatus('Sincronizando ventas (CAJA)…','info');
-    const r = await gsApiFetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(VENTAS_SHEET_RAW+'!A1:AK50000')}?valueRenderOption=UNFORMATTED_VALUE`
-    );
+    const r = await analiticaFetchRaw(VENTAS_SHEET_RAW+'!A1:AK50000'); // fuente RAW (solo lectura)
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas. Verifica la cuenta conectada.');
     if(r.status===404) throw new Error('No se encontró el Spreadsheet de ventas o la pestaña CAJA.');
     if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña CAJA.');
@@ -2473,7 +2515,11 @@ async function ventasSync(){
     ventasSaveToStorage();
     ventasMensualCache = { clave:null, datos:null }; // invalidar agregados memorizados
     // Tab auxiliar (best-effort): NUNCA toca CAJA ni el resto del Spreadsheet.
-    ventasWriteFactsSheet().catch(e=>console.warn('[Ventas] No se pudo escribir '+VENTAS_SHEET_FACTS+':', e.message));
+    ventasWriteFactsSheet().catch(e=>{
+      // Sin fallback al spreadsheet RAW: se reporta para corregir la configuración.
+      console.error('[Analítica] Error al escribir '+VENTAS_SHEET_FACTS+' en el Spreadsheet de ANALÍTICA:', e.message);
+      toast('⚠️ Datos actualizados, pero no se pudo guardar '+VENTAS_SHEET_FACTS+' en el Spreadsheet de Analítica: '+e.message,'error');
+    });
     console.log('[Ventas] Sync OK: '+wb+' filas WB → '+ventasFacts.length+' días. Descartadas sin fecha: '+descartadas);
     toast(`✅ Ventas actualizadas · ${wb} registros WB · ${ventasFacts.length} días · ${ventasMeta.duracion}s`,'success');
     gsUpdateSyncStatus('Ventas sincronizadas.','success');
@@ -2486,31 +2532,14 @@ async function ventasSync(){
   }
 }
 
-// Escribe los facts diarios en la pestaña auxiliar VENTAS_FACTS (la crea si falta).
+// Escribe los facts diarios en la tabla procesada VENTAS_FACTS, SIEMPRE en el
+// spreadsheet de ANALÍTICA (nunca en el RAW).
 async function ventasWriteFactsSheet(){
-  const metaResp = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}?fields=sheets.properties.title`);
-  if(metaResp.ok){
-    const {sheets=[]} = await metaResp.json();
-    if(!sheets.some(s=>s.properties.title===VENTAS_SHEET_FACTS)){
-      const cr = await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}:batchUpdate`,{
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({requests:[{addSheet:{properties:{title:VENTAS_SHEET_FACTS}}}]})
-      });
-      if(!cr.ok) throw new Error('No se pudo crear la hoja '+VENTAS_SHEET_FACTS);
-    }
-  }
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ranges:[VENTAS_SHEET_FACTS+'!A:V']})
-  });
   const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','Izipay','MercadoPago','Total','IngresoDia',
       'BrutoEfectivo','BrutoYape','BrutoPlin','BrutoIzipay','BrutoRappi','BrutoPedidosYa','BrutoTarjeta','BrutoMercadoPago','BrutoTotal'],
     ...ventasFacts.map(f=>{const b=f.bruto||{};return [f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.izipay||0,f.mercadopago,f.total,f.ing||0,
       b.efectivo||0,b.yape||0,b.plin||0,b.izipay||0,b.rappi||0,b.pedidosya||0,b.tarjeta||0,b.mercadopago||0,b.total||0];})];
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({valueInputOption:'RAW', data:[{range:VENTAS_SHEET_FACTS+'!A1', majorDimension:'ROWS', values:matrix}]})
-  });
+  return analiticaWriteProcessedSheet(VENTAS_SHEET_FACTS, matrix, 'A:V');
 }
 
 // ── Helpers comunes ───────────────────────────────────────────────
@@ -3085,8 +3114,8 @@ RENDERERS.estadisticasDiaSemana = function(){
    Ambos tabs son SOLO LECTURA; lo procesado se cachea en localStorage
    y se copia (best-effort) al tab auxiliar COMPRAS_FACTS.
    ================================================================ */
-const COMPRAS_SHEET_RAW   = 'COMPRAS';       // solo lectura
-const COMPRAS_SHEET_FACTS = 'COMPRAS_FACTS'; // tab auxiliar (escrito solo por la app)
+const COMPRAS_SHEET_RAW   = 'COMPRAS';       // pestaña RAW: solo lectura
+const COMPRAS_SHEET_FACTS = 'COMPRAS_FACTS'; // tabla procesada → ANALITICA_PROC_SS_ID
 const K_COMPRAS_DATA = 'compras_facts';
 const K_COMPRAS_META = 'compras_meta';
 // Índices 0-based según especificación: B=1 fecha, F=5 tipo, I=8 monto, K=10 filtro
@@ -3111,9 +3140,7 @@ async function comprasSync(){
   const t0=Date.now();
   try{
     gsUpdateSyncStatus('Sincronizando egresos (COMPRAS)…','info');
-    const r = await gsApiFetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values/${encodeURIComponent(COMPRAS_SHEET_RAW+'!A1:K50000')}?valueRenderOption=UNFORMATTED_VALUE`
-    );
+    const r = await analiticaFetchRaw(COMPRAS_SHEET_RAW+'!A1:K50000'); // fuente RAW (solo lectura)
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas/compras.');
     if(r.status===404) throw new Error('No se encontró la pestaña COMPRAS en el Spreadsheet.');
     if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña COMPRAS.');
@@ -3146,7 +3173,11 @@ async function comprasSync(){
       localStorage.setItem(K_COMPRAS_META, JSON.stringify(comprasMeta));
     }catch(e){ console.warn('[Flujo] No se pudo cachear compras:', e); }
     flujoCache={clave:null,datos:null};
-    comprasWriteFactsSheet().catch(e=>console.warn('[Flujo] No se pudo escribir '+COMPRAS_SHEET_FACTS+':', e.message));
+    comprasWriteFactsSheet().catch(e=>{
+      // Sin fallback al spreadsheet RAW: se reporta para corregir la configuración.
+      console.error('[Analítica] Error al escribir '+COMPRAS_SHEET_FACTS+' en el Spreadsheet de ANALÍTICA:', e.message);
+      toast('⚠️ Datos actualizados, pero no se pudo guardar '+COMPRAS_SHEET_FACTS+' en el Spreadsheet de Analítica: '+e.message,'error');
+    });
     console.log('[Flujo] Sync COMPRAS OK: '+wb+' filas WB → '+comprasFacts.length+' registros (día,tipo), '+comprasMeta.tipos+' tipos. Sin fecha: '+descartadas);
     return comprasMeta;
   }catch(e){
@@ -3156,28 +3187,11 @@ async function comprasSync(){
   }
 }
 
-// Tab auxiliar con los egresos agregados (best-effort; jamás toca COMPRAS).
+// Tabla procesada con los egresos agregados. SIEMPRE en el spreadsheet de
+// ANALÍTICA; jamás toca COMPRAS ni ninguna pestaña del RAW.
 async function comprasWriteFactsSheet(){
-  const metaResp=await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}?fields=sheets.properties.title`);
-  if(metaResp.ok){
-    const {sheets=[]}=await metaResp.json();
-    if(!sheets.some(s=>s.properties.title===COMPRAS_SHEET_FACTS)){
-      const cr=await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}:batchUpdate`,{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({requests:[{addSheet:{properties:{title:COMPRAS_SHEET_FACTS}}}]})
-      });
-      if(!cr.ok) throw new Error('No se pudo crear la hoja '+COMPRAS_SHEET_FACTS);
-    }
-  }
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchClear`,{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ranges:[COMPRAS_SHEET_FACTS+'!A:C']})
-  });
   const matrix=[['Fecha','Tipo','Monto'], ...comprasFacts.map(f=>[f.fecha,f.tipo,f.monto])];
-  await gsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${VENTAS_SS_ID}/values:batchUpdate`,{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({valueInputOption:'RAW',data:[{range:COMPRAS_SHEET_FACTS+'!A1',majorDimension:'ROWS',values:matrix}]})
-  });
+  return analiticaWriteProcessedSheet(COMPRAS_SHEET_FACTS, matrix, 'A:C');
 }
 
 // Sincroniza ambas fuentes del flujo (CAJA con col. AI + COMPRAS).
