@@ -2679,13 +2679,13 @@ function evChartSVG(serie){
    VENTAS POR CANAL DE VENTA (dentro de Evolución de Ventas)
    Fuente: pestaña VENTAS_DETALLE del Spreadsheet de ANALÍTICA
    (procesado), nunca del RAW. Una fila válida = una venta.
-   Columnas 0-based: O=14 monto, AF=31 fecha, AK=36 medio, AR=43 canal.
+   Columnas 0-based: T=19 monto, AF=31 fecha, AK=36 medio, AR=43 canal.
    Rendimiento: se descarga UNA sola vez y se cachea un registro
    compacto por venta; canal, medio, día/mes y monto/número se
    resuelven íntegramente en memoria, sin nuevas consultas.
    ================================================================ */
 const VD_SHEET = 'VENTAS_DETALLE';
-const VD_COL   = { monto:14, fecha:31, medio:36, canal:43 };
+const VD_COL   = { monto:19, fecha:31, medio:36, canal:43 };
 const K_VD_DATA = 'ventas_detalle_facts';
 const K_VD_META = 'ventas_detalle_meta';
 const VD_CANALES = ['PARA LLEVAR','SALÓN','PEDIDOS YA','RAPPI','RECOJO','DELIVERY'];
@@ -2760,26 +2760,44 @@ function vdMediosDisponibles(){
   return [...new Set(vdFacts.map(x=>x.m))].sort((a,b)=>a.localeCompare(b,'es',{sensitivity:'base'}));
 }
 
-// Agrega en memoria siguiendo el orden: rango → medio → agrupación → métrica →
-// desglose por canal. El total respeta el filtro de medio (nunca es el total
-// general cuando hay un medio seleccionado).
+// Agrega en memoria con DOS pipelines separados:
+//   Total Ventas: rango → agrupación → métrica          (el Medio NO interviene:
+//                 siempre representa el total general del período).
+//   Canales:      rango → MEDIO → canal → agrupación → métrica.
+// Así, con Medio=Tarjeta, el Total sigue siendo todas las ventas mientras las
+// series de canal muestran solo las de ese medio.
 function vdBuildSerie(){
   const {desde,hasta,agrup,metrica,medio,canal}=vdFilter;
   const acc=new Map();
+  const clave=f=> agrup==='mes' ? f.slice(0,7) : f;
+  const punto=k=>{ let p=acc.get(k); if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); } return p; };
   vdFacts.forEach(x=>{
-    if(x.f<desde || x.f>hasta) return;            // rango de fechas
-    if(medio!=='todos' && x.m!==medio) return;    // medio de venta
-    const k = agrup==='mes' ? x.f.slice(0,7) : x.f;
-    let p=acc.get(k);
-    if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); }
-    const val = metrica==='numero' ? 1 : (x.v||0); // 1 fila = 1 venta
-    p.total += val;
+    if(x.f<desde || x.f>hasta) return;                 // rango de fechas (común)
+    const val = metrica==='numero' ? 1 : (x.v||0);     // 1 fila = 1 venta
+    const p=punto(clave(x.f));
+    p.total += val;                                    // Total: sin filtro de medio
+    if(medio!=='todos' && x.m!==medio) return;         // Canales: sí filtran por medio
     if(x.c) p.porCanal[x.c]=(p.porCanal[x.c]||0)+val;
   });
   const puntos=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1).map(p=>({
     ...p, label: agrup==='mes' ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4) : fmtFechaCorta(p.key)
   }));
   return {puntos, canales: canal==='todos' ? VD_CANALES : [canal]};
+}
+
+// Promedios derivados de los MISMOS puntos que se renderizan (nunca de los
+// registros crudos), para que el valor mostrado coincida con lo que se ve.
+// - Total: promedio de todos los puntos visibles.
+// - Canal: promedio de los puntos visibles donde el canal tuvo ventas; los
+//   períodos sin datos del canal no se cuentan como cero ni distorsionan.
+function vdPromedioTotal(puntos){
+  if(!puntos.length) return null;
+  return puntos.reduce((s,p)=>s+p.total,0)/puntos.length;
+}
+function vdPromedioCanal(puntos, canal){
+  if(!canal || canal==='todos') return null;           // con "Todos" no hay 2ª línea
+  const vals=puntos.map(p=>p.porCanal[canal]).filter(v=>v!==undefined);
+  return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
 }
 
 const vdFmt    = v => vdFilter.metrica==='numero' ? Math.round(v).toLocaleString('es-PE') : fmtSolesDec(v);
@@ -2812,12 +2830,29 @@ function vdChartSVG(puntos, canales){
     return `<path d="${area(p=>p.porCanal[c]||0)}" fill="${col}" opacity="0.20"/>`+
       `<path d="${linea(p=>p.porCanal[c]||0)}" fill="none" stroke="${col}" stroke-width="2"/>`;
   }).join('');
+  // Líneas horizontales punteadas de promedio (encima de las áreas, con zona
+  // sensible propia para el tooltip inmediato).
+  const promLinea=(valor, color, etiqueta, dash)=>{
+    if(valor===null || valor===undefined || valor>maxV) return '';
+    const y=Y(valor);
+    return `<g class="vd-prom">
+      <line x1="${mL}" y1="${y.toFixed(1)}" x2="${W-mR}" y2="${y.toFixed(1)}" stroke="${color}" stroke-width="1.8" stroke-dasharray="${dash}" opacity="0.9"/>
+      <rect x="${mL}" y="${(y-7).toFixed(1)}" width="${iw}" height="14" fill="transparent" style="pointer-events:all"
+        data-prom="${vdFmt(valor)}" data-etiqueta="${etiqueta}"/>
+      <text x="${W-mR-4}" y="${(y-5).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="${color}">${etiqueta}: ${vdFmt(valor)}</text>
+    </g>`;
+  };
+  const promTotal = vdPromedioTotal(puntos);
+  const canalUnico = (vdFilter.canal!=='todos' && canales.length===1) ? canales[0] : null;
+  const promCanal = canalUnico ? vdPromedioCanal(puntos, canalUnico) : null;
+  const promLineas = promLinea(promTotal, '#475569', 'Prom. Total Ventas', '8 5')
+    + (canalUnico ? promLinea(promCanal, VD_COLORES[canalUnico]||'#64748b', 'Prom. '+canalUnico, '3 4') : '');
   return `
   <div style="position:relative">
     <svg id="vdSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
       ${grid}
       <line id="vdGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
-      ${totalArea}${canalAreas}${xlab}
+      ${totalArea}${canalAreas}${promLineas}${xlab}
       <line x1="${mL}" y1="${mT+ih}" x2="${W-mR}" y2="${mT+ih}" stroke="#c7c3e0"/>
     </svg>
     <div id="vdTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:7px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
@@ -2837,7 +2872,7 @@ function vdCardHTML(){
   return `
     <div class="card">
       <h2>🛒 Ventas por Canal de Venta</h2>
-      <p class="hint" style="margin-top:0">Fuente: ${VD_SHEET} (Spreadsheet de Analítica) · cada fila = una venta · ${metaStr}. Filtros independientes de los demás gráficos.</p>
+      <p class="hint" style="margin-top:0">Fuente: ${VD_SHEET} (Spreadsheet de Analítica) · cada fila = una venta · ${metaStr}. <b>Medio de Venta</b> filtra solo las series de canal; <b>Total Ventas</b> siempre muestra el total general del período. Filtros independientes de los demás gráficos.</p>
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="vdDesde" value="${vdFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="vdHasta" value="${vdFilter.hasta}"></div>
@@ -2910,6 +2945,18 @@ function vdBindCard(){
         tip.style.left=Math.min(rect.width-210, Math.max(0, px+10))+'px';
         tip.style.top='6px';
       };
+      // Tooltip inmediato de las líneas de promedio (mismo div flotante).
+      svg.querySelectorAll('.vd-prom rect').forEach(z=>{
+        z.onmouseenter=e=>{
+          const rect=svg.getBoundingClientRect();
+          tip.innerHTML=`<b>${z.dataset.etiqueta.replace('Prom.','Promedio')}</b><br>${z.dataset.prom}`;
+          tip.style.display='block';
+          tip.style.left=Math.min(rect.width-210, Math.max(0,(e.clientX-rect.left)+10))+'px';
+          tip.style.top='6px';
+          e.stopPropagation();
+        };
+        z.onmousemove=e=>{ e.stopPropagation(); };
+      });
       svg.onmouseleave=()=>{ tip.style.display='none'; guide.style.display='none'; };
     }
   }
