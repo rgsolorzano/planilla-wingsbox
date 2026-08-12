@@ -2675,6 +2675,246 @@ function evChartSVG(serie){
   </div>`;
 }
 
+/* ================================================================
+   VENTAS POR CANAL DE VENTA (dentro de Evolución de Ventas)
+   Fuente: pestaña VENTAS_DETALLE del Spreadsheet de ANALÍTICA
+   (procesado), nunca del RAW. Una fila válida = una venta.
+   Columnas 0-based: O=14 monto, AF=31 fecha, AK=36 medio, AR=43 canal.
+   Rendimiento: se descarga UNA sola vez y se cachea un registro
+   compacto por venta; canal, medio, día/mes y monto/número se
+   resuelven íntegramente en memoria, sin nuevas consultas.
+   ================================================================ */
+const VD_SHEET = 'VENTAS_DETALLE';
+const VD_COL   = { monto:14, fecha:31, medio:36, canal:43 };
+const K_VD_DATA = 'ventas_detalle_facts';
+const K_VD_META = 'ventas_detalle_meta';
+const VD_CANALES = ['PARA LLEVAR','SALÓN','PEDIDOS YA','RAPPI','RECOJO','DELIVERY'];
+const VD_COLORES = { 'PARA LLEVAR':'#f59e0b','SALÓN':'#7c3aed','PEDIDOS YA':'#be185d',
+  'RAPPI':'#ea580c','RECOJO':'#0891b2','DELIVERY':'#059669' };
+const VD_TOTAL_COLOR = '#94a3b8';
+
+let vdFacts=[];   // [{f:'YYYY-MM-DD', c:canal|null, m:medio, v:monto}] — 1 elemento = 1 venta
+let vdMeta=null;
+let vdAutoSyncIntentado=false;
+
+(function vdLoad(){
+  try{
+    const d=localStorage.getItem(K_VD_DATA), m=localStorage.getItem(K_VD_META);
+    if(d) vdFacts=JSON.parse(d);
+    if(m) vdMeta=JSON.parse(m);
+  }catch(e){ vdFacts=[]; vdMeta=null; }
+})();
+
+// Normaliza el canal a uno de los válidos (tolera mayúsculas, acentos y espacios).
+function vdNormCanal(raw){
+  const s=String(raw||'').trim();
+  if(!s) return null;
+  const plano=x=>x.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  const p=plano(s);
+  return VD_CANALES.find(c=>plano(c)===p) || null;
+}
+
+// Descarga y normaliza VENTAS_DETALLE (una sola consulta por sincronización).
+async function vdSync(){
+  if(!isAuthorized()){ toast('Inicia sesión para sincronizar el detalle de ventas.','error'); return null; }
+  const t0=Date.now();
+  try{
+    const r = await gsApiFetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${ANALITICA_PROC_SS_ID}/values/${encodeURIComponent(VD_SHEET+'!A1:AR100000')}?valueRenderOption=UNFORMATTED_VALUE`
+    );
+    if(r.status===403) throw new Error('Sin permiso para leer '+VD_SHEET+' en el Spreadsheet de ANALÍTICA.');
+    if(r.status===404) throw new Error('No se encontró la pestaña '+VD_SHEET+' en el Spreadsheet de ANALÍTICA.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+VD_SHEET+'.');
+    const filas=(await r.json()).values||[];
+    console.log('[Canal] '+VD_SHEET+': '+filas.length+' filas leídas.');
+    const out=[]; let invalidas=0;
+    filas.forEach(row=>{
+      if(!row||!row.length) return;
+      const fecha=normFechaGS(row[VD_COL.fecha]);
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ invalidas++; return; } // encabezado o fecha inválida
+      const monto=analNumOrNull(row[VD_COL.monto]);
+      out.push({ f:fecha, c:vdNormCanal(row[VD_COL.canal]),
+        m:String(row[VD_COL.medio]??'').trim()||'(Sin medio)', v:monto===null?0:monto });
+    });
+    vdFacts=out;
+    vdMeta={ lastSync:new Date().toISOString(), ventas:out.length, descartadas:invalidas,
+      medios:[...new Set(out.map(x=>x.m))].length, duracion:((Date.now()-t0)/1000).toFixed(1) };
+    try{
+      localStorage.setItem(K_VD_DATA, JSON.stringify(vdFacts));
+      localStorage.setItem(K_VD_META, JSON.stringify(vdMeta));
+    }catch(e){ console.warn('[Canal] No se pudo cachear VENTAS_DETALLE:', e); }
+    console.log('[Canal] Sync OK: '+out.length+' ventas ('+invalidas+' filas sin fecha válida descartadas).');
+    return vdMeta;
+  }catch(e){
+    console.error('[Canal] Sync error:', e);
+    toast('Error al sincronizar '+VD_SHEET+': '+e.message,'error');
+    return null;
+  }
+}
+
+// Filtros propios del gráfico (independientes del resto del módulo).
+let vdFilter = Object.assign({agrup:'dia', metrica:'monto', canal:'todos', medio:'todos'}, ventasUltNMeses(2));
+
+// Medios de venta ÚNICOS (columna AK), construidos dinámicamente desde los datos.
+function vdMediosDisponibles(){
+  return [...new Set(vdFacts.map(x=>x.m))].sort((a,b)=>a.localeCompare(b,'es',{sensitivity:'base'}));
+}
+
+// Agrega en memoria siguiendo el orden: rango → medio → agrupación → métrica →
+// desglose por canal. El total respeta el filtro de medio (nunca es el total
+// general cuando hay un medio seleccionado).
+function vdBuildSerie(){
+  const {desde,hasta,agrup,metrica,medio,canal}=vdFilter;
+  const acc=new Map();
+  vdFacts.forEach(x=>{
+    if(x.f<desde || x.f>hasta) return;            // rango de fechas
+    if(medio!=='todos' && x.m!==medio) return;    // medio de venta
+    const k = agrup==='mes' ? x.f.slice(0,7) : x.f;
+    let p=acc.get(k);
+    if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); }
+    const val = metrica==='numero' ? 1 : (x.v||0); // 1 fila = 1 venta
+    p.total += val;
+    if(x.c) p.porCanal[x.c]=(p.porCanal[x.c]||0)+val;
+  });
+  const puntos=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1).map(p=>({
+    ...p, label: agrup==='mes' ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4) : fmtFechaCorta(p.key)
+  }));
+  return {puntos, canales: canal==='todos' ? VD_CANALES : [canal]};
+}
+
+const vdFmt    = v => vdFilter.metrica==='numero' ? Math.round(v).toLocaleString('es-PE') : fmtSolesDec(v);
+const vdFmtEje = v => vdFilter.metrica==='numero' ? Math.round(v).toLocaleString('es-PE') : fmtSoles(v);
+
+// Áreas SUPERPUESTAS (no apiladas): cada serie se dibuja desde el eje 0 con su
+// valor real. "Total Ventas" se renderiza PRIMERO (al fondo), en gris tenue.
+function vdChartSVG(puntos, canales){
+  const W=940,H=380,mL=74,mR=18,mT=16,mB=52;
+  const iw=W-mL-mR, ih=H-mT-mB, n=puntos.length;
+  const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+  const maxV=Math.max(1,...puntos.map(p=>p.total))*1.08;
+  const Y=v=> mT+ih-(v/maxV)*ih;
+  const linea=getV=>puntos.map((p,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(getV(p)).toFixed(1)).join(' ');
+  const area=getV=> linea(getV)+` L ${X(n-1).toFixed(1)} ${(mT+ih).toFixed(1)} L ${X(0).toFixed(1)} ${(mT+ih).toFixed(1)} Z`;
+  let grid='';
+  for(let g=0; g<=4; g++){
+    const v=maxV*g/4, y=Y(v);
+    grid+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e9e7f5"/>`+
+      `<text x="${mL-8}" y="${y+4}" text-anchor="end" font-size="10" fill="#6b7280">${vdFmtEje(v)}</text>`;
+  }
+  const paso=Math.max(1,Math.ceil(n/12));
+  let xlab='';
+  puntos.forEach((p,i)=>{ if(i%paso && i!==n-1) return;
+    xlab+=`<text x="${X(i).toFixed(1)}" y="${H-mB+16}" text-anchor="middle" font-size="9" fill="#6b7280" transform="rotate(-35 ${X(i).toFixed(1)} ${H-mB+16})">${p.label}</text>`; });
+  const totalArea=`<path d="${area(p=>p.total)}" fill="${VD_TOTAL_COLOR}" opacity="0.28"/>`+
+    `<path d="${linea(p=>p.total)}" fill="none" stroke="${VD_TOTAL_COLOR}" stroke-width="2.2"/>`;
+  const canalAreas=canales.map(c=>{
+    const col=VD_COLORES[c]||'#64748b';
+    return `<path d="${area(p=>p.porCanal[c]||0)}" fill="${col}" opacity="0.20"/>`+
+      `<path d="${linea(p=>p.porCanal[c]||0)}" fill="none" stroke="${col}" stroke-width="2"/>`;
+  }).join('');
+  return `
+  <div style="position:relative">
+    <svg id="vdSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+      ${grid}
+      <line id="vdGuide" x1="0" y1="${mT}" x2="0" y2="${mT+ih}" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4 3" style="display:none"/>
+      ${totalArea}${canalAreas}${xlab}
+      <line x1="${mL}" y1="${mT+ih}" x2="${W-mR}" y2="${mT+ih}" stroke="#c7c3e0"/>
+    </svg>
+    <div id="vdTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:7px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 4px;font-size:12px">
+    <span><span style="display:inline-block;width:18px;height:9px;background:${VD_TOTAL_COLOR};opacity:.55;vertical-align:middle;margin-right:5px;border-radius:2px"></span><b>Total Ventas</b></span>
+    ${canales.map(c=>`<span><span style="display:inline-block;width:18px;height:9px;background:${VD_COLORES[c]||'#64748b'};opacity:.5;vertical-align:middle;margin-right:5px;border-radius:2px"></span>${c}</span>`).join('')}
+  </div>`;
+}
+
+// HTML de la tarjeta del gráfico (se inserta en el renderer de Evolución de Ventas).
+function vdCardHTML(){
+  const metaStr = vdMeta
+    ? `${vdMeta.ventas.toLocaleString('es-PE')} ventas · ${vdMeta.medios} medios · sync ${fmtFecha(vdMeta.lastSync.slice(0,10))}`
+    : 'Sin sincronizar todavía.';
+  const medios=vdMediosDisponibles();
+  return `
+    <div class="card">
+      <h2>🛒 Ventas por Canal de Venta</h2>
+      <p class="hint" style="margin-top:0">Fuente: ${VD_SHEET} (Spreadsheet de Analítica) · cada fila = una venta · ${metaStr}. Filtros independientes de los demás gráficos.</p>
+      <div class="toolbar" style="flex-wrap:wrap">
+        <div class="field"><label>Desde</label><input type="date" id="vdDesde" value="${vdFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="vdHasta" value="${vdFilter.hasta}"></div>
+        <div class="field"><label>Métrica</label>
+          <select id="vdMetrica"><option value="monto" ${vdFilter.metrica==='monto'?'selected':''}>Monto de ventas</option>
+            <option value="numero" ${vdFilter.metrica==='numero'?'selected':''}>Número de ventas</option></select></div>
+        <div class="field"><label>Agrupar por</label>
+          <select id="vdAgrup"><option value="dia" ${vdFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="mes" ${vdFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
+        <div class="field"><label>Canal de Venta</label>
+          <select id="vdCanal"><option value="todos" ${vdFilter.canal==='todos'?'selected':''}>Todos</option>
+            ${VD_CANALES.map(c=>`<option value="${c}" ${vdFilter.canal===c?'selected':''}>${c}</option>`).join('')}
+          </select></div>
+        <div class="field"><label>Medio de Venta</label>
+          <select id="vdMedio"><option value="todos" ${vdFilter.medio==='todos'?'selected':''}>Todos</option>
+            ${medios.map(m=>`<option value="${m}" ${vdFilter.medio===m?'selected':''}>${m}</option>`).join('')}
+          </select></div>
+        <div style="display:flex;gap:4px;align-self:flex-end">
+          <button class="btn btn-ghost btn-sm" id="vdQ2">Últimos 2 meses</button>
+          <button class="btn btn-ghost btn-sm" id="vdQ12">Últimos 12 meses</button>
+          <button class="btn btn-primary btn-sm" id="vdSyncBtn">🔄 Actualizar detalle</button>
+        </div>
+      </div>
+      ${(()=>{ if(!vdFacts.length) return `<div class="empty" style="padding:32px;text-align:center">Sin datos de ${VD_SHEET}. Presiona <b>🔄 Actualizar detalle</b>.</div>`;
+        const {puntos,canales}=vdBuildSerie();
+        if(!puntos.length) return `<div class="empty">Sin ventas en el rango y filtros seleccionados.</div>`;
+        return vdChartSVG(puntos,canales); })()}
+    </div>`;
+}
+
+// Enlaza filtros y tooltip inmediato del gráfico de canales.
+function vdBindCard(){
+  const g=id=>document.getElementById(id);
+  if(!g('vdDesde')) return;
+  const apply=()=>{
+    const d=g('vdDesde').value, h=g('vdHasta').value;
+    if(d&&h&&d>h){toast('La fecha inicial no puede ser posterior a la final','error');return;}
+    if(d) vdFilter.desde=d; if(h) vdFilter.hasta=h;
+    vdFilter.metrica=g('vdMetrica').value; vdFilter.agrup=g('vdAgrup').value;
+    vdFilter.canal=g('vdCanal').value;     vdFilter.medio=g('vdMedio').value;
+    RENDERERS.evolucionVentas(); // re-agrega en memoria: sin nuevas consultas
+  };
+  ['vdDesde','vdHasta','vdMetrica','vdAgrup','vdCanal','vdMedio'].forEach(id=>{const e=g(id); if(e) e.onchange=apply;});
+  const quick=n=>()=>{ Object.assign(vdFilter, ventasUltNMeses(n)); RENDERERS.evolucionVentas(); };
+  if(g('vdQ2'))  g('vdQ2').onclick=quick(2);
+  if(g('vdQ12')) g('vdQ12').onclick=quick(12);
+  if(g('vdSyncBtn')) g('vdSyncBtn').onclick=async function(){
+    this.disabled=true; this.textContent='Sincronizando…';
+    await vdSync();
+    RENDERERS.evolucionVentas();
+  };
+  // Tooltip inmediato (mismo patrón del resto de gráficos del módulo)
+  const svg=g('vdSvg');
+  if(svg && vdFacts.length){
+    const {puntos,canales}=vdBuildSerie();
+    if(puntos.length){
+      const tip=g('vdTip'), guide=g('vdGuide');
+      const W=940, mL=74, mR=18, iw=W-mL-mR, n=puntos.length;
+      const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
+      svg.onmousemove=e=>{
+        const rect=svg.getBoundingClientRect();
+        const vx=(e.clientX-rect.left)/rect.width*W;
+        let i=Math.round((vx-mL)/(n>1?iw/(n-1):1)); i=Math.max(0,Math.min(n-1,i));
+        const p=puntos[i];
+        guide.style.display='block'; guide.setAttribute('x1',X(i)); guide.setAttribute('x2',X(i));
+        const filas=canales.map(c=>`<span style="color:${VD_COLORES[c]||'#cbd5e1'}">●</span> ${c}: ${vdFmt(p.porCanal[c]||0)}`).join('<br>');
+        tip.innerHTML=`<b>${p.label}</b><br><span style="color:#cbd5e1">■</span> <b>Total Ventas: ${vdFmt(p.total)}</b><br>${filas}`;
+        tip.style.display='block';
+        const px=X(i)/W*rect.width;
+        tip.style.left=Math.min(rect.width-210, Math.max(0, px+10))+'px';
+        tip.style.top='6px';
+      };
+      svg.onmouseleave=()=>{ tip.style.display='none'; guide.style.display='none'; };
+    }
+  }
+}
+
 /* ── Composición de INGRESOS BRUTOS (análisis nuevo; cols. F..P de CAJA) ──
    Gráfico independiente dentro de Evolución de Ventas, con filtros PROPIOS:
    Desde/Hasta (default últimos 12 meses), Agrupar por (default Día) y Tipo de
@@ -2791,7 +3031,10 @@ RENDERERS.evolucionVentas = function(){
           <select id="evMedio"><option value="todos" ${evFilter.medio==='todos'?'selected':''}>Todos</option>
             ${VENTAS_MEDIOS.map(([k,lbl])=>`<option value="${k}" ${evFilter.medio===k?'selected':''}>${lbl}</option>`).join('')}
           </select></div>
-        <button class="btn btn-ghost btn-sm" id="evReset" style="align-self:flex-end">Últimos 12 meses</button>
+        <div style="display:flex;gap:4px;align-self:flex-end">
+          <button class="btn btn-ghost btn-sm" id="evQ2">Últimos 2 meses</button>
+          <button class="btn btn-ghost btn-sm" id="evReset">Últimos 12 meses</button>
+        </div>
       </div>
       <p class="hint">Al elegir un medio de pago, la línea de <b>monto</b> muestra solo ese medio; la línea de <b>cantidad de ventas</b> siempre representa el total de ventas.</p>
     </div>
@@ -2816,13 +3059,17 @@ RENDERERS.evolucionVentas = function(){
           <select id="evbTipo"><option value="todos" ${evbFilter.tipo==='todos'?'selected':''}>Todos</option>
             ${BRUTO_MEDIOS.map(([k,lbl])=>`<option value="${k}" ${evbFilter.tipo===k?'selected':''}>${lbl}</option>`).join('')}
           </select></div>
-        <button class="btn btn-ghost btn-sm" id="evbReset" style="align-self:flex-end">Últimos 2 meses</button>
+        <div style="display:flex;gap:4px;align-self:flex-end">
+          <button class="btn btn-ghost btn-sm" id="evbReset">Últimos 2 meses</button>
+          <button class="btn btn-ghost btn-sm" id="evbQ12">Últimos 12 meses</button>
+        </div>
       </div>
       ${(()=>{ const s=evbBuildSerie();
         if(!s.length) return `<div class="empty">Sin datos brutos en el rango. Si acabas de actualizar la app, presiona 🔄 Actualizar ventas.</div>`;
         const medios=evbFilter.tipo==='todos'? BRUTO_MEDIOS : BRUTO_MEDIOS.filter(([k])=>k===evbFilter.tipo);
         return evbChartSVG(s, medios); })()}
-    </div>`;
+    </div>
+    ${vdCardHTML()}`;
   document.getElementById('evSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
     await ventasSync();
@@ -2837,7 +3084,11 @@ RENDERERS.evolucionVentas = function(){
     RENDERERS.evolucionVentas();
   };
   ['evDesde','evHasta','evAgrup','evMedio'].forEach(id=>{document.getElementById(id).onchange=apply;});
-  document.getElementById('evReset').onclick=()=>{ evFilter=Object.assign({agrup:evFilter.agrup, medio:evFilter.medio}, ventasUlt12Meses()); RENDERERS.evolucionVentas(); };
+  // Accesos rápidos de rango (períodos móviles hasta hoy). Cada gráfico
+  // conserva su propio estado de filtro: esto solo afecta a evFilter.
+  const evQuick=n=>()=>{ evFilter=Object.assign({agrup:evFilter.agrup, medio:evFilter.medio}, ventasUltNMeses(n)); RENDERERS.evolucionVentas(); };
+  document.getElementById('evReset').onclick=evQuick(12);
+  document.getElementById('evQ2').onclick=evQuick(2);
   // Tooltip interactivo: punto más cercano al cursor
   const svg=document.getElementById('evSvg');
   if(svg && serie.length){
@@ -2869,8 +3120,15 @@ RENDERERS.evolucionVentas = function(){
     RENDERERS.evolucionVentas(); // evFilter (gráfico principal) permanece intacto
   };
   ['evbDesde','evbHasta','evbAgrup','evbTipo'].forEach(id=>{const e=document.getElementById(id); if(e) e.onchange=applyB;});
-  const rB=document.getElementById('evbReset');
-  if(rB) rB.onclick=()=>{ evbFilter=Object.assign({agrup:evbFilter.agrup, tipo:evbFilter.tipo}, ventasUltNMeses(2)); RENDERERS.evolucionVentas(); };
+  // Gráfico de canales: enlaces y carga inicial única (sin re-consultas al filtrar)
+  vdBindCard();
+  if(!vdFacts.length && !vdAutoSyncIntentado && isAuthorized()){
+    vdAutoSyncIntentado=true;
+    vdSync().then(()=>{ if(currentPage==='evolucionVentas') RENDERERS.evolucionVentas(); });
+  }
+  const evbQuick=n=>()=>{ evbFilter=Object.assign({agrup:evbFilter.agrup, tipo:evbFilter.tipo}, ventasUltNMeses(n)); RENDERERS.evolucionVentas(); };
+  const rB=document.getElementById('evbReset'); if(rB) rB.onclick=evbQuick(2);
+  const rB12=document.getElementById('evbQ12'); if(rB12) rB12.onclick=evbQuick(12);
   // Tooltip: período, cada medio visible con monto bruto, total bruto y %
   const svgB=document.getElementById('evbSvg');
   if(svgB){
