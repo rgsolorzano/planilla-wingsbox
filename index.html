@@ -6585,7 +6585,16 @@ function menajeSanearInventario(persistir=true){
     if(!r || !r.articuloId || !r.fecha || !ids.has(r.articuloId)){ invalidos++; return; }
     const clave=r.articuloId+'|'+r.fecha;
     if(porClave.has(clave)) invalidos++;
-    r.cantidad=Math.max(0, Math.round(Number(r.cantidad)||0)); // solo enteros
+    // Solo enteros >= 0 en las tres métricas; se preserva el histórico.
+    r.cantidad=menajeEntero(r.cantidad);
+    r.rotas   =menajeEntero(r.rotas);
+    r.rajadas =menajeEntero(r.rajadas);
+    // Invariante de negocio: rotas + rajadas nunca superan las totales.
+    if(r.rotas+r.rajadas > r.cantidad){
+      console.warn('[Menaje] Registro con rotas+rajadas > totales corregido:', r.fecha, r.articuloId);
+      r.rajadas=Math.max(0, r.cantidad-r.rotas);
+      if(r.rotas>r.cantidad){ r.rotas=r.cantidad; r.rajadas=0; }
+    }
     porClave.set(clave, r);
   });
   if(invalidos>0){
@@ -6599,6 +6608,22 @@ function menajeSanearInventario(persistir=true){
 // ── Helpers ───────────────────────────────────────────────────────
 function getMenajeStock(articuloId, fecha){
   return S.menajeInventario.find(r=>r.articuloId===articuloId && r.fecha===fecha);
+}
+// Lectura RETROCOMPATIBLE de las tres métricas. Los registros históricos solo
+// tienen `cantidad` (unidades): se interpreta como UNIDADES TOTALES y las
+// métricas nuevas valen 0. Nunca devuelve undefined/NaN.
+function menajeVal(r, campo){
+  if(!r) return null;
+  const n = v => { const x=Math.round(Number(v)); return Number.isFinite(x)&&x>=0 ? x : 0; };
+  if(campo==='total')   return n(r.cantidad);          // histórico: cantidad = totales
+  if(campo==='rotas')   return n(r.rotas);
+  if(campo==='rajadas') return n(r.rajadas);
+  return 0;
+}
+// Normaliza un entero >= 0 a partir de cualquier entrada (texto, decimal, negativo).
+function menajeEntero(v){
+  const n=Math.round(Number(v));
+  return Number.isFinite(n) && n>0 ? n : 0;
 }
 
 // ── Sync (independiente de otros módulos) ─────────────────────────
@@ -6695,42 +6720,79 @@ RENDERERS.invDiarioMenaje = function(){
     return;
   }
   el.innerHTML=`
-    <div class="page-head"><div><h1>📋 Inventario Menaje</h1><p>Registro diario del inventario de menaje (cantidades enteras).</p></div></div>
+    <div class="page-head"><div><h1>📋 Inventario Menaje</h1><p>Registro diario del inventario de menaje. <b>Rotas</b> y <b>Rajadas</b> están incluidas dentro de <b>Unidades totales</b>.</p></div></div>
     <div class="card">
       <div class="field"><label>Fecha</label>
         <input type="date" id="menajeFechaInp" value="${menajeFecha}"></div>
     </div>
     <div class="card">
       <div class="table-wrap"><table>
-        <thead><tr><th>Artículo</th><th class="num">Unidades</th></tr></thead>
+        <thead><tr><th>Artículo</th><th class="num">Unidades totales</th><th class="num">Rotas</th><th class="num">Rajadas</th></tr></thead>
         <tbody>${S.menajeArticulos.map(a=>{
           const r=getMenajeStock(a.id, menajeFecha);
-          return `<tr><td>${a.nombre}</td>
-            <td class="num"><input type="number" min="0" step="1" inputmode="numeric" class="menaje-inp"
-              data-art="${a.id}" value="${r!=null?r.cantidad:''}" placeholder="0" style="min-width:70px"></td>
+          const campo=(c,val)=>`<td class="num"><input type="number" min="0" step="1" inputmode="numeric"
+            class="menaje-inp menaje-${c}" data-art="${a.id}" data-campo="${c}"
+            value="${val!=null?val:''}" placeholder="0" style="min-width:70px"></td>`;
+          return `<tr data-fila="${a.id}"><td>${a.nombre}</td>
+            ${campo('total',   r?menajeVal(r,'total'):null)}
+            ${campo('rotas',   r?menajeVal(r,'rotas'):null)}
+            ${campo('rajadas', r?menajeVal(r,'rajadas'):null)}
           </tr>`;}).join('')}
         </tbody>
       </table></div>
       <div class="actions"><button class="btn btn-primary" id="menajeGuardar">💾 Guardar</button></div>
-      <p class="hint">Un registro por artículo y fecha. Solo cantidades enteras; los campos vacíos no se guardan.</p>
+      <p class="hint">Un registro por artículo y fecha. Solo <b>números enteros ≥ 0</b>; los campos vacíos no se guardan. La suma de <b>Rotas + Rajadas</b> no puede superar las <b>Unidades totales</b>.</p>
     </div>`;
 
   document.getElementById('menajeFechaInp').onchange=e=>{
     menajeFecha=e.target.value||menajeFecha; RENDERERS.invDiarioMenaje();
   };
+  // Validación visual inmediata: resalta la fila cuando rotas+rajadas > totales.
+  const leerFila=id=>{
+    const g=c=>document.querySelector(`.menaje-inp[data-art="${id}"][data-campo="${c}"]`);
+    const val=c=>{const e=g(c); return e && e.value.trim()!=='' ? menajeEntero(e.value) : null;};
+    return {total:val('total'), rotas:val('rotas'), rajadas:val('rajadas')};
+  };
+  const validarFila=id=>{
+    const v=leerFila(id);
+    const fila=document.querySelector(`tr[data-fila="${id}"]`);
+    const excede=(v.rotas||0)+(v.rajadas||0) > (v.total||0);
+    if(fila) fila.style.background = excede ? '#fee2e2' : '';
+    return !excede;
+  };
+  document.querySelectorAll('.menaje-inp').forEach(inp=>{
+    inp.oninput=()=>{
+      // Fuerza enteros >= 0 en la propia entrada (sin decimales ni negativos)
+      if(inp.value!=='' ){ const n=menajeEntero(inp.value); if(String(n)!==inp.value) inp.value=n; }
+      validarFila(inp.dataset.art);
+    };
+  });
   document.getElementById('menajeGuardar').onclick=function(){
     const fecha=menajeFecha;
     if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast('Selecciona una fecha válida','error');return;}
     const ids=new Set(S.menajeArticulos.map(a=>a.id));
+    // ── Validación previa: ninguna fila puede guardarse si rotas+rajadas > totales
+    const invalidos=S.menajeArticulos.filter(a=>{
+      const v=leerFila(a.id);
+      if(v.total===null && v.rotas===null && v.rajadas===null) return false; // fila vacía
+      validarFila(a.id);
+      return (v.rotas||0)+(v.rajadas||0) > (v.total||0);
+    });
+    if(invalidos.length){
+      toast('La suma de unidades rotas y rajadas no puede ser mayor que las unidades totales ('+
+        invalidos.map(a=>a.nombre).join(', ')+')','error');
+      return; // no se guarda nada
+    }
     let nuevos=0, actualizados=0;
-    document.querySelectorAll('.menaje-inp').forEach(inp=>{
-      if(inp.value.trim()==='') return; // vacío = sin registro
-      const articuloId=inp.dataset.art;
+    S.menajeArticulos.forEach(a=>{
+      const articuloId=a.id;
       if(!ids.has(articuloId)) return; // guarda de integridad
-      const cantidad=Math.max(0, Math.round(Number(inp.value)||0)); // solo enteros
+      const v=leerFila(articuloId);
+      if(v.total===null && v.rotas===null && v.rajadas===null) return; // sin datos: no se guarda
+      const cantidad=v.total||0, rotas=v.rotas||0, rajadas=v.rajadas||0;
       const r=getMenajeStock(articuloId,fecha);
-      if(r){ if(r.cantidad!==cantidad){r.cantidad=cantidad;} actualizados++; }
-      else { S.menajeInventario.push({id:uid(),articuloId,fecha,cantidad}); nuevos++; }
+      if(r){ r.cantidad=cantidad; r.rotas=rotas; r.rajadas=rajadas; actualizados++; }
+      else { S.menajeInventario.push({id:uid(),articuloId,fecha,cantidad,rotas,rajadas}); nuevos++; }
     });
     menajeSanearInventario(false); // red de seguridad: dedupe por (artículo, fecha)
     save(K.menajeInventario,S.menajeInventario);
@@ -6741,11 +6803,13 @@ RENDERERS.invDiarioMenaje = function(){
 };
 
 // ── RENDERER: Consolidado Menaje ──────────────────────────────────
-let conMenajeFilter=(()=>{
-  const hoy=new Date(), h=new Date(hoy); h.setDate(h.getDate()-6);
+// Rango MÓVIL de los últimos N días hasta hoy (por defecto 3).
+function menajeUltimosNDias(n=3){
+  const hoy=new Date(), h=new Date(hoy); h.setDate(h.getDate()-(n-1));
   const fmt=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   return {desde:fmt(h), hasta:fmt(hoy)};
-})();
+}
+let conMenajeFilter=menajeUltimosNDias(3);
 
 RENDERERS.consolidadoMenaje = function(){
   const el=document.getElementById('page-consolidadoMenaje');
@@ -6757,42 +6821,57 @@ RENDERERS.consolidadoMenaje = function(){
   }
   const fechas=rangoFechas(conMenajeFilter.desde, conMenajeFilter.hasta);
   const DIAS3=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+  // Cabecera de DOS niveles: cada fecha agrupa tres subcolumnas (Totales,
+  // Rotas, Rajadas). La primera columna (Artículo) permanece fija.
   const hdrFechas=fechas.map(f=>{
     const dow=DIAS3[new Date(f+'T12:00:00').getDay()];
-    return `<th class="num" style="text-align:center;background:#f0fdf4;border-left:2px solid #bbf7d0;padding:4px 6px;white-space:nowrap">
+    return `<th colspan="3" class="num" style="text-align:center;background:#f0fdf4;border-left:2px solid #86efac;padding:4px 6px;white-space:nowrap">
       <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
       <div style="font-weight:400;font-size:10px;color:#15803d">${dow}</div></th>`;
   }).join('');
+  const hdrSub=fechas.map(()=>
+    `<th class="num" style="text-align:center;background:#f7fee7;border-left:2px solid #86efac;font-size:9px;padding:2px 5px;white-space:nowrap">Tot.</th>`+
+    `<th class="num" style="text-align:center;background:#f7fee7;font-size:9px;padding:2px 5px;white-space:nowrap">Rot.</th>`+
+    `<th class="num" style="text-align:center;background:#f7fee7;font-size:9px;padding:2px 5px;white-space:nowrap">Raj.</th>`
+  ).join('');
   const filas=S.menajeArticulos.map(a=>`
     <tr>
-      <td class="cotejo-col-licor" style="background:#fff;border-right:2px solid #bbf7d0">${a.nombre}</td>
+      <td class="cotejo-col-licor" style="background:#fff;border-right:2px solid #86efac">${a.nombre}</td>
       ${fechas.map(f=>{
         const r=getMenajeStock(a.id,f);
-        return `<td class="num" style="border-left:2px solid #bbf7d0;font-size:11px;text-align:right">${r!=null?r.cantidad:''}</td>`;
+        // Históricos (solo `cantidad`): Totales = valor histórico y Rotas /
+        // Rajadas = 0. Sin registro → celdas vacías (nunca NaN ni undefined).
+        const tot=r?menajeVal(r,'total'):null, rot=r?menajeVal(r,'rotas'):null, raj=r?menajeVal(r,'rajadas'):null;
+        return `<td class="num" style="border-left:2px solid #86efac;font-size:11px;text-align:right">${tot==null?'':tot}</td>`
+             + `<td class="num" style="font-size:11px;text-align:right;color:${rot>0?'#b91c1c':'inherit'}">${rot==null?'':rot}</td>`
+             + `<td class="num" style="font-size:11px;text-align:right;color:${raj>0?'#c2410c':'inherit'}">${raj==null?'':raj}</td>`;
       }).join('')}
     </tr>`).join('');
   el.innerHTML=`
     <div class="page-head"><div><h1>📊 Consolidado Menaje</h1>
-      <p>Evolución diaria del inventario de menaje (una columna por fecha).</p></div></div>
+      <p>Evolución diaria del inventario de menaje: totales, rotas y rajadas por fecha.</p></div></div>
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="cMenajeDesde" value="${conMenajeFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="cMenajeHasta" value="${conMenajeFilter.hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="cMenajeClear" style="align-self:flex-end">Últimos 7 días</button>
+        <button class="btn btn-ghost btn-sm" id="cMenajeClear" style="align-self:flex-end">Últimos 3 días</button>
       </div>
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       <div class="cotejo-outer">
         <table class="cotejo-table">
-          <thead><tr>
-            <th class="cotejo-corner" style="background:#f0fdf4">Artículo</th>
-            ${hdrFechas}
-          </tr></thead>
+          <thead>
+            <tr>
+              <th class="cotejo-corner" rowspan="2" style="background:#f0fdf4;vertical-align:middle">Artículo</th>
+              ${hdrFechas}
+            </tr>
+            <tr>${hdrSub}</tr>
+          </thead>
           <tbody>${filas||`<tr><td class="empty" colspan="100">Sin datos.</td></tr>`}</tbody>
         </table>
       </div>
       <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
-        Celdas vacías = sin registro para esa fecha.
+        Cada fecha agrupa <b>Tot.</b> (unidades totales), <b>Rot.</b> (rotas) y <b>Raj.</b> (rajadas). Celdas vacías = sin registro; en los históricos anteriores a estas métricas, Rotas y Rajadas se muestran como 0. Desliza horizontalmente para ver más fechas.
       </p>
     </div>`;
   ['cMenajeDesde','cMenajeHasta'].forEach(id=>{
@@ -6805,9 +6884,7 @@ RENDERERS.consolidadoMenaje = function(){
     };
   });
   document.getElementById('cMenajeClear').onclick=()=>{
-    const hoy=new Date(), h2=new Date(hoy); h2.setDate(h2.getDate()-6);
-    const fmt=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-    conMenajeFilter={desde:fmt(h2),hasta:fmt(hoy)};
+    conMenajeFilter=menajeUltimosNDias(3);
     RENDERERS.consolidadoMenaje();
   };
 };
@@ -9010,7 +9087,8 @@ function gsSerializeInventario(){
     SalonProductos: gsRowsToMatrix(['id','nombre','unidades'], S.salonProductos.map(p=>({...p, unidades:p.unidades.join(',')}))),
     SalonInventario: gsRowsToMatrix(['id','productoId','fecha','unidad','cantidad'], S.salonInventario),
     MenajeArticulos: gsRowsToMatrix(['id','nombre'], S.menajeArticulos),
-    MenajeInventario: gsRowsToMatrix(['id','articuloId','fecha','cantidad'], S.menajeInventario),
+    MenajeInventario: gsRowsToMatrix(['id','articuloId','fecha','cantidad','rotas','rajadas'],
+      S.menajeInventario.map(r=>({...r, rotas:menajeVal(r,'rotas'), rajadas:menajeVal(r,'rajadas')}))),
     EfectivoCaja: (()=>{
       // Serialización plana: id,fecha,turno,responsable + ap_bolsa,ap0..ap10 + cl_bolsa,cl0..cl10
       const hdr = ['id','fecha','turno','responsable','apBolsa',
@@ -9325,7 +9403,10 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       }
       S.menajeInventario = (byName['MenajeInventario']||[]).map(r=>({
         id:String(r.id||uid()), articuloId:String(r.articuloId||''),
-        fecha:normFechaGS(r.fecha), cantidad:Math.max(0,Math.round(Number(r.cantidad)||0))
+        fecha:normFechaGS(r.fecha),
+        // Compatibilidad: si la hoja no trae rotas/rajadas (registros previos a
+        // estas métricas), se leen como 0 sin perder las unidades históricas.
+        cantidad:menajeEntero(r.cantidad), rotas:menajeEntero(r.rotas), rajadas:menajeEntero(r.rajadas)
       }));
       if(menajeSanearInventario() > 0) syncMenajeInventario();
       save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
