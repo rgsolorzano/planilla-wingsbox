@@ -1497,23 +1497,70 @@ function calcQuincenaEmpleado(emp, year, month, q){
     pagoFeriado:a.pagoFeriado+(d.pagoFeriado||0)
   }), {horasEf:0,horasProg:0,horasExtra:0,descAuto:0,descManual:0,pagoManual:0,pagoExtraHoras:0,pagoFeriado:0});
 
+  // ── LIQUIDACIÓN: fuente ÚNICA de conceptos monetarios de la quincena ──────
+  // payments[] y discounts[] son la verdad compartida por Cálculo Quincenal y
+  // Boleta por Empleado: el total se DERIVA de ellos, de modo que cualquier
+  // concepto nuevo que se agregue aquí aparece automáticamente en la boleta y
+  // en el total, sin poder desincronizarse.
+  // Cada concepto: {fecha|null, tipo, descripcion, monto, meta}
+  function construirLiquidacion({base, bonoPuntualidad, esLibre}){
+    const payments=[], discounts=[];
+    if(esLibre){
+      dias.forEach(d=>{ if((d.pagoLibre||0)>0) payments.push({fecha:d.fecha, tipo:'horasTrabajadas',
+        descripcion:`Horas trabajadas (${d.horasEf}h)`, monto:d.pagoLibre, meta:{horas:d.horasEf}}); });
+    }else if(base>0 || true){
+      payments.push({fecha:null, tipo:'base', descripcion:'Sueldo quincenal base', monto:base});
+    }
+    dias.forEach(d=>{
+      if(d.pagoExtraHoras>0) payments.push({fecha:d.fecha, tipo:'horasExtra',
+        descripcion:`Horas extra (${d.horasExtra}h)`, monto:d.pagoExtraHoras, meta:{horas:d.horasExtra}});
+      if((d.pagoFeriado||0)>0) payments.push({fecha:d.fecha, tipo:'feriado',
+        descripcion:`Feriado trabajado (${d.horasEf}h)`, monto:d.pagoFeriado, meta:{horas:d.horasEf}});
+      d.pagoExtraList.forEach(p=> payments.push({fecha:d.fecha, tipo:'pagoManual',
+        descripcion:`${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, monto:Number(p.monto)||0}));
+    });
+    if((bonoPuntualidad||0)>0) payments.push({fecha:null, tipo:'bonoPuntualidad',
+      descripcion:'Bono puntualidad', monto:bonoPuntualidad});
+    dias.forEach(d=>{
+      if((d.descAuto||0)>0){
+        const motivos=[];
+        if(d.esFalta) motivos.push(`Falta - ausencia (${d.horasProg}h)`);
+        if(d.hTard>0) motivos.push(`Tardanza ${d.hTard}h`);
+        if(d.hSal>0) motivos.push(`Salida anticipada ${d.hSal}h`);
+        if(d.horasFaltaMarc>0) motivos.push(`Falta de marcación ${d.horasFaltaMarc}h`);
+        discounts.push({fecha:d.fecha, tipo:'descAuto',
+          descripcion: motivos.length? motivos.join(', ') : 'Descuento automático', monto:d.descAuto});
+      }
+      d.descManualList.forEach(x=> discounts.push({fecha:d.fecha, tipo:'descManual',
+        descripcion:`${x.tipo}${x.detalle?(' ('+x.detalle+')'):''}`, monto:Number(x.monto)||0}));
+    });
+    const totalPagos     = payments.reduce((s,p)=>s+p.monto,0);
+    const totalDescuentos= discounts.reduce((s,x)=>s+x.monto,0);
+    return { payments, discounts, totalPagos, totalDescuentos, totalPagar: totalPagos-totalDescuentos };
+  }
+
   // --- EMPLEADO LIBRE: pago por horas trabajadas, no por sueldo quincenal ---
   if(empEsLibre(emp)){
     const sh = Number(emp.sueldoHora)||0;
     const libreSinSueldoHora = !(sh > 0); // si no tiene sueldo/hora, su pago es 0 hasta corregir
     dias.forEach(d=>{ d.pagoLibre = libreSinSueldoHora ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, sh); });
     // El pago por feriado es acumulable también para empleados libres.
-    const totalPagar = dias.reduce((s,d)=>s+(d.pagoLibre||0)+(d.pagoFeriado||0), 0);
-    return { dias, tot, base:0, totalPagar, esLibre:true, sueldoHora:sh, libreSinSueldoHora };
+    const liq = construirLiquidacion({base:0, bonoPuntualidad:0, esLibre:true});
+    return { dias, tot, base:0, totalPagar:liq.totalPagar, esLibre:true, sueldoHora:sh, libreSinSueldoHora,
+             payments:liq.payments, discounts:liq.discounts, totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos };
   }
 
   const base = Number(emp.sueldoQuincenal)||0;
   // Bono por puntualidad: solo 2ª quincena, evaluación completa (tardanza + asistencia).
   const evBono = evaluarBonoPuntualidad(emp, year, month);
   const bonoPuntualidad = q===2 ? evBono.bono : 0;
-  // Total = base + pagos extra + pago horas extra + bono - desc. manuales - desc. automáticos
-  const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras + tot.pagoFeriado + bonoPuntualidad - tot.descManual - tot.descAuto;
+  // Total DERIVADO de la liquidación (payments - discounts): única fuente de
+  // verdad compartida con la Boleta, sin sumatorias paralelas.
+  const liq = construirLiquidacion({base, bonoPuntualidad, esLibre:false});
+  const totalPagar = liq.totalPagar;
   return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad,
+           payments:liq.payments, discounts:liq.discounts,
+           totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos,
            retrasoMensualMinutos:evBono.minutosAcum,
            diasSinEntrada:evBono.diasSinEntrada,
            motivoBono:evBono.motivo,
@@ -5679,6 +5726,9 @@ function renderConsolidado(){
     return {nombre:emp.nombre, esLibre:r.esLibre===true, sueldoHora:Number(emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
       horasExtra:r.tot.horasExtra, pagoExtraHoras:r.tot.pagoExtraHoras, descAuto:r.tot.descAuto,
       descManual:r.tot.descManual, pagoManual:r.tot.pagoManual,
+      // Concepto tomado de la MISMA liquidación (no recalculado), para que las
+      // columnas expliquen íntegramente el Total a Pagar.
+      pagoFeriado:(r.payments||[]).filter(p=>p.tipo==='feriado').reduce((s,p)=>s+p.monto,0),
       bonoPuntualidad:r.bonoPuntualidad||0, retrasoMin:r.retrasoMensualMinutos||0,
       diasSinEntrada:r.diasSinEntrada||0, motivoBono:r.motivoBono||'', total:r.totalPagar,
       sueldoPlanilla, sueldoTransfer};
@@ -5686,10 +5736,23 @@ function renderConsolidado(){
   const T=_consolidado.reduce((a,c)=>({
     base:a.base+c.base, horasExtra:a.horasExtra+c.horasExtra, pagoExtraHoras:a.pagoExtraHoras+c.pagoExtraHoras,
     descAuto:a.descAuto+c.descAuto, descManual:a.descManual+c.descManual, pagoManual:a.pagoManual+c.pagoManual,
+    pagoFeriado:a.pagoFeriado+c.pagoFeriado,
     bonoPuntualidad:a.bonoPuntualidad+c.bonoPuntualidad, total:a.total+c.total,
     sueldoPlanilla:a.sueldoPlanilla+c.sueldoPlanilla, sueldoTransfer:a.sueldoTransfer+c.sueldoTransfer
-  }),{base:0,horasExtra:0,pagoExtraHoras:0,descAuto:0,descManual:0,pagoManual:0,bonoPuntualidad:0,total:0,sueldoPlanilla:0,sueldoTransfer:0});
+  }),{base:0,horasExtra:0,pagoExtraHoras:0,descAuto:0,descManual:0,pagoManual:0,pagoFeriado:0,bonoPuntualidad:0,total:0,sueldoPlanilla:0,sueldoTransfer:0});
 
+  // Auditoría: las columnas de conceptos deben explicar íntegramente el Total
+  // a Pagar de cada empleado. Se registra cualquier descuadre en vez de
+  // ocultarlo (misma política que la Boleta).
+  _consolidado.forEach(c=>{
+    if(c.esLibre) return; // el libre no tiene sueldo base: su total sale de horas
+    const esperado=c.base+c.pagoExtraHoras+c.pagoManual+c.pagoFeriado+c.bonoPuntualidad-c.descAuto-c.descManual;
+    if(Math.abs(esperado-c.total)>0.005){
+      console.error('[Consolidado] DESCUADRE columnas vs Total a Pagar', {
+        empleado:c.nombre, periodo:`${PER.month}/${PER.year} Q${PER.q}`,
+        totalCalculado:c.total, sumaDeColumnas:esperado, diferencia:esperado-c.total, conceptos:c });
+    }
+  });
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena':'2ª quincena'}`;
   out.innerHTML=`
     <div class="kpis">
@@ -5697,6 +5760,7 @@ function renderConsolidado(){
       <div class="kpi green"><div class="label">Total horas extra</div><div class="value">${money(T.pagoExtraHoras)}</div></div>
       <div class="kpi red"><div class="label">Total descuentos</div><div class="value">${money(T.descAuto+T.descManual)}</div></div>
       <div class="kpi green"><div class="label">Total pagos extra</div><div class="value">${money(T.pagoManual)}</div></div>
+      ${T.pagoFeriado>0?`<div class="kpi green"><div class="label">🎌 Total feriados trabajados</div><div class="value">${money(T.pagoFeriado)}</div></div>`:''}
       <div class="kpi blue"><div class="label">Total sueldo planilla</div><div class="value">${money(T.sueldoPlanilla)}</div></div>
       <div class="kpi blue"><div class="label">Total sueldo transferencia</div><div class="value">${money(T.sueldoTransfer)}</div></div>
       <div class="kpi violet"><div class="label">Total general a pagar</div><div class="value">${money(T.total)}</div></div>
@@ -5714,6 +5778,7 @@ function renderConsolidado(){
           <th class="num" style="white-space:normal;min-width:62px">Desc.<br>Auto</th>
           <th class="num" style="white-space:normal;min-width:62px">Desc.<br>Manual</th>
           <th class="num" style="white-space:normal;min-width:62px">Pagos<br>Extra</th>
+          <th class="num" style="white-space:normal;min-width:66px">Pago<br>Feriado</th>
           <th class="num" style="white-space:normal;min-width:80px">Bono<br>Puntualidad</th>
           <th class="num" style="white-space:normal;min-width:68px">Sueldo<br>Planilla</th>
           <th class="num" style="white-space:normal;min-width:70px">Sueldo<br>Transfer.</th>
@@ -5729,6 +5794,7 @@ function renderConsolidado(){
           <td class="num" style="color:${c.descAuto>0?'var(--red)':'var(--c-muted)'}">${c.esLibre?'<span title="No aplica a empleados libres">—</span>':money(c.descAuto)}</td>
           <td class="num" style="color:var(--red)">${money(c.descManual)}</td>
           <td class="num" style="color:var(--green)">${money(c.pagoManual)}</td>
+          <td class="num" style="color:${c.pagoFeriado>0?'var(--green)':'var(--c-muted)'}">${c.pagoFeriado>0?money(c.pagoFeriado):'—'}</td>
           <td class="num" style="color:${c.esLibre?'var(--c-muted)':c.bonoPuntualidad>0?'var(--green)':'var(--c-muted)'}" title="${c.esLibre?'Excluido (empleado libre)':c.motivoBono}">${c.esLibre?'Excluido':c.bonoPuntualidad>0?money(c.bonoPuntualidad):'—'}${!c.esLibre?`<br><small style="color:var(--c-muted)">${c.retrasoMin.toFixed(0)} min${c.diasSinEntrada>0?' · '+c.diasSinEntrada+'d s/ent.':''}</small>`:''}</td>
           <td class="num">${money(c.sueldoPlanilla)}</td><td class="num">${money(c.sueldoTransfer)}</td><td class="num"><b>${money(c.total)}</b></td>
         </tr>`).join('')}</tbody>
@@ -5736,7 +5802,7 @@ function renderConsolidado(){
           <td>TOTALES</td><td class="num">${money(T.base)}</td><td class="num">—</td><td class="num">—</td>
           <td class="num">${T.horasExtra}</td><td class="num">${money(T.pagoExtraHoras)}</td>
           <td class="num">${money(T.descAuto)}</td><td class="num">${money(T.descManual)}</td>
-          <td class="num">${money(T.pagoManual)}</td><td class="num">${money(T.bonoPuntualidad)}</td>
+          <td class="num">${money(T.pagoManual)}</td><td class="num">${money(T.pagoFeriado)}</td><td class="num">${money(T.bonoPuntualidad)}</td>
           <td class="num">${money(T.sueldoPlanilla)}</td><td class="num">${money(T.sueldoTransfer)}</td><td class="num">${money(T.total)}</td>
         </tr></tfoot>
       </table></div>
@@ -5745,10 +5811,10 @@ function renderConsolidado(){
 /* ---------- Exportación a CSV ---------- */
 function exportarCSV(){
   if(!_consolidado.length){ toast('Genera el consolidado primero','error'); return; }
-  const head=['Empleado','Sueldo base','Horas trabajadas','Horas programadas','Horas extra','Pago horas extra','Descuentos automaticos','Descuentos manuales','Pagos extra','Bono puntualidad','Retraso mes (min)','Sueldo planilla','Sueldo transferencia','Total a pagar'];
-  const rows=_consolidado.map(c=>[c.nombre,c.base,c.horasEf,c.horasProg,c.horasExtra,c.pagoExtraHoras,c.descAuto,c.descManual,c.pagoManual,c.bonoPuntualidad,c.retrasoMin,c.sueldoPlanilla,c.sueldoTransfer,c.total]);
-  const T=_consolidado.reduce((a,c)=>({base:a.base+c.base,he:a.he+c.horasExtra,phe:a.phe+c.pagoExtraHoras,da:a.da+c.descAuto,dm:a.dm+c.descManual,pm:a.pm+c.pagoManual,bp:a.bp+c.bonoPuntualidad,sp:a.sp+c.sueldoPlanilla,st:a.st+c.sueldoTransfer,t:a.t+c.total}),{base:0,he:0,phe:0,da:0,dm:0,pm:0,bp:0,sp:0,st:0,t:0});
-  rows.push(['TOTALES',T.base,'','',T.he,T.phe,T.da,T.dm,T.pm,T.bp,'',T.sp,T.st,T.t]);
+  const head=['Empleado','Sueldo base','Horas trabajadas','Horas programadas','Horas extra','Pago horas extra','Descuentos automaticos','Descuentos manuales','Pagos extra','Pago feriado','Bono puntualidad','Retraso mes (min)','Sueldo planilla','Sueldo transferencia','Total a pagar'];
+  const rows=_consolidado.map(c=>[c.nombre,c.base,c.horasEf,c.horasProg,c.horasExtra,c.pagoExtraHoras,c.descAuto,c.descManual,c.pagoManual,c.pagoFeriado,c.bonoPuntualidad,c.retrasoMin,c.sueldoPlanilla,c.sueldoTransfer,c.total]);
+  const T=_consolidado.reduce((a,c)=>({base:a.base+c.base,he:a.he+c.horasExtra,phe:a.phe+c.pagoExtraHoras,da:a.da+c.descAuto,dm:a.dm+c.descManual,pm:a.pm+c.pagoManual,pf:a.pf+c.pagoFeriado,bp:a.bp+c.bonoPuntualidad,sp:a.sp+c.sueldoPlanilla,st:a.st+c.sueldoTransfer,t:a.t+c.total}),{base:0,he:0,phe:0,da:0,dm:0,pm:0,pf:0,bp:0,sp:0,st:0,t:0});
+  rows.push(['TOTALES',T.base,'','',T.he,T.phe,T.da,T.dm,T.pm,T.pf,T.bp,'',T.sp,T.st,T.t]);
   const csv=[head,...rows].map(r=>r.map(v=>{ const s=String(v).replace(/"/g,'""'); return /[",;\n]/.test(s)?`"${s}"`:s; }).join(';')).join('\n');
   const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'});
   const a=document.createElement('a');
@@ -5792,7 +5858,16 @@ function renderBoleta(){
   // ----- EMPLEADO LIBRE: boleta por horas trabajadas -----
   if(r.esLibre){
     const sh=r.sueldoHora;
-    const filasL=r.dias.filter(d=>(d.horasEf||0)>0).map(d=>`<tr><td>${fmtFecha(d.fecha)} · ${DIAS[diaSemana(d.fecha)]}</td><td class="num">${d.horasEf}</td><td class="num">${money(sh)}</td><td class="num" style="color:var(--green)">${money(d.pagoLibre||0)}</td></tr>`).join('');
+    // Se presenta la MISMA liquidación (payments/discounts): un renglón por
+    // concepto, de modo que ningún pago nuevo pueda quedar fuera del detalle.
+    const filasL=(r.payments||[]).map(c=>{
+      const esFer=c.tipo==='feriado';
+      const horas=(c.meta&&c.meta.horas)!=null?c.meta.horas:'—';
+      return `<tr><td>${c.fecha?fmtFecha(c.fecha)+' · '+DIAS[diaSemana(c.fecha)]:''} ${esFer?'<span class="badge b-late">Feriado</span>':''}</td>`+
+        `<td class="num">${horas}</td><td class="num">${money(sh)}</td>`+
+        `<td class="num" style="color:var(--green)">${money(c.monto)}</td></tr>`;
+    }).join('');
+    const descL=(r.discounts||[]).map(c=>`<tr><td colspan="3">${c.fecha?fmtFecha(c.fecha)+' · ':''}${c.descripcion}</td><td class="num" style="color:var(--red)">- ${money(c.monto)}</td></tr>`).join('');
     const totalHoras=r.dias.reduce((s,d)=>s+(d.horasEf||0),0);
     const aviso = r.libreSinSueldoHora ? `<p class="hint" style="color:var(--red)">⚠ Sin sueldo por hora definido: el total se calcula como S/ 0.00 hasta corregirlo.</p>` : '';
     out.innerHTML=`
@@ -5803,7 +5878,7 @@ function renderBoleta(){
         <h3>Detalle por día</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>Fecha</th><th class="num">Horas trabajadas</th><th class="num">Sueldo/hora</th><th class="num">Pago del día</th></tr></thead>
-          <tbody>${filasL || `<tr><td colspan="4" class="empty">Sin días con horas trabajadas en el periodo.</td></tr>`}</tbody>
+          <tbody>${filasL || `<tr><td colspan="4" class="empty">Sin días con horas trabajadas en el periodo.</td></tr>`}${descL}</tbody>
           <tfoot><tr><td>Totales</td><td class="num">${totalHoras} h</td><td class="num">—</td><td class="num">${money(r.totalPagar)}</td></tr></tfoot>
         </table></div>
         <div class="summary">
@@ -5813,27 +5888,32 @@ function renderBoleta(){
     return;
   }
 
-  // ----- Detalle de pagos -----
-  const pagosRows=[];
-  pagosRows.push(['Sueldo quincenal base', r.base]);
-  // Detalle de horas extra POR DÍA (cuando hay pago por horas extra)
-  r.dias.forEach(d=>{ if(d.pagoExtraHoras>0) pagosRows.push([`${fmtFecha(d.fecha)} · Horas extra (${d.horasExtra}h)`, d.pagoExtraHoras]); });
-  r.dias.forEach(d=> d.pagoExtraList.forEach(p=> pagosRows.push([`${fmtFecha(d.fecha)} · ${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, Number(p.monto)||0])));
-  if((r.bonoPuntualidad||0) > 0) pagosRows.push([`Bono puntualidad (${(r.retrasoMensualMinutos||0).toFixed(0)} min tardanza · ${r.diasSinEntrada||0} días sin entrada)`, r.bonoPuntualidad]);
-  const subtotalPagos = r.base + r.tot.pagoExtraHoras + r.tot.pagoManual + (r.bonoPuntualidad||0);
+  // ----- Detalle de pagos y descuentos -----
+  // La boleta SOLO PRESENTA la liquidación calculada por calcQuincenaEmpleado:
+  // no recalcula ni vuelve a sumar conceptos (evita descuadres y duplicados).
+  // Cualquier concepto nuevo agregado al cálculo aparece aquí automáticamente.
+  const etiqueta=c=>{
+    const desc = c.tipo==='bonoPuntualidad'
+      ? `Bono puntualidad (${(r.retrasoMensualMinutos||0).toFixed(0)} min tardanza · ${r.diasSinEntrada||0} días sin entrada)`
+      : c.descripcion;
+    return c.fecha ? `${fmtFecha(c.fecha)} · ${desc}` : desc;
+  };
+  const pagosRows = (r.payments||[]).map(c=>[etiqueta(c), c.monto]);
+  const descRows  = (r.discounts||[]).map(c=>[etiqueta(c), c.monto]);
+  const subtotalPagos = r.totalPagos;
+  const subtotalDesc  = r.totalDescuentos;
 
-  // ----- Detalle de descuentos -----
-  const descRows=[];
-  r.dias.forEach(d=>{
-    const motivos=[];
-    if(d.esFalta) motivos.push(`Falta - ausencia (${d.horasProg}h)`);
-    if(d.hTard>0) motivos.push(`Tardanza ${d.hTard}h`);
-    if(d.hSal>0) motivos.push(`Salida anticipada ${d.hSal}h`);
-    if(d.horasFaltaMarc>0) motivos.push(`Falta de marcación ${d.horasFaltaMarc}h`);
-    if(motivos.length) descRows.push([`${fmtFecha(d.fecha)} · ${motivos.join(', ')}`, d.descAuto - 0]); // desc automático del día
-    d.descManualList.forEach(x=> descRows.push([`${fmtFecha(d.fecha)} · ${x.tipo}${x.detalle?(' ('+x.detalle+')'):''}`, Number(x.monto)||0]));
-  });
-  const subtotalDesc = r.tot.descAuto + r.tot.descManual;
+  // Auditoría de consistencia: el desglose debe cuadrar exactamente con el
+  // total del Cálculo Quincenal. Si no cuadra, se registra el detalle en
+  // consola en vez de ocultar la diferencia ajustando el total.
+  const CENT = 0.005;
+  if(Math.abs((subtotalPagos - subtotalDesc) - r.totalPagar) > CENT){
+    console.error('[Boleta] DESCUADRE con Cálculo Quincenal', {
+      empleado: emp.nombre, periodo: `${PER.month}/${PER.year} Q${PER.q}`,
+      totalCalculoQuincenal: r.totalPagar, totalBoleta: subtotalPagos - subtotalDesc,
+      diferencia: (subtotalPagos - subtotalDesc) - r.totalPagar,
+      pagos: r.payments, descuentos: r.discounts });
+  }
 
   const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
   const sueldoTransfer = r.totalPagar - sueldoPlanilla;
