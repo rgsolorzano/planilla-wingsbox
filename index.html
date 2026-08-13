@@ -2837,14 +2837,34 @@ async function vdSync(){
     const filas=(await r.json()).values||[];
     console.log('[Canal] '+VD_SHEET+': '+filas.length+' filas leídas.');
     const out=[]; let invalidas=0;
+    // Auditoría de CANAL DE VENTA (col. AR): se registran los valores que no
+    // corresponden a los seis canales válidos (vacíos, variantes, erratas) sin
+    // modificar el dato original. Sirven para explicar por qué la suma de
+    // participaciones podría no llegar al 100%.
+    const canalesNoClasificados=new Map(); let sinCanal=0;
     filas.forEach(row=>{
       if(!row||!row.length) return;
       const fecha=normFechaGS(row[VD_COL.fecha]);
       if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ invalidas++; return; } // encabezado o fecha inválida
       const monto=analNumOrNull(row[VD_COL.monto]);
-      out.push({ f:fecha, c:vdNormCanal(row[VD_COL.canal]),
+      const canalRaw=String(row[VD_COL.canal]??'');
+      const canal=vdNormCanal(canalRaw);
+      if(!canal){
+        const clave=canalRaw.trim()===''?'(vacío)':JSON.stringify(canalRaw);
+        canalesNoClasificados.set(clave,(canalesNoClasificados.get(clave)||0)+1);
+        sinCanal++;
+      }
+      out.push({ f:fecha, c:canal,
         m:String(row[VD_COL.medio]??'').trim()||'(Sin medio)', v:monto===null?0:monto });
     });
+    if(canalesNoClasificados.size){
+      console.warn('[Canal] AUDITORÍA columna AR: '+sinCanal+' venta(s) con canal no clasificado ('+
+        ((sinCanal/out.length)*100).toFixed(2)+'% del total). Estas ventas suman al Total pero no a ningún canal, '+
+        'por lo que la suma de participaciones no llegará al 100%. Valores encontrados:',
+        Object.fromEntries(canalesNoClasificados));
+    } else {
+      console.log('[Canal] AUDITORÍA columna AR: todas las ventas tienen un canal válido.');
+    }
     vdFacts=out;
     vdMeta={ lastSync:new Date().toISOString(), ventas:out.length, descartadas:invalidas,
       medios:[...new Set(out.map(x=>x.m))].length, duracion:((Date.now()-t0)/1000).toFixed(1) };
@@ -2903,6 +2923,24 @@ function vdPromedioTotal(puntos){
   if(!puntos.length) return null;
   return puntos.reduce((s,p)=>s+p.total,0)/puntos.length;
 }
+// Participación del canal en el período visible, calculada SIEMPRE sobre los
+// TOTALES ACUMULADOS del mismo conjunto de puntos que se grafica:
+//   % = SUM(valor del canal) / SUM(valor total) x 100
+// (COUNT de registros si la métrica es "Número de ventas", SUM del monto de la
+// columna T si es "Monto de ventas" — ambos ya agregados en los puntos).
+// NO se deriva de las líneas de promedio: el promedio del canal se calcula
+// solo sobre los períodos en que ese canal vendió, mientras el promedio total
+// usa todos los períodos, de modo que su cociente sobreestima la
+// participación. Son dos métricas distintas y se calculan por separado.
+// El numerador respeta el filtro de Medio de Venta (los canales lo aplican);
+// el denominador es el total general del período, sin filtrar por medio.
+function vdParticipacionCanal(puntos, canal){
+  if(!canal || canal==='todos' || !puntos.length) return null;
+  const numerador = puntos.reduce((s,p)=>s+(p.porCanal[canal]||0), 0);
+  const denominador = puntos.reduce((s,p)=>s+(p.total||0), 0);
+  if(!(denominador>0)) return null; // sin división entre cero: no hay porcentaje
+  return numerador/denominador*100;
+}
 function vdPromedioCanal(puntos, canal){
   if(!canal || canal==='todos') return null;           // con "Todos" no hay 2ª línea
   const vals=puntos.map(p=>p.porCanal[canal]).filter(v=>v!==undefined);
@@ -2958,10 +2996,9 @@ function vdChartSVG(puntos, canales){
   const promTotal = vdPromedioTotal(puntos);
   const canalUnico = (vdFilter.canal!=='todos' && canales.length===1) ? canales[0] : null;
   const promCanal = canalUnico ? vdPromedioCanal(puntos, canalUnico) : null;
-  // Participación del promedio del canal sobre el promedio Total visible.
-  // Si el Total es 0 o no existe, no se divide (se omite el porcentaje).
-  const pctCanal = (promCanal!==null && promTotal!==null && promTotal>0)
-    ? (promCanal/promTotal*100) : null;
+  // Participación acumulada real del canal en el período (no el cociente de
+  // los promedios, que sobreestima por usar divisores distintos).
+  const pctCanal = canalUnico ? vdParticipacionCanal(puntos, canalUnico) : null;
   const promLineas = promLinea(promTotal, '#475569', 'Prom. Total Ventas', '8 5', null)
     + (canalUnico ? promLinea(promCanal, VD_COLORES[canalUnico]||'#64748b', 'Prom. '+canalUnico, '3 4', pctCanal) : '');
   return `
