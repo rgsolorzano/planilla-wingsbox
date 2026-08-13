@@ -570,8 +570,13 @@ const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No ma
 const TIPOS_DESC_NUEVOS = TIPOS_DESC.filter(t=> t!=='Falta' && t!=='No marcación');
 const BONO_PUNTUALIDAD = 25;            // S/ por puntualidad mensual (2ª quincena)
 const BONO_PUNT_MAX_MINUTOS = 20;       // máximo de retraso mensual neto para calificar (<=20 min)
-const TIPOS_PAGO = ['Bono','Feriado','Bono de caja','Otros'];
-const TIPOS_LIBRE = ['Día libre','Vacaciones'];
+// 'Feriado' ya NO es un pago extra manual: se gestiona globalmente desde
+// Días Libres / Vacaciones y su pago se calcula automáticamente.
+const TIPOS_PAGO = ['Bono','Bono de caja','Otros'];
+// 'Feriado' es GLOBAL: se registra una sola vez para la fecha y aplica a
+// todos los empleados (se persiste con empleadoId = LIBRE_GLOBAL).
+const TIPOS_LIBRE = ['Día libre','Vacaciones','Feriado'];
+const LIBRE_GLOBAL = '*';
 const TIPOS_EMP = ['Mesero','Cocina','Caja'];
 // Tipos de propina admitidos por fila en el formulario de ingreso (formato nuevo).
 // Orden = orden del dropdown de registro: Tarjeta, Izipay, Yape, Efectivo, Plin
@@ -1155,10 +1160,47 @@ function calcHorasExtra(efectivas, programadas){
 /* ---------- Accesores auxiliares ---------- */
 function getHorario(empleadoId, dia){ return S.hor.find(h=>h.empleadoId===empleadoId && h.dia===dia); }
 function getMarcacion(empleadoId, fecha){ return S.mar.find(m=>m.empleadoId===empleadoId && m.fecha===fecha); }
-// Origen de la marcación: 'manual' o 'archivo'. Registros antiguos sin campo = 'archivo'.
-function marOrigen(m){ return (m && m.origen === 'manual') ? 'manual' : 'archivo'; }
-function esDiaLibre(empleadoId, fecha){ return S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha); }
-function tipoDiaLibre(empleadoId, fecha){ const l=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha); return l? l.tipo : null; }
+// ── Precedencia de marcaciones: MANUAL gana sobre EXTERNA, campo por campo ──
+// El origen se rastrea de forma independiente para entrada y salida
+// (origenEntrada / origenSalida), de modo que se pueda combinar, por ejemplo,
+// "entrada manual + salida externa". Los registros antiguos solo tienen
+// `origen` a nivel de registro: se interpreta como el origen de AMBOS campos,
+// preservando el comportamiento histórico sin migración destructiva.
+function marOrigenCampo(m, campo){ // campo: 'entrada' | 'salida'
+  if(!m) return 'archivo';
+  const esp = campo==='entrada' ? m.origenEntrada : m.origenSalida;
+  if(esp==='manual' || esp==='archivo') return esp;
+  return m.origen==='manual' ? 'manual' : 'archivo';
+}
+// Origen del registro (compatibilidad): es "manual" si algún campo lo es.
+function marOrigen(m){
+  if(!m) return 'archivo';
+  return (marOrigenCampo(m,'entrada')==='manual' || marOrigenCampo(m,'salida')==='manual') ? 'manual' : 'archivo';
+}
+// Marca un campo como corregido manualmente y mantiene `origen` coherente.
+function marSetOrigenCampo(m, campo, origen){
+  if(!m) return;
+  // Fijar explícitamente el otro campo si venía implícito, para no perder su origen.
+  const otro = campo==='entrada' ? 'salida' : 'entrada';
+  const origenOtro = marOrigenCampo(m, otro);
+  if(campo==='entrada'){ m.origenEntrada=origen; m.origenSalida=origenOtro; }
+  else                 { m.origenSalida=origen;  m.origenEntrada=origenOtro; }
+  m.origen = marOrigen(m); // derivado
+}
+// Feriado: condición GLOBAL de la fecha (aplica a todos los empleados).
+function esFeriado(fecha){ return S.libre.some(l=>l.tipo==='Feriado' && l.fecha===fecha); }
+function feriadoDe(fecha){ return S.libre.find(l=>l.tipo==='Feriado' && l.fecha===fecha) || null; }
+// Un día es "libre" si el empleado lo tiene registrado individualmente o si la
+// fecha es feriado global: en ambos casos no se generan descuentos por
+// ausencia, tardanza ni falta de marcación.
+function esDiaLibre(empleadoId, fecha){
+  return esFeriado(fecha) || S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha && l.tipo!=='Feriado');
+}
+function tipoDiaLibre(empleadoId, fecha){
+  const propio=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha && x.tipo!=='Feriado');
+  if(propio) return propio.tipo;
+  return esFeriado(fecha) ? 'Feriado' : null;
+}
 
 // ── normalizarMarcacionesMedianoche ────────────────────────────────────────
 // Auditoría y reparación de datos HISTÓRICOS ya corrompidos por el bug de
@@ -1273,9 +1315,11 @@ function calcDia(emp, fecha){
     const descManual = descManualList.reduce((s,d)=>s+(Number(d.monto)||0),0);
     const pagoManual = pagoExtraList.reduce((s,p)=>s+(Number(p.monto)||0),0);
     const pagoExtraHoras = 0; // libre no tiene "horas extra" vs programadas
-    const totalDia = pagoManual + pagoExtraHoras - descManual;
+    const feriado = esFeriado(fecha);
+    const pagoFeriado = feriado ? horasEf * (emp.sueldoHora||0) : 0;
+    const totalDia = pagoManual + pagoExtraHoras + pagoFeriado - descManual;
     return {
-      fecha, entradaReal, salidaReal,
+      fecha, entradaReal, salidaReal, feriado, pagoFeriado,
       horasEf, horasProg:0, horasExtra:0,
       hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras,
@@ -1302,6 +1346,7 @@ function calcDia(emp, fecha){
     // acumulen descuentos por días que aún no han terminado.
     const libre       = esDiaLibre(emp.id, fecha);
     const tipoLibre   = tipoDiaLibre(emp.id, fecha);
+    const feriado     = esFeriado(fecha), pagoFeriado = 0;
     const hor         = getHorario(emp.id, diaSemana(fecha));
     const horasProg   = calcHorasProgramadas(emp.id, fecha);
     const debeTrabajar= !libre && hor && !hor.libre && hor.entrada && hor.salida;
@@ -1312,7 +1357,7 @@ function calcDia(emp, fecha){
     const pagoManual     = pagoExtraList.reduce((s,p)=>s+(Number(p.monto)||0),0);
     const totalDia = pagoManual - descManual;
     return {
-      fecha, entradaReal:null, salidaReal:null,
+      fecha, entradaReal:null, salidaReal:null, feriado, pagoFeriado,
       horasEf:0, horasProg, horasExtra:0,
       hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:exo.activa, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras:0,
@@ -1382,6 +1427,13 @@ function calcDia(emp, fecha){
 
   const horasExtra = calcHorasExtra(horasEf, horasProg);
   const pagoExtraHoras = horasExtra * (emp.sueldoHora||0);
+  // ── Pago automático por trabajar en FERIADO ──────────────────────────────
+  // Horas efectivamente trabajadas (vigentes, ya con precedencia manual) x
+  // Sueldo/hora MANUAL del empleado (emp.sueldoHora), nunca el S./h calculado.
+  // Es ACUMULABLE con el pago de horas extra: no lo sustituye. Si no trabaja
+  // el feriado, horasEf = 0 → pago 0 y tampoco hay descuento (es día libre).
+  const feriado = esFeriado(fecha);
+  const pagoFeriado = feriado ? horasEf * (emp.sueldoHora||0) : 0;
 
   // descuentos y pagos manuales registrados en esa fecha
   const descManualList = S.desc.filter(d=>d.empleadoId===emp.id && d.fecha===fecha);
@@ -1390,10 +1442,10 @@ function calcDia(emp, fecha){
   const pagoManual = pagoExtraList.reduce((s,p)=>s+(Number(p.monto)||0),0);
 
   // Total diario informativo: pagos extra + horas extra - descuentos del día
-  const totalDia = pagoManual + pagoExtraHoras - descManual - descAuto;
+  const totalDia = pagoManual + pagoExtraHoras + pagoFeriado - descManual - descAuto;
 
   return {
-    fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra,
+    fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra, feriado, pagoFeriado,
     hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
     descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia,
     esPendiente:false // día pasado evaluado normalmente
@@ -1433,15 +1485,17 @@ function calcQuincenaEmpleado(emp, year, month, q){
   const tot = dias.reduce((a,d)=>({
     horasEf:a.horasEf+d.horasEf, horasProg:a.horasProg+d.horasProg, horasExtra:a.horasExtra+d.horasExtra,
     descAuto:a.descAuto+d.descAuto, descManual:a.descManual+d.descManual,
-    pagoManual:a.pagoManual+d.pagoManual, pagoExtraHoras:a.pagoExtraHoras+d.pagoExtraHoras
-  }), {horasEf:0,horasProg:0,horasExtra:0,descAuto:0,descManual:0,pagoManual:0,pagoExtraHoras:0});
+    pagoManual:a.pagoManual+d.pagoManual, pagoExtraHoras:a.pagoExtraHoras+d.pagoExtraHoras,
+    pagoFeriado:a.pagoFeriado+(d.pagoFeriado||0)
+  }), {horasEf:0,horasProg:0,horasExtra:0,descAuto:0,descManual:0,pagoManual:0,pagoExtraHoras:0,pagoFeriado:0});
 
   // --- EMPLEADO LIBRE: pago por horas trabajadas, no por sueldo quincenal ---
   if(empEsLibre(emp)){
     const sh = Number(emp.sueldoHora)||0;
     const libreSinSueldoHora = !(sh > 0); // si no tiene sueldo/hora, su pago es 0 hasta corregir
     dias.forEach(d=>{ d.pagoLibre = libreSinSueldoHora ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, sh); });
-    const totalPagar = dias.reduce((s,d)=>s+(d.pagoLibre||0), 0);
+    // El pago por feriado es acumulable también para empleados libres.
+    const totalPagar = dias.reduce((s,d)=>s+(d.pagoLibre||0)+(d.pagoFeriado||0), 0);
     return { dias, tot, base:0, totalPagar, esLibre:true, sueldoHora:sh, libreSinSueldoHora };
   }
 
@@ -1450,7 +1504,7 @@ function calcQuincenaEmpleado(emp, year, month, q){
   const evBono = evaluarBonoPuntualidad(emp, year, month);
   const bonoPuntualidad = q===2 ? evBono.bono : 0;
   // Total = base + pagos extra + pago horas extra + bono - desc. manuales - desc. automáticos
-  const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras + bonoPuntualidad - tot.descManual - tot.descAuto;
+  const totalPagar = base + tot.pagoManual + tot.pagoExtraHoras + tot.pagoFeriado + bonoPuntualidad - tot.descManual - tot.descAuto;
   return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad,
            retrasoMensualMinutos:evBono.minutosAcum,
            diasSinEntrada:evBono.diasSinEntrada,
@@ -2832,21 +2886,29 @@ function vdChartSVG(puntos, canales){
   }).join('');
   // Líneas horizontales punteadas de promedio (encima de las áreas, con zona
   // sensible propia para el tooltip inmediato).
-  const promLinea=(valor, color, etiqueta, dash)=>{
+  const promLinea=(valor, color, etiqueta, dash, pct)=>{
     if(valor===null || valor===undefined || valor>maxV) return '';
     const y=Y(valor);
+    // Sufijo de participación: solo si hay un porcentaje finito y válido
+    // (nunca NaN ni Infinity, ni cuando el promedio Total es 0).
+    const pctTxt = (pct!==null && pct!==undefined && isFinite(pct))
+      ? pct.toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2})+'% del total' : '';
     return `<g class="vd-prom">
       <line x1="${mL}" y1="${y.toFixed(1)}" x2="${W-mR}" y2="${y.toFixed(1)}" stroke="${color}" stroke-width="1.8" stroke-dasharray="${dash}" opacity="0.9"/>
       <rect x="${mL}" y="${(y-7).toFixed(1)}" width="${iw}" height="14" fill="transparent" style="pointer-events:all"
-        data-prom="${vdFmt(valor)}" data-etiqueta="${etiqueta}"/>
-      <text x="${W-mR-4}" y="${(y-5).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="${color}">${etiqueta}: ${vdFmt(valor)}</text>
+        data-prom="${vdFmt(valor)}" data-etiqueta="${etiqueta}" data-pct="${pctTxt}"/>
+      <text x="${W-mR-4}" y="${(y-5).toFixed(1)}" text-anchor="end" font-size="10" font-weight="700" fill="${color}">${etiqueta}: ${vdFmt(valor)}${pctTxt?' · '+pctTxt:''}</text>
     </g>`;
   };
   const promTotal = vdPromedioTotal(puntos);
   const canalUnico = (vdFilter.canal!=='todos' && canales.length===1) ? canales[0] : null;
   const promCanal = canalUnico ? vdPromedioCanal(puntos, canalUnico) : null;
-  const promLineas = promLinea(promTotal, '#475569', 'Prom. Total Ventas', '8 5')
-    + (canalUnico ? promLinea(promCanal, VD_COLORES[canalUnico]||'#64748b', 'Prom. '+canalUnico, '3 4') : '');
+  // Participación del promedio del canal sobre el promedio Total visible.
+  // Si el Total es 0 o no existe, no se divide (se omite el porcentaje).
+  const pctCanal = (promCanal!==null && promTotal!==null && promTotal>0)
+    ? (promCanal/promTotal*100) : null;
+  const promLineas = promLinea(promTotal, '#475569', 'Prom. Total Ventas', '8 5', null)
+    + (canalUnico ? promLinea(promCanal, VD_COLORES[canalUnico]||'#64748b', 'Prom. '+canalUnico, '3 4', pctCanal) : '');
   return `
   <div style="position:relative">
     <svg id="vdSvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
@@ -2949,7 +3011,8 @@ function vdBindCard(){
       svg.querySelectorAll('.vd-prom rect').forEach(z=>{
         z.onmouseenter=e=>{
           const rect=svg.getBoundingClientRect();
-          tip.innerHTML=`<b>${z.dataset.etiqueta.replace('Prom.','Promedio')}</b><br>${z.dataset.prom}`;
+          tip.innerHTML=`<b>${z.dataset.etiqueta.replace('Prom.','Promedio')}</b><br>${z.dataset.prom}`
+            + (z.dataset.pct ? ` · ${z.dataset.pct}` : '');
           tip.style.display='block';
           tip.style.left=Math.min(rect.width-210, Math.max(0,(e.clientX-rect.left)+10))+'px';
           tip.style.top='6px';
@@ -4165,6 +4228,8 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
   let manualesConservadas = 0, manualesBorradas = 0;
   if(reemplazar){
     if(conservarManuales){
+      // Se conservan los registros con ALGÚN campo manual; sus campos de
+      // archivo se refrescarán abajo con los datos nuevos.
       manualesConservadas = S.mar.filter(m=>marOrigen(m)==='manual').length;
       S.mar = S.mar.filter(m=>marOrigen(m)==='manual');
     }else{
@@ -4178,11 +4243,19 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
     const salidaReal  = g.salidas.length? g.salidas.sort().slice(-1)[0] : null; // salida más tardía
     let m = getMarcacion(g.empleadoId, g.fecha);
     if(m){
-      // No sobreescribir correcciones manuales cuando se pide conservarlas.
-      if(marOrigen(m)==='manual' && conservarManuales){ manualesProtegidas++; return; }
-      m.entradaReal=entradaReal; m.salidaReal=salidaReal; m.origen='archivo'; actualizadas++;
+      // Precedencia CAMPO POR CAMPO: un campo corregido manualmente no se
+      // sobreescribe con el dato externo, pero el otro campo sí se actualiza
+      // (permite "entrada manual + salida externa" y viceversa).
+      let tocado=false, protegido=false;
+      if(marOrigenCampo(m,'entrada')==='manual' && conservarManuales){ protegido=true; }
+      else { m.entradaReal=entradaReal; marSetOrigenCampo(m,'entrada','archivo'); tocado=true; }
+      if(marOrigenCampo(m,'salida')==='manual' && conservarManuales){ protegido=true; }
+      else { m.salidaReal=salidaReal; marSetOrigenCampo(m,'salida','archivo'); tocado=true; }
+      if(protegido) manualesProtegidas++;
+      if(tocado) actualizadas++;
     }
-    else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal, origen:'archivo'}); nuevas++; }
+    else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal,
+      origen:'archivo', origenEntrada:'archivo', origenSalida:'archivo'}); nuevas++; }
   });
   // Corregir marcaciones de cruce de medianoche ANTES de guardar y sincronizar.
   // (idempotente: si no hay cambios, retorna false sin tocar nada)
@@ -4277,11 +4350,14 @@ RENDERERS.marcaciones = function(){
   document.getElementById('marFClear').onclick=()=>{ marFilter={emp:'',desde:'',hasta:''}; RENDERERS.marcaciones(); };
 };
 
-// Editar una marcación (entrada/salida): toda edición manual marca el registro como "manual"
-// para que se conserve ante futuras reimportaciones desde archivo.
+// Editar una marcación: marca como "manual" ÚNICAMENTE el campo editado
+// (entrada o salida), para que ese valor tenga precedencia sobre futuras
+// importaciones externas sin afectar el origen del otro campo.
 window.marSet = function(id, campo, val){
   const m=S.mar.find(x=>x.id===id); if(!m) return;
-  m[campo]=val||null; m.origen='manual'; save(K.mar,S.mar);
+  m[campo]=val||null;
+  marSetOrigenCampo(m, campo==='entradaReal' ? 'entrada' : 'salida', 'manual');
+  save(K.mar,S.mar);
   normalizarMarcacionesMedianoche();
   RENDERERS.marcaciones();
   syncMarcaciones();
@@ -4306,11 +4382,15 @@ function addMarManual(){
   // Si ya existe un registro para ese empleado y día, se actualiza (estructura: 1 registro por día).
   let m = getMarcacion(empId, fecha);
   if(m){
-    if(entrada) m.entradaReal = entrada;
-    if(salida)  m.salidaReal  = salida;
-    m.origen='manual';
+    // Solo los campos ingresados pasan a ser manuales; el otro conserva su
+    // origen (permite entrada manual + salida externa y viceversa).
+    if(entrada){ m.entradaReal = entrada; marSetOrigenCampo(m,'entrada','manual'); }
+    if(salida) { m.salidaReal  = salida;  marSetOrigenCampo(m,'salida','manual'); }
   }else{
-    S.mar.push({id:uid(), empleadoId:empId, fecha, entradaReal:entrada, salidaReal:salida, origen:'manual'});
+    S.mar.push({id:uid(), empleadoId:empId, fecha, entradaReal:entrada, salidaReal:salida,
+      origen:'manual',
+      origenEntrada: entrada? 'manual':'archivo',
+      origenSalida:  salida ? 'manual':'archivo'});
   }
   save(K.mar,S.mar);
   normalizarMarcacionesMedianoche(); // corrige si este scan entra en la ventana de medianoche
@@ -4666,11 +4746,12 @@ RENDERERS.libres = function(){
   const ed = editLibreId? S.libre.find(x=>x.id===editLibreId) : null;
 
   el.innerHTML=`
-    <div class="page-head"><div><h1>🌴 Días libres / Vacaciones</h1><p>En estos días no se aplican descuentos por tardanza ni por falta de marcación.</p></div></div>
+    <div class="page-head"><div><h1>🌴 Días libres / Vacaciones</h1><p>En estos días no se aplican descuentos por tardanza ni por falta de marcación. Un <b>Feriado</b> es global: se registra una sola vez y aplica a todos los empleados; quien trabaje ese día recibe automáticamente <b>horas efectivas × Sueldo/hora</b>.</p></div></div>
     <div class="card">
       <h2>${ed?'Editar registro':'Nuevo registro'}</h2>
       <div class="form-grid">
-        <div class="field"><label>Empleado *</label><select id="lEmp">${empOptions(ed?ed.empleadoId:undefined)}</select></div>
+        <div class="field"><label>Empleado *</label><select id="lEmp">${empOptions(ed?ed.empleadoId:undefined)}</select>
+          <small id="lEmpHint" style="display:none;color:var(--c-muted)">El feriado es global: aplica a todos los empleados.</small></div>
         <div class="field"><label>${ed?'Fecha *':'Fecha inicio *'}</label><input type="date" id="lFecha" value="${ed?ed.fecha:hoy}"></div>
         ${ed?'':`<div class="field"><label>Fecha fin (opcional)</label><input type="date" id="lFechaFin" placeholder="Para rangos"></div>`}
         <div class="field"><label>Tipo *</label><select id="lTipo">${TIPOS_LIBRE.map(t=>`<option ${ed&&ed.tipo===t?'selected':''}>${t}</option>`).join('')}</select></div>
@@ -4700,8 +4781,9 @@ RENDERERS.libres = function(){
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Empleado</th><th>Tipo</th><th>Comentario</th><th>Acciones</th></tr></thead>
         <tbody>${filtrada.length? filtrada.map(l=>`
-          <tr class="row-vac"><td>${fmtFecha(l.fecha)}</td><td>${nombreEmp(l.empleadoId)}</td>
-          <td><span class="badge ${l.tipo==='Vacaciones'?'b-vac':'b-free'}">${l.tipo}</span></td>
+          <tr class="row-vac"><td>${fmtFecha(l.fecha)}</td>
+          <td>${l.tipo==='Feriado'?'<b>Todos los empleados</b> <small style="color:var(--c-muted)">(global)</small>':nombreEmp(l.empleadoId)}</td>
+          <td><span class="badge ${l.tipo==='Vacaciones'?'b-vac':(l.tipo==='Feriado'?'b-late':'b-free')}">${l.tipo}</span></td>
           <td>${l.comentario||'—'}</td>
           <td><button class="btn-icon" onclick="libreEdit('${l.id}')">✏️</button> <button class="btn-icon del" onclick="libreDel('${l.id}')">🗑️</button></td></tr>`).join('')
           : `<tr><td colspan="5" class="empty">${S.libre.length?'Sin registros para el filtro seleccionado.':'Sin días libres o vacaciones.'}</td></tr>`}</tbody>
@@ -4716,6 +4798,16 @@ RENDERERS.libres = function(){
     RENDERERS.libres();
   };
   ['lFDes','lFHas','lFEmp','lFTip'].forEach(id=>document.getElementById(id).onchange=applyF);
+  // Feriado = condición global de la fecha: se deshabilita el empleado.
+  const syncFeriadoUI=()=>{
+    const esFer=document.getElementById('lTipo').value==='Feriado';
+    const selEmp=document.getElementById('lEmp'), hint=document.getElementById('lEmpHint');
+    selEmp.disabled=esFer;
+    selEmp.style.opacity=esFer?'.5':'';
+    hint.style.display=esFer?'block':'none';
+  };
+  document.getElementById('lTipo').onchange=syncFeriadoUI;
+  syncFeriadoUI();
   document.getElementById('lFClear').onclick=()=>{
     libreFilter = { desde:'', hasta:'', empId:'', tipo:'' };
     RENDERERS.libres();
@@ -4723,23 +4815,32 @@ RENDERERS.libres = function(){
 
   document.getElementById('lSave').onclick=()=>{
     if(!lFecha.value){ lFecha.classList.add('invalid'); toast('Selecciona una fecha','error'); return; }
+    // Un Feriado es GLOBAL: se guarda una sola vez por fecha con
+    // empleadoId = LIBRE_GLOBAL y aplica automáticamente a todos.
+    const esFer = lTipo.value==='Feriado';
+    const empDe = () => esFer ? LIBRE_GLOBAL : lEmp.value;
     if(editLibreId){
       const l=S.libre.find(x=>x.id===editLibreId);
-      Object.assign(l,{empleadoId:lEmp.value, fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
+      Object.assign(l,{empleadoId:empDe(), fecha:lFecha.value, tipo:lTipo.value, comentario:lDet.value.trim()});
       editLibreId=null; save(K.libre,S.libre); toast('Registro actualizado','success'); syncLibresDom();
     }else{
       const ini=lFecha.value, fin=document.getElementById('lFechaFin').value;
       if(fin && fin<ini){ toast('La fecha fin no puede ser anterior a la de inicio','error'); return; }
       const fechas = fin ? rangoFechas(ini, fin) : [ini];
-      let creados=0;
+      let creados=0, duplicados=0;
       fechas.forEach(f=>{
-        if(!S.libre.some(x=>x.empleadoId===lEmp.value && x.fecha===f)){
-          S.libre.push({id:uid(), empleadoId:lEmp.value, fecha:f, tipo:lTipo.value, comentario:lDet.value.trim()});
+        // Para feriados el duplicado se evalúa solo por fecha (no por empleado).
+        const yaExiste = esFer
+          ? S.libre.some(x=>x.tipo==='Feriado' && x.fecha===f)
+          : S.libre.some(x=>x.empleadoId===empDe() && x.fecha===f && x.tipo!=='Feriado');
+        if(!yaExiste){
+          S.libre.push({id:uid(), empleadoId:empDe(), fecha:f, tipo:lTipo.value, comentario:lDet.value.trim()});
           creados++;
-        }
+        } else duplicados++;
       });
       save(K.libre,S.libre);
-      toast(creados>1?`${creados} días registrados`:'Registro guardado','success');
+      if(creados) toast(creados>1?`${creados} días registrados`:(esFer?'Feriado registrado para todos los empleados':'Registro guardado'),'success');
+      else toast(esFer?'Esa fecha ya está registrada como feriado':'Ese registro ya existe','info');
       syncLibresDom();
     }
     RENDERERS.libres();
@@ -5443,7 +5544,7 @@ function renderCalculo(){
           <small style="color:var(--c-muted)">orig: ${d.hTardOriginal}h${d.horasTardExoneradas>0?(' · neta: '+d.hTard+'h'):''}</small>
         ` : '—'}</td>
         <td class="num">${d.descManual>0?money(d.descManual):'—'}</td>
-        <td class="num">${(d.pagoManual+d.pagoExtraHoras)>0?money(d.pagoManual+d.pagoExtraHoras):'—'}</td>
+        <td class="num">${(d.pagoManual+d.pagoExtraHoras+(d.pagoFeriado||0))>0?money(d.pagoManual+d.pagoExtraHoras+(d.pagoFeriado||0)):'—'}${(d.pagoFeriado||0)>0?`<br><small style="color:var(--green)">🎌 feriado ${money(d.pagoFeriado)}</small>`:''}</td>
         <td style="white-space:normal;max-width:160px">${detDesc||'—'}</td>
         <td style="white-space:normal;max-width:160px">${detPago||'—'}</td>
         <td class="num"><b>${money(d.totalDia)}</b></td>
@@ -5479,6 +5580,7 @@ function renderCalculo(){
         <div class="item"><div class="l">Desc. manuales</div><div class="v" style="color:var(--red)">- ${money(r.tot.descManual)}</div></div>
         <div class="item"><div class="l">Pagos extra</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoManual)}</div></div>
         <div class="item"><div class="l">Total horas extra (${r.tot.horasExtra}h)</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoExtraHoras)}</div></div>
+        ${(r.tot.pagoFeriado||0)>0 ? `<div class="item"><div class="l">🎌 Pago por feriado trabajado</div><div class="v" style="color:var(--green)">+ ${money(r.tot.pagoFeriado)}</div></div>` : ''}
         ${PER.q===2 ? (()=>{
           if(r.esLibre) return `<div class="item"><div class="l" style="color:var(--c-muted)">🏆 Bono puntualidad</div><div class="v" style="color:var(--c-muted)">Excluido (empleado libre)</div></div>`;
           const minAcum  = Math.round(r.retrasoMensualMinutos||0);
@@ -8768,8 +8870,9 @@ function gsSerializeAll(){
       S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, ajustePlanilla:e.ajustePlanilla||0, horasCierre:e.horasCierre||0, fechaIngreso:e.fechaIngreso||'', visible:empEsVisible(e)?1:0 }))),
     Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
       S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
-    Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen'],
-      S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'', origen:marOrigen(m) }))),
+    Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen','origenEntrada','origenSalida'],
+      S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'',
+        origen:marOrigen(m), origenEntrada:marOrigenCampo(m,'entrada'), origenSalida:marOrigenCampo(m,'salida') }))),
     Descuentos: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
       S.desc.map(d=>({ id:d.id, empleadoId:d.empleadoId, fecha:d.fecha, tipo:d.tipo, monto:d.monto, detalle:d.detalle||'' }))),
     PagosExtra: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','detalle'],
@@ -9154,7 +9257,11 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
       S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
         entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
-        origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo' }));
+        origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo',
+        // Origen por campo; si la hoja es de una versión anterior se hereda
+        // del origen del registro, preservando el comportamiento histórico.
+        origenEntrada:(r.origenEntrada?String(r.origenEntrada).toLowerCase():(String(r.origen).toLowerCase()==='manual'?'manual':'archivo'))==='manual'?'manual':'archivo',
+        origenSalida:(r.origenSalida?String(r.origenSalida).toLowerCase():(String(r.origen).toLowerCase()==='manual'?'manual':'archivo'))==='manual'?'manual':'archivo' }));
       normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados al restaurar desde GS
       S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
