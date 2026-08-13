@@ -1109,7 +1109,9 @@ function calcHorasEfectivas(entradaReal, salidaReal){
 
 // Horas que debería trabajar según el horario del día. 0 si día libre/vacación.
 function calcHorasProgramadas(empleadoId, fecha){
-  if(esDiaLibre(empleadoId, fecha)) return 0;
+  // El FERIADO no altera la jornada programada: se conservan las horas del
+  // horario real del empleado. Solo un día libre/vacaciones propio la anula.
+  if(esLibrePropio(empleadoId, fecha)) return 0;
   const h = getHorario(empleadoId, diaSemana(fecha));
   if(!h || h.libre || !h.entrada || !h.salida) return 0;
   return round0(diffHoras(h.entrada, h.salida));
@@ -1190,11 +1192,17 @@ function marSetOrigenCampo(m, campo, origen){
 // Feriado: condición GLOBAL de la fecha (aplica a todos los empleados).
 function esFeriado(fecha){ return S.libre.some(l=>l.tipo==='Feriado' && l.fecha===fecha); }
 function feriadoDe(fecha){ return S.libre.find(l=>l.tipo==='Feriado' && l.fecha===fecha) || null; }
-// Un día es "libre" si el empleado lo tiene registrado individualmente o si la
-// fecha es feriado global: en ambos casos no se generan descuentos por
-// ausencia, tardanza ni falta de marcación.
+// Día libre PROPIO del empleado (día libre / vacaciones): anula la jornada.
+// NO incluye el feriado: un feriado es un adicional sobre la jornada normal y
+// jamás debe convertir las horas programadas en 0 (ver calcHorasProgramadas).
+function esLibrePropio(empleadoId, fecha){
+  return S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha && l.tipo!=='Feriado');
+}
+// "Libre" a efectos de EXENCIÓN de descuentos (ausencia, tardanza, falta de
+// marcación): incluye el feriado global, porque no trabajar un feriado no
+// genera descuento. No afecta a las horas programadas.
 function esDiaLibre(empleadoId, fecha){
-  return esFeriado(fecha) || S.libre.some(l=>l.empleadoId===empleadoId && l.fecha===fecha && l.tipo!=='Feriado');
+  return esFeriado(fecha) || esLibrePropio(empleadoId, fecha);
 }
 function tipoDiaLibre(empleadoId, fecha){
   const propio=S.libre.find(x=>x.empleadoId===empleadoId && x.fecha===fecha && x.tipo!=='Feriado');
@@ -5544,7 +5552,18 @@ function renderCalculo(){
           <small style="color:var(--c-muted)">orig: ${d.hTardOriginal}h${d.horasTardExoneradas>0?(' · neta: '+d.hTard+'h'):''}</small>
         ` : '—'}</td>
         <td class="num">${d.descManual>0?money(d.descManual):'—'}</td>
-        <td class="num">${(d.pagoManual+d.pagoExtraHoras+(d.pagoFeriado||0))>0?money(d.pagoManual+d.pagoExtraHoras+(d.pagoFeriado||0)):'—'}${(d.pagoFeriado||0)>0?`<br><small style="color:var(--green)">🎌 feriado ${money(d.pagoFeriado)}</small>`:''}</td>
+        <td class="num">${(()=>{
+          const tot=d.pagoManual+d.pagoExtraHoras+(d.pagoFeriado||0);
+          if(tot<=0) return '—';
+          // Desglose por concepto: horas extra y feriado nunca se mezclan en
+          // un total opaco (son bases de cálculo distintas).
+          const det=[];
+          if(d.pagoExtraHoras>0) det.push(`Hora extra: ${money(d.pagoExtraHoras)}`);
+          if((d.pagoFeriado||0)>0) det.push(`🎌 Feriado (${d.horasEf}h): ${money(d.pagoFeriado)}`);
+          if(d.pagoManual>0) det.push(`Manual: ${money(d.pagoManual)}`);
+          return money(tot)+(det.length>1||(d.pagoFeriado||0)>0
+            ? `<br><small style="color:var(--c-muted);white-space:normal">${det.join('<br>')}</small>` : '');
+        })()}</td>
         <td style="white-space:normal;max-width:160px">${detDesc||'—'}</td>
         <td style="white-space:normal;max-width:160px">${detPago||'—'}</td>
         <td class="num"><b>${money(d.totalDia)}</b></td>
