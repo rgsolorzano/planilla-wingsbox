@@ -11,6 +11,8 @@ alternativa para guardar/cargar los datos online y usarlos desde otro dispositiv
 
 ---
 
+
+
 ## Despliegue en GitHub Pages
 
 La app está pensada para desplegarse en:
