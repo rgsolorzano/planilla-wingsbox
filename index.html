@@ -7774,6 +7774,159 @@ function invLicoresExportar(){
 let alertaInsumosFilter = 'todas'; // 'todas' | 'consumo' | 'minimo' | 'anomalia' | 'ambas'
 window.alertaSetFilter = function(v){ alertaInsumosFilter = v; RENDERERS.alertaInsumos(); };
 
+/* ================================================================
+   CUADRE DE ALAS (sección del módulo Alerta de Insumos)
+   ----------------------------------------------------------------
+   NO crea fuente de datos propia: lee exclusivamente los registros
+   existentes de Inventario de Insumos (S.produccion), localizando
+   los insumos por NOMBRE y tomando su campo PROD o CIERRE.
+   Distingue siempre "registro con valor 0" de "registro inexistente":
+   lo primero vale 0, lo segundo deja la celda vacía (null) y nunca
+   se interpreta como cero.
+   ================================================================ */
+const ALAS_INSUMOS = {
+  precocidas: 'ALAS PRECOCIDAS',
+  salmuera:   'ALAS EN SALMUERA',
+  idpos:      'ALAS CONSUMIDAS SEGUN IDPOS',
+  entrantes:  'ALAS ENTRANTES',
+  kilos:      'KILOS ALAS PEDIDOS'
+};
+// Busca el insumo por nombre, tolerando mayúsculas/acentos/espacios.
+function alasInsumoPorNombre(nombre){
+  const plano=s=>String(s||'').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  const objetivo=plano(nombre);
+  return S.insumos.find(i=>plano(i.nombre)===objetivo) || null;
+}
+// Valor de un campo ('produccion'|'cierre') de un insumo en una fecha.
+// Devuelve null si el insumo no existe o no hay registro ese día
+// (ausencia ≠ 0); devuelve 0 solo si el registro existe y vale 0.
+function alasValor(nombreInsumo, fecha, campo){
+  const ins=alasInsumoPorNombre(nombreInsumo);
+  if(!ins) return null;
+  const r=getProduccion(ins.id, fecha);
+  if(!r) return null;
+  const v=r[campo];
+  if(v===null||v===undefined||v==='') return null;
+  const n=Number(v);
+  return Number.isFinite(n)?n:null;
+}
+// Suma de dos componentes conservando la semántica de ausencia:
+// si AMBOS son null → null (sin información). Si uno existe, se suma
+// el otro como 0 solo cuando hay al menos un dato real.
+function alasSuma(a,b){
+  if(a===null && b===null) return null;
+  return (a||0)+(b||0);
+}
+// Stock inicial = ALAS PRECOCIDAS [PROD] + ALAS EN SALMUERA [PROD]
+function alasStockInicial(fecha){
+  return alasSuma(alasValor(ALAS_INSUMOS.precocidas,fecha,'produccion'),
+                  alasValor(ALAS_INSUMOS.salmuera,  fecha,'produccion'));
+}
+// Stock final = ALAS PRECOCIDAS [CIERRE] + ALAS EN SALMUERA [CIERRE]
+function alasStockFinal(fecha){
+  return alasSuma(alasValor(ALAS_INSUMOS.precocidas,fecha,'cierre'),
+                  alasValor(ALAS_INSUMOS.salmuera,  fecha,'cierre'));
+}
+// Construye una fila por día del rango. Para "Alas contabilizadas" del
+// primer día se consulta internamente el día ANTERIOR al rango, que se
+// usa solo como dato auxiliar y no genera fila propia.
+function alasCuadreFilas(desde, hasta){
+  return rangoFechas(desde, hasta).map(fecha=>{
+    const stockIni = alasStockInicial(fecha);
+    const stockFin = alasStockFinal(fecha);
+    // Consumo real = Stock inicial − Stock final (nunca al revés)
+    const consumoReal = (stockIni!==null && stockFin!==null) ? stockIni-stockFin : null;
+    const consumoIdpos = alasValor(ALAS_INSUMOS.idpos, fecha, 'cierre');
+    // Diferencia consumo = IDPOS − Consumo real (se conserva el signo)
+    const difConsumo = (consumoIdpos!==null && consumoReal!==null) ? consumoIdpos-consumoReal : null;
+    const kgPedidos = alasValor(ALAS_INSUMOS.kilos,     fecha, 'produccion');
+    const entrantes = alasValor(ALAS_INSUMOS.entrantes, fecha, 'produccion');
+    // Alas contabilizadas = Stock inicial (hoy) − Stock final (día anterior).
+    // Si falta el dato del día anterior no se asume 0: queda vacío.
+    const stockFinPrev = alasStockFinal(fechaMenosUnDia(fecha));
+    const contabilizadas = (stockIni!==null && stockFinPrev!==null) ? stockIni-stockFinPrev : null;
+    // Diferencia entradas = Alas contabilizadas − Alas entrantes
+    const difEntradas = (contabilizadas!==null && entrantes!==null) ? contabilizadas-entrantes : null;
+    return { fecha, stockIni, stockFin, consumoReal, consumoIdpos, difConsumo,
+             kgPedidos, entrantes, contabilizadas, difEntradas };
+  });
+}
+// Rango por defecto del cuadre: últimos 7 días móviles hasta hoy.
+function alasRango7(){
+  const hoy=new Date(), d=new Date(hoy); d.setDate(d.getDate()-6);
+  const fmt=x=>x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
+  return {desde:fmt(d), hasta:fmt(hoy)};
+}
+let alasCuadreFilter = alasRango7();
+
+// Render del cuadro (se inserta como sección del módulo Alerta de Insumos).
+function alasCuadreHTML(){
+  const {desde,hasta}=alasCuadreFilter;
+  const filas=alasCuadreFilas(desde,hasta);
+  const num=v=> v===null ? '' : Number(v).toLocaleString('es-PE',{maximumFractionDigits:2});
+  // Las diferencias se colorean por signo; 0 en neutro.
+  const dif=v=>{
+    if(v===null) return '<td class="num"></td>';
+    const col = v>0 ? '#b91c1c' : (v<0 ? '#c2410c' : '#15803d');
+    return `<td class="num" style="color:${col};font-weight:700">${num(v)}</td>`;
+  };
+  const cuerpo=filas.map(r=>`
+    <tr>
+      <td>${fmtFecha(r.fecha)} <small style="color:var(--c-muted)">${DIAS[diaSemana(r.fecha)].slice(0,3)}</small></td>
+      <td class="num">${num(r.stockIni)}</td>
+      <td class="num">${num(r.stockFin)}</td>
+      <td class="num" style="font-weight:600">${num(r.consumoReal)}</td>
+      <td class="num">${num(r.consumoIdpos)}</td>
+      ${dif(r.difConsumo)}
+      <td class="num">${num(r.kgPedidos)}</td>
+      <td class="num">${num(r.entrantes)}</td>
+      <td class="num" style="font-weight:600">${num(r.contabilizadas)}</td>
+      ${dif(r.difEntradas)}
+    </tr>`).join('');
+  return `
+    <div class="card">
+      <h2>🍗 Cuadre de Alas</h2>
+      <p class="hint" style="margin-top:0">
+        Compara el movimiento físico de alas contra el consumo registrado en IDPOS, y cuadra las alas contabilizadas contra las entrantes.
+        Se calcula con los registros existentes de <b>Inventario de Insumos</b> (ALAS PRECOCIDAS, ALAS EN SALMUERA, ALAS CONSUMIDAS SEGUN IDPOS, ALAS ENTRANTES, KILOS ALAS PEDIDOS).
+        <b>Celdas vacías</b> = sin registro ese día (la ausencia de dato nunca se interpreta como 0).
+        <b>Alas contabilizadas</b> = stock inicial del día − stock final del día anterior (el día previo al rango se consulta automáticamente y no se muestra como fila).
+      </p>
+      <div class="toolbar" style="flex-wrap:wrap">
+        <div class="field"><label>Desde</label><input type="date" id="alasDesde" value="${desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="alasHasta" value="${hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="alasReset" style="align-self:flex-end">Últimos 7 días</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Fecha</th>
+          <th class="num">Stock inicial</th>
+          <th class="num">Stock final</th>
+          <th class="num">Consumo real de alas según conteo</th>
+          <th class="num">Consumo de alas según IDPOS</th>
+          <th class="num">Diferencia consumo</th>
+          <th class="num">KG pedidos</th>
+          <th class="num">Alas entrantes</th>
+          <th class="num">Alas contabilizadas</th>
+          <th class="num">Diferencia entradas</th>
+        </tr></thead>
+        <tbody>${cuerpo||`<tr><td colspan="10" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+}
+function alasCuadreBind(){
+  const g=id=>document.getElementById(id);
+  if(!g('alasDesde')) return;
+  const apply=()=>{
+    const d=g('alasDesde').value, h=g('alasHasta').value;
+    if(d&&h&&d>h){ toast('La fecha inicial no puede ser posterior a la final','error'); return; }
+    if(d) alasCuadreFilter.desde=d; if(h) alasCuadreFilter.hasta=h;
+    RENDERERS.alertaInsumos();
+  };
+  ['alasDesde','alasHasta'].forEach(id=>{ const e=g(id); if(e) e.onchange=apply; });
+  const r=g('alasReset'); if(r) r.onclick=()=>{ alasCuadreFilter=alasRango7(); RENDERERS.alertaInsumos(); };
+}
+
 RENDERERS.alertaInsumos = function(){
   const el = document.getElementById('page-alertaInsumos');
   if(!el) return;
@@ -7854,7 +8007,9 @@ RENDERERS.alertaInsumos = function(){
                   <thead><tr><th>Insumo</th><th>Unidad</th><th>Tipo de alerta</th><th>Valor actual / Umbral</th><th>Fecha de referencia</th></tr></thead>
                   <tbody>${filasHTML}</tbody>
                 </table></div>`}`}
-    </div>`;
+    </div>
+    ${alasCuadreHTML()}`;
+  alasCuadreBind();
 };
 
 /* ─── 11C-3: Cotejo de Consumo de Licores ─── */
