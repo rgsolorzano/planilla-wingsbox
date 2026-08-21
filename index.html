@@ -7071,12 +7071,14 @@ function insumoInventario(ins){
   // obligatoria y ningún insumo puede quedar sin ella.
   return (v==='noche' || v==='ambos') ? v : 'dia';
 }
-// ¿El insumo pertenece al inventario solicitado?
-//   filtro 'todos' → todos los insumos
-//   filtro 'dia'   → los de Stock día  + los de Ambos
+// ¿El insumo debe mostrarse con el filtro de inventario seleccionado?
+//   filtro 'ambos' → TODOS los insumos (es la opción "ver todo" de Producción;
+//                    'todos' se acepta por compatibilidad con estados previos)
+//   filtro 'dia'   → los de Stock día   + los de Ambos
 //   filtro 'noche' → los de Stock noche + los de Ambos
+// OJO: aquí 'ambos' es el valor del FILTRO, no la clasificación del insumo.
 function insumoEnInventario(ins, filtro){
-  if(!filtro || filtro==='todos') return true;
+  if(!filtro || filtro==='ambos' || filtro==='todos') return true;
   const t = insumoInventario(ins);
   return t===filtro || t==='ambos';
 }
@@ -7171,9 +7173,10 @@ function produccionUpsert(insumoId, fecha, produccion, cierre){
 
 /* ---------- Producción: registro diario por insumo ---------- */
 let prodFecha = fechaHoy();
-// Filtro de VISUALIZACIÓN por clasificación: 'todos' | 'dia' | 'noche'.
-// Solo oculta filas; jamás altera registros ya guardados.
-let prodInvFiltro = 'todos';
+// Filtro de VISUALIZACIÓN por clasificación: 'dia' | 'noche' | 'ambos'.
+// 'ambos' es la opción que muestra el listado completo (equivalente al antiguo
+// 'Todos', eliminado por redundante). Solo oculta filas; jamás altera datos.
+let prodInvFiltro = 'ambos';
 RENDERERS.produccion = function(){
   const el = document.getElementById('page-produccion');
   if(!S.insumos.length){
@@ -7200,7 +7203,6 @@ RENDERERS.produccion = function(){
         <div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div>
         <div class="field"><label>Inventario</label>
           <select id="prodInvFiltro" style="min-width:130px">
-            <option value="todos" ${prodInvFiltro==='todos'?'selected':''}>Todos</option>
             ${INVENTARIO_TIPOS.map(([v,l])=>`<option value="${v}" ${prodInvFiltro===v?'selected':''}>${l}</option>`).join('')}
           </select></div>
       </div>
@@ -7215,7 +7217,7 @@ RENDERERS.produccion = function(){
       <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con Google Sheets.</p>
     </div>`;
   document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
-  document.getElementById('prodInvFiltro').onchange = (e)=>{ prodInvFiltro = e.target.value || 'todos'; RENDERERS.produccion(); };
+  document.getElementById('prodInvFiltro').onchange = (e)=>{ prodInvFiltro = e.target.value || 'ambos'; RENDERERS.produccion(); };
   document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
   document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
 };
