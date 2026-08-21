@@ -6372,6 +6372,8 @@ window.salonProdDel=function(id){
     ? '"'+p.nombre+'" tiene '+asociados+' registro(s) de inventario. Eliminar el producto borrará también esos registros (no quedará ningún dato huérfano). ¿Continuar?'
     : '¿Eliminar el producto "'+p.nombre+'"?';
   if(!confirm(msg)) return;
+  gsMarcarEliminado('SalonProductos', {id});
+  gsMarcarEliminados('SalonInventario', S.salonInventario.filter(r=>r.productoId===id));
   S.salonProductos=S.salonProductos.filter(x=>x.id!==id);
   S.salonInventario=S.salonInventario.filter(r=>r.productoId!==id);
   save(K.salonProductos,S.salonProductos); save(K.salonInventario,S.salonInventario);
@@ -6766,6 +6768,8 @@ window.menajeArtDel=function(id){
     ? '"'+a.nombre+'" tiene '+asociados+' registro(s) de inventario. Eliminar el artículo borrará también esos registros (no quedará ningún dato huérfano). ¿Continuar?'
     : '¿Eliminar el artículo "'+a.nombre+'"?';
   if(!confirm(msg)) return;
+  gsMarcarEliminado('MenajeArticulos', {id});
+  gsMarcarEliminados('MenajeInventario', S.menajeInventario.filter(r=>r.articuloId===id));
   S.menajeArticulos=S.menajeArticulos.filter(x=>x.id!==id);
   S.menajeInventario=S.menajeInventario.filter(r=>r.articuloId!==id);
   save(K.menajeArticulos,S.menajeArticulos); save(K.menajeInventario,S.menajeInventario);
@@ -7051,6 +7055,57 @@ function unidadInsumo(id){ const i=S.insumos.find(x=>x.id===id); return i ? i.un
 // umbralMinimo  (number) — stock mínimo permitido
 function insumoAlertaConsumo(ins){ return !!ins && ins.alertaConsumo === true; }
 function insumoAlertaMinimo(ins){ return !!ins && ins.alertaMinimo === true; }
+/* ── Atributos de CONFIGURACIÓN del catálogo de insumos ──────────────────
+   Son propiedades del insumo, NUNCA de los registros históricos: cambiar la
+   clasificación o el orden no altera ninguna producción/cierre ya guardado.
+   ── inventario: 'dia' | 'noche' (obligatorio; los insumos preexistentes
+      quedan como 'dia' por retrocompatibilidad de lectura).
+   ── orden: entero que define la POSICIÓN GLOBAL en el catálogo. Es único
+      para toda la app: los filtros solo ocultan filas, nunca reordenan.     */
+const INVENTARIO_TIPOS = [['dia','Stock día'], ['noche','Stock noche']];
+function insumoInventario(ins){
+  return (ins && String(ins.inventario).toLowerCase()==='noche') ? 'noche' : 'dia';
+}
+function insumoInventarioLabel(ins){
+  const t=insumoInventario(ins);
+  return (INVENTARIO_TIPOS.find(x=>x[0]===t)||INVENTARIO_TIPOS[0])[1];
+}
+// Orden global: si un insumo no tiene `orden` (catálogo previo a esta función),
+// se usa su posición actual en el array, preservando el orden histórico.
+function insumoOrden(ins, idxFallback){
+  const n = Number(ins && ins.orden);
+  return Number.isFinite(n) ? n : (idxFallback!==undefined ? idxFallback : 9999);
+}
+// ÚNICA fuente del orden del catálogo. Todos los módulos que listan insumos
+// deben consumir esta función en vez de S.insumos directamente.
+function insumosOrdenados(){
+  return S.insumos
+    .map((i,idx)=>({i,idx}))
+    .sort((a,b)=>{
+      const d = insumoOrden(a.i,a.idx) - insumoOrden(b.i,b.idx);
+      return d!==0 ? d : a.idx-b.idx;   // desempate estable
+    })
+    .map(x=>x.i);
+}
+// Normaliza el orden a 0..n-1 sin huecos ni posiciones repetidas.
+function insumosReindexar(){
+  insumosOrdenados().forEach((ins,pos)=>{ ins.orden = pos; });
+}
+// Mueve un insumo una posición dentro del ORDEN GLOBAL (no dentro del filtro).
+function insumoMover(id, delta){
+  insumosReindexar();
+  const lista = insumosOrdenados();
+  const pos = lista.findIndex(i=>i.id===id);
+  if(pos<0) return false;
+  const destino = pos + delta;
+  if(destino<0 || destino>=lista.length) return false; // extremos: sin efecto
+  const a = lista[pos], b = lista[destino];
+  const tmp = a.orden; a.orden = b.orden; b.orden = tmp;
+  save(K.insumos, S.insumos);
+  syncInsumos();
+  return true;
+}
+
 function insumoUmbralConsumo(ins){
   if(ins && ins.umbralConsumo !== undefined && ins.umbralConsumo !== null && ins.umbralConsumo !== '') return Number(ins.umbralConsumo);
   return umbralPorDefecto(ins ? ins.unidad : '');
@@ -7102,6 +7157,9 @@ function produccionUpsert(insumoId, fecha, produccion, cierre){
 
 /* ---------- Producción: registro diario por insumo ---------- */
 let prodFecha = fechaHoy();
+// Filtro de VISUALIZACIÓN por clasificación: 'todos' | 'dia' | 'noche'.
+// Solo oculta filas; jamás altera registros ya guardados.
+let prodInvFiltro = 'todos';
 RENDERERS.produccion = function(){
   const el = document.getElementById('page-produccion');
   if(!S.insumos.length){
@@ -7109,18 +7167,28 @@ RENDERERS.produccion = function(){
       <div class="card"><div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div></div>`;
     return;
   }
-  const filas = S.insumos.map(ins=>{
+  // Orden GLOBAL del catálogo; el filtro solo oculta, conservando posiciones.
+  const insumosVista = insumosOrdenados()
+    .filter(i=> prodInvFiltro==='todos' ? true : insumoInventario(i)===prodInvFiltro);
+  const filas = insumosVista.length ? insumosVista.map(ins=>{
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
       <td>${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>
       <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="produccion" value="${reg?reg.produccion:''}" placeholder="0"></td>
       <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="cierre" value="${reg?reg.cierre:''}" placeholder="0"></td>
     </tr>`;
-  }).join('');
+  }).join('') : `<tr><td colspan="3" class="empty">No hay insumos en esta clasificación.</td></tr>`;
   el.innerHTML = `
-    <div class="page-head"><div><h1>📦 Producción</h1><p>Registra diariamente la producción y el cierre de cada insumo.</p></div></div>
+    <div class="page-head"><div><h1>📦 Producción</h1><p>Registra diariamente la producción y el cierre de cada insumo. El orden de los insumos se configura en <b>Administración de insumos</b>.</p></div></div>
     <div class="card">
-      <div class="toolbar"><div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div></div>
+      <div class="toolbar">
+        <div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div>
+        <div class="field"><label>Inventario</label>
+          <select id="prodInvFiltro" style="min-width:130px">
+            <option value="todos" ${prodInvFiltro==='todos'?'selected':''}>Todos</option>
+            ${INVENTARIO_TIPOS.map(([v,l])=>`<option value="${v}" ${prodInvFiltro===v?'selected':''}>${l}</option>`).join('')}
+          </select></div>
+      </div>
       <div class="table-wrap"><table>
         <thead><tr><th>Insumo</th><th class="num">Producción</th><th class="num">Cierre</th></tr></thead>
         <tbody>${filas}</tbody>
@@ -7132,6 +7200,7 @@ RENDERERS.produccion = function(){
       <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con Google Sheets.</p>
     </div>`;
   document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
+  document.getElementById('prodInvFiltro').onchange = (e)=>{ prodInvFiltro = e.target.value || 'todos'; RENDERERS.produccion(); };
   document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
   document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
 };
@@ -7173,7 +7242,10 @@ async function guardarProduccion(){
   if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
 }
 function exportarProduccionDiaExcel(){
-  const datos = S.insumos.map(ins=>{
+  // Exporta respetando el orden global y el filtro de clasificación vigente.
+  const datos = insumosOrdenados()
+    .filter(i=> prodInvFiltro==='todos' ? true : insumoInventario(i)===prodInvFiltro)
+    .map(ins=>{
     const r = getProduccion(ins.id, prodFecha);
     return { fecha:prodFecha, insumo:ins.nombre, produccion:r?r.produccion:0, cierre:r?r.cierre:0, unidad:ins.unidad };
   });
@@ -7204,24 +7276,35 @@ RENDERERS.insumos = function(){
         <b>Alerta por consumo</b>: se activa cuando el consumo acumulado de los últimos 3 días es menor al valor configurado en <b>Consumo</b>.
         <b>Alerta por mínimo</b>: se activa cuando el último inventario registrado es menor al valor configurado en <b>Mínimo</b>.
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
-        <b>Los cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
+        <b>Inventario</b>: clasifica cada insumo como <b>Stock día</b> o <b>Stock noche</b>; Producción permite filtrar por esa clasificación.
+        <b>Orden</b>: los botones ⬆️⬇️ definen el <b>orden global</b> del catálogo y se aplican de inmediato en Producción, Consolidado de Inventario y Alerta de Insumos.
+        <b>Los demás cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th>Unidad</th>
+        <thead><tr><th style="width:74px">Orden</th><th>Insumo</th><th>Unidad</th>
+          <th title="Clasificación obligatoria del insumo">Inventario</th>
           <th class="num" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
           <th class="num" title="Stock mínimo permitido">Mínimo</th>
           <th class="num" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por consumo</th>
           <th class="num" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por mínimo</th>
           <th>Acciones</th></tr></thead>
-        <tbody>${S.insumos.length? S.insumos.map(i=>`
-          <tr><td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
+        <tbody>${S.insumos.length? insumosOrdenados().map((i,pos,arr)=>`
+          <tr>
+            <td style="white-space:nowrap">
+              <button class="btn-icon" onclick="insumoSubir('${i.id}')" title="Subir" ${pos===0?'disabled style="opacity:.3;cursor:default"':''}>⬆️</button>
+              <button class="btn-icon" onclick="insumoBajar('${i.id}')" title="Bajar" ${pos===arr.length-1?'disabled style="opacity:.3;cursor:default"':''}>⬇️</button>
+            </td>
+            <td>${i.nombre}</td><td><span class="badge b-free">${i.unidad}</span></td>
+            <td><select class="insCfgInventario" data-id="${i.id}" style="min-width:110px">
+              ${INVENTARIO_TIPOS.map(([v,l])=>`<option value="${v}" ${insumoInventario(i)===v?'selected':''}>${l}</option>`).join('')}
+            </select></td>
             <td class="num"><input type="number" class="insCfgUmbralConsumo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralConsumo(i)}" title="Consumo mínimo esperado en 3 días"></td>
             <td class="num"><input type="number" class="insCfgUmbralMinimo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralMinimo(i)}" title="Stock mínimo permitido"></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaConsumo" data-id="${i.id}" ${insumoAlertaConsumo(i)?'checked':''}></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaMinimo" data-id="${i.id}" ${insumoAlertaMinimo(i)?'checked':''}></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="7" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="9" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
       <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
@@ -7235,6 +7318,9 @@ RENDERERS.insumos = function(){
     if(i){ document.getElementById('insFormTitle').textContent='Editar insumo'; document.getElementById('insNombre').value=i.nombre; document.getElementById('insUnidad').value=i.unidad; }
   }
 };
+window.insumoSubir = function(id){ if(insumoMover(id,-1)) RENDERERS.insumos(); };
+window.insumoBajar = function(id){ if(insumoMover(id, 1)) RENDERERS.insumos(); };
+
 function insumoSave(){
   const nombre = document.getElementById('insNombre').value.trim();
   const unidad = document.getElementById('insUnidad').value.trim();
@@ -7249,10 +7335,14 @@ function insumoSave(){
     save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
   }else{
     // Nuevo insumo: alerta por consumo activada por defecto (comportamiento histórico).
+    // Clasificación obligatoria por defecto y alta al FINAL del orden global,
+    // de modo que el nuevo insumo queda siempre incorporado al orden maestro.
+    insumosReindexar();
     S.insumos.push({ id:uid(), nombre, unidad,
       alertaConsumo:true, umbralConsumo:umbralPorDefecto(unidad),
       alertaMinimo:false, umbralMinimo:umbralPorDefecto(unidad),
-      resaltadoCelda:true });
+      resaltadoCelda:true,
+      inventario:'dia', orden:S.insumos.length });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
@@ -7278,6 +7368,11 @@ async function insumosActualizarResaltados(){
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
       if(ins) ins.alertaConsumo = cb.checked;
     });
+    document.querySelectorAll('.insCfgInventario').forEach(sel=>{
+      const ins = S.insumos.find(i=>i.id===sel.dataset.id);
+      // Clasificación OBLIGATORIA: cualquier valor fuera del dominio cae en 'dia'.
+      if(ins) ins.inventario = (sel.value==='noche') ? 'noche' : 'dia';
+    });
     document.querySelectorAll('.insCfgAlertaMinimo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
       if(ins) ins.alertaMinimo = cb.checked;
@@ -7296,6 +7391,7 @@ window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.s
 window.insumoDel = function(id){
   if(!confirm('¿Eliminar este insumo? Los registros históricos de producción ya guardados no se eliminan, pero ya no podrás registrar nueva producción para él.')) return;
   if(editInsumoId===id) editInsumoId=null;
+  gsMarcarEliminado('Insumos', {id});
   S.insumos = S.insumos.filter(i=>i.id!==id);
   save(K.insumos, S.insumos);
   toast('Insumo eliminado','warn');
@@ -7433,7 +7529,7 @@ RENDERERS.inventarioConsolidado = function(){
   }
 
   const soloAnom = !!invConsFilter.soloAnomalias;
-  const insumosBase = S.insumos;
+  const insumosBase = insumosOrdenados();   // orden maestro del catálogo
   const insumosFiltrados = soloAnom ? insumosBase.filter(insumeTieneAnomalia) : insumosBase;
 
   const hayInsumos = insumosBase.length > 0;
@@ -7536,6 +7632,8 @@ window.invDeleteDia = async function(fecha){
   const cantidad = S.produccion.filter(r=>r.fecha===fecha).length;
   if(!cantidad){ toast('No hay registros para ese día','info'); return; }
   if(!confirm(`¿Está seguro que desea eliminar todos los registros del día ${fmtFecha(fecha)}? Esta acción no se puede deshacer.`)) return;
+  // Marcar como eliminados para que la fusión con el remoto no los resucite.
+  gsMarcarEliminados('Produccion', S.produccion.filter(r=>r.fecha===fecha));
   S.produccion = S.produccion.filter(r=>r.fecha!==fecha);
   save(K.produccion, S.produccion);
   toast(`Registros del ${fmtFecha(fecha)} eliminados (${cantidad}).`,'warn');
@@ -7683,6 +7781,7 @@ window.licorEdit=function(id){ editLicorId=id; RENDERERS.licores(); window.scrol
 window.licorDel=function(id){
   if(!confirm('¿Eliminar este licor? Los registros históricos de inventario existentes no se eliminan.')) return;
   if(editLicorId===id) editLicorId=null;
+  gsMarcarEliminado('Licores', {id});
   S.licores=S.licores.filter(b=>b.id!==id);
   save(K.licores,S.licores);
   toast('Licor eliminado','warn');
@@ -7968,7 +8067,7 @@ RENDERERS.alertaInsumos = function(){
 
   // Evalúa las tres reglas para cada insumo — fuente única de verdad
   const filasTodas = [];
-  S.insumos.forEach(ins=>{
+  insumosOrdenados().forEach(ins=>{   // orden maestro del catálogo
     const ev = evaluarAlertasInsumo(ins);
     const consumoAlerta  = ev.consumo?.activa;
     const minimoAlerta   = ev.minimo?.activa;
@@ -8374,6 +8473,7 @@ window.bebCatEdit = function(id){ editBebidaCatId=id; RENDERERS.bebidasAdmin(); 
 window.bebCatDel = function(id){
   if(!confirm('¿Eliminar esta bebida? Los registros históricos de stock no se eliminarán.')) return;
   if(editBebidaCatId===id) editBebidaCatId=null;
+  gsMarcarEliminado('BebidasCat', {id});
   S.bebidasCat = S.bebidasCat.filter(b=>b.id!==id);
   save(K.bebidasCat,S.bebidasCat);
   toast('Bebida eliminada','warn');
@@ -9293,11 +9393,13 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda'],
-      S.insumos.map(i=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda','inventario','orden'],
+      S.insumos.map((i,idx)=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
         umbralConsumo:insumoUmbralConsumo(i), umbralMinimo:insumoUmbralMinimo(i),
         alertaConsumo:insumoAlertaConsumo(i)?1:0, alertaMinimo:insumoAlertaMinimo(i)?1:0,
-        resaltadoCelda:(i.resaltadoCelda!==false)?1:0 }))),
+        resaltadoCelda:(i.resaltadoCelda!==false)?1:0,
+        // Configuración del catálogo: clasificación y posición global.
+        inventario:insumoInventario(i), orden:insumoOrden(i,idx) }))),
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
@@ -9389,6 +9491,79 @@ async function gsSaveToSheets(domain='planilla'){
 // Se usa desde los wrappers de sincronización por módulo (syncXxx).
 // gsSaveToSheets (la función completa de arriba) se reserva para la
 // sincronización inicial al iniciar sesión y el botón "Guardar en GS".
+/* ================================================================
+   PROTECCIÓN ANTI-PÉRDIDA DE DATOS EN LA ESCRITURA
+   ----------------------------------------------------------------
+   La escritura de una hoja es "clear + write" de la hoja COMPLETA a
+   partir del estado local. Sin protección, eso convierte cada
+   guardado en un "última escritura gana" a nivel de HOJA: si el
+   estado local no contiene los registros que otro usuario (u otra
+   pestaña) guardó después de nuestra última carga, esos registros
+   se borran del Spreadsheet.
+
+   Solución: antes de escribir se LEE la hoja remota y se FUSIONA por
+   CLAVE NATURAL. Los registros remotos que no existen localmente se
+   CONSERVAN, salvo que el usuario los haya eliminado explícitamente
+   (tombstones). Los locales siempre ganan sobre su homónimo remoto.
+   Si la lectura previa falla, se ABORTA la escritura en lugar de
+   arriesgar un pisado.
+   ================================================================ */
+// Clave natural por hoja (identifica un registro entre usuarios).
+const GS_SHEET_KEYS = {
+  Insumos:['id'], Licores:['id'], BebidasCat:['id'],
+  SalonProductos:['id'], MenajeArticulos:['id'], Empleados:['id'],
+  Produccion:['insumoId','fecha'],
+  InvLicores:['bebidaId','fecha'],
+  StockBebidas:['bebidaId','fecha'],
+  SalonInventario:['productoId','fecha','unidad'],
+  MenajeInventario:['articuloId','fecha'],
+  EfectivoCaja:['fecha']
+};
+function gsClaveDe(sheetName, obj){
+  const cols = GS_SHEET_KEYS[sheetName] || ['id'];
+  return cols.map(c=>String(obj[c]??'').trim()).join('\u0001');
+}
+// Tombstones: registros eliminados deliberadamente por el usuario en esta
+// sesión. Sin ellos, la fusión "resucitaría" lo borrado al leerlo del remoto.
+const gsTombstones = new Map(); // sheetName -> Set(clave)
+function gsMarcarEliminado(sheetName, obj){
+  if(!gsTombstones.has(sheetName)) gsTombstones.set(sheetName, new Set());
+  gsTombstones.get(sheetName).add(gsClaveDe(sheetName, obj));
+}
+function gsMarcarEliminados(sheetName, objs){ (objs||[]).forEach(o=>gsMarcarEliminado(sheetName,o)); }
+
+// Lee la hoja remota y devuelve la matriz fusionada con la local.
+// Lanza si la lectura remota falla (para abortar la escritura).
+async function gsFusionarConRemoto(eid, sheetName, matrixLocal){
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+
+    '/values/'+encodeURIComponent(sheetName+'!A:AZ'));
+  if(r.status===404){ // la hoja aún no existe: nada que fusionar
+    return { matrix: matrixLocal, preservados: 0 };
+  }
+  if(!r.ok) throw new Error('No se pudo leer la hoja '+sheetName+' antes de guardar (HTTP '+r.status+'). '+
+    'Se canceló el guardado para no sobrescribir datos existentes.');
+  const j = await r.json();
+  const remotos = gsMatrixToObjects(j.values||[]);
+  if(!remotos.length) return { matrix: matrixLocal, preservados: 0 };
+  if(!matrixLocal || matrixLocal.length===0) matrixLocal = [[]];
+  const headers = (matrixLocal[0]||[]).map(h=>String(h).trim());
+  if(!headers.length) return { matrix: matrixLocal, preservados: 0 };
+  // Claves presentes localmente y claves eliminadas a propósito
+  const localesObj = gsMatrixToObjects(matrixLocal);
+  const clavesLocales = new Set(localesObj.map(o=>gsClaveDe(sheetName,o)));
+  const borrados = gsTombstones.get(sheetName) || new Set();
+  // Remotos que no están localmente y no fueron eliminados → se conservan
+  const aPreservar = remotos.filter(o=>{
+    const k = gsClaveDe(sheetName, o);
+    return !clavesLocales.has(k) && !borrados.has(k);
+  });
+  if(!aPreservar.length) return { matrix: matrixLocal, preservados: 0 };
+  const filasExtra = aPreservar.map(o=>headers.map(h=> (o[h]===undefined||o[h]===null) ? '' : o[h]));
+  console.warn('[GS] "'+sheetName+'": se preservaron '+aPreservar.length+
+    ' registro(s) existentes en el Spreadsheet que no estaban en el estado local (posible guardado de otro usuario o sesión).');
+  return { matrix: matrixLocal.concat(filasExtra), preservados: aPreservar.length };
+}
+
 async function gsSaveSheet(domain, sheetName, matrix){
   if(!isAuthorized()) return false;
   try{
@@ -9397,6 +9572,20 @@ async function gsSaveSheet(domain, sheetName, matrix){
     // Asegura que la hoja exista (idempotente; solo crea si falta).
     await gsEnsureSheetsExist(domain);
     const eid = encodeURIComponent(id);
+    // 0) FUSIÓN PREVIA: conserva los registros que existen en el Spreadsheet
+    //    y no están en el estado local (evita pisar a otro usuario/sesión).
+    //    Si la lectura falla, gsFusionarConRemoto lanza y no se limpia nada.
+    let preservados = 0;
+    try{
+      const fus = await gsFusionarConRemoto(eid, sheetName, matrix);
+      matrix = fus.matrix; preservados = fus.preservados;
+    }catch(e){
+      console.error('[GS] Guardado CANCELADO para "'+sheetName+'":', e.message);
+      gsUpdateSyncStatus('Guardado cancelado: '+e.message,'error');
+      toast('No se guardó "'+sheetName+'": '+e.message,'error');
+      gsRenderControls();
+      return false; // nunca borrar la hoja si no pudimos verificar el remoto
+    }
     // 1) Limpia solo esta hoja — rango amplio (A:AZ = 52 columnas) para cubrir
     //    hojas con más de 26 columnas (p.ej. EfectivoCaja tiene 28 cols: A..AB).
     //    Usar A:Z provocaba que las columnas AA y AB (cl9=S/100, cl10=S/200 del
@@ -9416,7 +9605,8 @@ async function gsSaveSheet(domain, sheetName, matrix){
       if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
     }
     gsState.lastSync = new Date();
-    console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas)');
+    console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas'+
+      (preservados?', '+preservados+' preservadas del remoto':'')+')');
     gsUpdateSyncStatus('"'+sheetName+'" guardado.','success');
     gsRenderControls();
     return true;
@@ -9549,6 +9739,12 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         alertaConsumo: r.alertaConsumo!==undefined ? esTrue(r.alertaConsumo) : undefined,
         alertaMinimo:  r.alertaMinimo!==undefined  ? esTrue(r.alertaMinimo)  : undefined,
         resaltadoCelda: !esFalse(r.resaltadoCelda),
+        // Configuración del catálogo. Si la hoja es anterior a estos campos:
+        // inventario → 'dia' (valor inicial pedido) y orden → posición en la hoja,
+        // preservando el orden con el que ya venían los insumos.
+        inventario: (String(r.inventario||'').toLowerCase()==='noche') ? 'noche' : 'dia',
+        orden: (r.orden!==undefined && r.orden!==null && r.orden!=='' && Number.isFinite(Number(r.orden)))
+                 ? Number(r.orden) : undefined,
         // Campos del modelo anterior (si existen en la hoja, se usan solo para
         // la traducción de compatibilidad dentro de migrarCamposInsumo).
         tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
