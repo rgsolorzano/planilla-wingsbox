@@ -7058,13 +7058,27 @@ function insumoAlertaMinimo(ins){ return !!ins && ins.alertaMinimo === true; }
 /* ── Atributos de CONFIGURACIÓN del catálogo de insumos ──────────────────
    Son propiedades del insumo, NUNCA de los registros históricos: cambiar la
    clasificación o el orden no altera ninguna producción/cierre ya guardado.
-   ── inventario: 'dia' | 'noche' (obligatorio; los insumos preexistentes
-      quedan como 'dia' por retrocompatibilidad de lectura).
+   ── inventario: 'dia' | 'noche' | 'ambos' (obligatorio). 'ambos' significa
+      que el insumo se inventaria de día Y de noche, por lo que aparece en
+      ambos filtros. Los insumos preexistentes sin el campo quedan como 'dia'
+      por retrocompatibilidad; los ya configurados conservan su valor.
    ── orden: entero que define la POSICIÓN GLOBAL en el catálogo. Es único
       para toda la app: los filtros solo ocultan filas, nunca reordenan.     */
-const INVENTARIO_TIPOS = [['dia','Stock día'], ['noche','Stock noche']];
+const INVENTARIO_TIPOS = [['dia','Stock día'], ['noche','Stock noche'], ['ambos','Ambos']];
 function insumoInventario(ins){
-  return (ins && String(ins.inventario).toLowerCase()==='noche') ? 'noche' : 'dia';
+  const v = String(ins && ins.inventario || '').toLowerCase();
+  // Cualquier valor fuera del dominio cae en 'dia': la clasificación es
+  // obligatoria y ningún insumo puede quedar sin ella.
+  return (v==='noche' || v==='ambos') ? v : 'dia';
+}
+// ¿El insumo pertenece al inventario solicitado?
+//   filtro 'todos' → todos los insumos
+//   filtro 'dia'   → los de Stock día  + los de Ambos
+//   filtro 'noche' → los de Stock noche + los de Ambos
+function insumoEnInventario(ins, filtro){
+  if(!filtro || filtro==='todos') return true;
+  const t = insumoInventario(ins);
+  return t===filtro || t==='ambos';
 }
 function insumoInventarioLabel(ins){
   const t=insumoInventario(ins);
@@ -7168,8 +7182,9 @@ RENDERERS.produccion = function(){
     return;
   }
   // Orden GLOBAL del catálogo; el filtro solo oculta, conservando posiciones.
-  const insumosVista = insumosOrdenados()
-    .filter(i=> prodInvFiltro==='todos' ? true : insumoInventario(i)===prodInvFiltro);
+  // Orden GLOBAL intacto; el filtro solo oculta filas. Los insumos 'Ambos'
+  // aparecen tanto en Stock día como en Stock noche, conservando su posición.
+  const insumosVista = insumosOrdenados().filter(i=>insumoEnInventario(i, prodInvFiltro));
   const filas = insumosVista.length ? insumosVista.map(ins=>{
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
@@ -7244,7 +7259,7 @@ async function guardarProduccion(){
 function exportarProduccionDiaExcel(){
   // Exporta respetando el orden global y el filtro de clasificación vigente.
   const datos = insumosOrdenados()
-    .filter(i=> prodInvFiltro==='todos' ? true : insumoInventario(i)===prodInvFiltro)
+    .filter(i=>insumoEnInventario(i, prodInvFiltro))
     .map(ins=>{
     const r = getProduccion(ins.id, prodFecha);
     return { fecha:prodFecha, insumo:ins.nombre, produccion:r?r.produccion:0, cierre:r?r.cierre:0, unidad:ins.unidad };
@@ -7276,7 +7291,7 @@ RENDERERS.insumos = function(){
         <b>Alerta por consumo</b>: se activa cuando el consumo acumulado de los últimos 3 días es menor al valor configurado en <b>Consumo</b>.
         <b>Alerta por mínimo</b>: se activa cuando el último inventario registrado es menor al valor configurado en <b>Mínimo</b>.
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
-        <b>Inventario</b>: clasifica cada insumo como <b>Stock día</b> o <b>Stock noche</b>; Producción permite filtrar por esa clasificación.
+        <b>Inventario</b>: clasifica cada insumo como <b>Stock día</b>, <b>Stock noche</b> o <b>Ambos</b> (se inventaría de día y de noche, por lo que aparece en los dos filtros de Producción).
         <b>Orden</b>: los botones ⬆️⬇️ definen el <b>orden global</b> del catálogo y se aplican de inmediato en Producción, Consolidado de Inventario y Alerta de Insumos.
         <b>Los demás cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
@@ -7370,8 +7385,9 @@ async function insumosActualizarResaltados(){
     });
     document.querySelectorAll('.insCfgInventario').forEach(sel=>{
       const ins = S.insumos.find(i=>i.id===sel.dataset.id);
-      // Clasificación OBLIGATORIA: cualquier valor fuera del dominio cae en 'dia'.
-      if(ins) ins.inventario = (sel.value==='noche') ? 'noche' : 'dia';
+      // Clasificación OBLIGATORIA: se normaliza contra el dominio permitido
+      // ('dia' | 'noche' | 'ambos'); cualquier otro valor cae en 'dia'.
+      if(ins) ins.inventario = insumoInventario({inventario:sel.value});
     });
     document.querySelectorAll('.insCfgAlertaMinimo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
@@ -9742,7 +9758,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // Configuración del catálogo. Si la hoja es anterior a estos campos:
         // inventario → 'dia' (valor inicial pedido) y orden → posición en la hoja,
         // preservando el orden con el que ya venían los insumos.
-        inventario: (String(r.inventario||'').toLowerCase()==='noche') ? 'noche' : 'dia',
+        inventario: insumoInventario({inventario:r.inventario}),
         orden: (r.orden!==undefined && r.orden!==null && r.orden!=='' && Number.isFinite(Number(r.orden)))
                  ? Number(r.orden) : undefined,
         // Campos del modelo anterior (si existen en la hoja, se usan solo para
