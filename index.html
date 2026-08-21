@@ -166,6 +166,33 @@
   .mx-table tbody tr:hover .mx-fix{background:#1e1b4b}  /* NO hover change — consolidados son solo lectura */
   .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
   .mx-table tbody tr:hover td:not(.mx-fix){background:#fff}  /* sin hover en consolidados */
+  /* ── Cuadre de Alas: encabezados legibles en varias líneas ───────────────
+     Anula el nowrap y el max-width del .num global, que hacían que los
+     títulos largos se desbordaran y se superpusieran entre sí.             */
+  .alas-table th{
+    white-space:normal!important;      /* permite 2-3 líneas por encabezado */
+    word-break:normal;overflow-wrap:anywhere;
+    max-width:none!important;
+    vertical-align:bottom;
+    font-size:11px;line-height:1.25;
+    padding:8px 6px;height:auto
+  }
+  .alas-table th.alas-col{min-width:96px}
+  .alas-table th.alas-col-lg{min-width:120px}   /* títulos de 4+ palabras */
+  .alas-table td{white-space:nowrap;max-width:none!important}
+  /* Columna separadora: sin encabezado, sin datos, solo corte visual */
+  .alas-table th.alas-sep,.alas-table td.alas-sep{
+    width:14px;min-width:14px;max-width:14px!important;
+    padding:0;background:#ede9fe;
+    border-left:2px solid #c4b5fd!important;border-right:2px solid #c4b5fd!important
+  }
+  .alas-table thead th.alas-sep{background:#ddd6fe}
+  @media(max-width:768px){
+    .alas-table th{font-size:10px;padding:6px 4px}
+    .alas-table th.alas-col{min-width:84px}
+    .alas-table th.alas-col-lg{min-width:104px}
+  }
+
   /* ── Responsive ≤ 768px ─────────────────────────────────────────────────── */
   @media(max-width:768px){
     .table-wrap table th,.table-wrap table td{padding:2px 4px;font-size:10px}
@@ -7878,6 +7905,7 @@ function alasCuadreHTML(){
       <td class="num" style="font-weight:600">${num(r.consumoReal)}</td>
       <td class="num">${num(r.consumoIdpos)}</td>
       ${dif(r.difConsumo)}
+      <td class="alas-sep" aria-hidden="true"></td>
       <td class="num">${num(r.kgPedidos)}</td>
       <td class="num">${num(r.entrantes)}</td>
       <td class="num" style="font-weight:600">${num(r.contabilizadas)}</td>
@@ -7891,26 +7919,28 @@ function alasCuadreHTML(){
         Se calcula con los registros existentes de <b>Inventario de Insumos</b> (ALAS PRECOCIDAS, ALAS EN SALMUERA, ALAS CONSUMIDAS SEGUN IDPOS, ALAS ENTRANTES, KILOS ALAS PEDIDOS).
         <b>Celdas vacías</b> = sin registro ese día (la ausencia de dato nunca se interpreta como 0).
         <b>Alas contabilizadas</b> = stock inicial del día − stock final del día anterior (el día previo al rango se consulta automáticamente y no se muestra como fila).
+        La franja vertical separa el <b>bloque de consumo</b> (stock, consumo real, IDPOS y su diferencia) del <b>bloque de entradas</b> (kg pedidos, entrantes, contabilizadas y su diferencia).
       </p>
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="alasDesde" value="${desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="alasHasta" value="${hasta}"></div>
         <button class="btn btn-ghost btn-sm" id="alasReset" style="align-self:flex-end">Últimos 7 días</button>
       </div>
-      <div class="table-wrap"><table>
+      <div class="table-wrap"><table class="alas-table">
         <thead><tr>
           <th>Fecha</th>
-          <th class="num">Stock inicial</th>
-          <th class="num">Stock final</th>
-          <th class="num">Consumo real de alas según conteo</th>
-          <th class="num">Consumo de alas según IDPOS</th>
-          <th class="num">Diferencia consumo</th>
-          <th class="num">KG pedidos</th>
-          <th class="num">Alas entrantes</th>
-          <th class="num">Alas contabilizadas</th>
-          <th class="num">Diferencia entradas</th>
+          <th class="num alas-col">Stock<br>inicial</th>
+          <th class="num alas-col">Stock<br>final</th>
+          <th class="num alas-col-lg">Consumo real de alas<br>según conteo</th>
+          <th class="num alas-col-lg">Consumo de alas<br>según IDPOS</th>
+          <th class="num alas-col">Diferencia<br>consumo</th>
+          <th class="alas-sep" aria-hidden="true"></th>
+          <th class="num alas-col">KG<br>pedidos</th>
+          <th class="num alas-col">Alas<br>entrantes</th>
+          <th class="num alas-col">Alas<br>contabilizadas</th>
+          <th class="num alas-col">Diferencia<br>entradas</th>
         </tr></thead>
-        <tbody>${cuerpo||`<tr><td colspan="10" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
+        <tbody>${cuerpo||`<tr><td colspan="11" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
 }
