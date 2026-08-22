@@ -7344,8 +7344,70 @@ function prodSeccionProduccionHTML(){
         <button class="btn btn-ghost btn-sm" id="prodRegAdd">+ Agregar otra producción</button>
         <button class="btn btn-primary" id="prodRegSave">💾 Guardar producción</button>
       </div>
+      ${prodRegListadoHTML()}
     </div>`;
 }
+
+/* Listado de las producciones YA registradas en la fecha seleccionada.
+   Lee de la misma fuente (S.prodInsumos) que usa el registro: no existe
+   estructura paralela. Se re-renderiza con cada cambio de fecha, alta o
+   eliminación, porque el HTML se reconstruye desde el estado vigente. */
+function prodRegListadoHTML(){
+  const regs = S.prodInsumos
+    .filter(r=>r.fecha===prodRegFecha)
+    .map(r=>({ r, ins:S.insumos.find(i=>i.id===r.insumoId) }))
+    .filter(x=>x.ins)                       // sin insumo en catálogo: no listable
+    .sort((a,b)=>{                          // orden global del catálogo
+      const ord=insumosOrdenados().map(i=>i.id);
+      return ord.indexOf(a.ins.id)-ord.indexOf(b.ins.id);
+    });
+  if(!regs.length){
+    return `<p class="hint" style="margin:14px 0 0;padding-top:12px;border-top:1px solid var(--c-line)">
+      No hay producciones registradas para el ${fmtFecha(prodRegFecha)}.</p>`;
+  }
+  const filas = regs.map(({r,ins})=>`
+    <tr>
+      <td>${ins.nombre}</td>
+      <td class="num">${r.cantidad}</td>
+      <td><span class="badge b-free">${ins.unidad}</span></td>
+      <td><button class="btn-icon del" onclick="prodRegEliminar('${r.id}')" title="Eliminar esta producción">🗑️ Eliminar</button></td>
+    </tr>`).join('');
+  return `
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--c-line)">
+      <h3 style="margin:0 0 8px;font-size:14px">Producciones registradas · ${fmtFecha(prodRegFecha)} <span style="color:var(--c-muted);font-weight:400">(${regs.length})</span></h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Insumo</th><th class="num">Cantidad producida</th><th>Unidad</th><th>Acciones</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>
+    </div>`;
+}
+
+/* Elimina UN registro de producción, previa confirmación que identifica
+   insumo, cantidad y fecha. No toca ningún otro registro del día.
+   Se marca como eliminado (tombstone) para que la fusión con el remoto
+   durante la sincronización no lo resucite. */
+window.prodRegEliminar = function(id){
+  const r = S.prodInsumos.find(x=>x.id===id);
+  if(!r) return;
+  const ins = S.insumos.find(i=>i.id===r.insumoId);
+  const nombre = ins ? ins.nombre : '(insumo desconocido)';
+  const unidad = ins ? (' '+ins.unidad) : '';
+  if(!confirm('¿Eliminar la producción registrada?\n\n'+
+    'Insumo: '+nombre+'\n'+
+    'Cantidad: '+r.cantidad+unidad+'\n'+
+    'Fecha: '+fmtFecha(r.fecha)+'\n\n'+
+    'Esta acción no se puede deshacer y solo afecta a este registro.')) return;
+  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('ProduccionInsumos', r);
+  S.prodInsumos = S.prodInsumos.filter(x=>x.id!==id);
+  save(K.prodInsumos, S.prodInsumos);
+  syncProdInsumos();
+  toast('Producción de "'+nombre+'" eliminada','warn');
+  // Los módulos que consumen producción la recalculan desde el estado, así que
+  // basta con re-renderizarlos: no hay valores derivados almacenados.
+  RENDERERS.produccion();
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
+  if(typeof RENDERERS.inventarioConsolidado==='function') RENDERERS.inventarioConsolidado();
+};
 function prodSeccionProduccionBind(){
   const g=id=>document.getElementById(id);
   if(!g('prodRegFecha')) return;
