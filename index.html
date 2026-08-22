@@ -7229,14 +7229,23 @@ function prodRegistroUpsert(insumoId, fecha, cantidad){
    duplica: si ya existe un registro de producción para esa
    combinación, se omite. Ejecutarla de nuevo no genera duplicados. */
 function migrarProduccionV2(){
-  let creados=0, omitidos=0;
+  let creados=0, omitidos=0, tocados=false;
   S.produccion.forEach(r=>{
     const cant = numOrNull(r.produccion);
     if(cant===null) return;                       // sin dato histórico
-    if(getProdRegistro(r.insumoId, r.fecha)){ omitidos++; return; } // ya migrado
+    // Marca POR REGISTRO: una vez migrado, el origen legado queda sellado.
+    // Sin este sello, borrar una producción hacía que la siguiente carga la
+    // recreara desde `r.produccion` y la eliminación parecía revertirse.
+    // El valor histórico NO se borra: solo se marca como ya migrado.
+    if(r.migradoV2){ omitidos++; return; }
+    if(getProdRegistro(r.insumoId, r.fecha)){      // ya existe: sellar igualmente
+      r.migradoV2 = true; tocados = true; omitidos++; return;
+    }
     S.prodInsumos.push({id:uid(), insumoId:r.insumoId, fecha:r.fecha, cantidad:cant, origen:'migrado'});
+    r.migradoV2 = true; tocados = true;
     creados++;
   });
+  if(tocados) save(K.produccion, S.produccion);   // persiste el sello
   if(creados){
     save(K.prodInsumos, S.prodInsumos);
     console.log('[Migración v2] '+creados+' producción(es) histórica(s) migrada(s) a la nueva estructura'+
@@ -9709,12 +9718,13 @@ function gsSerializeInventario(){
         inventario:insumoInventario(i), orden:insumoOrden(i,idx) }))),
     // Hoja de STOCK: conserva las columnas legadas como respaldo histórico
     // y añade los campos vigentes (vacío cuando el dato no existe, nunca 0).
-    Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre'],
+    Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre','migradoV2'],
       S.produccion.map(r=>({ id:r.id, insumoId:r.insumoId, fecha:r.fecha,
         produccion:(r.produccion===undefined||r.produccion===null)?'':r.produccion,
         cierre:(r.cierre===undefined||r.cierre===null)?'':r.cierre,
         stockInicial:(r.stockInicial===undefined||r.stockInicial===null)?'':r.stockInicial,
-        stockCierre:(r.stockCierre===undefined||r.stockCierre===null)?'':r.stockCierre }))),
+        stockCierre:(r.stockCierre===undefined||r.stockCierre===null)?'':r.stockCierre,
+        migradoV2:r.migradoV2?1:'' }))),
     // Hoja propia de PRODUCCIÓN (fuente única del concepto).
     ProduccionInsumos: gsRowsToMatrix(['id','insumoId','fecha','cantidad'], S.prodInsumos),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
@@ -10072,7 +10082,9 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // Campos legados: se conservan como respaldo del histórico.
         produccion:numOrNull(r.produccion), cierre:numOrNull(r.cierre),
         // Campos vigentes: null si la hoja no los trae (nunca 0 por omisión).
-        stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre) }));
+        stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre),
+        // Sello de migración: evita recrear producciones ya migradas (y borradas).
+        migradoV2: !!(r.migradoV2 && String(r.migradoV2).toLowerCase()!=='false' && r.migradoV2!=='0') }));
       S.prodInsumos = (byName['ProduccionInsumos']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
         cantidad:numOrNull(r.cantidad) })).filter(r=>r.insumoId && r.cantidad!==null);
