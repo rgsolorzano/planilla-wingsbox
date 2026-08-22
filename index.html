@@ -579,6 +579,8 @@ const K = {
   prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza',
   // Módulo Producción / Insumos (inventario)
   insumos:'pl_insumos', produccion:'pl_produccion', seedInsumos:'pl_seedInsumosDone',
+  // Producción como concepto INDEPENDIENTE del stock (ver migración v2).
+  prodInsumos:'pl_prodInsumos', migProdV2:'pl_migProdV2Done',
   // Módulo Licores (inventario)
   licores:'pl_licores', invLicores:'pl_invLicores', seedLicores:'pl_seedLicoresDone',
   // Módulo Bebidas diarias (inventario)
@@ -812,7 +814,7 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados
@@ -6960,7 +6962,7 @@ RENDERERS.consolidadoMenaje = function(){
 
 
 function dominioKeys(domain){
-  const invKeys = new Set([K.insumos, K.produccion, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat, K.efectivoCaja, K.salonProductos, K.salonInventario, K.seedSalon, K.menajeArticulos, K.menajeInventario, K.seedMenaje]);
+  const invKeys = new Set([K.insumos, K.produccion, K.prodInsumos, K.migProdV2, K.seedInsumos, K.gsheetIdInv, K.licores, K.invLicores, K.seedLicores, K.bebidasCat, K.stockBebidas, K.seedBebidasCat, K.efectivoCaja, K.salonProductos, K.salonInventario, K.seedSalon, K.menajeArticulos, K.menajeInventario, K.seedMenaje]);
   return domain==='inventario' ? Array.from(invKeys) : Object.values(K).filter(k=>!invKeys.has(k));
 }
 document.getElementById('btnSeed').onclick=()=>{
@@ -7064,7 +7066,9 @@ function insumoAlertaMinimo(ins){ return !!ins && ins.alertaMinimo === true; }
       por retrocompatibilidad; los ya configurados conservan su valor.
    ── orden: entero que define la POSICIÓN GLOBAL en el catálogo. Es único
       para toda la app: los filtros solo ocultan filas, nunca reordenan.     */
-const INVENTARIO_TIPOS = [['dia','Stock día'], ['noche','Stock noche'], ['ambos','Ambos']];
+// Clasificación del insumo: determina qué campos de STOCK son editables.
+// NO condiciona el registro de producción (cualquier insumo puede producir).
+const INVENTARIO_TIPOS = [['dia','Stock inicial'], ['noche','Stock cierre'], ['ambos','Ambos']];
 function insumoInventario(ins){
   const v = String(ins && ins.inventario || '').toLowerCase();
   // Cualquier valor fuera del dominio cae en 'dia': la clasificación es
@@ -7162,14 +7166,80 @@ function migrarCamposInsumo(ins){
   if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true; // se mantiene: regla de incremento anormal
   return ins;
 }
+/* ════════════════════════════════════════════════════════════════
+   ARQUITECTURA DE INVENTARIO DE INSUMOS (v2)
+   Tres conceptos separados, cada uno con UNA sola fuente:
+     · PRODUCCIÓN    → S.prodInsumos  (registro propio por insumo/fecha)
+     · STOCK INICIAL → S.produccion[].stockInicial
+     · STOCK CIERRE  → S.produccion[].stockCierre
+   El registro de S.produccion conserva sus campos antiguos
+   (`produccion`, `cierre`) intactos para no perder histórico: se leen
+   solo como respaldo de compatibilidad, nunca se escriben de nuevo.
+   ════════════════════════════════════════════════════════════════ */
+// Registro de STOCK de un insumo en una fecha (sigue viviendo en S.produccion).
 function getProduccion(insumoId, fecha){ return S.produccion.find(x=>x.insumoId===insumoId && x.fecha===fecha); }
-// Actualiza el registro existente de (insumo, fecha) o crea uno nuevo si no
-// existe. Nunca duplica ni toca registros de otras fechas/insumos.
-function produccionUpsert(insumoId, fecha, produccion, cierre){
-  let r = getProduccion(insumoId, fecha);
-  if(r){ r.produccion = produccion; r.cierre = cierre; }
-  else { S.produccion.push({ id:uid(), insumoId, fecha, produccion, cierre }); }
+function getStockReg(insumoId, fecha){ return getProduccion(insumoId, fecha); }
+
+// Valor numérico o null cuando el dato NO existe (jamás 0 por omisión).
+function numOrNull(v){
+  if(v===null || v===undefined || v==='') return null;
+  const n=Number(v);
+  return Number.isFinite(n) ? n : null;
 }
+// Stock inicial: solo el campo nuevo. Los históricos que no lo tienen quedan
+// VACÍOS a propósito (no se reconstruye ni se infiere).
+function stockInicialDe(insumoId, fecha){
+  const r=getStockReg(insumoId,fecha);
+  return r ? numOrNull(r.stockInicial) : null;
+}
+// Stock cierre: campo nuevo y, como respaldo, el campo legado `cierre`.
+function stockCierreDe(insumoId, fecha){
+  const r=getStockReg(insumoId,fecha);
+  if(!r) return null;
+  const n=numOrNull(r.stockCierre);
+  return n!==null ? n : numOrNull(r.cierre);
+}
+// ── PRODUCCIÓN: fuente única e independiente del stock ──
+function getProdRegistro(insumoId, fecha){
+  return S.prodInsumos.find(x=>x.insumoId===insumoId && x.fecha===fecha);
+}
+function produccionDe(insumoId, fecha){
+  const r=getProdRegistro(insumoId,fecha);
+  return r ? numOrNull(r.cantidad) : null;
+}
+// Crea o reemplaza la producción de (insumo, fecha). El reemplazo siempre
+// procede de una confirmación explícita del usuario (nunca silencioso).
+function prodRegistroUpsert(insumoId, fecha, cantidad){
+  const r=getProdRegistro(insumoId,fecha);
+  if(r){ r.cantidad=cantidad; return 'actualizado'; }
+  S.prodInsumos.push({id:uid(), insumoId, fecha, cantidad});
+  return 'nuevo';
+}
+
+/* ── MIGRACIÓN v2 (idempotente) ────────────────────────────────────
+   El campo legado `produccion` del registro de stock pasa a ser un
+   registro propio en S.prodInsumos, conservando fecha, insumo y
+   cantidad exactos. No se borra el campo original (respaldo) y no se
+   duplica: si ya existe un registro de producción para esa
+   combinación, se omite. Ejecutarla de nuevo no genera duplicados. */
+function migrarProduccionV2(){
+  let creados=0, omitidos=0;
+  S.produccion.forEach(r=>{
+    const cant = numOrNull(r.produccion);
+    if(cant===null) return;                       // sin dato histórico
+    if(getProdRegistro(r.insumoId, r.fecha)){ omitidos++; return; } // ya migrado
+    S.prodInsumos.push({id:uid(), insumoId:r.insumoId, fecha:r.fecha, cantidad:cant, origen:'migrado'});
+    creados++;
+  });
+  if(creados){
+    save(K.prodInsumos, S.prodInsumos);
+    console.log('[Migración v2] '+creados+' producción(es) histórica(s) migrada(s) a la nueva estructura'+
+      (omitidos?' ('+omitidos+' ya existían y no se duplicaron)':'')+'.');
+  }
+  localStorage.setItem(K.migProdV2,'1');
+  return {creados, omitidos};
+}
+
 
 /* ---------- Producción: registro diario por insumo ---------- */
 let prodFecha = fechaHoy();
@@ -7192,13 +7262,26 @@ RENDERERS.produccion = function(){
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
       <td>${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>
-      <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="produccion" value="${reg?reg.produccion:''}" placeholder="0"></td>
-      <td class="num"><input type="number" min="0" step="0.01" class="prodInput" data-insumo="${ins.id}" data-campo="cierre" value="${reg?reg.cierre:''}" placeholder="0"></td>
+      ${(()=>{
+        const t=insumoInventario(ins);
+        const editaIni = (t==='dia'   || t==='ambos');
+        const editaCie = (t==='noche' || t==='ambos');
+        const vIni = stockInicialDe(ins.id, prodFecha);
+        const vCie = stockCierreDe(ins.id, prodFecha);
+        const celda=(campo, val, editable)=>`<td class="num"><input type="number" min="0" step="0.01"
+          class="prodInput" data-insumo="${ins.id}" data-campo="${campo}"
+          value="${val===null?'':val}" placeholder="${editable?'0':'—'}"
+          ${editable?'':'disabled title="No editable: la clasificación Inventario de este insumo no incluye este campo" style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"'}></td>`;
+        return celda('stockInicial', vIni, editaIni) + celda('stockCierre', vCie, editaCie);
+      })()}
     </tr>`;
   }).join('') : `<tr><td colspan="3" class="empty">No hay insumos en esta clasificación.</td></tr>`;
   el.innerHTML = `
-    <div class="page-head"><div><h1>📦 Producción</h1><p>Registra diariamente la producción y el cierre de cada insumo. El orden de los insumos se configura en <b>Administración de insumos</b>.</p></div></div>
+    <div class="page-head"><div><h1>📦 Inv. Producción</h1><p>Registra la <b>producción</b> diaria y el <b>stock</b> (inicial y cierre) de cada insumo. El orden de los insumos se configura en <b>Administración de insumos</b>.</p></div></div>
+    ${prodSeccionProduccionHTML()}
     <div class="card">
+      <h2>Registrar stock</h2>
+      <p class="hint" style="margin-top:0">Stock inicial y stock de cierre del día. Los campos editables dependen de la clasificación <b>Inventario</b> de cada insumo; los no editables se muestran atenuados.</p>
       <div class="toolbar">
         <div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div>
         <div class="field"><label>Inventario</label>
@@ -7207,7 +7290,7 @@ RENDERERS.produccion = function(){
           </select></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Insumo</th><th class="num">Producción</th><th class="num">Cierre</th></tr></thead>
+        <thead><tr><th>Insumo</th><th class="num">Stock inicial</th><th class="num">Stock cierre</th></tr></thead>
         <tbody>${filas}</tbody>
       </table></div>
       <div class="actions">
@@ -7219,8 +7302,114 @@ RENDERERS.produccion = function(){
   document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
   document.getElementById('prodInvFiltro').onchange = (e)=>{ prodInvFiltro = e.target.value || 'ambos'; RENDERERS.produccion(); };
   document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
+  prodSeccionProduccionBind();
   document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
 };
+/* ── SECCIÓN "REGISTRAR PRODUCCIÓN" (filas dinámicas) ──────────────
+   Permite cargar la producción de varios insumos para una misma fecha
+   en una sola acción. Disponible para CUALQUIER insumo, sin importar
+   su clasificación de inventario. */
+let prodRegFecha = fechaHoy();
+let prodRegFilas = [ {insumoId:'', cantidad:''} ];
+
+function prodSeccionProduccionHTML(){
+  const insumos = insumosOrdenados();  // orden global del catálogo
+  if(!insumos.length) return '';
+  const optsDe = sel => `<option value="">— Selecciona insumo —</option>`+
+    insumos.map(i=>`<option value="${i.id}" ${sel===i.id?'selected':''}>${i.nombre}</option>`).join('');
+  const filas = prodRegFilas.map((f,idx)=>{
+    const ins = insumos.find(i=>i.id===f.insumoId);
+    const yaExiste = f.insumoId && getProdRegistro(f.insumoId, prodRegFecha);
+    return `<tr>
+      <td><select class="prodRegInsumo" data-idx="${idx}" style="min-width:220px">${optsDe(f.insumoId)}</select>
+        ${yaExiste?`<br><small style="color:var(--amber,#b45309)">⚠️ Ya existe producción para esta fecha</small>`:''}</td>
+      <td class="num"><input type="number" min="0" step="0.01" class="prodRegCant" data-idx="${idx}"
+        value="${f.cantidad}" placeholder="0" style="min-width:110px"></td>
+      <td><span class="badge b-free">${ins?ins.unidad:'—'}</span></td>
+      <td><button class="btn-icon del" onclick="prodRegQuitar(${idx})" title="Quitar fila">🗑️</button></td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="card">
+      <h2>Registrar producción</h2>
+      <p class="hint" style="margin-top:0">Cantidad producida por insumo en la fecha indicada. Puedes agregar tantas filas como necesites y guardarlas de una sola vez. Cualquier insumo puede registrar producción, sin importar su clasificación de inventario.</p>
+      <div class="toolbar">
+        <div class="field"><label>Fecha</label><input type="date" id="prodRegFecha" value="${prodRegFecha}"></div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Insumo</th><th class="num">Cantidad producida</th><th>Unidad</th><th></th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>
+      <div class="actions">
+        <button class="btn btn-ghost btn-sm" id="prodRegAdd">+ Agregar otra producción</button>
+        <button class="btn btn-primary" id="prodRegSave">💾 Guardar producción</button>
+      </div>
+    </div>`;
+}
+function prodSeccionProduccionBind(){
+  const g=id=>document.getElementById(id);
+  if(!g('prodRegFecha')) return;
+  g('prodRegFecha').onchange = e=>{ prodRegFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
+  document.querySelectorAll('.prodRegInsumo').forEach(sel=>{
+    sel.onchange = e=>{ prodRegFilas[+e.target.dataset.idx].insumoId = e.target.value; RENDERERS.produccion(); };
+  });
+  document.querySelectorAll('.prodRegCant').forEach(inp=>{
+    inp.oninput = e=>{ prodRegFilas[+e.target.dataset.idx].cantidad = e.target.value; };
+  });
+  g('prodRegAdd').onclick = ()=>{ prodRegFilas.push({insumoId:'', cantidad:''}); RENDERERS.produccion(); };
+  g('prodRegSave').onclick = guardarRegistroProduccion;
+}
+window.prodRegQuitar = function(idx){
+  prodRegFilas.splice(idx,1);
+  if(!prodRegFilas.length) prodRegFilas=[{insumoId:'',cantidad:''}];
+  RENDERERS.produccion();
+};
+// Guarda todas las filas en una sola acción. Ante un duplicado
+// (mismo insumo y fecha) NUNCA sobrescribe en silencio: pide confirmación
+// explícita por cada caso; si el usuario cancela, conserva el valor existente.
+function guardarRegistroProduccion(){
+  const fecha = prodRegFecha;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ toast('Selecciona una fecha válida','error'); return; }
+  const candidatas = prodRegFilas
+    .map(f=>({ insumoId:f.insumoId, valor:String(f.cantidad).trim() }))
+    .filter(f=>f.insumoId && f.valor!=='');
+  if(!candidatas.length){ toast('Selecciona un insumo e ingresa la cantidad producida','error'); return; }
+  // Validación numérica
+  const invalida = candidatas.find(f=>isNaN(Number(f.valor)) || Number(f.valor)<0);
+  if(invalida){ toast('Las cantidades deben ser numéricas y no negativas','error'); return; }
+  // Insumo repetido dentro del mismo formulario
+  const vistos = new Set();
+  for(const c of candidatas){
+    if(vistos.has(c.insumoId)){
+      const ins=S.insumos.find(i=>i.id===c.insumoId);
+      toast('El insumo "'+(ins?ins.nombre:'—')+'" está repetido en el formulario','error'); return;
+    }
+    vistos.add(c.insumoId);
+  }
+  let nuevos=0, reemplazados=0, conservados=0;
+  candidatas.forEach(c=>{
+    const ins = S.insumos.find(i=>i.id===c.insumoId);
+    const nombre = ins?ins.nombre:'—';
+    const existente = getProdRegistro(c.insumoId, fecha);
+    if(existente){
+      const ok = confirm('Ya existe una producción registrada para "'+nombre+'" el '+fmtFecha(fecha)+
+        ' (cantidad actual: '+existente.cantidad+').\n\n¿Deseas reemplazarla por '+Number(c.valor)+'?');
+      if(!ok){ conservados++; return; }   // se conserva el registro existente
+      reemplazados++;
+    } else nuevos++;
+    prodRegistroUpsert(c.insumoId, fecha, Number(c.valor));
+  });
+  save(K.prodInsumos, S.prodInsumos);
+  syncProdInsumos();
+  prodRegFilas = [{insumoId:'', cantidad:''}];
+  toast('Producción guardada: '+nuevos+' nueva(s)'+
+    (reemplazados?', '+reemplazados+' reemplazada(s)':'')+
+    (conservados?', '+conservados+' conservada(s)':'')+'.', 'success');
+  RENDERERS.produccion();
+  if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
+  if(typeof RENDERERS.inventarioConsolidado==='function') RENDERERS.inventarioConsolidado();
+}
+
 async function guardarProduccion(){
   const inputs = document.querySelectorAll('.prodInput');
   const porInsumo = {};
@@ -7241,17 +7430,20 @@ async function guardarProduccion(){
 
   let guardados = 0;
   Object.entries(porInsumo).forEach(([insumoId, vals])=>{
-    const prodVacio = vals.produccion===undefined || vals.produccion==='';
-    const cierreVacio = vals.cierre===undefined || vals.cierre==='';
-    if(prodVacio && cierreVacio) return; // fila totalmente vacía: no se crea/actualiza registro
-    const produccion = prodVacio ? 0 : Number(vals.produccion);
-    const cierre = cierreVacio ? 0 : Number(vals.cierre);
-    produccionUpsert(insumoId, prodFecha, produccion, cierre);
+    const iniVacio = vals.stockInicial===undefined || vals.stockInicial==='';
+    const cieVacio = vals.stockCierre===undefined || vals.stockCierre==='';
+    if(iniVacio && cieVacio) return; // fila vacía: no se crea/actualiza registro
+    // Upsert por (insumo, fecha) sobre el registro de STOCK. Un campo vacío se
+    // guarda como null (dato inexistente), NUNCA como 0.
+    let r = getStockReg(insumoId, prodFecha);
+    if(!r){ r = {id:uid(), insumoId, fecha:prodFecha}; S.produccion.push(r); }
+    if(!iniVacio) r.stockInicial = Number(vals.stockInicial);
+    if(!cieVacio) r.stockCierre  = Number(vals.stockCierre);
     guardados++;
   });
-  if(!guardados){ toast('Ingresa al menos un valor de producción o cierre','error'); return; }
+  if(!guardados){ toast('Ingresa al menos un valor de stock inicial o de cierre','error'); return; }
   save(K.produccion, S.produccion);
-  toast(`Producción guardada (${guardados} insumo(s)).`,'success');
+  toast(`Stock guardado (${guardados} insumo(s)).`,'success');
   RENDERERS.produccion();
   syncProduccion();
   // Refresca el módulo "Alerta de Insumos" si está abierto en otra pestaña/grupo
@@ -7263,11 +7455,13 @@ function exportarProduccionDiaExcel(){
   const datos = insumosOrdenados()
     .filter(i=>insumoEnInventario(i, prodInvFiltro))
     .map(ins=>{
-    const r = getProduccion(ins.id, prodFecha);
-    return { fecha:prodFecha, insumo:ins.nombre, produccion:r?r.produccion:0, cierre:r?r.cierre:0, unidad:ins.unidad };
+    const ini = stockInicialDe(ins.id, prodFecha), cie = stockCierreDe(ins.id, prodFecha);
+    const prod = produccionDe(ins.id, prodFecha);
+    return { fecha:prodFecha, insumo:ins.nombre, unidad:ins.unidad,
+             stockInicial: ini===null?'':ini, produccion: prod===null?'':prod, stockCierre: cie===null?'':cie };
   });
-  exportarExcelSimple('Produccion', datos, `produccion_${prodFecha}_${excelTimestamp()}.xlsx`);
-  toast('Excel de producción descargado','success');
+  exportarExcelSimple('InvProduccion', datos, `inv_produccion_${prodFecha}_${excelTimestamp()}.xlsx`);
+  toast('Excel de inventario descargado','success');
 }
 
 /* ---------- Administración de insumos ---------- */
@@ -7293,7 +7487,7 @@ RENDERERS.insumos = function(){
         <b>Alerta por consumo</b>: se activa cuando el consumo acumulado de los últimos 3 días es menor al valor configurado en <b>Consumo</b>.
         <b>Alerta por mínimo</b>: se activa cuando el último inventario registrado es menor al valor configurado en <b>Mínimo</b>.
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
-        <b>Inventario</b>: clasifica cada insumo como <b>Stock día</b>, <b>Stock noche</b> o <b>Ambos</b> (se inventaría de día y de noche, por lo que aparece en los dos filtros de Producción).
+        <b>Inventario</b>: define qué campos de stock son editables en <b>Inv. Producción → Registrar stock</b>: <b>Stock inicial</b>, <b>Stock cierre</b> o <b>Ambos</b>. No condiciona el registro de producción: cualquier insumo puede registrar producción.
         <b>Orden</b>: los botones ⬆️⬇️ definen el <b>orden global</b> del catálogo y se aplican de inmediato en Producción, Consolidado de Inventario y Alerta de Insumos.
         <b>Los demás cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
@@ -7449,88 +7643,109 @@ function fechaMenosUnDia(fechaISO){
   dt.setDate(dt.getDate()-1);
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
-// ---------------------------------------------------------------------
-// Cálculo de consumo de 3 días — lógica EXISTENTE, sin modificar.
-// Consumo_día = Cierre(día anterior) + Producción(ese día) - Cierre(ese día)
-// Consumo de 3 días = suma del consumo diario de los últimos 3 registros.
-// Devuelve null si no hay datos suficientes para evaluar.
-// ---------------------------------------------------------------------
-function consumoUltimos3Dias(insumoId){
-  const ultimos3 = S.produccion
-    .filter(r => r.insumoId === insumoId)
-    .sort((a, b) => b.fecha.localeCompare(a.fecha))
-    .slice(0, 3);
-  if(!ultimos3.length) return null;
 
-  let consumoAcumulado = 0;
-  let diasValidos = 0;
-  for(const reg of ultimos3){
-    const regAnterior = getProduccion(insumoId, fechaMenosUnDia(reg.fecha));
-    if(!regAnterior) continue; // sin registro del día anterior → omitir ese día
-    consumoAcumulado += numProp(regAnterior.cierre) + numProp(reg.produccion) - numProp(reg.cierre);
-    diasValidos++;
-  }
-  if(!diasValidos) return null;
-  return { consumo: consumoAcumulado, ultimaFecha: ultimos3[0].fecha };
-}
-// Último registro de producción/cierre del insumo (cualquier fecha).
-function ultimoRegistroInsumo(insumoId){
-  return S.produccion
-    .filter(r => r.insumoId === insumoId)
-    .sort((a, b) => b.fecha.localeCompare(a.fecha))[0] || null;
-}
+
 // ---------------------------------------------------------------------
 // Evalúa AMBAS reglas de alerta de forma independiente para un insumo.
 // Devuelve { consumo:{activa,valor,umbral,fecha}|null, minimo:{activa,valor,umbral,fecha}|null }
 // null en una clave significa que esa alerta no está configurada/activada
 // o no hay datos suficientes para evaluarla (no es lo mismo que "no en alerta").
 // ---------------------------------------------------------------------
+/* ── Consumo diario (arquitectura v2) ──────────────────────────────
+   Se prioriza el Stock inicial; si no hay pareja de días válida se
+   intenta con Stock cierre. Sin dos valores válidos → null: el día NO
+   entra en el acumulado y jamás se sustituye por 0.
+     Consumo = Stock(ayer) − Stock(hoy) + Producción(hoy)              */
+function consumoDiarioInsumo(insumoId, fecha){
+  const ayer = fechaMenosUnDia(fecha);
+  const prod = produccionDe(insumoId, fecha) || 0;
+  const iniHoy = stockInicialDe(insumoId, fecha), iniAyer = stockInicialDe(insumoId, ayer);
+  if(iniHoy!==null && iniHoy>0 && iniAyer!==null && iniAyer>0)
+    return { valor: iniAyer - iniHoy + prod, base:'inicial' };
+  const cieHoy = stockCierreDe(insumoId, fecha), cieAyer = stockCierreDe(insumoId, ayer);
+  if(cieHoy!==null && cieHoy>0 && cieAyer!==null && cieAyer>0)
+    return { valor: cieAyer - cieHoy + prod, base:'cierre' };
+  return null;
+}
+// Fechas con algún dato del insumo (stock o producción), de la más reciente atrás.
+function fechasConDatosInsumo(insumoId){
+  const set=new Set();
+  S.produccion.forEach(r=>{ if(r.insumoId===insumoId) set.add(r.fecha); });
+  S.prodInsumos.forEach(r=>{ if(r.insumoId===insumoId) set.add(r.fecha); });
+  return [...set].sort().reverse();
+}
+// Acumulado de los últimos 3 días CON consumo computable.
+function consumoUltimos3DiasV2(insumoId){
+  const fechas = fechasConDatosInsumo(insumoId);
+  let suma=0, dias=0, ultima=null;
+  for(const f of fechas){
+    if(dias>=3) break;
+    const c = consumoDiarioInsumo(insumoId, f);
+    if(c===null) continue;                 // día sin datos suficientes: se omite
+    suma += c.valor; dias++;
+    if(!ultima) ultima = f;
+  }
+  return dias ? { consumo:suma, dias, ultimaFecha:ultima } : null;
+}
+/* ── Cierre anómalo (v2): SOLO aumentos > 5% sin producción ese día ──
+   Nunca alerta por disminuciones. Se evalúa con Stock cierre y, en su
+   defecto, con Stock inicial.                                        */
+function incrementoAnormalV2(insumoId, fecha){
+  const insumo = S.insumos.find(i=>i.id===insumoId);
+  if(insumo && insumo.resaltadoCelda === false) return null;
+  if((produccionDe(insumoId, fecha) || 0) !== 0) return null;   // hubo producción: no es anomalía
+  const ayer = fechaMenosUnDia(fecha);
+  const pares = [
+    ['cierre',  stockCierreDe(insumoId,fecha),  stockCierreDe(insumoId,ayer)],
+    ['inicial', stockInicialDe(insumoId,fecha), stockInicialDe(insumoId,ayer)]
+  ];
+  for(const [base,hoy,ant] of pares){
+    if(hoy!==null && hoy>0 && ant!==null && ant>0 && hoy > ant*1.05)
+      return { valor:hoy, anterior:ant, base };
+  }
+  return null;
+}
+
 function evaluarAlertasInsumo(insumo){
   const out = { consumo:null, minimo:null, anomalia:null };
 
+  // 6.1 CONSUMO BAJO: acumulado de los últimos 3 días con dato computable.
   if(insumoAlertaConsumo(insumo)){
-    const c = consumoUltimos3Dias(insumo.id);
+    const c = consumoUltimos3DiasV2(insumo.id);
     if(c){
       const umbral = insumoUmbralConsumo(insumo);
-      // Consumo negativo = inconsistencia de datos (producción no registrada), no alerta real.
-      // Solo alertar cuando consumo ≥ 0 y sea menor al umbral esperado.
-      out.consumo = { activa: c.consumo >= 0 && c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
+      out.consumo = { activa: c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
     }
   }
+  // 6.2 STOCK MÍNIMO: se activa si el stock cierre O el stock inicial del día
+  // EXISTEN (no son null) y quedan por debajo del mínimo configurado.
+  // La ausencia de dato se representa con null, por lo que el 0 es un valor
+  // legítimo y SÍ se evalúa: un insumo agotado (stock 0) es precisamente el
+  // caso más crítico y debe generar alerta.
   if(insumoAlertaMinimo(insumo)){
-    const u = ultimoRegistroInsumo(insumo.id);
-    if(u){
-      const umbral = insumoUmbralMinimo(insumo);
-      // Inventario real del día = Producción + Cierre (no solo el Cierre)
-      const inventario = numProp(u.produccion) + numProp(u.cierre);
-      out.minimo = { activa: inventario < umbral, valor: inventario, umbral, fecha: u.fecha };
+    const umbral = insumoUmbralMinimo(insumo);
+    const fechas = fechasConDatosInsumo(insumo.id);
+    for(const f of fechas){
+      const cie = stockCierreDe(insumo.id, f), ini = stockInicialDe(insumo.id, f);
+      const cand = [cie, ini].filter(v=>v!==null);   // solo se excluye "sin dato"
+      if(!cand.length) continue;
+      const bajo = cand.find(v=>v < umbral);
+      if(bajo!==undefined){ out.minimo = { activa:true, valor:bajo, umbral, fecha:f }; }
+      else { out.minimo = { activa:false, valor:Math.min(...cand), umbral, fecha:f }; }
+      break;                                   // se evalúa el día más reciente con stock
     }
   }
-  // Anomalía de cierre: celda de cierre sube >2% sin producción ese día.
-  // Fuente de verdad compartida con el Consolidado de Inventario.
-  // Se evalúa en los últimos 3 días para detectar anomalías recientes.
+  // 6.3 CIERRE ANÓMALO: aumento > 5% sin producción (nunca por disminución).
   const hoyStr = fechaHoy();
   const hace3 = new Date(hoyStr+'T12:00:00'); hace3.setDate(hace3.getDate()-2);
   const fechas3d = rangoFechas(hace3.toISOString().slice(0,10), hoyStr);
-  const fechaAnom = fechas3d.find(f=>incrementoAnormal(insumo.id, f));
-  if(fechaAnom){
-    const r = getProduccion(insumo.id, fechaAnom);
-    out.anomalia = { activa: true, valor: numProp(r?.cierre), fecha: fechaAnom };
+  for(const f of fechas3d){
+    const an = incrementoAnormalV2(insumo.id, f);
+    if(an){ out.anomalia = { activa:true, valor:an.valor, fecha:f, base:an.base }; break; }
   }
   return out;
 }
-// Regla de incremento anormal de cierre sin producción registrada (se
-// MANTIENE intacta): compara contra el día calendario inmediatamente
-// anterior del MISMO insumo. Se resalta únicamente la celda de Cierre.
-function incrementoAnormal(insumoId, fecha){
-  const insumo = S.insumos.find(i=>i.id===insumoId);
-  if(insumo && insumo.resaltadoCelda === false) return false;
-  const r = getProduccion(insumoId, fecha); if(!r) return false;
-  if(numProp(r.produccion) !== 0) return false;
-  const ant = getProduccion(insumoId, fechaMenosUnDia(fecha)); if(!ant) return false;
-  const cierreAnt = numProp(ant.cierre); if(cierreAnt<=0) return false;
-  return numProp(r.cierre) > cierreAnt*1.02;
-}
+
 
 RENDERERS.inventarioConsolidado = function(){
   const el = document.getElementById('page-inventarioConsolidado');
@@ -7553,22 +7768,25 @@ RENDERERS.inventarioConsolidado = function(){
   const hayInsumos = insumosBase.length > 0;
   const hayDatos   = hayInsumos && insumosBase.some(ins=> fechas.some(f=>reg(ins.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th colspan="2" style="text-align:center;background:#f1ecfa;padding:4px 2px">
+  const theadFechas = fechas.map(f=>`<th colspan="3" style="text-align:center;background:#f1ecfa;padding:4px 2px">
       <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
       <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
       <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>
     </th>`).join('');
-  const theadSub = fechas.map(()=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Prod.</th><th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Cierre</th>`).join('');
+  const theadSub = fechas.map(()=>
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. inicial</th>`+
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Prod.</th>`+
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. cierre</th>`).join('');
 
   const filasInsumos = insumosFiltrados.map(ins=>{
     const celdas = fechas.map(f=>{
-      const r = reg(ins.id,f);
-      if(!r) return `<td class="num"></td><td class="num"></td>`;
-      const anomalo = incrementoAnormal(ins.id,f);
-      // Solo lectura: mostrar valores como texto, sin inputs editables
-      const prod   = r.produccion!=null ? r.produccion : 0;
-      const cierre = r.cierre!=null     ? r.cierre     : 0;
-      return `<td class="num">${prod}</td><td class="num ${anomalo?'inv-cell-alerta':''}">${cierre}</td>`;
+      // Tres conceptos, cada uno de su fuente. Sin dato → celda vacía
+      // (nunca 0). No hay resaltados automáticos heredados.
+      const ini  = stockInicialDe(ins.id, f);
+      const prod = produccionDe(ins.id, f);
+      const cie  = stockCierreDe(ins.id, f);
+      const c = v => `<td class="num">${v===null?'':v}</td>`;
+      return c(ini)+c(prod)+c(cie);
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
@@ -7944,15 +8162,12 @@ function alasInsumoPorNombre(nombre){
 // Valor de un campo ('produccion'|'cierre') de un insumo en una fecha.
 // Devuelve null si el insumo no existe o no hay registro ese día
 // (ausencia ≠ 0); devuelve 0 solo si el registro existe y vale 0.
+// campo: 'inicial' | 'cierre'. Devuelve null si el insumo o el dato no existen
+// (ausencia ≠ 0). Todos los valores del cuadre provienen del STOCK.
 function alasValor(nombreInsumo, fecha, campo){
   const ins=alasInsumoPorNombre(nombreInsumo);
   if(!ins) return null;
-  const r=getProduccion(ins.id, fecha);
-  if(!r) return null;
-  const v=r[campo];
-  if(v===null||v===undefined||v==='') return null;
-  const n=Number(v);
-  return Number.isFinite(n)?n:null;
+  return campo==='cierre' ? stockCierreDe(ins.id, fecha) : stockInicialDe(ins.id, fecha);
 }
 // Suma de dos componentes conservando la semántica de ausencia:
 // si AMBOS son null → null (sin información). Si uno existe, se suma
@@ -7963,8 +8178,8 @@ function alasSuma(a,b){
 }
 // Stock inicial = ALAS PRECOCIDAS [PROD] + ALAS EN SALMUERA [PROD]
 function alasStockInicial(fecha){
-  return alasSuma(alasValor(ALAS_INSUMOS.precocidas,fecha,'produccion'),
-                  alasValor(ALAS_INSUMOS.salmuera,  fecha,'produccion'));
+  return alasSuma(alasValor(ALAS_INSUMOS.precocidas,fecha,'inicial'),
+                  alasValor(ALAS_INSUMOS.salmuera,  fecha,'inicial'));
 }
 // Stock final = ALAS PRECOCIDAS [CIERRE] + ALAS EN SALMUERA [CIERRE]
 function alasStockFinal(fecha){
@@ -7980,19 +8195,22 @@ function alasCuadreFilas(desde, hasta){
     const stockFin = alasStockFinal(fecha);
     // Consumo real = Stock inicial − Stock final (nunca al revés)
     const consumoReal = (stockIni!==null && stockFin!==null) ? stockIni-stockFin : null;
-    const consumoIdpos = alasValor(ALAS_INSUMOS.idpos, fecha, 'cierre');
+    const consumoIdpos = alasValor(ALAS_INSUMOS.idpos, fecha, 'inicial');
     // Diferencia consumo = IDPOS − Consumo real (se conserva el signo)
     const difConsumo = (consumoIdpos!==null && consumoReal!==null) ? consumoIdpos-consumoReal : null;
-    const kgPedidos = alasValor(ALAS_INSUMOS.kilos,     fecha, 'produccion');
-    const entrantes = alasValor(ALAS_INSUMOS.entrantes, fecha, 'produccion');
+    const kgPedidos = alasValor(ALAS_INSUMOS.kilos,     fecha, 'inicial');
+    const entrantes = alasValor(ALAS_INSUMOS.entrantes, fecha, 'inicial');
     // Alas contabilizadas = Stock inicial (hoy) − Stock final (día anterior).
     // Si falta el dato del día anterior no se asume 0: queda vacío.
     const stockFinPrev = alasStockFinal(fechaMenosUnDia(fecha));
     const contabilizadas = (stockIni!==null && stockFinPrev!==null) ? stockIni-stockFinPrev : null;
     // Diferencia entradas = Alas contabilizadas − Alas entrantes
     const difEntradas = (contabilizadas!==null && entrantes!==null) ? contabilizadas-entrantes : null;
+    // Rendimiento = alas entrantes ÷ kg pedidos. Sin kg (o kg = 0) → vacío.
+    const rendimiento = (entrantes!==null && kgPedidos!==null && kgPedidos>0)
+      ? entrantes/kgPedidos : null;
     return { fecha, stockIni, stockFin, consumoReal, consumoIdpos, difConsumo,
-             kgPedidos, entrantes, contabilizadas, difEntradas };
+             kgPedidos, entrantes, contabilizadas, difEntradas, rendimiento };
   });
 }
 // Rango por defecto del cuadre: últimos 7 días móviles hasta hoy.
@@ -8027,13 +8245,15 @@ function alasCuadreHTML(){
       <td class="num">${num(r.entrantes)}</td>
       <td class="num" style="font-weight:600">${num(r.contabilizadas)}</td>
       ${dif(r.difEntradas)}
+      <td class="num">${r.rendimiento===null?'':r.rendimiento.toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2})+' alas/kg'}</td>
     </tr>`).join('');
   return `
     <div class="card">
       <h2>🍗 Cuadre de Alas</h2>
       <p class="hint" style="margin-top:0">
         Compara el movimiento físico de alas contra el consumo registrado en IDPOS, y cuadra las alas contabilizadas contra las entrantes.
-        Se calcula con los registros existentes de <b>Inventario de Insumos</b> (ALAS PRECOCIDAS, ALAS EN SALMUERA, ALAS CONSUMIDAS SEGUN IDPOS, ALAS ENTRANTES, KILOS ALAS PEDIDOS).
+        Se calcula con los registros existentes de <b>Inventario de Insumos</b> (ALAS PRECOCIDAS y ALAS EN SALMUERA usan <b>stock inicial</b> y <b>stock cierre</b>; ALAS CONSUMIDAS SEGUN IDPOS, ALAS ENTRANTES y KILOS ALAS PEDIDOS usan su <b>stock inicial</b>).
+        <b>Rendimiento alas</b> = alas entrantes ÷ kg pedidos.
         <b>Celdas vacías</b> = sin registro ese día (la ausencia de dato nunca se interpreta como 0).
         <b>Alas contabilizadas</b> = stock inicial del día − stock final del día anterior (el día previo al rango se consulta automáticamente y no se muestra como fila).
         La franja vertical separa el <b>bloque de consumo</b> (stock, consumo real, IDPOS y su diferencia) del <b>bloque de entradas</b> (kg pedidos, entrantes, contabilizadas y su diferencia).
@@ -8056,8 +8276,9 @@ function alasCuadreHTML(){
           <th class="num alas-col">Alas<br>entrantes</th>
           <th class="num alas-col">Alas<br>contabilizadas</th>
           <th class="num alas-col">Diferencia<br>entradas</th>
+          <th class="num alas-col">Rendimiento<br>alas</th>
         </tr></thead>
-        <tbody>${cuerpo||`<tr><td colspan="11" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
+        <tbody>${cuerpo||`<tr><td colspan="12" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
 }
@@ -9041,7 +9262,7 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -9531,6 +9752,7 @@ const GS_SHEET_KEYS = {
   Insumos:['id'], Licores:['id'], BebidasCat:['id'],
   SalonProductos:['id'], MenajeArticulos:['id'], Empleados:['id'],
   Produccion:['insumoId','fecha'],
+  ProduccionInsumos:['insumoId','fecha'],
   InvLicores:['bebidaId','fecha'],
   StockBebidas:['bebidaId','fecha'],
   SalonInventario:['productoId','fecha','unidad'],
@@ -9651,7 +9873,8 @@ function _syncSheet(domain, sheet, label, count){
 }
 // ── INVENTARIO ──
 function syncInsumos()     { _syncSheet('inventario','Insumos',    'Insumos',    S.insumos.length); }
-function syncProduccion()  { _syncSheet('inventario','Produccion', 'Producción', S.produccion.length); }
+function syncProduccion()  { _syncSheet('inventario','Produccion', 'Stock de insumos', S.produccion.length); }
+function syncProdInsumos() { _syncSheet('inventario','ProduccionInsumos','Producción', S.prodInsumos.length); }
 function syncLicores()     { _syncSheet('inventario','Licores',    'Licores',    S.licores.length); }
 function syncInvLicores()  { _syncSheet('inventario','InvLicores', 'Inv.Licores',S.invLicores.length); }
 function syncBebidasCat()  { _syncSheet('inventario','BebidasCat', 'Bebidas',    S.bebidasCat.length); }
@@ -10059,7 +10282,7 @@ const NAV_GROUPS_PLANILLA = [
 const NAV_MODULE_LABELS = {
   // Inventario
   insumos:['🧂','Insumos'], licores:['🍾','Licores'], bebidasAdmin:['🥤','Bebidas'],
-  syncInventario:['☁️','Sync. Inventario'], produccion:['📦','Producción'],
+  syncInventario:['☁️','Sync. Inventario'], produccion:['📦','Inv. Producción'],
   invDiarioLicores:['📋','Inv. Diario Licores'], stockDiarioBebidas:['📋','Stock Diario Bebidas'],
   inventarioConsolidado:['📈','Consolidado de Inventario'], alertaInsumos:['🔔','Alerta de Insumos'], cotejoLicores:['📊','Cotejo Licores'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'], consolidadoSalon:['📊','Consolidado Salón'],
