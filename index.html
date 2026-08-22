@@ -822,6 +822,12 @@ function reloadState(){
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
   S.insumos=load(K.insumos).map(migrarCamposInsumo); // migra tipoAlerta/umbral si faltan
   S.produccion=load(K.produccion);
+  // Producción: colección propia. Sin esta rehidratación, los registros
+  // guardados se perderían al recargar (quedaban solo en memoria).
+  S.prodInsumos=load(K.prodInsumos);
+  // Migración v2 (idempotente): pasa la producción histórica que aún viva en
+  // el campo legado del registro de stock a la colección propia.
+  migrarProduccionV2();
   S.licores=load(K.licores);
   S.invLicores=load(K.invLicores); migrarInvLicores();
   S.bebidasCat=load(K.bebidasCat);
@@ -9701,7 +9707,16 @@ function gsSerializeInventario(){
         resaltadoCelda:(i.resaltadoCelda!==false)?1:0,
         // Configuración del catálogo: clasificación y posición global.
         inventario:insumoInventario(i), orden:insumoOrden(i,idx) }))),
-    Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre'], S.produccion),
+    // Hoja de STOCK: conserva las columnas legadas como respaldo histórico
+    // y añade los campos vigentes (vacío cuando el dato no existe, nunca 0).
+    Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre'],
+      S.produccion.map(r=>({ id:r.id, insumoId:r.insumoId, fecha:r.fecha,
+        produccion:(r.produccion===undefined||r.produccion===null)?'':r.produccion,
+        cierre:(r.cierre===undefined||r.cierre===null)?'':r.cierre,
+        stockInicial:(r.stockInicial===undefined||r.stockInicial===null)?'':r.stockInicial,
+        stockCierre:(r.stockCierre===undefined||r.stockCierre===null)?'':r.stockCierre }))),
+    // Hoja propia de PRODUCCIÓN (fuente única del concepto).
+    ProduccionInsumos: gsRowsToMatrix(['id','insumoId','fecha','cantidad'], S.prodInsumos),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
     BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo','nroBotellasVacias','stockMinimo'],
@@ -10052,7 +10067,18 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // la traducción de compatibilidad dentro de migrarCamposInsumo).
         tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
       }));
-      S.produccion = (byName['Produccion']||[]).map(r=>({ id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha), produccion:Number(r.produccion)||0, cierre:Number(r.cierre)||0 }));
+      S.produccion = (byName['Produccion']||[]).map(r=>({
+        id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
+        // Campos legados: se conservan como respaldo del histórico.
+        produccion:numOrNull(r.produccion), cierre:numOrNull(r.cierre),
+        // Campos vigentes: null si la hoja no los trae (nunca 0 por omisión).
+        stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre) }));
+      S.prodInsumos = (byName['ProduccionInsumos']||[]).map(r=>({
+        id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
+        cantidad:numOrNull(r.cantidad) })).filter(r=>r.insumoId && r.cantidad!==null);
+      // Migra cualquier producción histórica que aún viva solo en el campo
+      // legado (idempotente: nunca duplica lo ya migrado).
+      migrarProduccionV2();
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
       S.invLicores = (byName['InvLicores']||[]).map(r=>{
         // Compatibilidad: si la hoja aún tiene el formato antiguo (con campo 'momento'),
@@ -10130,7 +10156,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         cantidad:menajeEntero(r.cantidad), rotas:menajeEntero(r.rotas), rajadas:menajeEntero(r.rajadas)
       }));
       if(menajeSanearInventario() > 0) syncMenajeInventario();
-      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.prodInsumos,S.prodInsumos); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
         if(!auto){ toast('El Spreadsheet no tiene datos de empleados.','error'); gsUpdateSyncStatus('Hoja Empleados sin datos. ID: '+id,'warn'); }
