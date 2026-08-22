@@ -166,6 +166,24 @@
   .mx-table tbody tr:hover .mx-fix{background:#1e1b4b}  /* NO hover change — consolidados son solo lectura */
   .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
   .mx-table tbody tr:hover td:not(.mx-fix){background:#fff}  /* sin hover en consolidados */
+  /* ── Administración de insumos: encabezados legibles ─────────────────────
+     Anula el nowrap y el max-width del .num global, que hacían que títulos
+     largos como "ALERTA POR CONSUMO" se desbordaran sobre la columna vecina. */
+  .ins-table th{
+    white-space:normal!important; max-width:none!important;
+    word-break:normal; overflow-wrap:anywhere;
+    vertical-align:bottom; line-height:1.25;
+    font-size:11px; padding:8px 6px; height:auto;
+  }
+  .ins-table th.ins-col{ min-width:88px }
+  .ins-table th.ins-col-chk{ min-width:104px }   /* columnas de checkbox */
+  .ins-table td{ max-width:none!important }
+  @media(max-width:768px){
+    .ins-table th{ font-size:10px; padding:6px 4px }
+    .ins-table th.ins-col{ min-width:74px }
+    .ins-table th.ins-col-chk{ min-width:88px }
+  }
+
   /* ── Consolidado de Inventario: separación entre bloques diarios ─────────
      Cada día ocupa 3 columnas (St. inicial · Prod. · St. cierre). La clase
      .inv-dia-ini marca la PRIMERA columna de cada bloque con un borde
@@ -7148,6 +7166,11 @@ function insumoMover(id, delta){
   return true;
 }
 
+// ¿El insumo participa en la alerta de STOCK ANÓMALO? Por defecto sí, tanto
+// para los insumos existentes como para los nuevos: se conserva el
+// comportamiento previo en que todos participaban. Solo afecta a esa alerta.
+function insumoAlertaAnomalo(ins){ return !(ins && ins.resaltadoCelda === false); }
+
 function insumoUmbralConsumo(ins){
   if(ins && ins.umbralConsumo !== undefined && ins.umbralConsumo !== null && ins.umbralConsumo !== '') return Number(ins.umbralConsumo);
   return umbralPorDefecto(ins ? ins.unidad : '');
@@ -7582,15 +7605,17 @@ RENDERERS.insumos = function(){
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
         <b>Inventario</b>: define qué campos de stock son editables en <b>Inv. Producción → Registrar stock</b>: <b>Stock inicial</b>, <b>Stock cierre</b> o <b>Ambos</b>. No condiciona el registro de producción: cualquier insumo puede registrar producción.
         <b>Orden</b>: los botones ⬆️⬇️ definen el <b>orden global</b> del catálogo y se aplican de inmediato en Producción, Consolidado de Inventario y Alerta de Insumos.
+        <b>Alerta stock anómalo</b>: si se desmarca, ese insumo no participa en la alerta de stock anómalo; las alertas de consumo y de mínimo no se ven afectadas.
         <b>Los demás cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
-      <div class="table-wrap"><table>
+      <div class="table-wrap"><table class="ins-table">
         <thead><tr><th style="width:74px">Orden</th><th>Insumo</th><th>Unidad</th>
-          <th title="Clasificación obligatoria del insumo">Inventario</th>
-          <th class="num" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
-          <th class="num" title="Stock mínimo permitido">Mínimo</th>
-          <th class="num" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por consumo</th>
-          <th class="num" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por mínimo</th>
+          <th class="ins-col" title="Define qué campos de stock son editables">Inventario</th>
+          <th class="num ins-col" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
+          <th class="num ins-col" title="Stock mínimo permitido">Mínimo</th>
+          <th class="num ins-col-chk" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por<br>consumo</th>
+          <th class="num ins-col-chk" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por<br>mínimo</th>
+          <th class="num ins-col-chk" title="Si se desmarca, el insumo no participa en la alerta de stock anómalo (no afecta a las demás alertas)">Alerta stock<br>anómalo</th>
           <th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? insumosOrdenados().map((i,pos,arr)=>`
           <tr>
@@ -7606,9 +7631,11 @@ RENDERERS.insumos = function(){
             <td class="num"><input type="number" class="insCfgUmbralMinimo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralMinimo(i)}" title="Stock mínimo permitido"></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaConsumo" data-id="${i.id}" ${insumoAlertaConsumo(i)?'checked':''}></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaMinimo" data-id="${i.id}" ${insumoAlertaMinimo(i)?'checked':''}></td>
+            <td class="num"><input type="checkbox" class="insCfgAlertaAnomalo" data-id="${i.id}" ${insumoAlertaAnomalo(i)?'checked':''}
+              title="Participa en la alerta de stock anómalo"></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="9" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="10" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
       <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
@@ -7677,6 +7704,11 @@ async function insumosActualizarResaltados(){
       // Clasificación OBLIGATORIA: se normaliza contra el dominio permitido
       // ('dia' | 'noche' | 'ambos'); cualquier otro valor cae en 'dia'.
       if(ins) ins.inventario = insumoInventario({inventario:sel.value});
+    });
+    document.querySelectorAll('.insCfgAlertaAnomalo').forEach(cb=>{
+      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
+      // Controla ÚNICAMENTE la participación en la alerta de stock anómalo.
+      if(ins) ins.resaltadoCelda = cb.checked;
     });
     document.querySelectorAll('.insCfgAlertaMinimo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
@@ -7785,7 +7817,7 @@ function consumoUltimos3DiasV2(insumoId){
    defecto, con Stock inicial.                                        */
 function incrementoAnormalV2(insumoId, fecha){
   const insumo = S.insumos.find(i=>i.id===insumoId);
-  if(insumo && insumo.resaltadoCelda === false) return null;
+  if(!insumoAlertaAnomalo(insumo)) return null;   // excluido por configuración
   if((produccionDe(insumoId, fecha) || 0) !== 0) return null;   // hubo producción: no es anomalía
   const ayer = fechaMenosUnDia(fecha);
   const pares = [
