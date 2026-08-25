@@ -9831,24 +9831,31 @@ async function gsSaveToSheets(domain='planilla'){
     const domainSheetId = localStorage.getItem(cfg.gsheetIdKey) || gsState.spreadsheetId;
     const id = encodeURIComponent(domainSheetId);
 
-    // 1) Limpiar todas las hojas
-    // Rango A:AZ para cubrir hojas con más de 26 columnas (EfectivoCaja tiene 28)
-    const clearRanges = cfg.sheets.map(n=>n+'!A:AZ');
-    const cr = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchClear', {
-      method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ ranges: clearRanges })
-    });
-    if(!cr.ok) throw new Error('No se pudieron limpiar las hojas');
-
-    // 2) Escribir cada hoja
-    const valueRanges = Object.entries(data).map(([name, matrix])=>({ range: name+'!A1', majorDimension:'ROWS', values: matrix }));
-    const ur = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values:batchUpdate', {
-      method:'POST', headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ valueInputOption:'RAW', data: valueRanges })
-    });
-    if(!ur.ok) throw new Error('No se pudieron escribir los datos');
-
+    /* ── CORRECCIÓN CRÍTICA ────────────────────────────────────────────────
+       Antes esta función hacía un batchClear de TODAS las hojas del dominio y
+       luego las reescribía desde el estado local, sin fusionar con el remoto
+       ni validar el contenido. Si el estado local estaba vacío o incompleto
+       (carga inicial fallida, sesión desactualizada, colección sin
+       rehidratar), el clear borraba el historial COMPLETO y, si la matriz no
+       traía encabezados, la hoja quedaba además sin columnas.
+       Ahora se delega hoja por hoja en gsSaveSheet(), que fusiona con el
+       remoto, valida encabezados, exige confirmación ante pérdidas masivas y
+       aborta sin limpiar si algo falla. Ninguna hoja se toca si su guardado
+       individual no puede completarse con seguridad.                        */
+    let okCount=0, fallidas=[];
+    for(const name of Object.keys(data)){
+      const guardada = await gsSaveSheet(domain, name, data[name]);
+      if(guardada) okCount++; else fallidas.push(name);
+    }
+    if(fallidas.length){
+      gsUpdateSyncStatus('Guardado parcial: '+okCount+' hoja(s) OK, '+fallidas.length+' cancelada(s).','warn');
+      toast('Guardado parcial: no se guardaron '+fallidas.join(', ')+
+        '. Sus datos en el Spreadsheet NO se modificaron.','warn');
+      gsRenderControls();
+      return;
+    }
     gsState.lastSync = new Date();
-    toast('Datos guardados correctamente.','success');
+    toast('Datos guardados correctamente ('+okCount+' hojas).','success');
     gsUpdateSyncStatus('Datos guardados ('+gsState.email+').','success');
   }catch(err){
     console.error(err);
@@ -9914,16 +9921,16 @@ async function gsFusionarConRemoto(eid, sheetName, matrixLocal){
   const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+
     '/values/'+encodeURIComponent(sheetName+'!A:AZ'));
   if(r.status===404){ // la hoja aún no existe: nada que fusionar
-    return { matrix: matrixLocal, preservados: 0 };
+    return { matrix: matrixLocal, preservados: 0, remotas: 0 };
   }
   if(!r.ok) throw new Error('No se pudo leer la hoja '+sheetName+' antes de guardar (HTTP '+r.status+'). '+
     'Se canceló el guardado para no sobrescribir datos existentes.');
   const j = await r.json();
   const remotos = gsMatrixToObjects(j.values||[]);
-  if(!remotos.length) return { matrix: matrixLocal, preservados: 0 };
+  if(!remotos.length) return { matrix: matrixLocal, preservados: 0, remotas: 0 };
   if(!matrixLocal || matrixLocal.length===0) matrixLocal = [[]];
   const headers = (matrixLocal[0]||[]).map(h=>String(h).trim());
-  if(!headers.length) return { matrix: matrixLocal, preservados: 0 };
+  if(!headers.length) return { matrix: matrixLocal, preservados: 0, remotas: remotos.length };
   // Claves presentes localmente y claves eliminadas a propósito
   const localesObj = gsMatrixToObjects(matrixLocal);
   const clavesLocales = new Set(localesObj.map(o=>gsClaveDe(sheetName,o)));
@@ -9933,12 +9940,31 @@ async function gsFusionarConRemoto(eid, sheetName, matrixLocal){
     const k = gsClaveDe(sheetName, o);
     return !clavesLocales.has(k) && !borrados.has(k);
   });
-  if(!aPreservar.length) return { matrix: matrixLocal, preservados: 0 };
+  if(!aPreservar.length) return { matrix: matrixLocal, preservados: 0, remotas: remotos.length };
   const filasExtra = aPreservar.map(o=>headers.map(h=> (o[h]===undefined||o[h]===null) ? '' : o[h]));
   console.warn('[GS] "'+sheetName+'": se preservaron '+aPreservar.length+
     ' registro(s) existentes en el Spreadsheet que no estaban en el estado local (posible guardado de otro usuario o sesión).');
-  return { matrix: matrixLocal.concat(filasExtra), preservados: aPreservar.length };
+  return { matrix: matrixLocal.concat(filasExtra), preservados: aPreservar.length, remotas: remotos.length };
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   PROTECCIÓN CONTRA BORRADO MASIVO
+   La escritura de una hoja es "clear + write". Si la matriz a escribir
+   llega vacía o sin encabezados, el clear se ejecuta y no se repone nada:
+   la hoja queda SIN DATOS Y SIN COLUMNAS. Estas guardas hacen imposible
+   ese escenario: si la matriz no es válida, se aborta ANTES del clear.
+   ════════════════════════════════════════════════════════════════════════ */
+function gsMatrizValida(sheetName, matrix){
+  if(!Array.isArray(matrix) || matrix.length===0)
+    return 'la matriz de "'+sheetName+'" está vacía (sin encabezados)';
+  const headers = matrix[0];
+  if(!Array.isArray(headers) || headers.length===0 || headers.every(h=>String(h??'').trim()===''))
+    return 'la fila de encabezados de "'+sheetName+'" está vacía';
+  return null;   // válida
+}
+// Umbral de seguridad: una escritura que reduzca drásticamente el número de
+// filas respecto al remoto se considera sospechosa y exige confirmación.
+const GS_BORRADO_MASIVO_MIN = 5;   // se ignora en hojas muy pequeñas
 
 async function gsSaveSheet(domain, sheetName, matrix){
   if(!isAuthorized()) return false;
@@ -9954,6 +9980,21 @@ async function gsSaveSheet(domain, sheetName, matrix){
     let preservados = 0;
     try{
       const fus = await gsFusionarConRemoto(eid, sheetName, matrix);
+      // Si el resultado reduce drásticamente las filas frente al remoto, es
+      // señal de un estado local incompleto: se pide confirmación explícita
+      // en lugar de destruir el historial en silencio.
+      if(fus.remotas > GS_BORRADO_MASIVO_MIN && (fus.matrix.length-1) < fus.remotas/2){
+        const ok = confirm('⚠️ ADVERTENCIA: el guardado de "'+sheetName+'" dejaría '+
+          (fus.matrix.length-1)+' registro(s), cuando el Spreadsheet tiene '+fus.remotas+'.\n\n'+
+          'Esto suele indicar que esta sesión tiene datos incompletos (por ejemplo, si la carga inicial falló).\n\n'+
+          '¿Continuar de todos modos? Se recomienda cancelar y pulsar "Cargar desde Google Sheets" primero.');
+        if(!ok){
+          console.warn('[GS] Guardado de "'+sheetName+'" cancelado por el usuario (posible pérdida masiva).');
+          toast('Guardado cancelado. Carga los datos del Spreadsheet antes de volver a guardar.','warn');
+          gsRenderControls();
+          return false;
+        }
+      }
       matrix = fus.matrix; preservados = fus.preservados;
     }catch(e){
       console.error('[GS] Guardado CANCELADO para "'+sheetName+'":', e.message);
@@ -9961,6 +10002,14 @@ async function gsSaveSheet(domain, sheetName, matrix){
       toast('No se guardó "'+sheetName+'": '+e.message,'error');
       gsRenderControls();
       return false; // nunca borrar la hoja si no pudimos verificar el remoto
+    }
+    // 0.b) GUARDA: nunca limpiar si lo que se va a escribir no es válido.
+    const invalida = gsMatrizValida(sheetName, matrix);
+    if(invalida){
+      console.error('[GS] Guardado ABORTADO para "'+sheetName+'": '+invalida+'. No se ejecutó ninguna limpieza.');
+      toast('Guardado cancelado: '+invalida+'. Los datos del Spreadsheet no se modificaron.','error');
+      gsRenderControls();
+      return false;
     }
     // 1) Limpia solo esta hoja — rango amplio (A:AZ = 52 columnas) para cubrir
     //    hojas con más de 26 columnas (p.ej. EfectivoCaja tiene 28 cols: A..AB).
@@ -10079,6 +10128,23 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
 
     console.log('[Sync] Hojas leídas ('+domain+'):', JSON.stringify(rowsPerSheet), '| ms='+(Date.now()-t0));
 
+    /* ── PROTECCIÓN DE LECTURA ─────────────────────────────────────────────
+       Una hoja ausente o con 0 filas NO es una orden de borrado. Si el estado
+       local tiene registros para esa colección, se CONSERVAN: sustituirlos por
+       un array vacío haría que el siguiente guardado propagara ese vacío al
+       Spreadsheet y destruyera el historial.
+       Devuelve true si la hoja puede aplicarse; false si debe conservarse lo local. */
+    const hojasConservadas = [];
+    const puedeAplicar = (nombreHoja, coleccionLocal)=>{
+      const filas = byName[nombreHoja];
+      const vacia = !filas || filas.length===0;
+      if(vacia && Array.isArray(coleccionLocal) && coleccionLocal.length>0){
+        hojasConservadas.push(nombreHoja+' ('+coleccionLocal.length+' registros locales)');
+        return false;
+      }
+      return true;
+    };
+
     if(domain==='inventario'){
       // Validación clave: si la hoja Insumos no existe (null/undefined) o tiene 0 filas
       // y YA tenemos insumos en memoria, es probable que el Spreadsheet sea incorrecto
@@ -10126,6 +10192,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // la traducción de compatibilidad dentro de migrarCamposInsumo).
         tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
       }));
+      if(puedeAplicar('Produccion', S.produccion))
       S.produccion = (byName['Produccion']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
         // Campos legados: se conservan como respaldo del histórico.
@@ -10134,6 +10201,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre),
         // Sello de migración: evita recrear producciones ya migradas (y borradas).
         migradoV2: !!(r.migradoV2 && String(r.migradoV2).toLowerCase()!=='false' && r.migradoV2!=='0') }));
+      if(puedeAplicar('ProduccionInsumos', S.prodInsumos))
       S.prodInsumos = (byName['ProduccionInsumos']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
         cantidad:numOrNull(r.cantidad) })).filter(r=>r.insumoId && r.cantidad!==null);
@@ -10141,6 +10209,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       // legado (idempotente: nunca duplica lo ya migrado).
       migrarProduccionV2();
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
+      if(puedeAplicar('InvLicores', S.invLicores))
       S.invLicores = (byName['InvLicores']||[]).map(r=>{
         // Compatibilidad: si la hoja aún tiene el formato antiguo (con campo 'momento'),
         // migrarInvLicores() se encargará de fusionarlo la próxima vez que cargue reloadState().
@@ -10155,6 +10224,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.bebidasCat = (byName['BebidasCat']||[]).map(r=>({ id:String(r.id||uid()), categoria:String(r.categoria||'').trim(), nombre:String(r.nombre||'').trim(), activo: !(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).trim().toLowerCase()==='false'),
         nroBotellasVacias: (r.nroBotellasVacias!==undefined&&r.nroBotellasVacias!==null&&r.nroBotellasVacias!=='') ? Number(r.nroBotellasVacias) : null,
         stockMinimo: (r.stockMinimo!==undefined&&r.stockMinimo!==null&&r.stockMinimo!=='') ? Number(r.stockMinimo) : null }));
+      if(puedeAplicar('StockBebidas', S.stockBebidas))
       S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:normFechaGS(r.fecha), stock:Number(r.stock)||0 }));
       S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
         id:String(r.id||uid()), fecha:normFechaGS(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
@@ -10186,6 +10256,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // para que SalonProductos nunca vuelva a quedar vacía.
         seedSalonProductos(true);
       }
+      if(puedeAplicar('SalonInventario', S.salonInventario))
       S.salonInventario = (byName['SalonInventario']||[]).map(r=>({
         id:String(r.id||uid()), productoId:String(r.productoId||''),
         fecha:normFechaGS(r.fecha), unidad:String(r.unidad||''),
@@ -10209,6 +10280,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       } else {
         seedMenajeArticulos(true);
       }
+      if(puedeAplicar('MenajeInventario', S.menajeInventario))
       S.menajeInventario = (byName['MenajeInventario']||[]).map(r=>({
         id:String(r.id||uid()), articuloId:String(r.articuloId||''),
         fecha:normFechaGS(r.fecha),
@@ -10217,6 +10289,13 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         cantidad:menajeEntero(r.cantidad), rotas:menajeEntero(r.rotas), rajadas:menajeEntero(r.rajadas)
       }));
       if(menajeSanearInventario() > 0) syncMenajeInventario();
+      if(hojasConservadas.length){
+        const aviso='Se conservaron los datos locales de: '+hojasConservadas.join(', ')+
+          ', porque el Spreadsheet los devolvió vacíos. No se sobrescribió nada.';
+        console.warn('[Sync] '+aviso);
+        gsUpdateSyncStatus(aviso,'warn');
+        toast('⚠️ '+aviso,'warn');
+      }
       save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.prodInsumos,S.prodInsumos); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
