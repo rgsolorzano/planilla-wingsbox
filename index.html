@@ -6453,7 +6453,7 @@ RENDERERS.invDiarioSalon = function(){
               const r=getSalonStock(p.id,salonFecha,u);
               return `<td class="num"><input type="number" min="0" step="1" class="salon-inp"
                 data-prod="${p.id}" data-unit="${u}"
-                value="${r!=null?r.cantidad:''}" placeholder="0" style="min-width:60px"></td>`;
+                value="${r!=null?r.cantidad:''}" placeholder="" style="min-width:60px"></td>`;
             }).join('')}
           </tr>`).join('')}
         </tbody>
@@ -6842,7 +6842,7 @@ RENDERERS.invDiarioMenaje = function(){
           const r=getMenajeStock(a.id, menajeFecha);
           const campo=(c,val)=>`<td class="num"><input type="number" min="0" step="1" inputmode="numeric"
             class="menaje-inp menaje-${c}" data-art="${a.id}" data-campo="${c}"
-            value="${val!=null?val:''}" placeholder="0" style="min-width:70px"></td>`;
+            value="${val!=null?val:''}" placeholder="" style="min-width:70px"></td>`;
           return `<tr data-fila="${a.id}"><td>${a.nombre}</td>
             ${campo('total',   r?menajeVal(r,'total'):null)}
             ${campo('rotas',   r?menajeVal(r,'rotas'):null)}
@@ -7166,6 +7166,25 @@ function insumoMover(id, delta){
   return true;
 }
 
+/* ── TIPO DE REGISTRO (config. del catálogo, NO de los históricos) ────────
+   Determina en qué SECCIÓN de Inv. Producción aparece el insumo:
+     'stock'      → solo en "Registrar stock"
+     'produccion' → solo en "Registrar producción"
+     'ambos'      → en las dos (valor por defecto)
+   Es INDEPENDIENTE de `inventario` (Stock inicial / Stock cierre / Ambos),
+   que sigue decidiendo qué campos de stock son editables. Un insumo puede
+   ser p. ej. tipoRegistro='ambos' + inventario='noche': aparece en ambas
+   secciones y dentro de stock solo se habilita Stock cierre.               */
+const TIPO_REGISTRO_TIPOS = [['stock','Solo stock'], ['produccion','Solo producción'], ['ambos','Ambos']];
+// Obligatorio y nunca vacío: cualquier valor fuera del dominio → 'ambos',
+// que es también el valor inicial de los insumos existentes y de los nuevos.
+function insumoTipoRegistro(ins){
+  const v = String(ins && ins.tipoRegistro || '').toLowerCase();
+  return (v==='stock' || v==='produccion') ? v : 'ambos';
+}
+function insumoRegistraProduccion(ins){ const t=insumoTipoRegistro(ins); return t==='produccion' || t==='ambos'; }
+function insumoRegistraStock(ins){      const t=insumoTipoRegistro(ins); return t==='stock'      || t==='ambos'; }
+
 // ¿El insumo participa en la alerta de STOCK ANÓMALO? Por defecto sí, tanto
 // para los insumos existentes como para los nuevos: se conserva el
 // comportamiento previo en que todos participaban. Solo afecta a esa alerta.
@@ -7209,6 +7228,9 @@ function migrarCamposInsumo(ins){
     ins.umbralMinimo = (ins.tipoAlerta === 'minimo' && ins.umbral!==undefined) ? Number(ins.umbral) : umbralPorDefecto(ins.unidad);
   }
   if(ins.resaltadoCelda === undefined) ins.resaltadoCelda = true; // se mantiene: regla de incremento anormal
+  // Tipo de registro OBLIGATORIO: los insumos existentes quedan en 'ambos',
+  // preservando el comportamiento actual (aparecen en las dos secciones).
+  ins.tipoRegistro = insumoTipoRegistro(ins);
   return ins;
 }
 /* ════════════════════════════════════════════════════════════════
@@ -7311,7 +7333,11 @@ RENDERERS.produccion = function(){
   // Orden GLOBAL del catálogo; el filtro solo oculta, conservando posiciones.
   // Orden GLOBAL intacto; el filtro solo oculta filas. Los insumos 'Ambos'
   // aparecen tanto en Stock día como en Stock noche, conservando su posición.
-  const insumosVista = insumosOrdenados().filter(i=>insumoEnInventario(i, prodInvFiltro));
+  // Registrar stock: solo insumos cuyo TIPO DE REGISTRO incluya stock,
+  // filtrados además por la clasificación de inventario elegida.
+  const insumosVista = insumosOrdenados()
+    .filter(i=>insumoRegistraStock(i))
+    .filter(i=>insumoEnInventario(i, prodInvFiltro));
   const filas = insumosVista.length ? insumosVista.map(ins=>{
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
@@ -7324,7 +7350,7 @@ RENDERERS.produccion = function(){
         const vCie = stockCierreDe(ins.id, prodFecha);
         const celda=(campo, val, editable)=>`<td class="num"><input type="number" min="0" step="0.01"
           class="prodInput" data-insumo="${ins.id}" data-campo="${campo}"
-          value="${val===null?'':val}" placeholder="${editable?'0':'—'}"
+          value="${val===null?'':val}" placeholder="${editable?'':'—'}"
           ${editable?'':'disabled title="No editable: la clasificación Inventario de este insumo no incluye este campo" style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"'}></td>`;
         return celda('stockInicial', vIni, editaIni) + celda('stockCierre', vCie, editaCie);
       })()}
@@ -7367,7 +7393,8 @@ let prodRegFecha = fechaHoy();
 let prodRegFilas = [ {insumoId:'', cantidad:''} ];
 
 function prodSeccionProduccionHTML(){
-  const insumos = insumosOrdenados();  // orden global del catálogo
+  // Registrar producción: solo insumos cuyo TIPO DE REGISTRO incluya producción.
+  const insumos = insumosOrdenados().filter(i=>insumoRegistraProduccion(i));
   if(!insumos.length) return '';
   const optsDe = sel => `<option value="">— Selecciona insumo —</option>`+
     insumos.map(i=>`<option value="${i.id}" ${sel===i.id?'selected':''}>${i.nombre}</option>`).join('');
@@ -7378,7 +7405,7 @@ function prodSeccionProduccionHTML(){
       <td><select class="prodRegInsumo" data-idx="${idx}" style="min-width:220px">${optsDe(f.insumoId)}</select>
         ${yaExiste?`<br><small style="color:var(--amber,#b45309)">⚠️ Ya existe producción para esta fecha</small>`:''}</td>
       <td class="num"><input type="number" min="0" step="0.01" class="prodRegCant" data-idx="${idx}"
-        value="${f.cantidad}" placeholder="0" style="min-width:110px"></td>
+        value="${f.cantidad}" placeholder="" style="min-width:110px"></td>
       <td><span class="badge b-free">${ins?ins.unidad:'—'}</span></td>
       <td><button class="btn-icon del" onclick="prodRegQuitar(${idx})" title="Quitar fila">🗑️</button></td>
     </tr>`;
@@ -7569,6 +7596,7 @@ async function guardarProduccion(){
 function exportarProduccionDiaExcel(){
   // Exporta respetando el orden global y el filtro de clasificación vigente.
   const datos = insumosOrdenados()
+    .filter(i=>insumoRegistraStock(i))
     .filter(i=>insumoEnInventario(i, prodInvFiltro))
     .map(ins=>{
     const ini = stockInicialDe(ins.id, prodFecha), cie = stockCierreDe(ins.id, prodFecha);
@@ -7605,12 +7633,14 @@ RENDERERS.insumos = function(){
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
         <b>Inventario</b>: define qué campos de stock son editables en <b>Inv. Producción → Registrar stock</b>: <b>Stock inicial</b>, <b>Stock cierre</b> o <b>Ambos</b>. No condiciona el registro de producción: cualquier insumo puede registrar producción.
         <b>Orden</b>: los botones ⬆️⬇️ definen el <b>orden global</b> del catálogo y se aplican de inmediato en Producción, Consolidado de Inventario y Alerta de Insumos.
+        <b>Tipo de registro</b>: define en qué secciones de <b>Inv. Producción</b> aparece el insumo (Solo stock, Solo producción o Ambos); es independiente de <b>Inventario</b>.
         <b>Alerta stock anómalo</b>: si se desmarca, ese insumo no participa en la alerta de stock anómalo; las alertas de consumo y de mínimo no se ven afectadas.
         <b>Los demás cambios NO se guardan automáticamente</b>: realiza todos los ajustes y presiona "Actualizar" para guardar y sincronizar.
       </p>
       <div class="table-wrap"><table class="ins-table">
         <thead><tr><th style="width:74px">Orden</th><th>Insumo</th><th>Unidad</th>
           <th class="ins-col" title="Define qué campos de stock son editables">Inventario</th>
+          <th class="ins-col" title="Define en qué secciones de Inv. Producción aparece el insumo">Tipo de<br>registro</th>
           <th class="num ins-col" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
           <th class="num ins-col" title="Stock mínimo permitido">Mínimo</th>
           <th class="num ins-col-chk" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por<br>consumo</th>
@@ -7627,6 +7657,9 @@ RENDERERS.insumos = function(){
             <td><select class="insCfgInventario" data-id="${i.id}" style="min-width:110px">
               ${INVENTARIO_TIPOS.map(([v,l])=>`<option value="${v}" ${insumoInventario(i)===v?'selected':''}>${l}</option>`).join('')}
             </select></td>
+            <td><select class="insCfgTipoRegistro" data-id="${i.id}" style="min-width:126px">
+              ${TIPO_REGISTRO_TIPOS.map(([v,l])=>`<option value="${v}" ${insumoTipoRegistro(i)===v?'selected':''}>${l}</option>`).join('')}
+            </select></td>
             <td class="num"><input type="number" class="insCfgUmbralConsumo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralConsumo(i)}" title="Consumo mínimo esperado en 3 días"></td>
             <td class="num"><input type="number" class="insCfgUmbralMinimo" data-id="${i.id}" min="0" step="0.1" style="min-width:72px" value="${insumoUmbralMinimo(i)}" title="Stock mínimo permitido"></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaConsumo" data-id="${i.id}" ${insumoAlertaConsumo(i)?'checked':''}></td>
@@ -7635,7 +7668,7 @@ RENDERERS.insumos = function(){
               title="Participa en la alerta de stock anómalo"></td>
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="10" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="11" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
       <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
@@ -7673,7 +7706,7 @@ function insumoSave(){
       alertaConsumo:true, umbralConsumo:umbralPorDefecto(unidad),
       alertaMinimo:false, umbralMinimo:umbralPorDefecto(unidad),
       resaltadoCelda:true,
-      inventario:'dia', orden:S.insumos.length });
+      inventario:'dia', tipoRegistro:'ambos', orden:S.insumos.length });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
@@ -7704,6 +7737,11 @@ async function insumosActualizarResaltados(){
       // Clasificación OBLIGATORIA: se normaliza contra el dominio permitido
       // ('dia' | 'noche' | 'ambos'); cualquier otro valor cae en 'dia'.
       if(ins) ins.inventario = insumoInventario({inventario:sel.value});
+    });
+    document.querySelectorAll('.insCfgTipoRegistro').forEach(sel=>{
+      const ins = S.insumos.find(i=>i.id===sel.dataset.id);
+      // Obligatorio: se normaliza contra el dominio permitido.
+      if(ins) ins.tipoRegistro = insumoTipoRegistro({tipoRegistro:sel.value});
     });
     document.querySelectorAll('.insCfgAlertaAnomalo').forEach(cb=>{
       const ins = S.insumos.find(i=>i.id===cb.dataset.id);
@@ -8165,10 +8203,10 @@ RENDERERS.invDiarioLicores = function(){
     const r = getInvLicor(b.id, invLicoresFecha);
     return `<tr>
       <td>${b.nombre}</td>
-      <td class="num"><input type="number" class="invLicEntOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.entradaOzs?r.entradaOzs:''}" placeholder="0"></td>
-      <td class="num"><input type="number" class="invLicEntBot" data-id="${b.id}" min="0" step="1" value="${r&&r.entradaBots?r.entradaBots:''}" placeholder="0"></td>
-      <td class="num"><input type="number" class="invLicSalOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.salidaOzs?r.salidaOzs:''}" placeholder="0"></td>
-      <td class="num"><input type="number" class="invLicSalBot" data-id="${b.id}" min="0" step="1" value="${r&&r.salidaBots?r.salidaBots:''}" placeholder="0"></td>
+      <td class="num"><input type="number" class="invLicEntOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.entradaOzs?r.entradaOzs:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicEntBot" data-id="${b.id}" min="0" step="1" value="${r&&r.entradaBots?r.entradaBots:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicSalOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.salidaOzs?r.salidaOzs:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicSalBot" data-id="${b.id}" min="0" step="1" value="${r&&r.salidaBots?r.salidaBots:''}" placeholder=""></td>
     </tr>`;
   }).join('');
   el.innerHTML=`
@@ -8863,7 +8901,7 @@ RENDERERS.stockDiarioBebidas = function(){
     return catHeader+`<tr>
       <td><small class="badge b-free">${b.categoria}</small></td>
       <td>${b.nombre}</td>
-      <td class="num"><input type="number" class="stockBebInput" data-id="${b.id}" min="0" step="0.01" value="${r!=null?r.stock:''}" placeholder="0"></td>
+      <td class="num"><input type="number" class="stockBebInput" data-id="${b.id}" min="0" step="0.01" value="${r!=null?r.stock:''}" placeholder=""></td>
     </tr>`;
   }).join('');
   el.innerHTML=`
@@ -9758,13 +9796,13 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda','inventario','orden'],
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda','inventario','tipoRegistro','orden'],
       S.insumos.map((i,idx)=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
         umbralConsumo:insumoUmbralConsumo(i), umbralMinimo:insumoUmbralMinimo(i),
         alertaConsumo:insumoAlertaConsumo(i)?1:0, alertaMinimo:insumoAlertaMinimo(i)?1:0,
         resaltadoCelda:(i.resaltadoCelda!==false)?1:0,
         // Configuración del catálogo: clasificación y posición global.
-        inventario:insumoInventario(i), orden:insumoOrden(i,idx) }))),
+        inventario:insumoInventario(i), tipoRegistro:insumoTipoRegistro(i), orden:insumoOrden(i,idx) }))),
     // Hoja de STOCK: conserva las columnas legadas como respaldo histórico
     // y añade los campos vigentes (vacío cuando el dato no existe, nunca 0).
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre','migradoV2'],
@@ -10186,6 +10224,8 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // inventario → 'dia' (valor inicial pedido) y orden → posición en la hoja,
         // preservando el orden con el que ya venían los insumos.
         inventario: insumoInventario({inventario:r.inventario}),
+        // Obligatorio; una hoja anterior a este campo → 'ambos' (valor inicial).
+        tipoRegistro: insumoTipoRegistro({tipoRegistro:r.tipoRegistro}),
         orden: (r.orden!==undefined && r.orden!==null && r.orden!=='' && Number.isFinite(Number(r.orden)))
                  ? Number(r.orden) : undefined,
         // Campos del modelo anterior (si existen en la hoja, se usan solo para
