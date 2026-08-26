@@ -655,13 +655,26 @@ const uid = ()=> Date.now().toString(36) + Math.random().toString(36).slice(2,7)
 // navegador (hora local). new Date().toISOString() usa UTC, lo que hace que
 // en zonas UTC-5 (Lima/Perú) después de las 19:00 UTC la fecha devuelta sea
 // el día siguiente, mostrando "mañana" como fecha por defecto en los módulos.
-function fechaHoy(){
-  const d=new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+/* ── ZONA HORARIA: America/Lima (UTC-5) ───────────────────────────────────
+   La fecha "de hoy" NUNCA debe depender de la zona del navegador ni de UTC:
+   con toISOString() (UTC) a partir de las 19:00 en Lima ya se devolvía el día
+   siguiente. Estos helpers resuelven siempre el día calendario en Lima.      */
+const TZ_LIMA = 'America/Lima';
+// Devuelve 'YYYY-MM-DD' del instante dado (o de ahora) según el reloj de Lima.
+function fechaEnLima(d){
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_LIMA,
+    year:'numeric', month:'2-digit', day:'2-digit' });
+  return fmt.format(d || new Date());   // en-CA produce YYYY-MM-DD
 }
-function fechaAyer(){
-  const d=new Date(); d.setDate(d.getDate()-1);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+// Suma/resta días a una fecha ISO sin pasar por Date (evita corrimientos).
+function fechaMasDias(fechaISO, n){
+  const [y,m,d] = fechaISO.split('-').map(Number);
+  const t = Date.UTC(y, m-1, d) + n*86400000;   // aritmética en UTC puro
+  const dt = new Date(t);
+  return dt.getUTCFullYear()+'-'+String(dt.getUTCMonth()+1).padStart(2,'0')+'-'+String(dt.getUTCDate()).padStart(2,'0');
+}
+function fechaHoy(){ return fechaEnLima(); }
+function fechaAyer(){ return fechaMasDias(fechaEnLima(), -1);
 }
 // syncPlanilla() fue eliminada — cada módulo llama a su propio wrapper de sincronización
 // (syncEmpleados, syncHorarios, syncMarcaciones, etc.) para garantizar aislamiento total.
@@ -7774,14 +7787,91 @@ window.insumoDel = function(id){
   if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
 };
 
+/* ════════════════════════════════════════════════════════════════════════
+   PORCIONES CONSUMIDAS (fuente externa, SOLO LECTURA)
+   Origen: pestaña VENTAS_PRODUCTO_DETALLE del Spreadsheet de Analítica.
+   Cada fila = una porción vendida. Se descarga UNA sola vez por rango y se
+   agrega en memoria como porciones[fecha][PRODUCTO] = n, evitando cientos
+   de consultas. Jamás se escribe en esa hoja ni se mezcla con el inventario.
+   ════════════════════════════════════════════════════════════════════════ */
+const VPD_SHEET = 'VENTAS_PRODUCTO_DETALLE';
+// Insumos con seguimiento de porciones. La coincidencia es EXACTA por nombre
+// (tras recortar espacios y normalizar mayúsculas/acentos): "SALVAJE" nunca
+// debe casar con "ALITAS SALVAJE" ni con "SALVAJE 6 UND".
+const VPD_PRODUCTOS = ['ACEVICHADO CLÁSICO','ACEVICHADO PICANTE','AJILLO','ANTICUCHERA',
+  'BBQ CLÁSICA','BBQ PICANTE','BRASA','BUFALO','CHARAPITA','CHIMICHURRI','HONEY MUSTARD',
+  'LEMON PEPPER','MANGO HABANERO','MARACUYÁ CLÁSICO','MARACUYÁ PICANTE','PIÑA HABANERA',
+  'SALVAJE','TERIYAKI DULCE','TIFFANY'];
+function vpdNormalizar(s){
+  return String(s??'').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+}
+const VPD_SET = new Set(VPD_PRODUCTOS.map(vpdNormalizar));
+// porciones[fecha]['NOMBRE NORMALIZADO'] = cantidad. Ausencia = sin ventas.
+let vpdPorciones = {};
+let vpdEstado = { cargando:false, rango:null, error:null, ultima:null, filas:0 };
+
+// Recuenta las porciones del rango. Devuelve true si la carga fue exitosa.
+async function vpdCargarPorciones(desde, hasta, opts={}){
+  if(!isAuthorized()) return false;
+  const clave = desde+'|'+hasta;
+  if(!opts.forzar && vpdEstado.rango===clave && !vpdEstado.error) return true; // ya cargado
+  vpdEstado.cargando = true; vpdEstado.error = null;
+  try{
+    const r = await gsApiFetch(
+      'https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
+      '/values/'+encodeURIComponent(VPD_SHEET+'!A1:Z100000')+'?valueRenderOption=UNFORMATTED_VALUE');
+    if(r.status===403) throw new Error('Sin permiso para leer '+VPD_SHEET+'.');
+    if(r.status===404) throw new Error('No se encontró la pestaña '+VPD_SHEET+'.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+VPD_SHEET+'.');
+    const filas = (await r.json()).values || [];
+    if(!filas.length) throw new Error(VPD_SHEET+' no devolvió datos.');
+    // Localiza las columnas por encabezado (tolerante a su posición).
+    const heads = filas[0].map(h=>vpdNormalizar(h));
+    const iProd  = heads.findIndex(h=>h==='PRODUCTO');
+    const iFecha = heads.findIndex(h=>h==='FECHA VENTA' || h==='FECHAVENTA' || h==='FECHA DE VENTA');
+    if(iProd<0 || iFecha<0) throw new Error('No se encontraron las columnas PRODUCTO y FECHA VENTA en '+VPD_SHEET+'.');
+    const acc = {}; let contadas = 0;
+    for(let k=1;k<filas.length;k++){
+      const row = filas[k]; if(!row || !row.length) continue;
+      const fecha = normFechaGS(row[iFecha]);
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) continue;      // encabezado o fecha inválida
+      if(fecha < desde || fecha > hasta) continue;            // fuera del rango visible
+      const prod = vpdNormalizar(row[iProd]);
+      if(!VPD_SET.has(prod)) continue;                        // coincidencia EXACTA
+      (acc[fecha] = acc[fecha] || {});
+      acc[fecha][prod] = (acc[fecha][prod] || 0) + 1;         // 1 fila = 1 porción
+      contadas++;
+    }
+    vpdPorciones = acc;
+    vpdEstado = { cargando:false, rango:clave, error:null, ultima:new Date(), filas:contadas };
+    console.log('[Porciones] '+contadas+' porción(es) contabilizada(s) entre '+desde+' y '+hasta+'.');
+    return true;
+  }catch(e){
+    console.error('[Porciones] Error:', e);
+    vpdEstado = { cargando:false, rango:null, error:e.message, ultima:vpdEstado.ultima, filas:0 };
+    return false;
+  }
+}
+// Porciones de un insumo en una fecha. null = sin registros de venta (celda
+// vacía); nunca se devuelve 0 por ausencia de datos.
+function porcionesDe(nombreInsumo, fecha){
+  const key = vpdNormalizar(nombreInsumo);
+  if(!VPD_SET.has(key)) return null;             // insumo fuera de la lista
+  const dia = vpdPorciones[fecha];
+  if(!dia) return null;
+  const n = dia[key];
+  return (n===undefined) ? null : n;
+}
+
 /* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
 // Rango por defecto: últimos 3 días (hoy - 2 días hasta hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
-let invConsFilter = (function(){
-  const hoy = new Date(), hace2 = new Date(hoy.getTime() - 2*86400000);
-  const fmt = d => d.toISOString().slice(0,10);
-  return { desde: fmt(hace2), hasta: fmt(hoy), soloAnomalias: false };
-})();
+// Rango por defecto: últimos 4 días (hoy-3 .. hoy) SIEMPRE en hora de Lima.
+function invRangoUlt4(){
+  const hoy = fechaEnLima();
+  return { desde: fechaMasDias(hoy,-3), hasta: hoy };
+}
+let invConsFilter = invRangoUlt4();
 // Tope de columnas de fecha que genera la matriz (cada fecha = 2 columnas).
 // Evita una tabla inmanejable si el usuario deja un rango muy amplio o vacío.
 const INV_MAX_DIAS = 60;
@@ -7900,8 +7990,7 @@ function evaluarAlertasInsumo(insumo){
   }
   // 6.3 CIERRE ANÓMALO: aumento > 5% sin producción (nunca por disminución).
   const hoyStr = fechaHoy();
-  const hace3 = new Date(hoyStr+'T12:00:00'); hace3.setDate(hace3.getDate()-2);
-  const fechas3d = rangoFechas(hace3.toISOString().slice(0,10), hoyStr);
+  const fechas3d = rangoFechas(fechaMasDias(hoyStr,-2), hoyStr);
   for(const f of fechas3d){
     const an = incrementoAnormalV2(insumo.id, f);
     if(an){ out.anomalia = { activa:true, valor:an.valor, fecha:f, base:an.base }; break; }
@@ -7915,23 +8004,14 @@ RENDERERS.inventarioConsolidado = function(){
   const { desde, hasta, fechas } = invRangoEfectivo();
   const reg = (insumoId, fecha) => getProduccion(insumoId, fecha);
 
-  // ── Detección de anomalías — fuente única de verdad: evaluarAlertasInsumo ──
-  // evaluarAlertasInsumo ahora incluye incrementoAnormal (últimos 3 días),
-  // consumo bajo y stock mínimo. Así Consolidado y Alerta de Insumos
-  // usan exactamente la misma lógica.
-  function insumeTieneAnomalia(ins){
-    const ev = evaluarAlertasInsumo(ins);
-    return ev.consumo?.activa || ev.minimo?.activa || ev.anomalia?.activa || false;
-  }
 
-  const soloAnom = !!invConsFilter.soloAnomalias;
   const insumosBase = insumosOrdenados();   // orden maestro del catálogo
-  const insumosFiltrados = soloAnom ? insumosBase.filter(insumeTieneAnomalia) : insumosBase;
+  const insumosFiltrados = insumosBase;
 
   const hayInsumos = insumosBase.length > 0;
   const hayDatos   = hayInsumos && insumosBase.some(ins=> fechas.some(f=>reg(ins.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th colspan="3" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
+  const theadFechas = fechas.map(f=>`<th colspan="4" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
       <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
       <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
       <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>
@@ -7939,7 +8019,8 @@ RENDERERS.inventarioConsolidado = function(){
   const theadSub = fechas.map(()=>
     `<th class="num inv-dia-ini" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. inicial</th>`+
     `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Prod.</th>`+
-    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. cierre</th>`).join('');
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. cierre</th>`+
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap" title="Porciones vendidas según VENTAS_PRODUCTO_DETALLE">Porciones<br>consumidas</th>`).join('');
 
   const filasInsumos = insumosFiltrados.map(ins=>{
     const celdas = fechas.map(f=>{
@@ -7948,32 +8029,33 @@ RENDERERS.inventarioConsolidado = function(){
       const ini  = stockInicialDe(ins.id, f);
       const prod = produccionDe(ins.id, f);
       const cie  = stockCierreDe(ins.id, f);
+      // 4ª columna: porciones vendidas (fuente externa, solo lectura).
+      // null = sin registros de venta → celda vacía, nunca 0.
+      const por  = porcionesDe(ins.nombre, f);
       const c = (v,cls='') => `<td class="num${cls?' '+cls:''}">${v===null?'':v}</td>`;
       // La primera celda del día abre el bloque con el separador grueso.
-      return c(ini,'inv-dia-ini')+c(prod)+c(cie);
+      return c(ini,'inv-dia-ini')+c(prod)+c(cie)+
+        `<td class="num" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
 
   // Subtítulo del historial con contador actualizado
-  const contadorTexto = soloAnom
-    ? `${insumosFiltrados.length} insumo${insumosFiltrados.length!==1?'s':''} con anomalías`
-    : `${fechas.length} día${fechas.length===1?'':'s'}, ${insumosBase.length} insumo${insumosBase.length===1?'':'s'}`;
-  const badgeFiltro = soloAnom
-    ? `<span style="background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;margin-left:12px">⚠ Solo anomalías</span>`
-    : '';
+  const contadorTexto = `${fechas.length} día${fechas.length===1?'':'s'}, ${insumosBase.length} insumo${insumosBase.length===1?'':'s'}`;
+  const badgeFiltro = vpdEstado.cargando
+    ? `<span style="background:#ede9fe;color:#5b21b6;border:1px solid #c4b5fd;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;margin-left:12px">⏳ Cargando porciones…</span>`
+    : (vpdEstado.error
+      ? `<span style="background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;margin-left:12px" title="${vpdEstado.error}">⚠ Porciones no disponibles</span>`
+      : '');
 
   el.innerHTML = `
-    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica de producción y cierre por insumo, en formato matricial (una fila por insumo, dos columnas por fecha).</p></div></div>
+    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica por insumo: stock inicial, producción, stock cierre y porciones consumidas (una fila por insumo, cuatro columnas por fecha).</p></div></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="invFHasta" value="${hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="invFClear" style="align-self:flex-end">Últimos 3 días</button>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;align-self:flex-end;padding-bottom:4px">
-          <input type="checkbox" id="invFAnom" ${soloAnom?'checked':''} style="width:16px;height:16px;cursor:pointer">
-          <span style="font-size:13px;font-weight:500;color:var(--c-text)">Mostrar solo anomalías</span>
-        </label>
+        <button class="btn btn-ghost btn-sm" id="invFClear" style="align-self:flex-end">Últimos 4 días</button>
+        <button class="btn btn-primary btn-sm" id="invFPorciones" style="align-self:flex-end" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
       </div>
       <h2>Historial por insumo (${contadorTexto})${badgeFiltro}</h2>
       <p class="hint" style="margin-top:0">
@@ -7996,20 +8078,35 @@ RENDERERS.inventarioConsolidado = function(){
   const applyF = ()=>{
     const d = document.getElementById('invFDesde').value, h = document.getElementById('invFHasta').value;
     if(d && h && d>h){ toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error'); return; }
-    invConsFilter = { desde:d, hasta:h, soloAnomalias: document.getElementById('invFAnom')?.checked||false };
+    invConsFilter = { desde:d, hasta:h };
     RENDERERS.inventarioConsolidado();
   };
   document.getElementById('invFDesde').onchange = applyF;
   document.getElementById('invFHasta').onchange = applyF;
-  document.getElementById('invFAnom').onchange  = ()=>{
-    invConsFilter.soloAnomalias = document.getElementById('invFAnom').checked;
-    RENDERERS.inventarioConsolidado();
-  };
   document.getElementById('invFClear').onclick = ()=>{
-    const hoy = new Date(), hace2 = new Date(hoy.getTime() - 2*86400000);
-    invConsFilter = { desde: hace2.toISOString().slice(0,10), hasta: hoy.toISOString().slice(0,10), soloAnomalias: invConsFilter.soloAnomalias };
+    invConsFilter = invRangoUlt4();          // últimos 4 días en hora de Lima
     RENDERERS.inventarioConsolidado();
   };
+  // Botón de refresco manual: vuelve a consultar la fuente externa. No toca
+  // el inventario ni escribe en el Spreadsheet de origen.
+  const btnPor = document.getElementById('invFPorciones');
+  if(btnPor) btnPor.onclick = async ()=>{
+    vpdEstado.cargando = true;
+    RENDERERS.inventarioConsolidado();       // muestra el estado de carga
+    const ok = await vpdCargarPorciones(desde, hasta, {forzar:true});
+    RENDERERS.inventarioConsolidado();
+    toast(ok ? 'Porciones actualizadas ('+vpdEstado.filas+' porciones en el rango).'
+             : 'No se pudieron actualizar las porciones: '+(vpdEstado.error||''),
+          ok?'success':'error');
+  };
+  // Carga automática al abrir el módulo o al cambiar el rango: si las
+  // porciones en memoria no corresponden al rango visible, se recargan.
+  if(!vpdEstado.cargando && vpdEstado.rango !== (desde+'|'+hasta) && isAuthorized()){
+    vpdEstado.cargando = true;
+    vpdCargarPorciones(desde, hasta).then(()=>{
+      if(currentPage==='inventarioConsolidado') RENDERERS.inventarioConsolidado();
+    });
+  }
 };
 
 // Edición rápida (inline) de un registro de inventario: guarda en localStorage,
@@ -8297,7 +8394,7 @@ function invLicoresExportar(){
    S.produccion, por lo que refleja cualquier cambio de inmediato.
    ================================================================ */
 // Estado del filtro de alertas — persiste entre renders
-let alertaInsumosFilter = 'todas'; // 'todas' | 'consumo' | 'minimo' | 'anomalia' | 'ambas'
+let alertaInsumosFilter = 'todas'; // 'todas' | 'consumo' | 'minimo' | 'anomalia'
 window.alertaSetFilter = function(v){ alertaInsumosFilter = v; RENDERERS.alertaInsumos(); };
 
 /* ================================================================
@@ -8490,7 +8587,6 @@ RENDERERS.alertaInsumos = function(){
     if(f==='consumo')  return r.consumoAlerta;
     if(f==='minimo')   return r.minimoAlerta;
     if(f==='anomalia') return r.anomaliaAlerta;
-    if(f==='ambas')    return r.consumoAlerta && r.minimoAlerta;
     return true;
   });
 
@@ -8519,9 +8615,8 @@ RENDERERS.alertaInsumos = function(){
     consumo: filasTodas.filter(r=>r.consumoAlerta).length,
     minimo:  filasTodas.filter(r=>r.minimoAlerta).length,
     anomalia:filasTodas.filter(r=>r.anomaliaAlerta).length,
-    ambas:   filasTodas.filter(r=>r.consumoAlerta&&r.minimoAlerta).length,
   };
-  const bts = [['todas','Todas'],['consumo','Consumo bajo'],['minimo','Stock mínimo'],['anomalia','Cierre anómalo'],['ambas','Ambas alertas']];
+  const bts = [['todas','Todas'],['consumo','Consumo bajo'],['minimo','Stock mínimo'],['anomalia','Cierre anómalo']];
   const filtroHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
     ${bts.map(([v,lbl])=>`<button class="btn btn-sm ${f===v?'btn-primary':'btn-ghost'}" onclick="alertaSetFilter('${v}')" style="font-size:12px">${lbl} <span style="font-size:10px;opacity:.75">(${cnt[v]})</span></button>`).join('')}
   </div>`;
