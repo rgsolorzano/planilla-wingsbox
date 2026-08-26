@@ -7895,6 +7895,41 @@ function porcionesDe(nombreInsumo, fecha){
   return (n===undefined) ? null : n;
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   CANT. CONSUMIDA (métrica derivada del INVENTARIO, no de las ventas)
+     Consumo(hoy) = Stock(hoy) + Producción(hoy) − Stock(día siguiente)
+   El "día siguiente" es el día CALENDARIO posterior (no el siguiente día
+   con datos ni el siguiente del rango) y puede estar fuera del rango
+   visible: se consulta igualmente, pero nunca se añade como columna.
+   Prioridad estricta: primero Stock INICIAL en ambos días; si alguno de los
+   dos es null, se intenta con Stock CIERRE en ambos días. Nunca se mezclan
+   tipos de stock entre días. Sin ninguna pareja completa → celda vacía.
+   Es independiente de PORCIONES CONSUMIDAS (que viene de ventas).
+   ════════════════════════════════════════════════════════════════════════ */
+// Insumos con seguimiento de cantidad consumida (coincidencia EXACTA por
+// nombre, normalizando mayúsculas/acentos/espacios). No incluye TIFFANY.
+const CC_PRODUCTOS = ['ACEVICHADO CLÁSICO','ACEVICHADO PICANTE','AJILLO','ANTICUCHERA',
+  'BBQ CLÁSICA','BBQ PICANTE','BRASA','BUFALO','CHARAPITA','CHIMICHURRI','HONEY MUSTARD',
+  'LEMON PEPPER','MANGO HABANERO','MARACUYÁ CLÁSICO','MARACUYÁ PICANTE','PIÑA HABANERA',
+  'SALVAJE','TERIYAKI DULCE'];
+const CC_SET = new Set(CC_PRODUCTOS.map(vpdNormalizar));
+function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nombre)); }
+
+// Devuelve el consumo del día o null si no hay información suficiente.
+// Distingue estrictamente null (sin registro) de 0 (dato válido que sí opera).
+function cantConsumidaDe(insumo, fecha){
+  if(!insumoAplicaCantConsumida(insumo.nombre)) return null;   // fuera de la lista
+  const sig = fechaMasDias(fecha, 1);                          // día calendario siguiente
+  const prod = produccionDe(insumo.id, fecha) || 0;            // sin producción = 0 producido
+  // PRIORIDAD 1 — Stock inicial en AMBOS días
+  const iniHoy = stockInicialDe(insumo.id, fecha), iniSig = stockInicialDe(insumo.id, sig);
+  if(iniHoy!==null && iniSig!==null) return iniHoy + prod - iniSig;
+  // PRIORIDAD 2 — Stock cierre en AMBOS días (mismo tipo en los dos días)
+  const cieHoy = stockCierreDe(insumo.id, fecha), cieSig = stockCierreDe(insumo.id, sig);
+  if(cieHoy!==null && cieSig!==null) return cieHoy + prod - cieSig;
+  return null;                                                 // celda vacía, nunca 0
+}
+
 /* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
 // Rango por defecto: últimos 3 días (hoy - 2 días hasta hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
@@ -8043,7 +8078,7 @@ RENDERERS.inventarioConsolidado = function(){
   const hayInsumos = insumosBase.length > 0;
   const hayDatos   = hayInsumos && insumosBase.some(ins=> fechas.some(f=>reg(ins.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th colspan="4" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
+  const theadFechas = fechas.map(f=>`<th colspan="5" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
       <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
       <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
       <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>
@@ -8052,6 +8087,7 @@ RENDERERS.inventarioConsolidado = function(){
     `<th class="num inv-dia-ini" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. inicial</th>`+
     `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Prod.</th>`+
     `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. cierre</th>`+
+    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap" title="Stock del día + producción − stock del día siguiente">Cant.<br>consumida</th>`+
     `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap" title="Porciones vendidas según VENTAS_PRODUCTO_DETALLE">Porciones<br>consumidas</th>`).join('');
 
   const filasInsumos = insumosFiltrados.map(ins=>{
@@ -8064,9 +8100,12 @@ RENDERERS.inventarioConsolidado = function(){
       // 4ª columna: porciones vendidas (fuente externa, solo lectura).
       // null = sin registros de venta → celda vacía, nunca 0.
       const por  = porcionesDe(ins.nombre, f);
+      // Métrica derivada del inventario (no de ventas); null → celda vacía.
+      const cant = cantConsumidaDe(ins, f);
       const c = (v,cls='') => `<td class="num${cls?' '+cls:''}">${v===null?'':v}</td>`;
       // La primera celda del día abre el bloque con el separador grueso.
       return c(ini,'inv-dia-ini')+c(prod)+c(cie)+
+        `<td class="num" style="color:#0f766e;font-weight:600">${cant===null?'':cant}</td>`+
         `<td class="num" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
@@ -8081,7 +8120,7 @@ RENDERERS.inventarioConsolidado = function(){
       : '');
 
   el.innerHTML = `
-    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica por insumo: stock inicial, producción, stock cierre y porciones consumidas (una fila por insumo, cuatro columnas por fecha).</p></div></div>
+    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica por insumo: stock inicial, producción, stock cierre, cantidad consumida y porciones consumidas (una fila por insumo, cinco columnas por fecha).</p></div></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
