@@ -7795,6 +7795,20 @@ window.insumoDel = function(id){
    de consultas. Jamás se escribe en esa hoja ni se mezcla con el inventario.
    ════════════════════════════════════════════════════════════════════════ */
 const VPD_SHEET = 'VENTAS_PRODUCTO_DETALLE';
+// Traduce una letra de columna de Sheets a su índice 0-based (A=0, Z=25, AJ=35).
+// Se usa para no depender de contar posiciones a mano ni de buscar el
+// encabezado por texto (la búsqueda fallaba y bloqueaba toda la carga).
+function colLetraAIndice(letras){
+  let n=0;
+  for(const c of String(letras).toUpperCase()) n = n*26 + (c.charCodeAt(0)-64);
+  return n-1;
+}
+// Posiciones CONFIRMADAS en la hoja: FECHA VENTA = Z, PRODUCTO = AJ.
+const VPD_COL_FECHA    = colLetraAIndice('Z');    // 25
+const VPD_COL_PRODUCTO = colLetraAIndice('AJ');   // 35
+// El rango debe cubrir hasta AJ; con A1:Z el PRODUCTO nunca llegaba en la
+// respuesta y la lectura fallaba con "no se encontraron las columnas".
+const VPD_RANGO = VPD_SHEET+'!A1:AR100000';
 // Insumos con seguimiento de porciones. La coincidencia es EXACTA por nombre
 // (tras recortar espacios y normalizar mayúsculas/acentos): "SALVAJE" nunca
 // debe casar con "ALITAS SALVAJE" ni con "SALVAJE 6 UND".
@@ -7819,32 +7833,50 @@ async function vpdCargarPorciones(desde, hasta, opts={}){
   try{
     const r = await gsApiFetch(
       'https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
-      '/values/'+encodeURIComponent(VPD_SHEET+'!A1:Z100000')+'?valueRenderOption=UNFORMATTED_VALUE');
+      '/values/'+encodeURIComponent(VPD_RANGO)+'?valueRenderOption=UNFORMATTED_VALUE');
     if(r.status===403) throw new Error('Sin permiso para leer '+VPD_SHEET+'.');
     if(r.status===404) throw new Error('No se encontró la pestaña '+VPD_SHEET+'.');
     if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+VPD_SHEET+'.');
     const filas = (await r.json()).values || [];
-    if(!filas.length) throw new Error(VPD_SHEET+' no devolvió datos.');
-    // Localiza las columnas por encabezado (tolerante a su posición).
-    const heads = filas[0].map(h=>vpdNormalizar(h));
-    const iProd  = heads.findIndex(h=>h==='PRODUCTO');
-    const iFecha = heads.findIndex(h=>h==='FECHA VENTA' || h==='FECHAVENTA' || h==='FECHA DE VENTA');
-    if(iProd<0 || iFecha<0) throw new Error('No se encontraron las columnas PRODUCTO y FECHA VENTA en '+VPD_SHEET+'.');
-    const acc = {}; let contadas = 0;
+    if(!filas.length) throw new Error(VPD_SHEET+' no devolvió datos (0 filas).');
+    // Columnas por POSICIÓN FIJA (Z y AJ). No se busca el encabezado por
+    // texto: sirve solo como verificación informativa en consola.
+    const iFecha = VPD_COL_FECHA, iProd = VPD_COL_PRODUCTO;
+    const heads = (filas[0]||[]).map(h=>vpdNormalizar(h));
+    console.log('[Porciones] Diagnóstico:', {
+      spreadsheet: ANALITICA_PROC_SS_ID, tab: VPD_SHEET, rango: VPD_RANGO,
+      filasRecibidas: filas.length, columnasFila1: heads.length,
+      colFecha: 'Z (idx '+iFecha+') = '+JSON.stringify(heads[iFecha]??null),
+      colProducto: 'AJ (idx '+iProd+') = '+JSON.stringify(heads[iProd]??null),
+      rangoConsultado: desde+' → '+hasta });
+    if(heads[iFecha] && heads[iFecha]!=='FECHA VENTA')
+      console.warn('[Porciones] La columna Z no se llama "FECHA VENTA" sino '+JSON.stringify(heads[iFecha])+'. Se usa la posición fija igualmente.');
+    if(heads[iProd] && heads[iProd]!=='PRODUCTO')
+      console.warn('[Porciones] La columna AJ no se llama "PRODUCTO" sino '+JSON.stringify(heads[iProd])+'. Se usa la posición fija igualmente.');
+    const acc = {}; let contadas = 0, sinFecha = 0, fueraRango = 0, noListados = 0;
     for(let k=1;k<filas.length;k++){
       const row = filas[k]; if(!row || !row.length) continue;
+      // normFechaGS resuelve string, serial de Sheets y fecha con hora sin
+      // desplazar el día (no usa la zona del navegador ni UTC).
       const fecha = normFechaGS(row[iFecha]);
-      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) continue;      // encabezado o fecha inválida
-      if(fecha < desde || fecha > hasta) continue;            // fuera del rango visible
-      const prod = vpdNormalizar(row[iProd]);
-      if(!VPD_SET.has(prod)) continue;                        // coincidencia EXACTA
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ sinFecha++; continue; }
+      if(fecha < desde || fecha > hasta){ fueraRango++; continue; }
+      const prod = vpdNormalizar(row[iProd]);                 // coincidencia EXACTA
+      if(!VPD_SET.has(prod)){ noListados++; continue; }
       (acc[fecha] = acc[fecha] || {});
       acc[fecha][prod] = (acc[fecha][prod] || 0) + 1;         // 1 fila = 1 porción
       contadas++;
     }
+    if(contadas===0){
+      console.warn('[Porciones] 0 porciones en el rango. Filas: '+(filas.length-1)+
+        ' | sin fecha válida: '+sinFecha+' | fuera del rango: '+fueraRango+
+        ' | producto no listado: '+noListados+
+        ' | muestra col Z/AJ: '+JSON.stringify([filas[1]?.[iFecha], filas[1]?.[iProd]]));
+    }
     vpdPorciones = acc;
     vpdEstado = { cargando:false, rango:clave, error:null, ultima:new Date(), filas:contadas };
-    console.log('[Porciones] '+contadas+' porción(es) contabilizada(s) entre '+desde+' y '+hasta+'.');
+    console.log('[Porciones] '+contadas+' porción(es) contabilizada(s) entre '+desde+' y '+hasta+
+      ' (descartadas → sin fecha: '+sinFecha+', fuera de rango: '+fueraRango+', no listadas: '+noListados+').');
     return true;
   }catch(e){
     console.error('[Porciones] Error:', e);
@@ -8096,7 +8128,7 @@ RENDERERS.inventarioConsolidado = function(){
     const ok = await vpdCargarPorciones(desde, hasta, {forzar:true});
     RENDERERS.inventarioConsolidado();
     toast(ok ? 'Porciones actualizadas ('+vpdEstado.filas+' porciones en el rango).'
-             : 'No se pudieron actualizar las porciones: '+(vpdEstado.error||''),
+             : 'No se pudieron actualizar las porciones. '+(vpdEstado.error||'Revisa la consola para el detalle técnico.'),
           ok?'success':'error');
   };
   // Carga automática al abrir el módulo o al cambiar el rango: si las
@@ -9801,10 +9833,17 @@ function normFechaGS(v){
   // interprete la fecha string como serial numérico. UNFORMATTED_VALUE devuelve el serial;
   // FORMATTED_STRING devuelve "22/07/2026" (locale Perú). Ambos casos quedan cubiertos aquí.
   if(!isNaN(n)&&n>40000&&n<100000){
-    const d=new Date((n-25569)*86400000);
+    // Math.floor: un serial con parte decimal lleva la HORA; se trunca al día
+    // para que una venta de las 19:00 no se desplace de fecha.
+    const d=new Date((Math.floor(n)-25569)*86400000);
     return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
   }
-  const s=String(v).trim();
+  let s=String(v).trim();
+  // Fecha CON HORA ("24/08/2026 14:30", "2026-08-24T19:05:00", "…Z"): se toma
+  // solo la parte de fecha. Nunca se convierte a Date local ni a UTC, de modo
+  // que el día no se desplaza por zona horaria.
+  const conHora = s.match(/^(\S+)[T\s]\d{1,2}:\d{2}/);
+  if(conHora) s = conHora[1];
   if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // ya es ISO
   // N/N/YYYY — puede ser DD/MM/YYYY (América Latina) o M/D/YYYY (EE.UU.)
   // Desambiguación: si el 2.° número > 12 no puede ser mes → formato M/D/YYYY
