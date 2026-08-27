@@ -1128,6 +1128,9 @@ function goto(page){
   // la restricción de acceso por rol: una cuenta autorizada solo puede
   // "enrutar" hacia los módulos de su rol, incluso si goto() se invoca
   // directamente (consola, atajo, etc.) en vez de hacer clic en el menú.
+  // Tras pintar el módulo, repone los datos que quedaron sin guardar cuando
+  // expiró la sesión (solo del mismo módulo). No se consideran guardados.
+  setTimeout(()=>{ try{ if(isAuthorized()) sesRestaurarBorrador(); }catch(e){} }, 0);
   if(isAuthorized() && !moduloPermitido(page)){
     toast('No tienes acceso a este módulo con esta cuenta.','error');
     page = paginaPorDefecto();
@@ -9776,7 +9779,23 @@ function gsSignOut(){
   gsRenderControls();
 }
 
-function gsIsSignedIn(){ return !!gsState.accessToken; }
+/* ── VIGENCIA DE SESIÓN ────────────────────────────────────────────────────
+   Antes bastaba con que existiera un accessToken en memoria, sin mirar su
+   expiración: por eso, tras horas de suspensión, la app parecía operativa con
+   un token ya vencido y el usuario solo lo descubría al fallar un guardado.
+   Ahora la caducidad forma parte de la comprobación, con 30 s de margen. */
+const SESION_MARGEN_MS = 30000;
+function gsTokenVigente(){
+  if(!gsState.accessToken) return false;
+  const exp = Number(gsState.tokenExpiry||0);
+  return exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
+}
+function gsIsSignedIn(){ return gsTokenVigente(); }
+// Minutos restantes de sesión (informativo).
+function gsMinutosRestantes(){
+  const exp = Number(gsState.tokenExpiry||0);
+  return exp ? Math.max(0, Math.round((exp-Date.now())/60000)) : null;
+}
 
 /* Obtiene el email de la cuenta conectada (informativo) */
 async function gsFetchUserEmail(){
@@ -10248,6 +10267,12 @@ function gsMatrizValida(sheetName, matrix){
 const GS_BORRADO_MASIVO_MIN = 5;   // se ignora en hojas muy pequeñas
 
 async function gsSaveSheet(domain, sheetName, matrix){
+  // Guarda de sesión: con el token vencido no se intenta escribir ni se
+  // reporta éxito; se conserva lo ingresado y se solicita iniciar sesión.
+  if(gsState.accessToken && !gsTokenVigente()){
+    sesManejarExpiracion('guardado con token vencido');
+    return false;
+  }
   if(!isAuthorized()) return false;
   try{
     const id = await gsEnsureSpreadsheet(domain);
@@ -10311,6 +10336,7 @@ async function gsSaveSheet(domain, sheetName, matrix){
       if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
     }
     gsState.lastSync = new Date();
+    sesDescartarBorrador();   // guardado confirmado: el borrador ya no aplica
     console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas'+
       (preservados?', '+preservados+' preservadas del remoto':'')+')');
     gsUpdateSyncStatus('"'+sheetName+'" guardado.','success');
@@ -10648,10 +10674,143 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
   gsRenderControls();
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   GESTIÓN DE SESIÓN, BORRADORES Y VERSIÓN
+   Mecanismo genérico y transversal: no toca la lógica de ningún módulo.
+   1) Borrador: al detectar expiración se capturan los campos del módulo
+      activo (por su id/clase) en localStorage. NO son datos guardados: se
+      restauran tras el nuevo login y solo se descartan cuando el usuario
+      guarda correctamente o los descarta de forma explícita.
+   2) Reactivación: al volver de suspensión o recuperar el foco se valida
+      sesión y versión antes de permitir seguir trabajando.
+   3) Versión: se compara la versión del archivo servido con la cargada,
+      para no seguir usando código antiguo desde la caché del navegador.
+   ════════════════════════════════════════════════════════════════════════ */
+const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
+// Versión de la app embebida en el propio archivo.
+const APP_VERSION = '2026-08-27.1';
+let sesionExpiradaAvisada = false;
+
+// ── Borradores de formulario ──────────────────────────────────────────────
+// Captura los campos visibles del módulo activo (input/select/textarea con id).
+function sesCapturarBorrador(){
+  try{
+    const cont = document.getElementById('page') || document.body;
+    const campos = {};
+    cont.querySelectorAll('input, select, textarea').forEach(el=>{
+      const clave = el.id || (el.className && el.dataset ?
+        (el.className.split(' ')[0]+'|'+(el.dataset.insumo||el.dataset.art||el.dataset.id||el.dataset.prod||el.dataset.idx||'')) : '');
+      if(!clave) return;
+      if(el.type==='checkbox' || el.type==='radio'){ campos[clave] = el.checked ? '1':'0'; }
+      else if(String(el.value??'').trim()!==''){ campos[clave] = el.value; }
+    });
+    if(!Object.keys(campos).length) return false;
+    localStorage.setItem(SES_KEYS.borrador, JSON.stringify({
+      modulo: currentPage, fecha: new Date().toISOString(), campos }));
+    console.warn('[Sesión] Borrador conservado de "'+currentPage+'" ('+Object.keys(campos).length+' campos). No se guardó en el Spreadsheet.');
+    return true;
+  }catch(e){ console.error('[Sesión] No se pudo conservar el borrador:', e); return false; }
+}
+function sesLeerBorrador(){
+  try{ const b=localStorage.getItem(SES_KEYS.borrador); return b?JSON.parse(b):null; }catch(e){ return null; }
+}
+function sesDescartarBorrador(){ localStorage.removeItem(SES_KEYS.borrador); }
+// Repuebla los campos del módulo si hay un borrador de ese mismo módulo.
+function sesRestaurarBorrador(){
+  const b = sesLeerBorrador();
+  if(!b || b.modulo!==currentPage) return false;
+  let repuestos = 0;
+  const cont = document.getElementById('page') || document.body;
+  cont.querySelectorAll('input, select, textarea').forEach(el=>{
+    const clave = el.id || (el.className && el.dataset ?
+      (el.className.split(' ')[0]+'|'+(el.dataset.insumo||el.dataset.art||el.dataset.id||el.dataset.prod||el.dataset.idx||'')) : '');
+    if(!clave || !(clave in b.campos)) return;
+    if(el.type==='checkbox' || el.type==='radio') el.checked = b.campos[clave]==='1';
+    else el.value = b.campos[clave];
+    repuestos++;
+  });
+  if(repuestos) sesMostrarAvisoBorrador(b, repuestos);
+  return repuestos>0;
+}
+// Aviso no intrusivo con opción de descartar.
+function sesMostrarAvisoBorrador(b, n){
+  if(document.getElementById('sesBorradorAviso')) return;
+  const d = document.createElement('div');
+  d.id = 'sesBorradorAviso';
+  d.style.cssText='margin:0 0 12px;padding:10px 14px;border-radius:10px;background:#fef3c7;border:1px solid #fde68a;color:#92400e;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap';
+  d.innerHTML = `<span>📝 Se recuperaron <b>${n} dato(s)</b> que habías ingresado antes de que expirara la sesión (del ${fmtFecha(b.fecha.slice(0,10))}). <b>Aún no están guardados</b>: revísalos y pulsa Guardar.</span>
+    <button class="btn btn-ghost btn-sm" id="sesBorradorDescartar">Descartar</button>`;
+  const cont = document.getElementById('page') || document.body;
+  cont.insertBefore(d, cont.firstChild);
+  const btn = document.getElementById('sesBorradorDescartar');
+  if(btn) btn.onclick = ()=>{ sesDescartarBorrador(); d.remove(); toast('Datos pendientes descartados','warn'); };
+}
+
+// ── Expiración de sesión ──────────────────────────────────────────────────
+// Punto ÚNICO de reacción: conserva el borrador, invalida el token y pide login.
+function sesManejarExpiracion(motivo){
+  if(sesionExpiradaAvisada) return;      // evita avisos duplicados y bucles
+  sesionExpiradaAvisada = true;
+  const habiaDatos = sesCapturarBorrador();
+  gsState.accessToken = null;
+  gsClearSession();
+  try{ if(typeof gsRenderControls==='function') gsRenderControls(); }catch(e){}
+  toast('Tu sesión ha expirado. Inicia sesión nuevamente para continuar.' +
+        (habiaDatos?' Tus datos sin guardar se conservaron.':''), 'error');
+  console.warn('[Sesión] Expirada ('+motivo+').');
+  try{ if(typeof RENDERERS[currentPage]==='function') RENDERERS[currentPage](); }catch(e){}
+}
+
+// ── Versión de la aplicación ──────────────────────────────────────────────
+// Descarga el propio documento sin caché y compara la versión declarada.
+async function sesHayNuevaVersion(){
+  try{
+    const r = await fetch(window.location.pathname + '?v=' + Date.now(), { cache:'no-store' });
+    if(!r.ok) return false;
+    const txt = await r.text();
+    const m = txt.match(/const APP_VERSION = '([^']+)'/);
+    return !!(m && m[1] && m[1] !== APP_VERSION);
+  }catch(e){ return false; }   // sin red: no se fuerza recarga
+}
+async function sesAplicarNuevaVersionSiHay(){
+  if(await sesHayNuevaVersion()){
+    sesCapturarBorrador();                 // nunca perder lo tecleado
+    toast('Hay una versión más reciente. Actualizando…','info');
+    setTimeout(()=>window.location.reload(true), 800);
+    return true;
+  }
+  return false;
+}
+
+// ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
+let sesUltimaValidacion = 0;
+async function sesValidarAlReactivar(){
+  if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
+  sesUltimaValidacion = Date.now();
+  const habiaToken = !!gsState.accessToken;
+  if(habiaToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación'); return; }
+  if(habiaToken) await sesAplicarNuevaVersionSiHay();
+}
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
+window.addEventListener('focus', sesValidarAlReactivar);
+window.addEventListener('online', sesValidarAlReactivar);
+// Chequeo periódico ligero (sin recargar): un único timer.
+if(!window.__sesTimer){
+  window.__sesTimer = setInterval(()=>{
+    if(gsState.accessToken && !gsTokenVigente()) sesManejarExpiracion('vencimiento en uso');
+  }, 60000);
+}
+// Coherencia entre pestañas: si una cierra sesión, las demás lo reflejan.
+window.addEventListener('storage', (e)=>{
+  if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){
+    sesManejarExpiracion('cierre de sesión en otra pestaña');
+  }
+});
+
 function gsHandleError(err, accion){
   if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
-    gsState.accessToken = null;
-    toast('Error de permisos o sesión expirada. Vuelve a iniciar sesión.','error');
+    // Punto único: conserva lo tecleado, invalida la sesión y pide login.
+    sesManejarExpiracion('respuesta 401 del servidor');
     gsUpdateSyncStatus('Sesión expirada. Inicia sesión de nuevo.','error');
   }else{
     toast('Error al '+accion+' en Google Sheets: '+(err.message||err),'error');
@@ -10955,7 +11114,12 @@ async function authTrySilent(){
 // NO se vuelve a sincronizar automáticamente.
 function authGrant(viaLogin){
   document.body.classList.add('authed');
+  sesionExpiradaAvisada = false;             // nueva sesión: se rearma el aviso
   gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
+  // Al iniciar sesión se comprueba que se esté usando la última versión: si
+  // hay una más reciente, se recarga (conservando antes cualquier borrador)
+  // para evitar trabajar con código antiguo servido desde la caché.
+  if(viaLogin) sesAplicarNuevaVersionSiHay();
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
