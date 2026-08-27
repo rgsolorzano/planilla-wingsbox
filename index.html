@@ -7915,21 +7915,34 @@ const CC_PRODUCTOS = ['ACEVICHADO CLÁSICO','ACEVICHADO PICANTE','AJILLO','ANTIC
 const CC_SET = new Set(CC_PRODUCTOS.map(vpdNormalizar));
 function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nombre)); }
 
+/* ── CONSUMO DIARIO: definición ÚNICA de la aplicación ────────────────────
+   Es la disminución de stock entre dos mediciones consecutivas del MISMO
+   tipo, mirando al día calendario SIGUIENTE:
+     Prioridad 1:  ST. INICIAL (hoy) − ST. INICIAL (día siguiente)
+     Prioridad 2:  ST. CIERRE  (hoy) − ST. CIERRE  (día siguiente)
+   La PRODUCCIÓN no participa: sigue registrándose y mostrándose, pero no
+   suma ni resta aquí. Nunca se mezclan tipos de stock entre días.
+   Solo `null` (sin registro) descarta una medición; el 0 es válido y opera.
+   Sin pareja completa → null (vacío), jamás 0.
+   La usan tanto CANT. CONSUMIDA (Consolidado) como la alerta de consumo
+   bajo (Alerta de Insumos), de modo que no puede haber dos definiciones. */
+function consumoDiarioStock(insumoId, fecha){
+  const sig = fechaMasDias(fecha, 1);              // día calendario siguiente (Lima)
+  const iniHoy = stockInicialDe(insumoId, fecha), iniSig = stockInicialDe(insumoId, sig);
+  if(iniHoy!==null && iniSig!==null) return { valor: iniHoy - iniSig, base:'inicial' };
+  const cieHoy = stockCierreDe(insumoId, fecha),  cieSig = stockCierreDe(insumoId, sig);
+  if(cieHoy!==null && cieSig!==null) return { valor: cieHoy - cieSig, base:'cierre' };
+  return null;                                     // información insuficiente
+}
+
 // Devuelve el consumo del día o null si no hay información suficiente.
 // Distingue estrictamente null (sin registro) de 0 (dato válido que sí opera).
 function cantConsumidaDe(insumo, fecha){
   if(!insumoAplicaCantConsumida(insumo.nombre)) return null;   // fuera de la lista
-  const sig = fechaMasDias(fecha, 1);                          // día calendario siguiente
-  const prod = produccionDe(insumo.id, fecha) || 0;            // sin producción = 0 producido
-  // PRIORIDAD 1 — Stock inicial en AMBOS días
-  const iniHoy = stockInicialDe(insumo.id, fecha), iniSig = stockInicialDe(insumo.id, sig);
-  if(iniHoy!==null && iniSig!==null) return iniHoy + prod - iniSig;
-  // PRIORIDAD 2 — Stock cierre en AMBOS días (mismo tipo en los dos días)
-  const cieHoy = stockCierreDe(insumo.id, fecha), cieSig = stockCierreDe(insumo.id, sig);
-  if(cieHoy!==null && cieSig!==null) return cieHoy + prod - cieSig;
-  return null;                                                 // celda vacía, nunca 0
+  // Misma definición que usa la Alerta de Insumos: sin producción.
+  const c = consumoDiarioStock(insumo.id, fecha);
+  return c===null ? null : c.valor;
 }
-
 /* ---------- Consolidado de Inventario (matriz histórica por insumo) ---------- */
 // Rango por defecto: últimos 3 días (hoy - 2 días hasta hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
@@ -7939,6 +7952,8 @@ function invRangoUlt4(){
   return { desde: fechaMasDias(hoy,-3), hasta: hoy };
 }
 let invConsFilter = invRangoUlt4();
+// Filtro de insumo compartido por las DOS tablas: '' = Todos.
+let invConsInsumo = '';
 // Tope de columnas de fecha que genera la matriz (cada fecha = 2 columnas).
 // Evita una tabla inmanejable si el usuario deja un rango muy amplio o vacío.
 const INV_MAX_DIAS = 60;
@@ -7977,15 +7992,7 @@ function fechaMenosUnDia(fechaISO){
    entra en el acumulado y jamás se sustituye por 0.
      Consumo = Stock(ayer) − Stock(hoy) + Producción(hoy)              */
 function consumoDiarioInsumo(insumoId, fecha){
-  const ayer = fechaMenosUnDia(fecha);
-  const prod = produccionDe(insumoId, fecha) || 0;
-  const iniHoy = stockInicialDe(insumoId, fecha), iniAyer = stockInicialDe(insumoId, ayer);
-  if(iniHoy!==null && iniHoy>0 && iniAyer!==null && iniAyer>0)
-    return { valor: iniAyer - iniHoy + prod, base:'inicial' };
-  const cieHoy = stockCierreDe(insumoId, fecha), cieAyer = stockCierreDe(insumoId, ayer);
-  if(cieHoy!==null && cieHoy>0 && cieAyer!==null && cieAyer>0)
-    return { valor: cieAyer - cieHoy + prod, base:'cierre' };
-  return null;
+  return consumoDiarioStock(insumoId, fecha);   // definición única (sin producción)
 }
 // Fechas con algún dato del insumo (stock o producción), de la más reciente atrás.
 function fechasConDatosInsumo(insumoId){
@@ -7994,18 +8001,23 @@ function fechasConDatosInsumo(insumoId){
   S.prodInsumos.forEach(r=>{ if(r.insumoId===insumoId) set.add(r.fecha); });
   return [...set].sort().reverse();
 }
-// Acumulado de los últimos 3 días CON consumo computable.
+/* Acumulado de las ÚLTIMAS 3 MEDICIONES VÁLIDAS de consumo, buscando hacia
+   atrás desde la fecha más reciente con datos. Los días cuyo consumo es null
+   se IGNORAN por completo (no cuentan como medición ni se sustituyen por 0),
+   por lo que las 3 mediciones no son necesariamente días consecutivos.
+   Si hay menos de 3, se usan las disponibles; si no hay ninguna → null y no
+   se evalúa la alerta (falta de información, no consumo cero).            */
 function consumoUltimos3DiasV2(insumoId){
-  const fechas = fechasConDatosInsumo(insumoId);
-  let suma=0, dias=0, ultima=null;
+  const fechas = fechasConDatosInsumo(insumoId);   // de la más reciente hacia atrás
+  let suma=0, mediciones=0, ultima=null;
   for(const f of fechas){
-    if(dias>=3) break;
+    if(mediciones>=3) break;
     const c = consumoDiarioInsumo(insumoId, f);
-    if(c===null) continue;                 // día sin datos suficientes: se omite
-    suma += c.valor; dias++;
+    if(c===null) continue;                          // medición nula: se ignora
+    suma += c.valor; mediciones++;
     if(!ultima) ultima = f;
   }
-  return dias ? { consumo:suma, dias, ultimaFecha:ultima } : null;
+  return mediciones ? { consumo:suma, dias:mediciones, ultimaFecha:ultima } : null;
 }
 /* ── Cierre anómalo (v2): SOLO aumentos > 5% sin producción ese día ──
    Nunca alerta por disminuciones. Se evalúa con Stock cierre y, en su
@@ -8073,40 +8085,60 @@ RENDERERS.inventarioConsolidado = function(){
 
 
   const insumosBase = insumosOrdenados();   // orden maestro del catálogo
-  const insumosFiltrados = insumosBase;
+  // Filtro de insumo COMPARTIDO: se aplica sobre el mismo listado ordenado,
+  // por lo que ambas tablas quedan siempre sincronizadas.
+  const insumoSel = invConsInsumo && insumosBase.find(i=>i.id===invConsInsumo) ? invConsInsumo : '';
+  const insumosFiltrados = insumoSel ? insumosBase.filter(i=>i.id===insumoSel) : insumosBase;
 
   const hayInsumos = insumosBase.length > 0;
   const hayDatos   = hayInsumos && insumosBase.some(ins=> fechas.some(f=>reg(ins.id,f)));
 
-  const theadFechas = fechas.map(f=>`<th colspan="5" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
+  // Encabezado de fechas reutilizable por ambas tablas (mismo lenguaje visual).
+  // `conBorrar` solo en la tabla de inventario, que es la que gestiona datos.
+  const headFechas = (cols, conBorrar)=> fechas.map(f=>`<th colspan="${cols}" class="inv-dia-ini" style="text-align:center;background:#f1ecfa;padding:4px 2px">
       <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
       <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
-      <button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>
+      ${conBorrar?`<button class="btn btn-ghost btn-sm inv-del-dia-btn" onclick="invDeleteDia('${f}')" title="Eliminar todos los registros de este día">🗑️</button>`:''}
     </th>`).join('');
-  const theadSub = fechas.map(()=>
-    `<th class="num inv-dia-ini" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. inicial</th>`+
-    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">Prod.</th>`+
-    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap">St. cierre</th>`+
-    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap" title="Stock del día + producción − stock del día siguiente">Cant.<br>consumida</th>`+
-    `<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap" title="Porciones vendidas según VENTAS_PRODUCTO_DETALLE">Porciones<br>consumidas</th>`).join('');
+  const sub = (txt, primera, title='')=>
+    `<th class="num${primera?' inv-dia-ini':''}" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap"${title?` title="${title}"`:''}>${txt}</th>`;
 
+  // ── TABLA 1: INVENTARIO (todos los insumos, 3 columnas por día) ──
+  const theadFechas = headFechas(3, true);
+  const theadSub = fechas.map(()=>
+    sub('St. inicial', true) + sub('Prod.', false) + sub('St. cierre', false)).join('');
   const filasInsumos = insumosFiltrados.map(ins=>{
     const celdas = fechas.map(f=>{
-      // Tres conceptos, cada uno de su fuente. Sin dato → celda vacía
-      // (nunca 0). No hay resaltados automáticos heredados.
+      // Cada concepto de su fuente. Sin dato → celda vacía (nunca 0).
       const ini  = stockInicialDe(ins.id, f);
       const prod = produccionDe(ins.id, f);
       const cie  = stockCierreDe(ins.id, f);
-      // 4ª columna: porciones vendidas (fuente externa, solo lectura).
-      // null = sin registros de venta → celda vacía, nunca 0.
-      const por  = porcionesDe(ins.nombre, f);
-      // Métrica derivada del inventario (no de ventas); null → celda vacía.
-      const cant = cantConsumidaDe(ins, f);
       const c = (v,cls='') => `<td class="num${cls?' '+cls:''}">${v===null?'':v}</td>`;
-      // La primera celda del día abre el bloque con el separador grueso.
-      return c(ini,'inv-dia-ini')+c(prod)+c(cie)+
-        `<td class="num" style="color:#0f766e;font-weight:600">${cant===null?'':cant}</td>`+
-        `<td class="num" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`;
+      return c(ini,'inv-dia-ini')+c(prod)+c(cie);   // la 1ª abre el bloque del día
+    }).join('');
+    return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
+  }).join('');
+
+  /* ── TABLA 2: CONSUMO Y RENDIMIENTO ──────────────────────────────────────
+     Solo los insumos con indicadores (los 18 de CC_PRODUCTOS), respetando el
+     MISMO orden global y el MISMO filtro de fechas/insumo que la tabla 1.
+     RENDIMIENTO = CANT. CONSUMIDA ÷ PORCIONES CONSUMIDAS; vacío si las
+     porciones son 0, nulas o si falta la cantidad (nunca 0, NaN ni Infinity). */
+  const insumosIndicadores = insumosFiltrados.filter(i=>insumoAplicaCantConsumida(i.nombre));
+  const theadFechas2 = headFechas(3, false);
+  const theadSub2 = fechas.map(()=>
+    sub('Porciones<br>consumidas', true, 'Porciones vendidas según VENTAS_PRODUCTO_DETALLE') +
+    sub('Cant.<br>consumida', false, 'Stock del día + producción − stock del día siguiente') +
+    sub('Rendimiento', false, 'Cantidad consumida ÷ porciones consumidas')).join('');
+  const filasIndicadores = insumosIndicadores.map(ins=>{
+    const celdas = fechas.map(f=>{
+      const por  = porcionesDe(ins.nombre, f);      // ventas (sin cambios)
+      const cant = cantConsumidaDe(ins, f);         // inventario (sin cambios)
+      // División protegida: porciones 0/nulas o cantidad nula → vacío.
+      const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
+      return `<td class="num inv-dia-ini" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`+
+             `<td class="num" style="color:#0f766e;font-weight:600">${cant===null?'':cant}</td>`+
+             `<td class="num" style="color:#b45309;font-weight:600">${rend===null?'':(Math.round(rend*100)/100)}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
@@ -8120,13 +8152,17 @@ RENDERERS.inventarioConsolidado = function(){
       : '');
 
   el.innerHTML = `
-    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica por insumo: stock inicial, producción, stock cierre, cantidad consumida y porciones consumidas (una fila por insumo, cinco columnas por fecha).</p></div></div>
+    <div class="page-head"><div><h1>📈 Consolidado de Inventario</h1><p>Evolución histórica por insumo. La primera tabla muestra el <b>inventario</b> (stock inicial, producción y stock cierre); la segunda, los indicadores de <b>consumo y rendimiento</b>. Ambas comparten el rango de fechas y el filtro de insumo.</p></div></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="date" id="invFDesde" value="${desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="invFHasta" value="${hasta}"></div>
         <button class="btn btn-ghost btn-sm" id="invFClear" style="align-self:flex-end">Últimos 4 días</button>
-        <button class="btn btn-primary btn-sm" id="invFPorciones" style="align-self:flex-end" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
+        <div class="field"><label>Insumo</label>
+          <select id="invFInsumo" style="min-width:200px">
+            <option value="">Todos</option>
+            ${insumosBase.map(i=>`<option value="${i.id}" ${insumoSel===i.id?'selected':''}>${i.nombre}</option>`).join('')}
+          </select></div>
       </div>
       <h2>Historial por insumo (${contadorTexto})${badgeFiltro}</h2>
       <p class="hint" style="margin-top:0">
@@ -8144,6 +8180,31 @@ RENDERERS.inventarioConsolidado = function(){
             </thead>
             <tbody>${filasInsumos}</tbody>
           </table></div>`}
+    </div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end;justify-content:space-between">
+        <h2 style="margin:0">Consumo y rendimiento${badgeFiltro}</h2>
+        <button class="btn btn-primary btn-sm" id="invFPorciones" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
+      </div>
+      <p class="hint" style="margin-top:0">
+        Indicadores derivados por insumo y día: <b>Porciones consumidas</b> (ventas), <b>Cant. consumida</b> (stock + producción − stock del día siguiente) y
+        <b>Rendimiento</b> (cant. consumida ÷ porciones consumidas). Solo se muestran los insumos con seguimiento de consumo; comparte el rango de fechas y el filtro de insumo de la tabla anterior.
+      </p>
+      ${insumosIndicadores.length===0
+        ? `<div class="mx-outer"><table class="mx-table">
+             <thead>
+               <tr><th class="mx-fix" rowspan="2">Insumo</th>${theadFechas2}</tr>
+               <tr>${theadSub2}</tr>
+             </thead>
+             <tbody><tr><td class="empty" colspan="${1+fechas.length*3}">No hay indicadores disponibles para este insumo.</td></tr></tbody>
+           </table></div>`
+        : `<div class="mx-outer"><table class="mx-table">
+             <thead>
+               <tr><th class="mx-fix" rowspan="2">Insumo</th>${theadFechas2}</tr>
+               <tr>${theadSub2}</tr>
+             </thead>
+             <tbody>${filasIndicadores}</tbody>
+           </table></div>`}
     </div>`;
 
   const applyF = ()=>{
@@ -8154,6 +8215,11 @@ RENDERERS.inventarioConsolidado = function(){
   };
   document.getElementById('invFDesde').onchange = applyF;
   document.getElementById('invFHasta').onchange = applyF;
+  // Filtro de insumo: afecta simultáneamente a las dos tablas.
+  document.getElementById('invFInsumo').onchange = (e)=>{
+    invConsInsumo = e.target.value || '';
+    RENDERERS.inventarioConsolidado();
+  };
   document.getElementById('invFClear').onclick = ()=>{
     invConsFilter = invRangoUlt4();          // últimos 4 días en hora de Lima
     RENDERERS.inventarioConsolidado();
