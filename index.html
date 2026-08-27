@@ -7916,22 +7916,26 @@ const CC_SET = new Set(CC_PRODUCTOS.map(vpdNormalizar));
 function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nombre)); }
 
 /* ── CONSUMO DIARIO: definición ÚNICA de la aplicación ────────────────────
-   Es la disminución de stock entre dos mediciones consecutivas del MISMO
-   tipo, mirando al día calendario SIGUIENTE:
-     Prioridad 1:  ST. INICIAL (hoy) − ST. INICIAL (día siguiente)
-     Prioridad 2:  ST. CIERRE  (hoy) − ST. CIERRE  (día siguiente)
-   La PRODUCCIÓN no participa: sigue registrándose y mostrándose, pero no
-   suma ni resta aquí. Nunca se mezclan tipos de stock entre días.
-   Solo `null` (sin registro) descarta una medición; el 0 es válido y opera.
-   Sin pareja completa → null (vacío), jamás 0.
+   Disminución de stock entre dos mediciones consecutivas del MISMO tipo,
+   más la producción incorporada al DÍA SIGUIENTE:
+     Prioridad 1:  ST. INICIAL (hoy) − ST. INICIAL (mañana) + PROD. (mañana)
+     Prioridad 2:  ST. CIERRE  (hoy) − ST. CIERRE  (mañana) + PROD. (mañana)
+   ATENCIÓN: la producción es la del DÍA SIGUIENTE, no la del día calculado.
+   Un PROD. inexistente cuenta como 0 SOLO para esta operación en memoria;
+   el dato almacenado sigue siendo null y no se reescribe.
+   Nunca se mezclan tipos de stock entre días. Solo `null` (sin registro)
+   descarta una medición de stock; el 0 es una medición válida que opera.
+   Sin pareja completa de stock → null (vacío), jamás 0.
    La usan tanto CANT. CONSUMIDA (Consolidado) como la alerta de consumo
    bajo (Alerta de Insumos), de modo que no puede haber dos definiciones. */
 function consumoDiarioStock(insumoId, fecha){
   const sig = fechaMasDias(fecha, 1);              // día calendario siguiente (Lima)
+  // Producción del DÍA SIGUIENTE; null → 0 solo para este cálculo.
+  const prodSig = produccionDe(insumoId, sig) || 0;
   const iniHoy = stockInicialDe(insumoId, fecha), iniSig = stockInicialDe(insumoId, sig);
-  if(iniHoy!==null && iniSig!==null) return { valor: iniHoy - iniSig, base:'inicial' };
+  if(iniHoy!==null && iniSig!==null) return { valor: iniHoy - iniSig + prodSig, base:'inicial' };
   const cieHoy = stockCierreDe(insumoId, fecha),  cieSig = stockCierreDe(insumoId, sig);
-  if(cieHoy!==null && cieSig!==null) return { valor: cieHoy - cieSig, base:'cierre' };
+  if(cieHoy!==null && cieSig!==null) return { valor: cieHoy - cieSig + prodSig, base:'cierre' };
   return null;                                     // información insuficiente
 }
 
@@ -7939,7 +7943,7 @@ function consumoDiarioStock(insumoId, fecha){
 // Distingue estrictamente null (sin registro) de 0 (dato válido que sí opera).
 function cantConsumidaDe(insumo, fecha){
   if(!insumoAplicaCantConsumida(insumo.nombre)) return null;   // fuera de la lista
-  // Misma definición que usa la Alerta de Insumos: sin producción.
+  // Misma definición que usa la Alerta de Insumos (incluye PROD. del día siguiente).
   const c = consumoDiarioStock(insumo.id, fecha);
   return c===null ? null : c.valor;
 }
@@ -7992,7 +7996,7 @@ function fechaMenosUnDia(fechaISO){
    entra en el acumulado y jamás se sustituye por 0.
      Consumo = Stock(ayer) − Stock(hoy) + Producción(hoy)              */
 function consumoDiarioInsumo(insumoId, fecha){
-  return consumoDiarioStock(insumoId, fecha);   // definición única (sin producción)
+  return consumoDiarioStock(insumoId, fecha);   // definición ÚNICA compartida con el Consolidado
 }
 // Fechas con algún dato del insumo (stock o producción), de la más reciente atrás.
 function fechasConDatosInsumo(insumoId){
