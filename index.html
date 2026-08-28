@@ -8007,11 +8007,12 @@ const CC_SET = new Set(CC_PRODUCTOS.map(vpdNormalizar));
 function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nombre)); }
 
 /* ── CONSUMO DIARIO: definición ÚNICA de la aplicación ────────────────────
-   Disminución de stock entre dos mediciones consecutivas del MISMO tipo,
-   más la producción incorporada al DÍA SIGUIENTE:
+   Disminución de stock entre dos mediciones CONTIGUAS del MISMO tipo, más la
+   producción del día que aporta el stock final de la comparación:
      Prioridad 1:  ST. INICIAL (hoy) − ST. INICIAL (mañana) + PROD. (mañana)
-     Prioridad 2:  ST. CIERRE  (hoy) − ST. CIERRE  (mañana) + PROD. (mañana)
-   ATENCIÓN: la producción es la del DÍA SIGUIENTE, no la del día calculado.
+     Prioridad 2:  ST. CIERRE  (ayer) − ST. CIERRE  (hoy)   + PROD. (hoy)
+   Cada prioridad usa su propio par de días: la 1 mira hacia adelante y la 2
+   hacia atrás. Nunca se combinan campos de fórmulas distintas.
    Un PROD. inexistente cuenta como 0 SOLO para esta operación en memoria;
    el dato almacenado sigue siendo null y no se reescribe.
    Nunca se mezclan tipos de stock entre días. Solo `null` (sin registro)
@@ -8020,14 +8021,31 @@ function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nomb
    La usan tanto CANT. CONSUMIDA (Consolidado) como la alerta de consumo
    bajo (Alerta de Insumos), de modo que no puede haber dos definiciones. */
 function consumoDiarioStock(insumoId, fecha){
-  const sig = fechaMasDias(fecha, 1);              // día calendario siguiente (Lima)
-  // Producción del DÍA SIGUIENTE; null → 0 solo para este cálculo.
-  const prodSig = produccionDe(insumoId, sig) || 0;
+  const sig = fechaMasDias(fecha,  1);   // día calendario SIGUIENTE (Lima)
+  const ant = fechaMasDias(fecha, -1);   // día calendario ANTERIOR  (Lima)
+
+  /* PRIORIDAD 1 — STOCK INICIAL (mira al día siguiente):
+       ST. INICIAL (hoy) − ST. INICIAL (mañana) + PROD (mañana)
+     Solo se aplica si AMBOS stocks del par contiguo existen. */
   const iniHoy = stockInicialDe(insumoId, fecha), iniSig = stockInicialDe(insumoId, sig);
-  if(iniHoy!==null && iniSig!==null) return { valor: iniHoy - iniSig + prodSig, base:'inicial' };
-  const cieHoy = stockCierreDe(insumoId, fecha),  cieSig = stockCierreDe(insumoId, sig);
-  if(cieHoy!==null && cieSig!==null) return { valor: cieHoy - cieSig + prodSig, base:'cierre' };
-  return null;                                     // información insuficiente
+  if(iniHoy!==null && iniSig!==null){
+    const prodSig = produccionDe(insumoId, sig) || 0;   // PROD vacío = 0
+    return { valor: iniHoy - iniSig + prodSig, base:'inicial' };
+  }
+
+  /* PRIORIDAD 2 — STOCK CIERRE (mira al día anterior):
+       ST. CIERRE (ayer) − ST. CIERRE (hoy) + PROD (hoy)
+     Nunca se combina con la fórmula anterior ni se mezclan tipos de stock. */
+  const cieAnt = stockCierreDe(insumoId, ant), cieHoy = stockCierreDe(insumoId, fecha);
+  if(cieAnt!==null && cieHoy!==null){
+    const prodHoy = produccionDe(insumoId, fecha) || 0;  // PROD vacío = 0
+    return { valor: cieAnt - cieHoy + prodHoy, base:'cierre' };
+  }
+
+  /* Sin el par contiguo completo el consumo queda VACÍO. No se busca hacia
+     atrás ni hacia adelante otro día con datos: la ausencia de un día
+     intermedio rompe deliberadamente la continuidad del cálculo. */
+  return null;
 }
 
 // Devuelve el consumo del día o null si no hay información suficiente.
