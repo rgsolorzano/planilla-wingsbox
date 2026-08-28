@@ -1123,7 +1123,22 @@ function toast(msg, type='info'){
 /* ---------- Navegación entre módulos ---------- */
 const RENDERERS = {};
 let currentPage='empleados';
+/* Guarda de sesión para acciones del usuario. Devuelve false si la sesión
+   expiró (conservando lo tecleado y pidiendo login). Se usa al navegar y
+   antes de cualquier operación autenticada, de modo que la expiración se
+   detecta al primer movimiento y no al fallar un guardado. */
+function sesGuardActividad(){
+  if(gsState.accessToken && !gsTokenVigente()){
+    sesManejarExpiracion('actividad del usuario');
+    return false;
+  }
+  return true;
+}
+
 function goto(page){
+  // Cada cambio de módulo revalida la sesión: navegar ya no da una falsa
+  // sensación de sesión activa tras una suspensión prolongada.
+  sesGuardActividad();
   // Refuerza en la propia función de navegación (no solo ocultando botones)
   // la restricción de acceso por rol: una cuenta autorizada solo puede
   // "enrutar" hacia los módulos de su rol, incluso si goto() se invoca
@@ -7201,6 +7216,29 @@ function insumoTipoRegistro(ins){
 function insumoRegistraProduccion(ins){ const t=insumoTipoRegistro(ins); return t==='produccion' || t==='ambos'; }
 function insumoRegistraStock(ins){      const t=insumoTipoRegistro(ins); return t==='stock'      || t==='ambos'; }
 
+/* ── ALERTA POR RENDIMIENTO (configuración del catálogo) ──────────────────
+   Decide qué insumos aparecen en la tabla "Consumo y rendimiento" y cuál es
+   su rango aceptable. Por defecto activa, con umbrales 60–80, tanto para los
+   insumos existentes como para los nuevos. Es independiente de las demás
+   alertas y no altera la fórmula de rendimiento.                          */
+const RENDIMIENTO_MIN_DEF = 60, RENDIMIENTO_MAX_DEF = 80;
+function insumoAlertaRendimiento(ins){ return !(ins && ins.alertaRendimiento === false); }
+function insumoRendMin(ins){
+  const n = Number(ins && ins.rendMin);
+  return Number.isFinite(n) ? n : RENDIMIENTO_MIN_DEF;
+}
+function insumoRendMax(ins){
+  const n = Number(ins && ins.rendMax);
+  return Number.isFinite(n) ? n : RENDIMIENTO_MAX_DEF;
+}
+/* ¿Ese rendimiento está fuera del rango del insumo? Límites INCLUSIVOS:
+   alerta si rend <= mín o rend >= máx. Un rendimiento vacío (null) NUNCA es
+   alerta; un 0 calculado sí se evalúa contra los umbrales.                */
+function rendimientoEsAlerta(ins, rend){
+  if(rend===null || rend===undefined || !Number.isFinite(rend)) return false;
+  return rend <= insumoRendMin(ins) || rend >= insumoRendMax(ins);
+}
+
 // ¿El insumo participa en la alerta de STOCK ANÓMALO? Por defecto sí, tanto
 // para los insumos existentes como para los nuevos: se conserva el
 // comportamiento previo en que todos participaban. Solo afecta a esa alerta.
@@ -7247,6 +7285,10 @@ function migrarCamposInsumo(ins){
   // Tipo de registro OBLIGATORIO: los insumos existentes quedan en 'ambos',
   // preservando el comportamiento actual (aparecen en las dos secciones).
   ins.tipoRegistro = insumoTipoRegistro(ins);
+  // Rendimiento: activo por defecto con umbrales 60–80 (insumos existentes y nuevos).
+  if(ins.alertaRendimiento === undefined) ins.alertaRendimiento = true;
+  if(!Number.isFinite(Number(ins.rendMin))) ins.rendMin = RENDIMIENTO_MIN_DEF;
+  if(!Number.isFinite(Number(ins.rendMax))) ins.rendMax = RENDIMIENTO_MAX_DEF;
   return ins;
 }
 /* ════════════════════════════════════════════════════════════════
@@ -7662,6 +7704,8 @@ RENDERERS.insumos = function(){
           <th class="num ins-col-chk" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por<br>consumo</th>
           <th class="num ins-col-chk" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por<br>mínimo</th>
           <th class="num ins-col-chk" title="Si se desmarca, el insumo no participa en la alerta de stock anómalo (no afecta a las demás alertas)">Alerta stock<br>anómalo</th>
+          <th class="num ins-col-chk" title="Si se marca, el insumo aparece en la tabla Consumo y rendimiento">Alerta por<br>rendimiento</th>
+          <th class="num" style="min-width:150px" title="Rango aceptable de rendimiento (límites inclusivos)">Umbrales<br>rendimiento</th>
           <th>Acciones</th></tr></thead>
         <tbody>${S.insumos.length? insumosOrdenados().map((i,pos,arr)=>`
           <tr>
@@ -7682,9 +7726,22 @@ RENDERERS.insumos = function(){
             <td class="num"><input type="checkbox" class="insCfgAlertaMinimo" data-id="${i.id}" ${insumoAlertaMinimo(i)?'checked':''}></td>
             <td class="num"><input type="checkbox" class="insCfgAlertaAnomalo" data-id="${i.id}" ${insumoAlertaAnomalo(i)?'checked':''}
               title="Participa en la alerta de stock anómalo"></td>
+            ${(()=>{
+              const act = insumoAlertaRendimiento(i);
+              const dis = act ? '' : 'disabled style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"';
+              return `<td class="num"><input type="checkbox" class="insCfgAlertaRend" data-id="${i.id}" ${act?'checked':''}
+                  title="Incluir este insumo en la tabla Consumo y rendimiento"></td>
+                <td class="num" style="white-space:nowrap">
+                  <input type="number" step="0.01" class="insCfgRendMin" data-id="${i.id}" value="${insumoRendMin(i)}"
+                    title="Rendimiento mínimo aceptable" style="width:62px" ${dis}>
+                  <span style="color:var(--c-muted);font-size:10px">–</span>
+                  <input type="number" step="0.01" class="insCfgRendMax" data-id="${i.id}" value="${insumoRendMax(i)}"
+                    title="Rendimiento máximo aceptable" style="width:62px" ${dis}>
+                </td>`;
+            })()}
             <td><button class="btn-icon" onclick="insumoEdit('${i.id}')">✏️ Editar</button>
                 <button class="btn-icon del" onclick="insumoDel('${i.id}')">🗑️ Eliminar</button></td></tr>
-        `).join('') : `<tr><td colspan="11" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
+        `).join('') : `<tr><td colspan="13" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
       <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
@@ -7693,11 +7750,27 @@ RENDERERS.insumos = function(){
   document.getElementById('insClear').onclick = ()=>{ editInsumoId=null; RENDERERS.insumos(); };
   const actBtn = document.getElementById('insActualizar');
   if(actBtn) actBtn.onclick = insumosActualizarResaltados;
+  insumosBindUmbrales();   // habilita/deshabilita los umbrales según su checkbox
   if(editInsumoId){
     const i = S.insumos.find(x=>x.id===editInsumoId);
     if(i){ document.getElementById('insFormTitle').textContent='Editar insumo'; document.getElementById('insNombre').value=i.nombre; document.getElementById('insUnidad').value=i.unidad; }
   }
 };
+// Habilita/deshabilita los umbrales al instante, sin perder sus valores.
+function insumosBindUmbrales(){
+  document.querySelectorAll('.insCfgAlertaRend').forEach(cb=>{
+    cb.onchange = ()=>{
+      const id = cb.dataset.id, act = cb.checked;
+      ['.insCfgRendMin','.insCfgRendMax'].forEach(cls=>{
+        const el = document.querySelector(cls+'[data-id="'+id+'"]'); if(!el) return;
+        el.disabled = !act;
+        el.style.background = act ? '' : '#f3f4f6';
+        el.style.color      = act ? '' : '#9ca3af';
+        el.style.cursor     = act ? '' : 'not-allowed';
+      });
+    };
+  });
+}
 window.insumoSubir = function(id){ if(insumoMover(id,-1)) RENDERERS.insumos(); };
 window.insumoBajar = function(id){ if(insumoMover(id, 1)) RENDERERS.insumos(); };
 
@@ -7722,7 +7795,8 @@ function insumoSave(){
       alertaConsumo:true, umbralConsumo:umbralPorDefecto(unidad),
       alertaMinimo:false, umbralMinimo:umbralPorDefecto(unidad),
       resaltadoCelda:true,
-      inventario:'dia', tipoRegistro:'ambos', orden:S.insumos.length });
+      inventario:'dia', tipoRegistro:'ambos', orden:S.insumos.length,
+      alertaRendimiento:true, rendMin:RENDIMIENTO_MIN_DEF, rendMax:RENDIMIENTO_MAX_DEF });
     save(K.insumos, S.insumos); toast('Insumo creado','success');
   }
   RENDERERS.insumos();
@@ -7753,6 +7827,20 @@ async function insumosActualizarResaltados(){
       // Clasificación OBLIGATORIA: se normaliza contra el dominio permitido
       // ('dia' | 'noche' | 'ambos'); cualquier otro valor cae en 'dia'.
       if(ins) ins.inventario = insumoInventario({inventario:sel.value});
+    });
+    document.querySelectorAll('.insCfgAlertaRend').forEach(cb=>{
+      const ins = S.insumos.find(i=>i.id===cb.dataset.id);
+      if(ins) ins.alertaRendimiento = cb.checked;
+    });
+    document.querySelectorAll('.insCfgRendMin').forEach(inp=>{
+      const ins = S.insumos.find(i=>i.id===inp.dataset.id);
+      const n = Number(inp.value);
+      if(ins && Number.isFinite(n)) ins.rendMin = n;   // se conserva aunque esté deshabilitado
+    });
+    document.querySelectorAll('.insCfgRendMax').forEach(inp=>{
+      const ins = S.insumos.find(i=>i.id===inp.dataset.id);
+      const n = Number(inp.value);
+      if(ins && Number.isFinite(n)) ins.rendMax = n;
     });
     document.querySelectorAll('.insCfgTipoRegistro').forEach(sel=>{
       const ins = S.insumos.find(i=>i.id===sel.dataset.id);
@@ -7961,6 +8049,8 @@ function invRangoUlt4(){
 let invConsFilter = invRangoUlt4();
 // Filtro de insumo compartido por las DOS tablas: '' = Todos.
 let invConsInsumo = '';
+// 'Filtra alertas' de la tabla Consumo y rendimiento (desmarcado por defecto).
+let invConsSoloAlertas = false;
 // Tope de columnas de fecha que genera la matriz (cada fecha = 2 columnas).
 // Evita una tabla inmanejable si el usuario deja un rango muy amplio o vacío.
 const INV_MAX_DIAS = 60;
@@ -8131,7 +8221,20 @@ RENDERERS.inventarioConsolidado = function(){
      MISMO orden global y el MISMO filtro de fechas/insumo que la tabla 1.
      RENDIMIENTO = CANT. CONSUMIDA ÷ PORCIONES CONSUMIDAS; vacío si las
      porciones son 0, nulas o si falta la cantidad (nunca 0, NaN ni Infinity). */
-  const insumosIndicadores = insumosFiltrados.filter(i=>insumoAplicaCantConsumida(i.nombre));
+  // Participan los insumos con ALERTA POR RENDIMIENTO activa. Se respetan
+  // además los filtros de fecha e insumo (se aplican sobre insumosFiltrados).
+  let insumosIndicadores = insumosFiltrados.filter(i=>insumoAlertaRendimiento(i));
+  // 'Filtra alertas': deja solo los insumos con ALGÚN día fuera de su rango
+  // dentro del período visible. Un rendimiento vacío nunca cuenta como alerta.
+  if(invConsSoloAlertas){
+    insumosIndicadores = insumosIndicadores.filter(ins=>
+      fechas.some(f=>{
+        const por  = porcionesDe(ins.nombre, f);
+        const cant = cantConsumidaDe(ins, f);
+        const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
+        return rendimientoEsAlerta(ins, rend);
+      }));
+  }
   const theadFechas2 = headFechas(3, false);
   const theadSub2 = fechas.map(()=>
     sub('Porciones<br>consumidas', true, 'Porciones vendidas según VENTAS_PRODUCTO_DETALLE') +
@@ -8143,9 +8246,11 @@ RENDERERS.inventarioConsolidado = function(){
       const cant = cantConsumidaDe(ins, f);         // inventario (sin cambios)
       // División protegida: porciones 0/nulas o cantidad nula → vacío.
       const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
+      // Fuera del rango configurado (límites inclusivos) → celda resaltada.
+      const alerta = rendimientoEsAlerta(ins, rend);
       return `<td class="num inv-dia-ini" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`+
              `<td class="num" style="color:#0f766e;font-weight:600">${cant===null?'':cant}</td>`+
-             `<td class="num" style="color:#b45309;font-weight:600">${rend===null?'':(Math.round(rend*100)/100)}</td>`;
+             `<td class="num${alerta?' inv-cell-alerta':''}" style="${alerta?'':'color:#b45309;'}font-weight:600"${alerta?` title="Fuera del rango ${insumoRendMin(ins)}–${insumoRendMax(ins)}"`:''}>${rend===null?'':(Math.round(rend*100)/100)}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
@@ -8191,11 +8296,18 @@ RENDERERS.inventarioConsolidado = function(){
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end;justify-content:space-between">
         <h2 style="margin:0">Consumo y rendimiento${badgeFiltro}</h2>
-        <button class="btn btn-primary btn-sm" id="invFPorciones" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
+        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="invFSoloAlertas" ${invConsSoloAlertas?'checked':''} style="width:16px;height:16px;cursor:pointer">
+            <span style="font-size:13px;font-weight:500;color:var(--c-text)">Filtra alertas</span>
+          </label>
+          <button class="btn btn-primary btn-sm" id="invFPorciones" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
+        </div>
       </div>
       <p class="hint" style="margin-top:0">
         Indicadores derivados por insumo y día: <b>Porciones consumidas</b> (ventas), <b>Cant. consumida</b> (stock + producción − stock del día siguiente) y
-        <b>Rendimiento</b> (cant. consumida ÷ porciones consumidas). Solo se muestran los insumos con seguimiento de consumo; comparte el rango de fechas y el filtro de insumo de la tabla anterior.
+        <b>Rendimiento</b> (cant. consumida ÷ porciones consumidas). Se muestran los insumos con <b>Alerta por rendimiento</b> activa en Administración de insumos; comparte el rango de fechas y el filtro de insumo de la tabla anterior.
+        Con <b>Filtra alertas</b> solo aparecen los insumos con algún día fuera de su rango configurado (límites inclusivos); un rendimiento vacío nunca es alerta.
       </p>
       ${insumosIndicadores.length===0
         ? `<div class="mx-outer"><table class="mx-table">
@@ -8203,7 +8315,9 @@ RENDERERS.inventarioConsolidado = function(){
                <tr><th class="mx-fix" rowspan="2">Insumo</th>${theadFechas2}</tr>
                <tr>${theadSub2}</tr>
              </thead>
-             <tbody><tr><td class="empty" colspan="${1+fechas.length*3}">No hay indicadores disponibles para este insumo.</td></tr></tbody>
+             <tbody><tr><td class="empty" colspan="${1+fechas.length*3}">${invConsSoloAlertas
+                ? 'Ningún insumo presenta rendimiento fuera de sus umbrales en el período seleccionado.'
+                : 'No hay indicadores disponibles para este insumo.'}</td></tr></tbody>
            </table></div>`
         : `<div class="mx-outer"><table class="mx-table">
              <thead>
@@ -8222,6 +8336,9 @@ RENDERERS.inventarioConsolidado = function(){
   };
   document.getElementById('invFDesde').onchange = applyF;
   document.getElementById('invFHasta').onchange = applyF;
+  // 'Filtra alertas': se combina con los filtros de fecha e insumo.
+  const chkAl = document.getElementById('invFSoloAlertas');
+  if(chkAl) chkAl.onchange = (e)=>{ invConsSoloAlertas = e.target.checked; RENDERERS.inventarioConsolidado(); };
   // Filtro de insumo: afecta simultáneamente a las dos tablas.
   document.getElementById('invFInsumo').onchange = (e)=>{
     invConsInsumo = e.target.value || '';
@@ -9810,6 +9927,9 @@ async function gsFetchUserEmail(){
 /* ---------- Wrapper de fetch con manejo de token expirado (401) ---------- */
 async function gsApiFetch(url, options={}){
   if(!gsState.accessToken) throw new Error('NO_SESSION');
+  // Detección temprana: si el token ya caducó no se envía la petición; se
+  // conserva lo tecleado y se pide login antes de tocar el backend.
+  if(!gsTokenVigente()){ sesManejarExpiracion('operación con token vencido'); throw new Error('SESSION_EXPIRED'); }
   const opt = Object.assign({}, options);
   opt.headers = Object.assign({}, options.headers, { 'Authorization':'Bearer '+gsState.accessToken });
   let r = await fetch(url, opt);
@@ -10058,13 +10178,15 @@ function gsSerializeAll(){
 // gsSerializeAll() pero para el spreadsheet de Wingsbox.oficial@gmail.com.
 function gsSerializeInventario(){
   return {
-    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda','inventario','tipoRegistro','orden'],
+    Insumos: gsRowsToMatrix(['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo','alertaMinimo','resaltadoCelda','inventario','tipoRegistro','orden','alertaRendimiento','rendMin','rendMax'],
       S.insumos.map((i,idx)=>({ id:i.id, nombre:i.nombre, unidad:i.unidad,
         umbralConsumo:insumoUmbralConsumo(i), umbralMinimo:insumoUmbralMinimo(i),
         alertaConsumo:insumoAlertaConsumo(i)?1:0, alertaMinimo:insumoAlertaMinimo(i)?1:0,
         resaltadoCelda:(i.resaltadoCelda!==false)?1:0,
         // Configuración del catálogo: clasificación y posición global.
-        inventario:insumoInventario(i), tipoRegistro:insumoTipoRegistro(i), orden:insumoOrden(i,idx) }))),
+        inventario:insumoInventario(i), tipoRegistro:insumoTipoRegistro(i), orden:insumoOrden(i,idx),
+        alertaRendimiento:insumoAlertaRendimiento(i)?1:0,
+        rendMin:insumoRendMin(i), rendMax:insumoRendMax(i) }))),
     // Hoja de STOCK: conserva las columnas legadas como respaldo histórico
     // y añade los campos vigentes (vacío cuando el dato no existe, nunca 0).
     Produccion: gsRowsToMatrix(['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre','migradoV2'],
@@ -10495,6 +10617,10 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         inventario: insumoInventario({inventario:r.inventario}),
         // Obligatorio; una hoja anterior a este campo → 'ambos' (valor inicial).
         tipoRegistro: insumoTipoRegistro({tipoRegistro:r.tipoRegistro}),
+        // Config. de rendimiento; una hoja anterior a estos campos → activo con 60–80.
+        alertaRendimiento: !esFalse(r.alertaRendimiento),
+        rendMin: (r.rendMin!==undefined && r.rendMin!=='' && Number.isFinite(Number(r.rendMin))) ? Number(r.rendMin) : RENDIMIENTO_MIN_DEF,
+        rendMax: (r.rendMax!==undefined && r.rendMax!=='' && Number.isFinite(Number(r.rendMax))) ? Number(r.rendMax) : RENDIMIENTO_MAX_DEF,
         orden: (r.orden!==undefined && r.orden!==null && r.orden!=='' && Number.isFinite(Number(r.orden)))
                  ? Number(r.orden) : undefined,
         // Campos del modelo anterior (si existen en la hoja, se usan solo para
@@ -10794,6 +10920,28 @@ async function sesValidarAlReactivar(){
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
 window.addEventListener('focus', sesValidarAlReactivar);
 window.addEventListener('online', sesValidarAlReactivar);
+// pageshow cubre la restauración desde la caché de retroceso (bfcache), donde
+// no siempre se emite visibilitychange.
+window.addEventListener('pageshow', (e)=>{ if(e.persisted) sesValidarAlReactivar(); });
+
+/* Detector de SUSPENSIÓN por salto de reloj. Es el mecanismo clave del caso
+   "portátil suspendido toda la noche": si solo se bloquea la pantalla y la
+   pestaña sigue visible, el navegador no emite visibilitychange ni focus, y
+   los timers no corren mientras el equipo duerme. Al despertar, el intervalo
+   detecta que pasó mucho más tiempo del esperado y revalida la sesión. */
+let sesUltimoTick = Date.now();
+if(!window.__sesTickTimer){
+  window.__sesTickTimer = setInterval(()=>{
+    const ahora = Date.now();
+    const salto = ahora - sesUltimoTick;
+    sesUltimoTick = ahora;
+    if(salto > 120000){            // el equipo estuvo suspendido
+      console.warn('[Sesión] Reanudación detectada tras '+Math.round(salto/60000)+' min de inactividad.');
+      sesUltimaValidacion = 0;     // fuerza la revalidación inmediata
+      sesValidarAlReactivar();
+    }
+  }, 30000);
+}
 // Chequeo periódico ligero (sin recargar): un único timer.
 if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
