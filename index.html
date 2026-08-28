@@ -10834,37 +10834,80 @@ let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
 // Captura los campos visibles del módulo activo (input/select/textarea con id).
+/* Clave ÚNICA de un campo dentro del formulario.
+   CORRECCIÓN CRÍTICA: antes se componía solo de clase + data-insumo, y los
+   inputs de Stock inicial y Stock cierre (misma clase, mismo insumo, distinto
+   data-campo) colisionaban: al capturar, uno sobrescribía al otro y, al
+   restaurar, el mismo valor se escribía en AMBOS campos. Eso generaba
+   registros con stockInicial === stockCierre que el usuario nunca ingresó.
+   Ahora se incluyen TODOS los discriminadores del input. */
+function sesClaveCampo(el){
+  if(el.id) return 'id:'+el.id;
+  if(!el.className || !el.dataset) return '';
+  const d = el.dataset;
+  const partes = [el.className.split(' ')[0],
+    d.insumo||'', d.art||'', d.prod||'', d.id||'', d.bebida||'', d.licor||'',
+    d.campo||'', d.unit||'', d.unidad||'', d.momento||'', d.tipo||'', d.idx||''];
+  const cuerpo = partes.slice(1).join('|');
+  return cuerpo.replace(/\|+$/,'')==='' ? '' : partes.join('|');
+}
+// Fecha del formulario activo (para no restaurar en un día distinto).
+function sesFechaFormulario(){
+  const cont = document.getElementById('page') || document.body;
+  const f = cont.querySelector('input[type="date"]');
+  return f && f.value ? f.value : '';
+}
 function sesCapturarBorrador(){
   try{
     const cont = document.getElementById('page') || document.body;
     const campos = {};
     cont.querySelectorAll('input, select, textarea').forEach(el=>{
-      const clave = el.id || (el.className && el.dataset ?
-        (el.className.split(' ')[0]+'|'+(el.dataset.insumo||el.dataset.art||el.dataset.id||el.dataset.prod||el.dataset.idx||'')) : '');
+      // Los campos deshabilitados no son datos del usuario: no se capturan.
+      if(el.disabled) return;
+      const clave = sesClaveCampo(el);
       if(!clave) return;
       if(el.type==='checkbox' || el.type==='radio'){ campos[clave] = el.checked ? '1':'0'; }
       else if(String(el.value??'').trim()!==''){ campos[clave] = el.value; }
     });
     if(!Object.keys(campos).length) return false;
     localStorage.setItem(SES_KEYS.borrador, JSON.stringify({
-      modulo: currentPage, fecha: new Date().toISOString(), campos }));
+      v: SES_BORRADOR_VERSION, modulo: currentPage, fecha: new Date().toISOString(),
+      fechaForm: sesFechaFormulario(), campos }));
     console.warn('[Sesión] Borrador conservado de "'+currentPage+'" ('+Object.keys(campos).length+' campos). No se guardó en el Spreadsheet.');
     return true;
   }catch(e){ console.error('[Sesión] No se pudo conservar el borrador:', e); return false; }
 }
+// Los borradores creados con el formato anterior (clave colisionada) se
+// descartan: podrían repoblar Stock inicial y Stock cierre con el mismo valor.
+const SES_BORRADOR_VERSION = 2;
 function sesLeerBorrador(){
-  try{ const b=localStorage.getItem(SES_KEYS.borrador); return b?JSON.parse(b):null; }catch(e){ return null; }
+  try{
+    const raw = localStorage.getItem(SES_KEYS.borrador);
+    if(!raw) return null;
+    const b = JSON.parse(raw);
+    if(!b || b.v !== SES_BORRADOR_VERSION){
+      console.warn('[Sesión] Borrador con formato antiguo descartado (no se restaura para evitar datos incorrectos).');
+      localStorage.removeItem(SES_KEYS.borrador);
+      return null;
+    }
+    return b;
+  }catch(e){ return null; }
 }
 function sesDescartarBorrador(){ localStorage.removeItem(SES_KEYS.borrador); }
 // Repuebla los campos del módulo si hay un borrador de ese mismo módulo.
 function sesRestaurarBorrador(){
   const b = sesLeerBorrador();
   if(!b || b.modulo!==currentPage) return false;
+  // El borrador pertenece a la fecha en que se capturó: si el formulario está
+  // en otro día, NO se restaura (evita que datos del 27 aparezcan como del 28).
+  const fechaActual = sesFechaFormulario();
+  if(b.fechaForm && fechaActual && b.fechaForm !== fechaActual) return false;
   let repuestos = 0;
   const cont = document.getElementById('page') || document.body;
   cont.querySelectorAll('input, select, textarea').forEach(el=>{
-    const clave = el.id || (el.className && el.dataset ?
-      (el.className.split(' ')[0]+'|'+(el.dataset.insumo||el.dataset.art||el.dataset.id||el.dataset.prod||el.dataset.idx||'')) : '');
+    // Nunca se repone en un campo no editable: el usuario no pudo escribirlo.
+    if(el.disabled) return;
+    const clave = sesClaveCampo(el);
     if(!clave || !(clave in b.campos)) return;
     if(el.type==='checkbox' || el.type==='radio') el.checked = b.campos[clave]==='1';
     else el.value = b.campos[clave];
@@ -10969,6 +11012,39 @@ window.addEventListener('storage', (e)=>{
     sesManejarExpiracion('cierre de sesión en otra pestaña');
   }
 });
+
+/* ── DIAGNÓSTICO: registros de stock posiblemente autogenerados ───────────
+   SOLO LECTURA: identifica y lista, nunca borra ni modifica nada.
+   Criterio (huella del defecto de borrador ya corregido):
+     · stockInicial y stockCierre existen y son IGUALES, y
+     · las columnas legadas (produccion/cierre) están vacías, y
+     · el insumo NO está configurado como 'ambos' → el usuario no pudo
+       haber tecleado ambos campos, así que el par idéntico es sospechoso.
+   Se ejecuta desde la consola: auditarStockSospechoso()            */
+function auditarStockSospechoso(fecha){
+  const filas = S.produccion.filter(r=>{
+    if(fecha && r.fecha!==fecha) return false;
+    const ini = numOrNull(r.stockInicial), cie = numOrNull(r.stockCierre);
+    if(ini===null || cie===null || ini!==cie) return false;
+    if(numOrNull(r.produccion)!==null || numOrNull(r.cierre)!==null) return false; // legado con datos: legítimo
+    const ins = S.insumos.find(i=>i.id===r.insumoId);
+    return ins ? insumoInventario(ins)!=='ambos' : true;   // 'ambos' sí pudo teclear los dos
+  });
+  const det = filas.map(r=>{
+    const ins = S.insumos.find(i=>i.id===r.insumoId);
+    return { fecha:r.fecha, insumo: ins?ins.nombre:'(desconocido)',
+             configuracion: ins?insumoInventario(ins):'?',
+             stockInicial:r.stockInicial, stockCierre:r.stockCierre, id:r.id };
+  }).sort((a,b)=> a.fecha<b.fecha?-1 : a.fecha>b.fecha?1 : a.insumo.localeCompare(b.insumo));
+  const porFecha = {};
+  det.forEach(d=>{ porFecha[d.fecha] = (porFecha[d.fecha]||0)+1; });
+  console.log('%c[Auditoría] '+det.length+' registro(s) sospechoso(s)'+(fecha?' en '+fecha:'')+'.','font-weight:bold');
+  console.log('Por fecha:', porFecha);
+  if(det.length) console.table(det);
+  console.log('Nada fue modificado. Para revisar un día concreto: auditarStockSospechoso("2026-08-28")');
+  return det;
+}
+window.auditarStockSospechoso = auditarStockSospechoso;
 
 function gsHandleError(err, accion){
   if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
