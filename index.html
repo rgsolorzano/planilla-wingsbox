@@ -8042,9 +8042,13 @@ function cantConsumidaDe(insumo, fecha){
 // Rango por defecto: últimos 3 días (hoy - 2 días hasta hoy). Se inicializa una sola
 // vez; cambiar de fecha en el filtro no se reinicia entre renders.
 // Rango por defecto: últimos 4 días (hoy-3 .. hoy) SIEMPRE en hora de Lima.
+/* Últimos 4 días COMPLETOS ya transcurridos: termina AYER (hoy − 1) y abarca
+   4 días (hasta − 3). El día en curso se excluye porque aún no ha cerrado.
+   La fecha base se resuelve en America/Lima, de modo que por la noche no se
+   toma el día siguiente por una conversión UTC.                            */
 function invRangoUlt4(){
-  const hoy = fechaEnLima();
-  return { desde: fechaMasDias(hoy,-3), hasta: hoy };
+  const ayer = fechaMasDias(fechaEnLima(), -1);
+  return { desde: fechaMasDias(ayer,-3), hasta: ayer };
 }
 let invConsFilter = invRangoUlt4();
 // Filtro de insumo compartido por las DOS tablas: '' = Todos.
@@ -8181,11 +8185,24 @@ RENDERERS.inventarioConsolidado = function(){
   const reg = (insumoId, fecha) => getProduccion(insumoId, fecha);
 
 
+  // ¿El insumo tiene alerta de rendimiento en algún día del rango visible?
+  // Reutiliza rendimientoEsAlerta() y la fórmula vigente; no las duplica.
+  const insTieneAlertaRend = (ins)=>
+    insumoAlertaRendimiento(ins) && fechas.some(f=>{
+      const por  = porcionesDe(ins.nombre, f);
+      const cant = cantConsumidaDe(ins, f);
+      const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
+      return rendimientoEsAlerta(ins, rend);
+    });
+
   const insumosBase = insumosOrdenados();   // orden maestro del catálogo
   // Filtro de insumo COMPARTIDO: se aplica sobre el mismo listado ordenado,
   // por lo que ambas tablas quedan siempre sincronizadas.
   const insumoSel = invConsInsumo && insumosBase.find(i=>i.id===invConsInsumo) ? invConsInsumo : '';
   const insumosFiltrados = insumoSel ? insumosBase.filter(i=>i.id===insumoSel) : insumosBase;
+  // Con 'Filtra alertas' activo, el Historial por insumo muestra únicamente
+  // los insumos con alerta de rendimiento (mismos que la segunda tabla).
+  const insumosTabla1 = invConsSoloAlertas ? insumosFiltrados.filter(insTieneAlertaRend) : insumosFiltrados;
 
   const hayInsumos = insumosBase.length > 0;
   const hayDatos   = hayInsumos && insumosBase.some(ins=> fechas.some(f=>reg(ins.id,f)));
@@ -8204,7 +8221,7 @@ RENDERERS.inventarioConsolidado = function(){
   const theadFechas = headFechas(3, true);
   const theadSub = fechas.map(()=>
     sub('St. inicial', true) + sub('Prod.', false) + sub('St. cierre', false)).join('');
-  const filasInsumos = insumosFiltrados.map(ins=>{
+  const filasInsumos = insumosTabla1.map(ins=>{
     const celdas = fechas.map(f=>{
       // Cada concepto de su fuente. Sin dato → celda vacía (nunca 0).
       const ini  = stockInicialDe(ins.id, f);
@@ -8224,16 +8241,12 @@ RENDERERS.inventarioConsolidado = function(){
   // Participan los insumos con ALERTA POR RENDIMIENTO activa. Se respetan
   // además los filtros de fecha e insumo (se aplican sobre insumosFiltrados).
   let insumosIndicadores = insumosFiltrados.filter(i=>insumoAlertaRendimiento(i));
-  // 'Filtra alertas': deja solo los insumos con ALGÚN día fuera de su rango
-  // dentro del período visible. Un rendimiento vacío nunca cuenta como alerta.
+  // 'Filtra alertas' (filtro GLOBAL del módulo): deja solo los insumos con
+  // ALGÚN día fuera de su rango dentro del período visible. Un rendimiento
+  // vacío nunca cuenta como alerta. El mismo predicado se aplica a la tabla
+  // de inventario, para que ambas muestren exactamente los mismos insumos.
   if(invConsSoloAlertas){
-    insumosIndicadores = insumosIndicadores.filter(ins=>
-      fechas.some(f=>{
-        const por  = porcionesDe(ins.nombre, f);
-        const cant = cantConsumidaDe(ins, f);
-        const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
-        return rendimientoEsAlerta(ins, rend);
-      }));
+    insumosIndicadores = insumosIndicadores.filter(insTieneAlertaRend);
   }
   const theadFechas2 = headFechas(3, false);
   const theadSub2 = fechas.map(()=>
@@ -8256,7 +8269,8 @@ RENDERERS.inventarioConsolidado = function(){
   }).join('');
 
   // Subtítulo del historial con contador actualizado
-  const contadorTexto = `${fechas.length} día${fechas.length===1?'':'s'}, ${insumosBase.length} insumo${insumosBase.length===1?'':'s'}`;
+  const contadorTexto = `${fechas.length} día${fechas.length===1?'':'s'}, ${insumosTabla1.length} insumo${insumosTabla1.length===1?'':'s'}`
+    + (invConsSoloAlertas ? ' con alerta' : '');
   const badgeFiltro = vpdEstado.cargando
     ? `<span style="background:#ede9fe;color:#5b21b6;border:1px solid #c4b5fd;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;margin-left:12px">⏳ Cargando porciones…</span>`
     : (vpdEstado.error
@@ -8275,6 +8289,11 @@ RENDERERS.inventarioConsolidado = function(){
             <option value="">Todos</option>
             ${insumosBase.map(i=>`<option value="${i.id}" ${insumoSel===i.id?'selected':''}>${i.nombre}</option>`).join('')}
           </select></div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;align-self:flex-end;padding-bottom:4px"
+               title="Muestra solo los insumos con rendimiento fuera de sus umbrales. Aplica a las dos tablas.">
+          <input type="checkbox" id="invFSoloAlertas" ${invConsSoloAlertas?'checked':''} style="width:16px;height:16px;cursor:pointer">
+          <span style="font-size:13px;font-weight:500;color:var(--c-text)">Filtra alertas</span>
+        </label>
       </div>
       <h2>Historial por insumo (${contadorTexto})${badgeFiltro}</h2>
       <p class="hint" style="margin-top:0">
@@ -8290,24 +8309,20 @@ RENDERERS.inventarioConsolidado = function(){
               <tr><th class="mx-fix" rowspan="2">Insumo</th>${theadFechas}</tr>
               <tr>${theadSub}</tr>
             </thead>
-            <tbody>${filasInsumos}</tbody>
+            <tbody>${filasInsumos || `<tr><td class="empty" colspan="${1+fechas.length*3}">${invConsSoloAlertas
+              ? 'Ningún insumo presenta alertas de rendimiento en el período seleccionado.'
+              : 'Sin insumos para el filtro seleccionado.'}</td></tr>`}</tbody>
           </table></div>`}
     </div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end;justify-content:space-between">
         <h2 style="margin:0">Consumo y rendimiento${badgeFiltro}</h2>
-        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="invFSoloAlertas" ${invConsSoloAlertas?'checked':''} style="width:16px;height:16px;cursor:pointer">
-            <span style="font-size:13px;font-weight:500;color:var(--c-text)">Filtra alertas</span>
-          </label>
-          <button class="btn btn-primary btn-sm" id="invFPorciones" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
-        </div>
+        <button class="btn btn-primary btn-sm" id="invFPorciones" ${vpdEstado.cargando?'disabled':''}>${vpdEstado.cargando?'⏳ Actualizando…':'🔄 Actualizar porciones'}</button>
       </div>
       <p class="hint" style="margin-top:0">
         Indicadores derivados por insumo y día: <b>Porciones consumidas</b> (ventas), <b>Cant. consumida</b> (stock + producción − stock del día siguiente) y
         <b>Rendimiento</b> (cant. consumida ÷ porciones consumidas). Se muestran los insumos con <b>Alerta por rendimiento</b> activa en Administración de insumos; comparte el rango de fechas y el filtro de insumo de la tabla anterior.
-        Con <b>Filtra alertas</b> solo aparecen los insumos con algún día fuera de su rango configurado (límites inclusivos); un rendimiento vacío nunca es alerta.
+        <b>Filtra alertas</b> (en la barra superior) es un filtro global: cuando está activo, ambas tablas muestran solo los insumos con algún día fuera de su rango configurado (límites inclusivos); un rendimiento vacío nunca es alerta.
       </p>
       ${insumosIndicadores.length===0
         ? `<div class="mx-outer"><table class="mx-table">
