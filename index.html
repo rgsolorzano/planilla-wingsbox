@@ -4416,12 +4416,53 @@ function agruparFilasMarcacion(filasRaw){
 // Aplica los grupos {empleadoId,fecha,entradas,salidas} sobre S.mar respetando
 // "reemplazar" y "conservar manuales", exactamente con la misma lógica que ya
 // usaba importarExcel(). Reutilizado por ambas fuentes (Excel y Sheets).
+/* Clave lógica de una marcación, normalizada para comparar sin que
+   diferencias irrelevantes de formato creen falsos distintos:
+   empleado + fecha + entrada + salida.                                   */
+function marClaveLogica(m){
+  const hora = h => { const s=String(h??'').trim(); return s ? s.slice(0,5) : ''; };  // HH:MM
+  return [String(m.empleadoId??'').trim(), String(m.fecha??'').trim(),
+          hora(m.entradaReal), hora(m.salidaReal)].join('\u0001');
+}
+/* Elimina duplicados EXACTOS del estado conservando un único registro por
+   (empleado, fecha). Prioriza el que tenga algún campo manual, para no
+   perder correcciones del usuario; entre iguales, conserva el primero.
+   Es idempotente: sobre datos limpios no cambia nada.                    */
+function marDeduplicar(){
+  const vistos = new Map();          // empleadoId+fecha -> registro conservado
+  const salida = [];
+  let eliminados = 0;
+  S.mar.forEach(m=>{
+    const k = String(m.empleadoId??'').trim()+'\u0001'+String(m.fecha??'').trim();
+    const prev = vistos.get(k);
+    if(!prev){ vistos.set(k, m); salida.push(m); return; }
+    eliminados++;
+    // Si el duplicado tiene datos manuales y el conservado no, se prefiere aquel.
+    if(marOrigen(m)==='manual' && marOrigen(prev)!=='manual'){
+      salida[salida.indexOf(prev)] = m;
+      vistos.set(k, m);
+    }
+  });
+  if(eliminados){
+    S.mar = salida;
+    console.warn('[Marcaciones] '+eliminados+' duplicado(s) consolidado(s) en memoria (se conservó un registro por empleado y fecha).');
+  }
+  return eliminados;
+}
+
 function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
+  // El estado puede traer duplicados históricos: se consolidan antes de
+  // comparar, para que el upsert por (empleado, fecha) sea fiable.
+  marDeduplicar();
   let manualesConservadas = 0, manualesBorradas = 0;
   if(reemplazar){
+    // Reemplazo REAL: lo que se descarta se marca como eliminado para que la
+    // fusión con el remoto no lo reintroduzca en el siguiente guardado.
+    const descartar = conservarManuales
+      ? S.mar.filter(m=>marOrigen(m)!=='manual')   // solo las de archivo
+      : S.mar.slice();                              // todas
+    if(typeof gsMarcarEliminados==='function') gsMarcarEliminados('Marcaciones', descartar);
     if(conservarManuales){
-      // Se conservan los registros con ALGÚN campo manual; sus campos de
-      // archivo se refrescarán abajo con los datos nuevos.
       manualesConservadas = S.mar.filter(m=>marOrigen(m)==='manual').length;
       S.mar = S.mar.filter(m=>marOrigen(m)==='manual');
     }else{
@@ -4430,10 +4471,14 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
     }
   }
   let nuevas=0, actualizadas=0, manualesProtegidas=0;
+  // Índice por (empleado, fecha) para evitar un find() lineal por cada grupo:
+  // con miles de marcaciones, la búsqueda anidada degradaba el rendimiento.
+  const idx = new Map();
+  S.mar.forEach(m=>{ idx.set(String(m.empleadoId)+'\u0001'+String(m.fecha), m); });
   Object.values(grupos).forEach(g=>{
     const entradaReal = g.entradas.length? g.entradas.sort()[0] : null;       // entrada más temprana
     const salidaReal  = g.salidas.length? g.salidas.sort().slice(-1)[0] : null; // salida más tardía
-    let m = getMarcacion(g.empleadoId, g.fecha);
+    let m = idx.get(String(g.empleadoId)+'\u0001'+String(g.fecha));
     if(m){
       // Precedencia CAMPO POR CAMPO: un campo corregido manualmente no se
       // sobreescribe con el dato externo, pero el otro campo sí se actualiza
@@ -4446,12 +4491,18 @@ function aplicarGruposMarcacion(grupos, {reemplazar, conservarManuales}){
       if(protegido) manualesProtegidas++;
       if(tocado) actualizadas++;
     }
-    else { S.mar.push({id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal,
-      origen:'archivo', origenEntrada:'archivo', origenSalida:'archivo'}); nuevas++; }
+    else {
+      const nueva = {id:uid(), empleadoId:g.empleadoId, fecha:g.fecha, entradaReal, salidaReal,
+        origen:'archivo', origenEntrada:'archivo', origenSalida:'archivo'};
+      S.mar.push(nueva);
+      idx.set(String(g.empleadoId)+'\u0001'+String(g.fecha), nueva);   // evita duplicar en la misma pasada
+      nuevas++;
+    }
   });
   // Corregir marcaciones de cruce de medianoche ANTES de guardar y sincronizar.
   // (idempotente: si no hay cambios, retorna false sin tocar nada)
   normalizarMarcacionesMedianoche();
+  marDeduplicar();   // garantía final: una marcación = un registro
   return { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas };
 }
 
@@ -10349,6 +10400,12 @@ async function gsSaveToSheets(domain='planilla'){
 const GS_SHEET_KEYS = {
   Insumos:['id'], Licores:['id'], BebidasCat:['id'],
   SalonProductos:['id'], MenajeArticulos:['id'], Empleados:['id'],
+  /* Marcaciones: SIN esta entrada la fusión con el remoto caía en ['id'].
+     Como el reemplazo regenera los registros con uid() nuevos, ninguna clave
+     local coincidía con la remota y la fusión "preservaba" TODAS las filas
+     antiguas, duplicando la hoja en cada sincronización. La identidad real de
+     una marcación es el par (empleado, fecha). */
+  Marcaciones:['empleadoId','fecha'],
   Produccion:['insumoId','fecha'],
   ProduccionInsumos:['insumoId','fecha'],
   InvLicores:['bebidaId','fecha'],
@@ -10757,6 +10814,13 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         cantidad:menajeEntero(r.cantidad), rotas:menajeEntero(r.rotas), rajadas:menajeEntero(r.rajadas)
       }));
       if(menajeSanearInventario() > 0) syncMenajeInventario();
+      // Duplicados heredados de sincronizaciones anteriores: se consolidan en
+      // memoria. No se reescribe la hoja aquí; el usuario decide cuándo con
+      // "Guardar en Google Sheets" o limpiarMarcacionesDuplicadas().
+      if(typeof marDeduplicar==='function'){
+        const dup = marDeduplicar();
+        if(dup>0) console.warn('[Marcaciones] La hoja contiene '+dup+' fila(s) duplicada(s). Ejecuta limpiarMarcacionesDuplicadas() para revisarlas.');
+      }
       if(hojasConservadas.length){
         const aviso='Se conservaron los datos locales de: '+hojasConservadas.join(', ')+
           ', porque el Spreadsheet los devolvió vacíos. No se sobrescribió nada.';
@@ -11063,6 +11127,50 @@ function auditarStockSospechoso(fecha){
   return det;
 }
 window.auditarStockSospechoso = auditarStockSospechoso;
+
+/* ── DIAGNÓSTICO de marcaciones duplicadas ────────────────────────────────
+   SOLO LECTURA: cuenta y lista los duplicados por (empleado, fecha) sin
+   modificar nada. Se ejecuta desde la consola: auditarMarcacionesDuplicadas() */
+function auditarMarcacionesDuplicadas(){
+  const grupos = new Map();
+  S.mar.forEach(m=>{
+    const k = String(m.empleadoId??'')+'\u0001'+String(m.fecha??'');
+    if(!grupos.has(k)) grupos.set(k, []);
+    grupos.get(k).push(m);
+  });
+  const dups = [...grupos.entries()].filter(([,v])=>v.length>1);
+  const det = dups.map(([k,v])=>{
+    const [empId, fecha] = k.split('\u0001');
+    const emp = S.emp.find(e=>e.id===empId);
+    return { empleado: emp?emp.nombre:'(desconocido)', fecha, copias: v.length,
+             manuales: v.filter(x=>marOrigen(x)==='manual').length,
+             entrada: v[0].entradaReal||'', salida: v[0].salidaReal||'' };
+  }).sort((a,b)=> b.copias-a.copias);
+  const sobrantes = dups.reduce((s,[,v])=>s+v.length-1, 0);
+  console.log('%c[Marcaciones] '+S.mar.length+' registros | '+dups.length+
+    ' combinación(es) empleado+fecha duplicada(s) | '+sobrantes+' fila(s) sobrante(s).','font-weight:bold');
+  if(det.length) console.table(det.slice(0,100));
+  console.log('Nada fue modificado. Para consolidarlos: limpiarMarcacionesDuplicadas()');
+  return { total:S.mar.length, duplicadas:dups.length, sobrantes, detalle:det };
+}
+/* Consolida los duplicados dejando UN registro por (empleado, fecha),
+   priorizando los que tengan datos manuales. Pide confirmación y persiste. */
+function limpiarMarcacionesDuplicadas(){
+  const info = auditarMarcacionesDuplicadas();
+  if(!info.sobrantes){ console.log('No hay duplicados que limpiar.'); return 0; }
+  if(!confirm('Se consolidarán '+info.sobrantes+' marcación(es) duplicada(s), conservando un registro por empleado y fecha '+
+     '(se prioriza el que tenga datos manuales).\n\nLas marcaciones manuales no se pierden. ¿Continuar?')) return 0;
+  const antes = S.mar.length;
+  const eliminados = marDeduplicar();
+  save(K.mar, S.mar);
+  syncMarcaciones();
+  toast('Duplicados consolidados: '+eliminados+' fila(s) eliminada(s).','success');
+  console.log('[Marcaciones] '+antes+' → '+S.mar.length+' registros.');
+  if(typeof RENDERERS.marcaciones==='function') RENDERERS.marcaciones();
+  return eliminados;
+}
+window.auditarMarcacionesDuplicadas = auditarMarcacionesDuplicadas;
+window.limpiarMarcacionesDuplicadas = limpiarMarcacionesDuplicadas;
 
 function gsHandleError(err, accion){
   if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
