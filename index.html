@@ -818,8 +818,8 @@ function evaluarBonoPuntualidad(emp, year, month){
       if(f >= hoy && !getMarcacion(emp.id, f)?.entradaReal) return;
       // Excluir días de vacaciones/libre registrados en el sistema
       if(esDiaLibre(emp.id, f)) return;
-      // Excluir días de descanso según horario semanal
-      const hor = getHorario(emp.id, diaSemana(f));
+      // Excluir días de descanso según el horario de la CONDICIÓN de esa fecha
+      const hor = getHorarioEnFecha(emp.id, f);
       if(!hor || hor.libre) return;
       // Día laborable pasado: evaluar
       const mar = getMarcacion(emp.id, f);
@@ -864,6 +864,7 @@ function retrasoMensualMinutos(emp, year, month){
 let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
+  migrarCondiciones();   // idempotente: cada empleado tiene al menos una condición
   normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
@@ -914,11 +915,14 @@ function empEsActivo(e){ return !(e && e.activo === false); }
 function empEsVisible(e){ return !(e && e.visible === false); }
 
 // Antigüedad calculada desde fechaIngreso hasta hoy
-function calcAntiguedad(fechaIngreso){
+/* Antigüedad de una condición: desde su ingreso hasta su cese (si lo tiene)
+   o hasta HOY si sigue vigente. La fecha actual es la real del sistema. */
+function calcAntiguedad(fechaIngreso, fechaCese){
   if(!fechaIngreso) return '—';
   const ini = new Date(fechaIngreso+'T12:00:00');
   if(isNaN(ini.getTime())) return '—';
-  const hoy = new Date();
+  const hoy = fechaCese ? new Date(String(fechaCese)+'T12:00:00') : new Date();
+  if(isNaN(hoy.getTime())) return '—';
   if(ini > hoy) return '0 meses 0 días';
   let y = hoy.getFullYear()-ini.getFullYear(),
       m = hoy.getMonth()-ini.getMonth(),
@@ -1212,7 +1216,7 @@ function calcHorasProgramadas(empleadoId, fecha){
   // El FERIADO no altera la jornada programada: se conservan las horas del
   // horario real del empleado. Solo un día libre/vacaciones propio la anula.
   if(esLibrePropio(empleadoId, fecha)) return 0;
-  const h = getHorario(empleadoId, diaSemana(fecha));
+  const h = getHorarioEnFecha(empleadoId, fecha);   // horario de la condición vigente
   if(!h || h.libre || !h.entrada || !h.salida) return 0;
   return round0(diffHoras(h.entrada, h.salida));
 }
@@ -1260,7 +1264,128 @@ function calcHorasExtra(efectivas, programadas){
 }
 
 /* ---------- Accesores auxiliares ---------- */
-function getHorario(empleadoId, dia){ return S.hor.find(h=>h.empleadoId===empleadoId && h.dia===dia); }
+/* ════════════════════════════════════════════════════════════════════════
+   CONDICIONES LABORALES POR EMPLEADO
+   Un empleado (identidad única e inmutable: emp.id) puede tener varias
+   CONDICIONES a lo largo del tiempo. Cada condición agrupa los campos
+   laborales y tiene un rango de vigencia [desde, hasta] con hasta INCLUSIVO
+   y null = vigente indefinidamente.
+   REGLA FUNDAMENTAL: para cualquier fecha analizada se resuelve primero la
+   condición vigente y se usan SUS datos, nunca los de la condición actual.
+   Los campos viven en emp.condiciones[]; los campos sueltos del empleado se
+   conservan intactos como respaldo histórico y compatibilidad.
+   ════════════════════════════════════════════════════════════════════════ */
+const COND_CAMPOS = ['tipo','sueldoQuincenal','sueldoPlanilla','sueldoHora',
+  'afpComision','ajustePlanilla','horasCierre','esLibre'];
+const COND_FECHA_BASE = '2022-01-01';   // ingreso por defecto en la migración
+
+// Migración idempotente: un empleado sin condiciones obtiene una a partir de
+// sus campos actuales, con su fecha de ingreso (o 01/01/2022) y cese null.
+function migrarCondiciones(){
+  let creadas = 0;
+  S.emp.forEach(e=>{
+    if(Array.isArray(e.condiciones) && e.condiciones.length) return;   // ya migrado
+    const c = { id: uid(), desde: (e.fechaIngreso||'').trim() || COND_FECHA_BASE, hasta: null };
+    COND_CAMPOS.forEach(k=>{ c[k] = e[k]; });
+    e.condiciones = [c];
+    creadas++;
+  });
+  if(creadas) console.log('[Condiciones] '+creadas+' empleado(s) migrado(s) a una condición inicial.');
+  return creadas;
+}
+// Condiciones ordenadas por fecha de inicio.
+function condicionesDe(emp){
+  if(!emp) return [];
+  const cs = Array.isArray(emp.condiciones) ? emp.condiciones.slice() : [];
+  return cs.sort((a,b)=> String(a.desde||'').localeCompare(String(b.desde||'')));
+}
+/* Condición vigente en una fecha: desde <= fecha <= hasta (hasta inclusivo);
+   si hasta es null, vigente indefinidamente. null si ninguna aplica. */
+function condicionEnFecha(emp, fecha){
+  if(!emp || !fecha) return null;
+  const f = String(fecha);
+  return condicionesDe(emp).find(c=>{
+    const d = String(c.desde||'');
+    if(!d || f < d) return false;
+    return !c.hasta || f <= String(c.hasta);
+  }) || null;
+}
+// Última condición (la de fecha de inicio más reciente).
+function condicionActual(emp){
+  const cs = condicionesDe(emp);
+  return cs.length ? cs[cs.length-1] : null;
+}
+// ¿El empleado sigue activo hoy? (su última condición no tiene cese)
+function empleadoVigente(emp){
+  const c = condicionActual(emp);
+  return !!c && !c.hasta;
+}
+/* Empleado "efectivo" en una fecha: mismo objeto con los campos laborales
+   sustituidos por los de la condición vigente. Es el punto ÚNICO por el que
+   todos los cálculos deben pasar. Si no hay condición aplicable devuelve
+   null: la fecha queda fuera de cualquier condición y no debe calcularse. */
+function empEnFecha(emp, fecha){
+  if(!emp) return null;
+  const c = condicionEnFecha(emp, fecha);
+  if(!c) return null;
+  const eff = Object.assign({}, emp);
+  COND_CAMPOS.forEach(k=>{ eff[k] = c[k]; });
+  eff.fechaIngreso = c.desde;
+  eff.fechaCese    = c.hasta || null;
+  eff.condicionId  = c.id;
+  return eff;
+}
+/* Valida un rango contra las demás condiciones del empleado.
+   Devuelve null si es válido, o el mensaje de error. */
+function validarCondicion(emp, cond){
+  const desde = String(cond.desde||'').trim();
+  const hasta = cond.hasta ? String(cond.hasta).trim() : null;
+  if(!desde) return 'La fecha de ingreso es obligatoria.';
+  if(hasta && hasta < desde) return 'La fecha de cese no puede ser anterior a la de ingreso.';
+  const otras = condicionesDe(emp).filter(c=>c.id !== cond.id);
+  // Dos condiciones se solapan si cada una empieza antes de que acabe la otra.
+  const choca = otras.find(c=>{
+    const d2 = String(c.desde||''), h2 = c.hasta ? String(c.hasta) : null;
+    const finA = hasta || '9999-12-31', finB = h2 || '9999-12-31';
+    return desde <= finB && d2 <= finA;
+  });
+  if(choca){
+    return 'El rango se superpone con otra condición ('+fmtFecha(choca.desde)+
+           ' → '+(choca.hasta?fmtFecha(choca.hasta):'actualidad')+'). '+
+           'Una condición debe terminar antes de que empiece la siguiente.';
+  }
+  return null;
+}
+// Etiqueta legible del rango de una condición.
+function condEtiqueta(c){
+  if(!c) return '—';
+  return fmtFecha(c.desde)+' → '+(c.hasta ? fmtFecha(c.hasta) : 'Actualidad');
+}
+
+/* Horario POR CONDICIÓN: los registros llevan condicionId. Los horarios
+   antiguos (sin condicionId) se consideran de la primera condición, de modo
+   que nada se pierde en la migración. */
+function getHorario(empleadoId, dia, condicionId){
+  const props = S.hor.filter(h=>h.empleadoId===empleadoId && h.dia===dia);
+  if(!props.length) return undefined;
+  if(condicionId){
+    const propio = props.find(h=>h.condicionId===condicionId);
+    if(propio) return propio;
+    // Compatibilidad: horario sin condición asignada (dato heredado).
+    const heredado = props.find(h=>!h.condicionId);
+    const emp = S.emp.find(e=>e.id===empleadoId);
+    const primera = emp ? condicionesDe(emp)[0] : null;
+    if(heredado && primera && primera.id===condicionId) return heredado;
+    return heredado && props.length===1 ? heredado : undefined;
+  }
+  return props.find(h=>!h.condicionId) || props[0];
+}
+// Horario aplicable a una FECHA concreta (resuelve la condición primero).
+function getHorarioEnFecha(empleadoId, fecha){
+  const emp = S.emp.find(e=>e.id===empleadoId);
+  const c = emp ? condicionEnFecha(emp, fecha) : null;
+  return getHorario(empleadoId, diaSemana(fecha), c ? c.id : null);
+}
 function getMarcacion(empleadoId, fecha){ return S.mar.find(m=>m.empleadoId===empleadoId && m.fecha===fecha); }
 // ── Precedencia de marcaciones: MANUAL gana sobre EXTERNA, campo por campo ──
 // El origen se rastrea de forma independiente para entrada y salida
@@ -1401,7 +1526,27 @@ function normalizarMarcacionesMedianoche(){
 }
 
 /* Calcula la fila diaria completa de un empleado para una fecha */
-function calcDia(emp, fecha){
+/* calcDia — PUNTO ÚNICO de resolución de condición.
+   Todo el cálculo diario (sueldos, horario, descuentos, feriado, extras)
+   pasa por aquí, de modo que sustituir el empleado por su versión efectiva
+   en la fecha propaga las condiciones históricas a TODOS los conceptos sin
+   duplicar lógica en cada módulo.
+   Si la fecha queda fuera de toda condición, el día se marca como
+   'sinCondicion' y se EXCLUYE del cálculo (no se inventan sueldos). */
+function calcDia(empOriginal, fecha){
+  const emp = empEnFecha(empOriginal, fecha) || null;
+  if(!emp){
+    const mar = getMarcacion(empOriginal.id, fecha);
+    return { fecha, sinCondicion:true,
+      entradaReal: mar?mar.entradaReal:null, salidaReal: mar?mar.salidaReal:null,
+      horasEf:0, horasProg:0, horasExtra:0, feriado:false, pagoFeriado:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
+      horasDescAuto:0, descAuto:0, descFalta:0, descManual:0, pagoManual:0,
+      pagoExtraHoras:0, totalDia:0, libre:false, tipoLibre:null, esPendiente:false };
+  }
+  return calcDiaCondicion(emp, fecha);
+}
+function calcDiaCondicion(emp, fecha){
   const hoy = fechaHoy(); // fecha local (sin sesgo UTC)
 
   // ── Empleado Libre (cobra por horas) ─────────────────────────────────────
@@ -1455,7 +1600,8 @@ function calcDia(emp, fecha){
     const libre       = esDiaLibre(emp.id, fecha);
     const tipoLibre   = tipoDiaLibre(emp.id, fecha);
     const feriado     = esFeriado(fecha), pagoFeriado = 0;
-    const hor         = getHorario(emp.id, diaSemana(fecha));
+    // Horario de la CONDICIÓN vigente en esa fecha (no el horario actual).
+  const hor         = getHorario(emp.id, diaSemana(fecha), emp.condicionId);
     const horasProg   = calcHorasProgramadas(emp.id, fecha);
     const debeTrabajar= !libre && hor && !hor.libre && hor.entrada && hor.salida;
     const exo         = getExoneracionTardanza(emp.id, fecha);
@@ -1481,7 +1627,7 @@ function calcDia(emp, fecha){
   let salidaReal    = mar? mar.salidaReal  : null;
   const libre = esDiaLibre(emp.id, fecha);
   const tipoLibre = tipoDiaLibre(emp.id, fecha);
-  const hor = getHorario(emp.id, diaSemana(fecha));
+  const hor = getHorarioEnFecha(emp.id, fecha);   // horario de la condición vigente
 
   const horasProg = calcHorasProgramadas(emp.id, fecha);
 
@@ -1561,8 +1707,93 @@ function calcDia(emp, fecha){
 }
 
 /* Resumen quincenal de un empleado (suma de días + sueldo base) */
+/* ── Segmentos de una quincena por CONDICIÓN ───────────────────────────────
+   Devuelve un tramo por cada condición que estuvo vigente dentro de la
+   quincena, con sus fechas. Si el empleado tuvo una sola condición (caso
+   habitual) devuelve un único segmento y el cálculo es idéntico al anterior. */
+function segmentosQuincena(emp, year, month, q){
+  const fechas = rangoQuincena(year, month, q);
+  const segs = [];
+  fechas.forEach(f=>{
+    const c = condicionEnFecha(emp, f);
+    const cid = c ? c.id : null;
+    const ult = segs[segs.length-1];
+    if(ult && ult.condicionId===cid) ult.fechas.push(f);
+    else segs.push({ condicionId:cid, cond:c, fechas:[f] });
+  });
+  return segs;
+}
+/* Cálculo quincenal CONSCIENTE DE CONDICIONES.
+   · Una sola condición (o ninguna) → comportamiento exactamente anterior.
+   · Varias condiciones → se calcula cada tramo con SUS datos y se suman los
+     resultados, sin mezclar sueldos, AFP, ajustes ni horarios entre tramos.
+   Los tramos sin condición aplicable se excluyen del cálculo (sus días
+   quedan marcados como sinCondicion y se reportan aparte). */
 function calcQuincenaEmpleado(emp, year, month, q){
-  const dias = rangoQuincena(year, month, q).map(f=>{
+  const segs = segmentosQuincena(emp, year, month, q).filter(s=>s.condicionId);
+  if(segs.length > 1){
+    return calcQuincenaMultiCondicion(emp, year, month, q, segs);
+  }
+  return calcQuincenaBase(emp, year, month, q);
+}
+/* Suma los resultados de cada tramo conservando una única identidad de
+   empleado. El sueldo base de cada condición se prorratea por los días de
+   la quincena que le corresponden, para no pagar dos sueldos completos. */
+function calcQuincenaMultiCondicion(emp, year, month, q, segs){
+  const totalDiasQ = rangoQuincena(year, month, q).length;
+  const parciales = segs.map(s=>{
+    const r = calcQuincenaBase(emp, year, month, q, s.fechas, s.cond);
+    return Object.assign(r, { condicionId:s.condicionId, cond:s.cond,
+      desde:s.fechas[0], hasta:s.fechas[s.fechas.length-1],
+      proporcion: s.fechas.length/totalDiasQ });
+  });
+  const suma = (f)=> parciales.reduce((a,r)=>a+(Number(f(r))||0), 0);
+  const tot = parciales.reduce((a,r)=>({
+    horasEf:a.horasEf+r.tot.horasEf, horasProg:a.horasProg+r.tot.horasProg,
+    horasExtra:a.horasExtra+r.tot.horasExtra, descAuto:a.descAuto+r.tot.descAuto,
+    descManual:a.descManual+r.tot.descManual, pagoManual:a.pagoManual+r.tot.pagoManual,
+    pagoExtraHoras:a.pagoExtraHoras+r.tot.pagoExtraHoras, pagoFeriado:a.pagoFeriado+(r.tot.pagoFeriado||0)
+  }), {horasEf:0,horasProg:0,horasExtra:0,descAuto:0,descManual:0,pagoManual:0,pagoExtraHoras:0,pagoFeriado:0});
+  return {
+    dias: parciales.flatMap(r=>r.dias),
+    tot, base: suma(r=>r.base), totalPagar: suma(r=>r.totalPagar),
+    esLibre: parciales.every(r=>r.esLibre),
+    bonoPuntualidad: suma(r=>r.bonoPuntualidad),
+    payments:  parciales.flatMap(r=>r.payments||[]),
+    discounts: parciales.flatMap(r=>r.discounts||[]),
+    totalPagos: suma(r=>r.totalPagos), totalDescuentos: suma(r=>r.totalDescuentos),
+    multiCondicion: true, parciales   // cada boleta puede emitirse por tramo
+  };
+}
+/* ── QUINCENA INCOMPLETA PARA UNA CONDICIÓN ───────────────────────────────
+   Una condición NO cubre la quincena completa cuando:
+     · su INGRESO cae dentro de la quincena y no es día 1 ni 16 (punto 12), o
+     · su CESE cae dentro de la quincena (punto 13).
+   En ambos casos no corresponde el sueldo quincenal (ni siquiera prorrateado):
+   se paga por HORAS EFECTIVAMENTE TRABAJADAS × SUELDO/HORA, igual que un
+   empleado libre. Aplica también al histórico por decisión del usuario.
+   No aplica a empleados libres, que ya cobran por horas siempre.          */
+function condQuincenaIncompleta(cond, fechasQuincena){
+  if(!cond || !fechasQuincena || !fechasQuincena.length) return null;
+  const ini = fechasQuincena[0], fin = fechasQuincena[fechasQuincena.length-1];
+  const desde = String(cond.desde||''), hasta = cond.hasta ? String(cond.hasta) : null;
+  // Ingreso dentro de la quincena que no coincide con el inicio del período
+  if(desde > ini && desde <= fin){
+    const dia = Number(desde.slice(8,10));
+    if(dia !== 1 && dia !== 16) return 'ingreso';
+    // Un ingreso el 1 o el 16 que además es el inicio del período es completo;
+    // si cae en medio (p. ej. ingreso el 16 dentro de la quincena 1-15) también
+    // es parcial y se paga por horas.
+    if(desde !== ini) return 'ingreso';
+  }
+  // Cese dentro de la quincena: el período no llegó a completarse
+  if(hasta && hasta >= ini && hasta < fin) return 'cese';
+  return null;
+}
+
+function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
+  // Con un tramo se usan solo sus fechas; sin él, la quincena completa.
+  const dias = (fechasSeg && fechasSeg.length ? fechasSeg : rangoQuincena(year, month, q)).map(f=>{
     const d = calcDia(emp, f);
     d.considerarHoraExtra = getConsiderarHoraExtra(emp.id, f);
     if(!d.considerarHoraExtra && d.pagoExtraHoras > 0){
@@ -1650,7 +1881,34 @@ function calcQuincenaEmpleado(emp, year, month, q){
              payments:liq.payments, discounts:liq.discounts, totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos };
   }
 
-  const base = Number(emp.sueldoQuincenal)||0;
+  // Datos salariales de la CONDICIÓN del tramo (o de la vigente en la quincena).
+  const empQ = condSeg ? Object.assign({}, emp, (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=condSeg[k]); return o; })())
+                       : (empEnFecha(emp, (fechasSeg&&fechasSeg[0]) || rangoQuincena(year,month,q)[0]) || emp);
+  const fechasQ    = rangoQuincena(year, month, q);
+  const totalDiasQ = fechasQ.length;
+  const diasTramo  = (fechasSeg && fechasSeg.length) ? fechasSeg.length : totalDiasQ;
+
+  /* Quincena INCOMPLETA para esta condición (ingreso fuera de 1/16 o cese
+     dentro del período): se paga por horas efectivamente trabajadas, no con
+     el sueldo quincenal. Reutiliza el mismo mecanismo del empleado libre. */
+  const condRef = condSeg || condicionEnFecha(emp, (fechasSeg&&fechasSeg[0]) || fechasQ[0]);
+  const motivoParcial = condQuincenaIncompleta(condRef, fechasQ);
+  if(motivoParcial){
+    const shP = Number(empQ.sueldoHora)||0;
+    const sinSH = !(shP > 0);
+    dias.forEach(d=>{ d.pagoLibre = sinSH ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, shP); });
+    const liqP = construirLiquidacion({base:0, bonoPuntualidad:0, esLibre:true});
+    console.log('[Planilla] '+emp.nombre+' '+month+'/'+year+' Q'+q+
+      ': quincena incompleta por '+motivoParcial+' → pago por horas ('+tot.horasEf+'h × '+shP+').');
+    return { dias, tot, base:0, totalPagar:liqP.totalPagar, esLibre:false,
+             pagoPorHoras:true, motivoParcial, sueldoHora:shP, libreSinSueldoHora:sinSH,
+             payments:liqP.payments, discounts:liqP.discounts,
+             totalPagos:liqP.totalPagos, totalDescuentos:liqP.totalDescuentos };
+  }
+
+  // Prorrateo: si el tramo no cubre toda la quincena por un CAMBIO de condición
+  // (no por ingreso/cese), el sueldo se reparte según los días que le tocan.
+  const base = (Number(empQ.sueldoQuincenal)||0) * (diasTramo/totalDiasQ);
   // Bono por puntualidad: solo 2ª quincena, evaluación completa (tardanza + asistencia).
   const evBono = evaluarBonoPuntualidad(emp, year, month);
   const bonoPuntualidad = q===2 ? evBono.bono : 0;
@@ -1714,6 +1972,9 @@ function cuadHLabel(h){
 RENDERERS.cuadrante = function(){
   const el = document.getElementById('page-cuadrante');
   if(!el) return;
+  // Solo personal ACTIVO HOY: su última condición no tiene fecha de cese.
+  // No se ocultan en otros módulos; es un filtro de esta vista.
+  const empCuadrante = S.emp.filter(empleadoVigente);
   if(!S.emp.length){
     el.innerHTML=`<div class="page-head"><div><h1>📅 Cuadrante Semanal</h1></div></div>`+noEmpWarning();
     return;
@@ -4059,16 +4320,18 @@ RENDERERS.empleados = function(){
   const el = document.getElementById('page-empleados');
 
   // ── Computed values per employee ────────────────────────────────
-  const empCalc = e => {
-    const afp         = Number(e.afpComision)||0;
-    const ajuste      = Number(e.ajustePlanilla)||0;
-    const hCierre     = Number(e.horasCierre)||0;
-    const sueldoTot   = (e.sueldoQuincenal||0)*2 + afp;
+  // Los importes provienen de la CONDICIÓN de la fila, no de los campos sueltos.
+  const empCalc = (e, cond) => {
+    const c           = cond || condicionActual(e) || e;
+    const afp         = Number(c.afpComision)||0;
+    const ajuste      = Number(c.ajustePlanilla)||0;
+    const hCierre     = Number(c.horasCierre)||0;
+    const sueldoTot   = (c.sueldoQuincenal||0)*2 + afp;
     const horasSem    = empHorasSemanales(e.id);
     const horasTot    = horasSem + hCierre;
     const sHoraCalc   = horasTot>0 ? (sueldoTot - ajuste)/(horasTot*4) : 0;
-    const antig       = calcAntiguedad(e.fechaIngreso);
-    return { afp, ajuste, hCierre, sueldoTot, horasSem, horasTot, sHoraCalc, antig };
+    const antig       = calcAntiguedad(c.desde||e.fechaIngreso, c.hasta||null);
+    return { afp, ajuste, hCierre, sueldoTot, horasSem, horasTot, sHoraCalc, antig, cond:c };
   };
 
   el.innerHTML = `
@@ -4086,11 +4349,13 @@ RENDERERS.empleados = function(){
         <div class="field"><label>Ajuste por planilla</label><input id="empAjuste" type="number" min="0" step="0.01" placeholder="0.00"></div>
         <div class="field"><label>Horas cierre</label><input id="empHorasCierre" type="number" min="0" step="0.5" placeholder="0"></div>
         <div class="field"><label>Fecha de ingreso</label><input id="empFechaIngreso" type="date" placeholder="yyyy-mm-dd"></div>
+        <div class="field"><label>Fecha de cese</label><input id="empFechaCese" type="date" placeholder="yyyy-mm-dd" title="Vacío = condición vigente indefinidamente"></div>
         <div class="field"><label>Modalidad</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empEsLibre"> Empleado libre (cobra por horas)</label></div>
         <div class="field"><label>Estado</label><label class="pill" style="margin-top:2px"><input type="checkbox" id="empActivo" checked> Activo</label></div>
       </div>
       <p class="hint" style="margin-top:0">Un <b>empleado libre</b> no cobra sueldo quincenal: su pago es las horas trabajadas de cada día × sueldo por hora. Requiere sueldo por hora.</p>
       <div class="actions">
+        <div id="empCondZona" style="display:contents"></div>
         <button class="btn btn-primary" id="empSave">Guardar</button>
         <button class="btn btn-ghost" id="empClear">Limpiar</button>
       </div>
@@ -4110,29 +4375,36 @@ RENDERERS.empleados = function(){
             <th>Acciones</th>
           </tr></thead>
           <tbody>
-            ${S.emp.length ? S.emp.map(e=>{
-              const c=empCalc(e);
+            ${S.emp.length ? S.emp.flatMap(e=>{
+              // Una fila POR CONDICIÓN. Sigue siendo la misma persona: el id
+              // del empleado no cambia y las acciones operan sobre él.
+              const conds = condicionesDe(e);
+              return (conds.length?conds:[null]).map((cond, idxC)=>{
+              const c=empCalc(e, cond);
               const inact=!empEsActivo(e);
               const vis=empEsVisible(e);
+              const vigente = cond && !cond.hasta;
               const sueldoTotDisplay = `S/ ${Math.round(c.sueldoTot).toLocaleString('es-PE')}`;
-              return `<tr style="${!vis?'opacity:.55':''}">
+              return `<tr style="${!vis?'opacity:.55':''}${!vigente&&cond?';background:#fafafa':''}">
                 <td style="${inact?'color:var(--c-muted)':''}">${e.nombre}
-                  ${empEsLibre(e)?'<span class="badge b-late" style="font-size:10px">Libre</span>':''}
+                  ${cond&&conds.length>1?`<span class="badge" style="font-size:9px;background:#ede9fe;color:#5b21b6">Cond. ${idxC+1}</span>`:''}
+                  ${vigente&&conds.length>1?'<span class="badge b-free" style="font-size:9px">Vigente</span>':''}
+                  ${(cond?cond.esLibre:empEsLibre(e))?'<span class="badge b-late" style="font-size:10px">Libre</span>':''}
                   ${inact?'<span class="badge b-miss" style="font-size:10px">Inactivo</span>':''}
                   ${!vis?'<span class="badge" style="font-size:10px;background:#f1f5f9;color:#64748b">Oculto</span>':''}
                 </td>
-                <td><span class="badge ${esCocina(e)?'b-vac':empTipo(e)==='Caja'?'':'b-extra'}">${empTipo(e)}</span></td>
-                <td class="num">${money(e.sueldoQuincenal)}</td>
-                <td class="num">${money(e.sueldoPlanilla)}</td>
+                <td><span class="badge ${(c.cond.tipo||empTipo(e))==='Cocina'?'b-vac':(c.cond.tipo||empTipo(e))==='Caja'?'':'b-extra'}">${c.cond.tipo||empTipo(e)}</span></td>
+                <td class="num">${money(c.cond.sueldoQuincenal)}</td>
+                <td class="num">${money(c.cond.sueldoPlanilla)}</td>
                 <td class="num">${money(c.afp)}</td>
                 <td class="num">${c.ajuste?money(c.ajuste):'—'}</td>
                 <td class="num"><b>${sueldoTotDisplay}</b></td>
                 <td class="num">${c.hCierre||'—'}</td>
                 <td class="num">${c.horasSem}</td>
                 <td class="num"><b>${c.horasTot}</b></td>
-                <td class="num">${money(e.sueldoHora)}</td>
+                <td class="num">${money(c.cond.sueldoHora)}</td>
                 <td class="num">${money(c.sHoraCalc)}</td>
-                <td style="font-size:11px;white-space:nowrap">${e.fechaIngreso?fmtFecha(e.fechaIngreso):'—'}</td>
+                <td style="font-size:11px;white-space:nowrap">${cond?condEtiqueta(cond):(e.fechaIngreso?fmtFecha(e.fechaIngreso):'—')}</td>
                 <td style="font-size:11px;white-space:nowrap;color:var(--c-muted)">${c.antig}</td>
                 <td style="text-align:center">
                   <label style="cursor:pointer" title="${vis?'Click para ocultar':'Click para mostrar'}">
@@ -4144,7 +4416,7 @@ RENDERERS.empleados = function(){
                   <button class="btn-icon${inact?'':' b-warn'}" onclick="empToggleActivo('${e.id}')" title="${inact?'Reactivar':'Inactivar'}">${inact?'✅ Reactivar':'🔕 Inactivar'}</button>
                   <button class="btn-icon del" onclick="empDel('${e.id}')">🗑️ Eliminar</button>
                 </td>
-              </tr>`;}).join('')
+              </tr>`;});}).join('')
             : `<tr><td colspan="16" class="empty">No hay empleados. Crea el primero arriba.</td></tr>`}
           </tbody>
         </table>
@@ -4152,6 +4424,36 @@ RENDERERS.empleados = function(){
     </div>`;
 
   document.getElementById('empSave').onclick = empSave;
+  // ── Gestión de CONDICIONES del empleado en edición ──
+  const zonaCond = document.getElementById('empCondZona');
+  if(zonaCond && editEmpId){
+    const e = S.emp.find(x=>x.id===editEmpId);
+    migrarCondiciones();
+    const conds = condicionesDe(e);
+    if(!editCondId) editCondId = (condicionActual(e)||{}).id || null;
+    zonaCond.innerHTML = `
+      <div class="field"><label>Condición a editar</label>
+        <select id="empCondSel" style="min-width:240px">
+          ${conds.map(c=>`<option value="${c.id}" ${editCondId===c.id?'selected':''}>${condEtiqueta(c)}${!c.hasta?' · vigente':''}</option>`).join('')}
+          <option value="__nueva__" ${editCondId==='__nueva__'?'selected':''}>➕ Nueva condición…</option>
+        </select></div>`;
+    const sel = document.getElementById('empCondSel');
+    sel.onchange = ()=>{ editCondId = sel.value; RENDERERS.empleados(); window.scrollTo({top:0,behavior:'smooth'}); };
+    const c = editCondId==='__nueva__' ? null : conds.find(x=>x.id===editCondId);
+    const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=(v===null||v===undefined)?'':v; };
+    if(c){
+      set('empSueldoQ',c.sueldoQuincenal); set('empSueldoP',c.sueldoPlanilla); set('empSueldoH',c.sueldoHora);
+      set('empAFP',c.afpComision); set('empAjuste',c.ajustePlanilla); set('empHorasCierre',c.horasCierre);
+      set('empFechaIngreso',c.desde); set('empFechaCese',c.hasta||'');
+      const t=document.getElementById('empTipo'); if(t&&c.tipo) t.value=c.tipo;
+      const l=document.getElementById('empEsLibre'); if(l) l.checked=!!c.esLibre;
+    } else {
+      // Nueva condición: se sugiere el día siguiente al último cese.
+      const ult = conds[conds.length-1];
+      set('empFechaIngreso', ult && ult.hasta ? fechaMasDias(ult.hasta,1) : fechaHoy());
+      set('empFechaCese','');
+    }
+  }
   document.getElementById('empClear').onclick = empClearForm;
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
@@ -4180,6 +4482,7 @@ function empSave(){
   const ajustePlanilla=parseFloat(document.getElementById('empAjuste').value)||0;
   const horasCierre=parseFloat(document.getElementById('empHorasCierre').value)||0;
   const fechaIngreso=document.getElementById('empFechaIngreso').value||'';
+  const fechaCese=(document.getElementById('empFechaCese')||{}).value||'';
   // validación de campos obligatorios
   let ok=true;
   [['empNombre',nombre],['empDoc',doc]].forEach(([id,v])=>{ const f=document.getElementById(id); f.classList.toggle('invalid',!v); if(!v)ok=false; });
@@ -4188,14 +4491,34 @@ function empSave(){
   // Para empleados libres, el sueldo por hora es obligatorio y debe ser > 0
   if(esLibre && !(sh>0)){ document.getElementById('empSueldoH').classList.add('invalid'); toast('Un empleado libre requiere un sueldo por hora mayor a 0','error'); return; }
 
+  // Datos laborales que forman la CONDICIÓN
+  const datosCond = {tipo,esLibre,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,
+                     afpComision,ajustePlanilla,horasCierre};
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
-    Object.assign(e,{nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,afpComision,ajustePlanilla,horasCierre,fechaIngreso});
-    save(K.emp,S.emp); editEmpId=null; toast('Empleado actualizado','success');
+    migrarCondiciones();
+    // Condición a modificar: la seleccionada, o una NUEVA si se pidió agregar.
+    let cond = editCondId==='__nueva__'
+      ? {id:uid(), desde:fechaIngreso||fechaHoy(), hasta:fechaCese||null}
+      : (condicionesDe(e).find(c=>c.id===editCondId) || condicionActual(e));
+    const propuesta = Object.assign({}, cond, datosCond,
+      {desde: fechaIngreso || cond.desde, hasta: fechaCese || null});
+    const err = validarCondicion(e, propuesta);
+    if(err){ toast(err,'error'); return; }   // rangos superpuestos o inválidos
+    if(editCondId==='__nueva__'){ e.condiciones.push(propuesta); }
+    else { Object.assign(cond, propuesta); }
+    // Los campos sueltos reflejan la condición VIGENTE (compatibilidad).
+    const act = condicionActual(e) || propuesta;
+    Object.assign(e,{nombre,documento:doc,activo,fechaIngreso:act.desde},
+      (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=act[k]); return o; })());
+    save(K.emp,S.emp); editEmpId=null; editCondId=null;
+    toast(editCondId==='__nueva__'?'Condición agregada':'Empleado actualizado','success');
     syncEmpleados();
   }else{
     const id=uid();
-    S.emp.push({id,nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,afpComision,ajustePlanilla,horasCierre,fechaIngreso,visible:true});
+    const cond = Object.assign({id:uid(), desde: fechaIngreso || COND_FECHA_BASE, hasta: fechaCese||null}, datosCond);
+    S.emp.push({id,nombre,documento:doc,tipo,esLibre,activo,sueldoQuincenal:sq,sueldoPlanilla:sp,sueldoHora:sh,afpComision,ajustePlanilla,horasCierre,fechaIngreso,visible:true,
+      condiciones:[cond]});
     save(K.emp,S.emp);
     crearHorarioDefault(id); // genera las 7 filas de horario
     toast('Empleado creado','success');
@@ -4203,7 +4526,7 @@ function empSave(){
   }
   RENDERERS.empleados();
 }
-window.empEdit = function(id){ editEmpId=id; RENDERERS.empleados(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.empEdit = function(id){ editEmpId=id; editCondId=null; RENDERERS.empleados(); window.scrollTo({top:0,behavior:'smooth'}); };
 // Alterna el estado activo/inactivo del empleado sin borrar ningún dato histórico.
 window.empToggleActivo = function(id){
   const e = S.emp.find(x=>x.id===id); if(!e) return;
@@ -4268,14 +4591,23 @@ function noEmpWarning(){
 /* ================================================================
    MÓDULO 2: HORARIOS POR EMPLEADO
    ================================================================ */
+let editCondId = null;   // condición que se está editando ('__nueva__' para crear)
 let horEmpSel = null;
+let horCondSel = null;   // condición cuyo horario se está editando
 RENDERERS.horarios = function(){
   const el = document.getElementById('page-horarios');
   if(!S.emp.length){ el.innerHTML = `<div class="page-head"><div><h1>🕒 Horarios</h1></div></div>`+noEmpWarning(); return; }
   if(!horEmpSel || !S.emp.find(e=>e.id===horEmpSel)) horEmpSel = S.emp[0].id;
+  // Cada CONDICIÓN tiene su propio horario. Por defecto se edita la vigente.
+  const empSel = S.emp.find(e=>e.id===horEmpSel);
+  const condsEmp = condicionesDe(empSel);
+  if(!horCondSel || !condsEmp.some(c=>c.id===horCondSel)){
+    const act = condicionActual(empSel);
+    horCondSel = act ? act.id : (condsEmp[0] ? condsEmp[0].id : null);
+  }
 
   const rows = DIAS.map((nombre,d)=>{
-    const h = getHorario(horEmpSel,d) || {dia:d,libre:true,entrada:'',salida:''};
+    const h = getHorario(horEmpSel,d,horCondSel) || {dia:d,libre:true,entrada:'',salida:''};
     const horas = (!h.libre && h.entrada && h.salida) ? round0(diffHoras(h.entrada,h.salida)) : 0;
     return `
       <tr class="${h.libre?'row-free':''}">
@@ -4292,6 +4624,10 @@ RENDERERS.horarios = function(){
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Empleado</label><select id="horEmp" onchange="horSelEmp(this.value)">${empOptions(horEmpSel)}</select></div>
+        ${condsEmp.length>1 ? `<div class="field"><label>Condición (rango de vigencia)</label>
+          <select id="horCond" onchange="horSelCond(this.value)" style="min-width:230px">
+            ${condsEmp.map(c=>`<option value="${c.id}" ${horCondSel===c.id?'selected':''}>${condEtiqueta(c)}</option>`).join('')}
+          </select></div>` : ''}
         <button class="btn btn-green" id="horSave">💾 Guardar cambios</button>
       </div>
       <div class="table-wrap">
@@ -4300,21 +4636,25 @@ RENDERERS.horarios = function(){
           <tbody>${rows}</tbody>
         </table>
       </div>
-      <p class="hint">Las horas a trabajar se calculan automáticamente como la diferencia entre entrada y salida (redondeada a horas completas). Los cambios se aplican al pulsar <b>Guardar cambios</b>.</p>
+      <p class="hint">Las horas a trabajar se calculan automáticamente como la diferencia entre entrada y salida (redondeada a horas completas). Los cambios se aplican al pulsar <b>Guardar cambios</b>.
+      ${condsEmp.length>1?`<br>Estás editando el horario de la condición <b>${condEtiqueta(condsEmp.find(c=>c.id===horCondSel))}</b>; no afecta a las demás condiciones del empleado.`:''}</p>
     </div>`;
   document.getElementById('horSave').onclick = horGuardar;
 };
 // Los cambios se mantienen en memoria y solo se persisten con el botón Guardar.
-window.horSelEmp = function(id){ horGuardar(true); horEmpSel=id; RENDERERS.horarios(); };
+window.horSelEmp = function(id){ horGuardar(true); horEmpSel=id; horCondSel=null; RENDERERS.horarios(); };
+window.horSelCond = function(id){ horGuardar(true); horCondSel=id; RENDERERS.horarios(); };
 window.horSetLibre = function(dia, libre){
-  let h = getHorario(horEmpSel,dia);
-  if(!h){ h={empleadoId:horEmpSel,dia,entrada:'',salida:''}; S.hor.push(h); }
+  let h = getHorario(horEmpSel,dia,horCondSel);
+  if(!h){ h={empleadoId:horEmpSel,dia,entrada:'',salida:'',condicionId:horCondSel}; S.hor.push(h); }
+  if(h.condicionId===undefined || h.condicionId===null) h.condicionId = horCondSel;
   h.libre=libre; if(libre){ h.entrada=''; h.salida=''; }
   RENDERERS.horarios(); // re-render para habilitar/deshabilitar inputs (sin persistir aún)
 };
 window.horSet = function(dia, campo, val){
-  let h = getHorario(horEmpSel,dia);
-  if(!h){ h={empleadoId:horEmpSel,dia,libre:false,entrada:'',salida:''}; S.hor.push(h); }
+  let h = getHorario(horEmpSel,dia,horCondSel);
+  if(!h){ h={empleadoId:horEmpSel,dia,libre:false,entrada:'',salida:'',condicionId:horCondSel}; S.hor.push(h); }
+  if(h.condicionId===undefined || h.condicionId===null) h.condicionId = horCondSel;
   h[campo]=val; // solo memoria; se persiste con Guardar
 };
 function horGuardar(silent){
@@ -6218,10 +6558,14 @@ function adminImport(){
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
         activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
         sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0,
-        afpComision:Number(r.afpComision)||0, ajustePlanilla:Number(r.ajustePlanilla)||0, horasCierre:Number(r.horasCierre)||0, fechaIngreso:String(r.fechaIngreso||'').trim(), visible:!(r.visible===0||r.visible==='0'||r.visible===false) }));
+        afpComision:Number(r.afpComision)||0, ajustePlanilla:Number(r.ajustePlanilla)||0, horasCierre:Number(r.horasCierre)||0, fechaIngreso:String(r.fechaIngreso||'').trim(), visible:!(r.visible===0||r.visible==='0'||r.visible===false),
+        // Condiciones desde la fuente; si faltan, migrarCondiciones() las genera
+        // a partir de los campos sueltos sin perder información.
+        condiciones: (()=>{ try{ const a=JSON.parse(r.condiciones||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } })() }));
       S.hor = (hor||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
-        entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
+        entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'',
+        condicionId:r.condicionId?String(r.condicionId):null }));
       S.desc = (desc||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (pago||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.libre = (libre||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
@@ -10233,10 +10577,13 @@ function gsMatrixToObjects(values){
 
 function gsSerializeAll(){
   return {
-    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora','afpComision','ajustePlanilla','horasCierre','fechaIngreso','visible'],
-      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, ajustePlanilla:e.ajustePlanilla||0, horasCierre:e.horasCierre||0, fechaIngreso:e.fechaIngreso||'', visible:empEsVisible(e)?1:0 }))),
-    Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida'],
-      S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'' }))),
+    Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora','afpComision','ajustePlanilla','horasCierre','fechaIngreso','visible','condiciones'],
+      S.emp.map(e=>({ id:e.id, nombre:e.nombre, documento:e.documento, tipo:empTipo(e), esLibre:empEsLibre(e)?1:0, activo:empEsActivo(e)?1:0, sueldoQuincenal:e.sueldoQuincenal, sueldoPlanilla:e.sueldoPlanilla, sueldoHora:e.sueldoHora, afpComision:e.afpComision||0, ajustePlanilla:e.ajustePlanilla||0, horasCierre:e.horasCierre||0, fechaIngreso:e.fechaIngreso||'', visible:empEsVisible(e)?1:0,
+        // Condiciones serializadas como JSON: una sola fuente de verdad.
+        condiciones: JSON.stringify(condicionesDe(e)) }))),
+    Horarios: gsRowsToMatrix(['empleadoId','dia','libre','entrada','salida','condicionId'],
+      S.hor.map(h=>({ empleadoId:h.empleadoId, dia:h.dia, libre:h.libre?1:0, entrada:h.entrada||'', salida:h.salida||'',
+        condicionId:h.condicionId||'' }))),
     Marcaciones: gsRowsToMatrix(['id','empleadoId','fecha','entradaReal','salidaReal','origen','origenEntrada','origenSalida'],
       S.mar.map(m=>({ id:m.id, empleadoId:m.empleadoId, fecha:m.fecha, entradaReal:m.entradaReal||'', salidaReal:m.salidaReal||'',
         origen:marOrigen(m), origenEntrada:marOrigenCampo(m,'entrada'), origenSalida:marOrigenCampo(m,'salida') }))),
@@ -10850,10 +11197,16 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         esLibre:(r.esLibre===1||r.esLibre==='1'||r.esLibre===true||String(r.esLibre).toLowerCase()==='true'),
         activo:!(r.activo===0||r.activo==='0'||r.activo===false||String(r.activo).toLowerCase()==='false'),
         sueldoQuincenal:Number(r.sueldoQuincenal)||0, sueldoPlanilla:Number(r.sueldoPlanilla)||0, sueldoHora:Number(r.sueldoHora)||0,
-        afpComision:Number(r.afpComision)||0, ajustePlanilla:Number(r.ajustePlanilla)||0, horasCierre:Number(r.horasCierre)||0, fechaIngreso:String(r.fechaIngreso||'').trim(), visible:!(r.visible===0||r.visible==='0'||r.visible===false) }));
+        afpComision:Number(r.afpComision)||0, ajustePlanilla:Number(r.ajustePlanilla)||0, horasCierre:Number(r.horasCierre)||0, fechaIngreso:String(r.fechaIngreso||'').trim(), visible:!(r.visible===0||r.visible==='0'||r.visible===false),
+        // Condiciones desde la fuente; si faltan, migrarCondiciones() las genera
+        // a partir de los campos sueltos sin perder información.
+        condiciones: (()=>{ try{ const a=JSON.parse(r.condiciones||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; } })() }));
       S.hor = (byName['Horarios']||[]).map(r=>({ empleadoId:String(r.empleadoId), dia:Number(r.dia),
         libre:(r.libre===1||r.libre==='1'||r.libre===true||String(r.libre).toLowerCase()==='true'),
-        entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'' }));
+        entrada:r.entrada?String(r.entrada):'', salida:r.salida?String(r.salida):'',
+        condicionId:r.condicionId?String(r.condicionId):null }));
+      migrarCondiciones();   // tras leer del remoto: garantiza condiciones válidas
+      migrarCondiciones();   // tras leer del remoto: garantiza condiciones válidas
       S.mar = (byName['Marcaciones']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
         entradaReal:r.entradaReal?String(r.entradaReal):null, salidaReal:r.salidaReal?String(r.salidaReal):null,
         origen:(String(r.origen).toLowerCase()==='manual')?'manual':'archivo',
