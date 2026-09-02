@@ -1369,14 +1369,18 @@ function getHorario(empleadoId, dia, condicionId){
   const props = S.hor.filter(h=>h.empleadoId===empleadoId && h.dia===dia);
   if(!props.length) return undefined;
   if(condicionId){
+    // Coincidencia EXACTA por condición: nunca se devuelve el horario de otra.
     const propio = props.find(h=>h.condicionId===condicionId);
     if(propio) return propio;
-    // Compatibilidad: horario sin condición asignada (dato heredado).
+    /* Compatibilidad con horarios heredados (sin condicionId): solo se
+       atribuyen a la PRIMERA condición del empleado, que es la que existía
+       cuando se crearon. Para cualquier otra condición se devuelve undefined
+       (aún sin horario propio) en vez de mezclar datos ajenos. */
     const heredado = props.find(h=>!h.condicionId);
+    if(!heredado) return undefined;
     const emp = S.emp.find(e=>e.id===empleadoId);
     const primera = emp ? condicionesDe(emp)[0] : null;
-    if(heredado && primera && primera.id===condicionId) return heredado;
-    return heredado && props.length===1 ? heredado : undefined;
+    return (primera && primera.id===condicionId) ? heredado : undefined;
   }
   return props.find(h=>!h.condicionId) || props[0];
 }
@@ -4305,9 +4309,16 @@ RENDERERS.flujoCaja = function(){
 
 
 // ── Helper: horas semanales programadas según horario ───────────────────────
-function empHorasSemanales(empId){
+/* Horas semanales del horario de UNA CONDICIÓN concreta.
+   CAUSA RAÍZ del bug: esta función solo recibía el empleado, así que
+   getHorario() caía en su rama sin condición y devolvía el primer horario
+   encontrado — el de otra condición. Ahora la condición es parte de la
+   consulta: empleado + condición → horario → H. SEMANA.
+   Sin condicionId conserva el comportamiento anterior (empleado con una sola
+   condición o llamadas heredadas).                                        */
+function empHorasSemanales(empId, condicionId){
   return [0,1,2,3,4,5,6].reduce((s,d)=>{
-    const h=getHorario(empId,d);
+    const h=getHorario(empId,d,condicionId);
     if(!h||h.libre) return s;
     const ent=hmToMin(h.entrada), sal=hmToMin(h.salida);
     if(ent===null||sal===null) return s;
@@ -4322,12 +4333,15 @@ RENDERERS.empleados = function(){
   // ── Computed values per employee ────────────────────────────────
   // Los importes provienen de la CONDICIÓN de la fila, no de los campos sueltos.
   const empCalc = (e, cond) => {
-    const c           = cond || condicionActual(e) || e;
+    const condReal    = cond || condicionActual(e);          // condición real, si existe
+    const c           = condReal || e;                       // respaldo: campos sueltos
     const afp         = Number(c.afpComision)||0;
     const ajuste      = Number(c.ajustePlanilla)||0;
     const hCierre     = Number(c.horasCierre)||0;
     const sueldoTot   = (c.sueldoQuincenal||0)*2 + afp;
-    const horasSem    = empHorasSemanales(e.id);
+    // El horario se consulta por (empleado + condición). Sin condición real
+    // se omite el filtro, conservando el comportamiento anterior.
+    const horasSem    = empHorasSemanales(e.id, condReal ? condReal.id : null);
     const horasTot    = horasSem + hCierre;
     const sHoraCalc   = horasTot>0 ? (sueldoTot - ajuste)/(horasTot*4) : 0;
     const antig       = calcAntiguedad(c.desde||e.fechaIngreso, c.hasta||null);
