@@ -6036,6 +6036,36 @@ function readPeriod(prefix){
   PER.year=+document.getElementById(prefix+'Anio').value;
   PER.q=+document.getElementById(prefix+'Q').value;
 }
+/* ── Enlace REACTIVO de los selectores de período ──────────────────────────
+   CAUSA RAÍZ del bug: periodSelector() pintaba los <select> de Mes, Año y
+   Quincena pero NADIE les asignaba onchange. Solo el botón "Generar" llamaba
+   a readPeriod(), así que al cambiar el mes el estado PER seguía en el
+   período anterior y el reporte se recalculaba con los valores viejos (de ahí
+   que el banner mostrara "Septiembre" con los selectores en "Agosto"). Al
+   volver al módulo, el re-render tomaba el PER ya actualizado por un
+   "Generar" posterior y aparecía vacío si ese período no tenía datos.
+
+   Se enlaza aquí, junto a periodSelector(), para que cualquier módulo que use
+   el selector obtenga el comportamiento reactivo sin repetir código y sin que
+   pueda volver a olvidarse.
+   `onCambio` recibe el prefijo y debe repintar los datos del nuevo período. */
+function bindPeriodSelector(prefix, onCambio){
+  ['Mes','Anio','Q'].forEach(sufijo=>{
+    const el = document.getElementById(prefix+sufijo);
+    if(!el) return;
+    el.onchange = ()=>{
+      readPeriod(prefix);            // 1) el estado adopta la selección actual
+      periodoSerie++;                // 2) invalida cualquier render en curso
+      onCambio(prefix, periodoSerie);// 3) recalcula con el período nuevo
+    };
+  });
+}
+/* Contador de generación: protege contra condiciones de carrera cuando el
+   usuario cambia de filtro varias veces seguidas. Un render que arranca con
+   una serie anterior comprueba este valor y se descarta si ya quedó obsoleto,
+   de modo que en pantalla siempre queda la ÚLTIMA selección. */
+let periodoSerie = 0;
+function periodoVigente(serie){ return serie===undefined || serie===periodoSerie; }
 
 /* ================================================================
    MÓDULO 7: CÁLCULO QUINCENAL (reporte por empleado, una fila por día)
@@ -6055,10 +6085,21 @@ RENDERERS.calculo = function(){
       </div>
     </div>
     <div id="calcOut"></div>`;
-  document.getElementById('cGen').onclick=()=>{ readPeriod('c'); calcEmpSel=document.getElementById('cEmp').value; renderCalculo(); };
-  document.getElementById('cEmp').onchange=(e)=>{ readPeriod('c'); calcEmpSel=e.target.value; renderCalculo(); };
+  // Actualización automática al cambiar Mes/Año/Quincena, y manual con el
+  // botón: ambas rutas ejecutan EXACTAMENTE la misma lógica.
+  const calcRefrescar = ()=>{
+    readPeriod('c');
+    const selEmp = document.getElementById('cEmp');
+    if(selEmp) calcEmpSel = selEmp.value;
+    renderCalculo(++periodoSerie);
+  };
+  bindPeriodSelector('c', calcRefrescar);
+  document.getElementById('cGen').onclick = calcRefrescar;
+  document.getElementById('cEmp').onchange = calcRefrescar;
   document.getElementById('cSaveHE').onclick=calcGuardarConsiderarHE;
-  renderCalculo();
+  // Al entrar al módulo, el estado y los selectores parten sincronizados.
+  readPeriod('c');
+  renderCalculo(++periodoSerie);
 };
 function calcGuardarConsiderarHE(){
   if(!hasPendingConsiderarHE()){ toast('No hay cambios pendientes','info'); return; }
@@ -6088,7 +6129,10 @@ function updateCalcSaveHEUI(){
     hint.textContent = 'Hay cambios sin guardar en las casillas de horas extra.';
   } else if(hint) hint.remove();
 }
-function renderCalculo(){
+function renderCalculo(serie){
+  // Si el usuario ya cambió de período, este render quedó obsoleto: se descarta
+  // para que nunca sobrescriba los datos de una selección más reciente.
+  if(!periodoVigente(serie)) return;
   const out=document.getElementById('calcOut');
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena (1-15)':'2ª quincena (16-fin)'}`;
@@ -6287,11 +6331,15 @@ RENDERERS.consolidado = function(){
       </div>
     </div>
     <div id="consOut"></div>`;
-  document.getElementById('gGen').onclick=()=>{ readPeriod('g'); renderConsolidado(); };
+  const consRefrescar = ()=>{ readPeriod('g'); renderConsolidado(++periodoSerie); };
+  bindPeriodSelector('g', consRefrescar);
+  document.getElementById('gGen').onclick = consRefrescar;
+  readPeriod('g');
+  renderConsolidado(++periodoSerie);
   document.getElementById('gCsv').onclick=exportarCSV;
-  renderConsolidado();
 };
-function renderConsolidado(){
+function renderConsolidado(serie){
+  if(!periodoVigente(serie)) return;   // render obsoleto: se descarta
   const out=document.getElementById('consOut');
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
   _consolidado = S.emp.filter(empEsVisible).map(emp=>{
