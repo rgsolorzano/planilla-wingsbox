@@ -4453,39 +4453,69 @@ RENDERERS.empleados = function(){
         </select></div>`;
     const sel = document.getElementById('empCondSel');
     sel.onchange = ()=>{ editCondId = sel.value; RENDERERS.empleados(); window.scrollTo({top:0,behavior:'smooth'}); };
-    const c = editCondId==='__nueva__' ? null : conds.find(x=>x.id===editCondId);
-    const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=(v===null||v===undefined)?'':v; };
-    if(c){
-      set('empSueldoQ',c.sueldoQuincenal); set('empSueldoP',c.sueldoPlanilla); set('empSueldoH',c.sueldoHora);
-      set('empAFP',c.afpComision); set('empAjuste',c.ajustePlanilla); set('empHorasCierre',c.horasCierre);
-      set('empFechaIngreso',c.desde); set('empFechaCese',c.hasta||'');
-      const t=document.getElementById('empTipo'); if(t&&c.tipo) t.value=c.tipo;
-      const l=document.getElementById('empEsLibre'); if(l) l.checked=!!c.esLibre;
-    } else {
-      // Nueva condición: se sugiere el día siguiente al último cese.
-      const ult = conds[conds.length-1];
-      set('empFechaIngreso', ult && ult.hasta ? fechaMasDias(ult.hasta,1) : fechaHoy());
-      set('empFechaCese','');
-    }
   }
   document.getElementById('empClear').onclick = empClearForm;
+  /* CAUSA RAÍZ DEL BUG: aquí existía una segunda precarga que escribía los
+     campos laborales desde el EMPLEADO (sus campos sueltos, que reflejan la
+     condición vigente) y se ejecutaba DESPUÉS de la precarga por condición,
+     pisándola. Por eso al elegir una condición histórica algunos campos
+     seguían mostrando los valores de la vigente.
+     Ahora esta precarga solo carga los datos que pertenecen a la PERSONA
+     (nombre, documento, estado); todo lo laboral lo carga
+     empCargarCondicionEnForm(), única fuente para esos campos. */
   if(editEmpId){
     const e=S.emp.find(x=>x.id===editEmpId);
     if(e){
       document.getElementById('empFormTitle').textContent='Editar empleado';
       empNombre.value=e.nombre; empDoc.value=e.documento;
-      document.getElementById('empTipo').value=empTipo(e);
-      document.getElementById('empEsLibre').checked=empEsLibre(e);
       document.getElementById('empActivo').checked=empEsActivo(e);
-      empSueldoQ.value=e.sueldoQuincenal; empSueldoP.value=e.sueldoPlanilla; empSueldoH.value=e.sueldoHora;
-      document.getElementById('empAFP').value=e.afpComision||'';
-      document.getElementById('empAjuste').value=e.ajustePlanilla||'';
-      document.getElementById('empHorasCierre').value=e.horasCierre||'';
-      document.getElementById('empFechaIngreso').value=e.fechaIngreso||'';
+      empCargarCondicionEnForm(e);   // ← los campos laborales, siempre al final
     }
   }
 };
 function empClearForm(){ editEmpId=null; RENDERERS.empleados(); }
+/* Carga en el formulario los campos laborales de la CONDICIÓN seleccionada.
+   Es la ÚNICA función que escribe esos campos, de modo que ningún valor puede
+   quedar residual de otra condición ni del empleado. Todos los campos se
+   asignan siempre (incluso vacíos), nunca condicionalmente. */
+function empCargarCondicionEnForm(e){
+  if(!e) return;
+  const conds = condicionesDe(e);
+  const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=(v===null||v===undefined)?'':v; };
+  if(editCondId==='__nueva__'){
+    // Condición nueva: campos en blanco y fecha sugerida tras el último cese.
+    const ult = conds[conds.length-1];
+    ['empSueldoQ','empSueldoP','empSueldoH','empAFP','empAjuste','empHorasCierre'].forEach(id=>set(id,''));
+    set('empFechaIngreso', ult && ult.hasta ? fechaMasDias(ult.hasta,1) : fechaHoy());
+    set('empFechaCese','');
+    const t=document.getElementById('empTipo'); if(t) t.value = empTipo(e);
+    const l=document.getElementById('empEsLibre'); if(l) l.checked = false;
+    return;
+  }
+  const c = conds.find(x=>x.id===editCondId) || condicionActual(e);
+  if(!c){   // sin condiciones (dato legado): se usan los campos sueltos
+    set('empSueldoQ',e.sueldoQuincenal); set('empSueldoP',e.sueldoPlanilla); set('empSueldoH',e.sueldoHora);
+    set('empAFP',e.afpComision); set('empAjuste',e.ajustePlanilla); set('empHorasCierre',e.horasCierre);
+    set('empFechaIngreso',e.fechaIngreso||''); set('empFechaCese','');
+    const t=document.getElementById('empTipo'); if(t) t.value=empTipo(e);
+    const l=document.getElementById('empEsLibre'); if(l) l.checked=empEsLibre(e);
+    return;
+  }
+  // TODOS los campos laborales provienen de la condición seleccionada.
+  set('empSueldoQ',   c.sueldoQuincenal);
+  set('empSueldoP',   c.sueldoPlanilla);
+  set('empSueldoH',   c.sueldoHora);
+  set('empAFP',       c.afpComision);
+  set('empAjuste',    c.ajustePlanilla);
+  set('empHorasCierre', c.horasCierre);
+  set('empFechaIngreso', c.desde||'');
+  set('empFechaCese',    c.hasta||'');
+  const t=document.getElementById('empTipo');
+  if(t) t.value = c.tipo || empTipo(e);
+  const l=document.getElementById('empEsLibre');
+  if(l) l.checked = !!c.esLibre;
+}
+
 function empSave(){
   const nombre=empNombre.value.trim(), doc=empDoc.value.trim();
   const tipo=document.getElementById('empTipo').value;
@@ -4519,14 +4549,18 @@ function empSave(){
       {desde: fechaIngreso || cond.desde, hasta: fechaCese || null});
     const err = validarCondicion(e, propuesta);
     if(err){ toast(err,'error'); return; }   // rangos superpuestos o inválidos
-    if(editCondId==='__nueva__'){ e.condiciones.push(propuesta); }
+    const esNueva = editCondId==='__nueva__';
+    // Solo se toca la condición seleccionada: las demás quedan intactas.
+    if(esNueva){ e.condiciones.push(propuesta); }
     else { Object.assign(cond, propuesta); }
-    // Los campos sueltos reflejan la condición VIGENTE (compatibilidad).
+    /* Los campos sueltos del empleado son un ESPEJO de la condición vigente
+       (compatibilidad con módulos que aún los leen). Nunca al revés: editar
+       una condición histórica no debe alterar la vigente ni sus espejos. */
     const act = condicionActual(e) || propuesta;
     Object.assign(e,{nombre,documento:doc,activo,fechaIngreso:act.desde},
       (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=act[k]); return o; })());
     save(K.emp,S.emp); editEmpId=null; editCondId=null;
-    toast(editCondId==='__nueva__'?'Condición agregada':'Empleado actualizado','success');
+    toast(esNueva?'Condición agregada':'Condición actualizada','success');
     syncEmpleados();
   }else{
     const id=uid();
