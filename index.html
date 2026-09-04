@@ -1546,7 +1546,13 @@ function calcDia(empOriginal, fecha){
       horasEf:0, horasProg:0, horasExtra:0, feriado:false, pagoFeriado:0,
       hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual:0, pagoManual:0,
-      pagoExtraHoras:0, totalDia:0, libre:false, tipoLibre:null, esPendiente:false };
+      pagoExtraHoras:0, totalDia:0, libre:false, tipoLibre:null, esPendiente:false,
+      /* Estas listas deben existir SIEMPRE: construirLiquidacion() las recorre
+         para todos los días. Sin ellas, un solo día fuera de toda condición
+         lanzaba "Cannot read properties of undefined (reading 'forEach')" y,
+         al no estar aislado el bucle, tumbaba el render completo de
+         "Todos los empleados". */
+      pagoExtraList:[], descManualList:[], pagoLibre:0, horasFaltaMarc:0 };
   }
   return calcDiaCondicion(emp, fecha);
 }
@@ -1560,6 +1566,8 @@ function calcDiaCondicion(emp, fecha){
   //   • hTard = 0 (no hay hora programada contra la que medir tardanza)
   //   • descAuto = 0 (ningún descuento automático por asistencia)
   // Solo se calcula horasEf para el pago por hora efectiva.
+  // `emp` aquí ya viene resuelto por calcDia() a la condición de la fecha,
+  // por lo que empEsLibre() refleja la modalidad vigente ESE día.
   if(empEsLibre(emp)){
     const mar = getMarcacion(emp.id, fecha);
     const entradaReal = mar?.entradaReal || null;
@@ -1795,7 +1803,32 @@ function condQuincenaIncompleta(cond, fechasQuincena){
   return null;
 }
 
+/* Condición aplicable a un tramo: la primera de sus fechas con condición
+   vigente. Buscar solo en el día inicial fallaba cuando el empleado ingresaba
+   a mitad del período (p. ej. ingreso el 11 en la quincena 1-15): el día 1 no
+   tenía condición y el tramo quedaba sin resolver, sin aplicar el pago por
+   horas que le corresponde. */
+function condicionDelTramo(emp, fechas){
+  for(const f of fechas){
+    const c = condicionEnFecha(emp, f);
+    if(c) return c;
+  }
+  return null;
+}
 function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
+  /* ── CONDICIÓN DEL PERÍODO ────────────────────────────────────────────────
+     CAUSA RAÍZ del bug: la modalidad y los importes se tomaban de `emp`, es
+     decir de los campos sueltos del empleado, que son el ESPEJO de su
+     condición VIGENTE. Por eso un empleado con condición actual "Libre" se
+     calculaba como libre también en quincenas históricas en las que NO lo era.
+     `empQ` resuelve la condición correspondiente al período/tramo y de ella
+     salen TODOS los valores: modalidad, sueldos, AFP, ajuste y horas cierre. */
+  const fechasRef0 = (fechasSeg && fechasSeg.length) ? fechasSeg : rangoQuincena(year, month, q);
+  const condRef0   = condSeg || condicionDelTramo(emp, fechasRef0);
+  const empQ = condRef0
+    ? Object.assign({}, emp, (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=condRef0[k]); return o; })())
+    : emp;   // sin condición aplicable: se usan los campos sueltos como respaldo
+
   // Con un tramo se usan solo sus fechas; sin él, la quincena completa.
   const dias = (fechasSeg && fechasSeg.length ? fechasSeg : rangoQuincena(year, month, q)).map(f=>{
     const d = calcDia(emp, f);
@@ -1817,7 +1850,8 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
       faltasVistas++;
       if(faltasVistas > 1){       // a partir de la 2da omisión
         d.horasFaltaMarc = 1;
-        d.descFaltaMarc = emp.sueldoHora || 0;
+        // Sueldo/hora de la CONDICIÓN del período, no del campo suelto.
+        d.descFaltaMarc = Number(empQ.sueldoHora) || 0;
         d.horasDescAuto += d.horasFaltaMarc;
         d.descAuto += d.descFaltaMarc;
         d.totalDia -= d.descFaltaMarc;
@@ -1875,8 +1909,9 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
   }
 
   // --- EMPLEADO LIBRE: pago por horas trabajadas, no por sueldo quincenal ---
-  if(empEsLibre(emp)){
-    const sh = Number(emp.sueldoHora)||0;
+  // La modalidad proviene de la condición del período, no de la vigente hoy.
+  if(empEsLibre(empQ)){
+    const sh = Number(empQ.sueldoHora)||0;
     const libreSinSueldoHora = !(sh > 0); // si no tiene sueldo/hora, su pago es 0 hasta corregir
     dias.forEach(d=>{ d.pagoLibre = libreSinSueldoHora ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, sh); });
     // El pago por feriado es acumulable también para empleados libres.
@@ -1885,9 +1920,6 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
              payments:liq.payments, discounts:liq.discounts, totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos };
   }
 
-  // Datos salariales de la CONDICIÓN del tramo (o de la vigente en la quincena).
-  const empQ = condSeg ? Object.assign({}, emp, (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=condSeg[k]); return o; })())
-                       : (empEnFecha(emp, (fechasSeg&&fechasSeg[0]) || rangoQuincena(year,month,q)[0]) || emp);
   const fechasQ    = rangoQuincena(year, month, q);
   const totalDiasQ = fechasQ.length;
   const diasTramo  = (fechasSeg && fechasSeg.length) ? fechasSeg.length : totalDiasQ;
@@ -1895,12 +1927,34 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
   /* Quincena INCOMPLETA para esta condición (ingreso fuera de 1/16 o cese
      dentro del período): se paga por horas efectivamente trabajadas, no con
      el sueldo quincenal. Reutiliza el mismo mecanismo del empleado libre. */
-  const condRef = condSeg || condicionEnFecha(emp, (fechasSeg&&fechasSeg[0]) || fechasQ[0]);
+  const condRef = condRef0;   // misma condición que rige los importes del tramo
   const motivoParcial = condQuincenaIncompleta(condRef, fechasQ);
   if(motivoParcial){
     const shP = Number(empQ.sueldoHora)||0;
     const sinSH = !(shP > 0);
-    dias.forEach(d=>{ d.pagoLibre = sinSH ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, shP); });
+    /* Al pagar por horas efectivas NO se aplican descuentos automáticos por
+       ausencia: sin sueldo quincenal que los absorba, descontar por los días
+       no trabajados dejaba el total en negativo (se cobraba dos veces la
+       ausencia, al no pagarse la hora y además descontarse). Es el mismo
+       criterio que ya rige para el empleado libre en calcDia().
+       Los descuentos MANUALES y los pagos extra sí se conservan: son
+       conceptos explícitos del usuario, ajenos a la asistencia. */
+    let descAutoAnulado = 0;
+    dias.forEach(d=>{
+      d.pagoLibre = sinSH ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, shP);
+      if(d.descAuto){
+        descAutoAnulado += d.descAuto;
+        d.totalDia += d.descAuto;      // se revierte del total del día
+        d.descAuto = 0;
+        d.descFalta = 0;
+        d.horasDescAuto = 0;
+      }
+    });
+    tot.descAuto = 0;                  // el agregado también queda sin descuentos
+    if(descAutoAnulado>0){
+      console.log('[Planilla] '+emp.nombre+': se omitieron '+descAutoAnulado.toFixed(2)+
+        ' de descuentos automáticos por ausencia (el tramo se paga por horas).');
+    }
     const liqP = construirLiquidacion({base:0, bonoPuntualidad:0, esLibre:true});
     console.log('[Planilla] '+emp.nombre+' '+month+'/'+year+' Q'+q+
       ': quincena incompleta por '+motivoParcial+' → pago por horas ('+tot.horasEf+'h × '+shP+').');
@@ -6140,8 +6194,26 @@ function renderCalculo(serie){
   let html=`<div class="card" style="background:#fdeef1;border-color:#f6c4ce"><b>Periodo:</b> ${titulo}</div>`;
 
   const emps = calcEmpSel? S.emp.filter(e=>e.id===calcEmpSel) : S.emp.filter(empEsVisible);
+  /* AISLAMIENTO POR EMPLEADO: antes, si el cálculo de UN empleado lanzaba una
+     excepción, el forEach se interrumpía y NINGÚN empleado llegaba a pintarse
+     (pantalla en blanco). Por eso "Todos los empleados" fallaba mientras el
+     cálculo individual del mismo empleado funcionaba. Ahora cada empleado se
+     procesa de forma independiente: el que falle se muestra como tarjeta de
+     error identificándolo, y el resto se calcula con normalidad.
+     La lógica de cálculo es la MISMA en ambos modos (calcQuincenaEmpleado). */
   emps.forEach(emp=>{
-    const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
+    let r;
+    try{
+      r = calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
+    }catch(err){
+      console.error('[Planilla] Error al calcular a "'+emp.nombre+'" ('+emp.id+') en '+
+        PER.month+'/'+PER.year+' Q'+PER.q+':', err);
+      html += `<div class="card" style="border-color:#f6c4ce;background:#fdeef1">
+        <b>⚠️ ${emp.nombre}</b><br>
+        <span style="font-size:13px;color:var(--c-muted)">No se pudo calcular esta quincena para este empleado: ${String(err.message||err)}.
+        Revisa sus condiciones laborales y su horario. Los demás empleados sí se calcularon.</span></div>`;
+      return;
+    }
 
     // --- EMPLEADO LIBRE: detalle diario por horas trabajadas × sueldo/hora ---
     if(r.esLibre){
@@ -6343,8 +6415,17 @@ function renderConsolidado(serie){
   const out=document.getElementById('consOut');
   if(!out) return;   // el módulo aún no está montado
   if(!S.emp.length){ out.innerHTML=noEmpWarning(); return; }
+  const erroresCons = [];   // empleados que no pudieron calcularse
   _consolidado = S.emp.filter(empEsVisible).map(emp=>{
-    const r=calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
+    let r;
+    try{
+      r = calcQuincenaEmpleado(emp, PER.year, PER.month, PER.q);
+    }catch(err){
+      // Un empleado con datos inconsistentes no debe vaciar todo el consolidado.
+      console.error('[Consolidado] Error al calcular a "'+emp.nombre+'" ('+emp.id+'):', err);
+      erroresCons.push(emp.nombre);
+      return null;
+    }
     const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
     // Sueldo transferencia = Total a pagar - Sueldo planilla
     const sueldoTransfer = r.totalPagar - sueldoPlanilla;
@@ -6357,7 +6438,11 @@ function renderConsolidado(serie){
       bonoPuntualidad:r.bonoPuntualidad||0, retrasoMin:r.retrasoMensualMinutos||0,
       diasSinEntrada:r.diasSinEntrada||0, motivoBono:r.motivoBono||'', total:r.totalPagar,
       sueldoPlanilla, sueldoTransfer};
-  });
+  }).filter(Boolean);   // se excluyen los empleados que fallaron (ya reportados)
+  if(erroresCons.length){
+    console.warn('[Consolidado] No se pudo calcular a: '+erroresCons.join(', ')+'. El resto sí se muestra.');
+    toast('No se pudo calcular a: '+erroresCons.join(', ')+'. Revisa sus condiciones.','warn');
+  }
   const T=_consolidado.reduce((a,c)=>({
     base:a.base+c.base, horasExtra:a.horasExtra+c.horasExtra, pagoExtraHoras:a.pagoExtraHoras+c.pagoExtraHoras,
     descAuto:a.descAuto+c.descAuto, descManual:a.descManual+c.descManual, pagoManual:a.pagoManual+c.pagoManual,
