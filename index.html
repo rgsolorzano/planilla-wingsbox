@@ -1771,6 +1771,11 @@ function calcQuincenaMultiCondicion(emp, year, month, q, segs){
     tot, base: suma(r=>r.base), totalPagar: suma(r=>r.totalPagar),
     esLibre: parciales.every(r=>r.esLibre),
     bonoPuntualidad: suma(r=>r.bonoPuntualidad),
+    // Cada tramo aporta su parte proporcional, con los valores de SU condición.
+    sueldoPlanilla: suma(r=>r.sueldoPlanilla),
+    afpComision:    suma(r=>r.afpComision),
+    ajustePlanilla: suma(r=>r.ajustePlanilla),
+    sueldoHora: (parciales[parciales.length-1]||{}).sueldoHora || 0,
     payments:  parciales.flatMap(r=>r.payments||[]),
     discounts: parciales.flatMap(r=>r.discounts||[]),
     totalPagos: suma(r=>r.totalPagos), totalDescuentos: suma(r=>r.totalDescuentos),
@@ -1825,6 +1830,10 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
      salen TODOS los valores: modalidad, sueldos, AFP, ajuste y horas cierre. */
   const fechasRef0 = (fechasSeg && fechasSeg.length) ? fechasSeg : rangoQuincena(year, month, q);
   const condRef0   = condSeg || condicionDelTramo(emp, fechasRef0);
+  // Proporción del tramo respecto de la quincena: se declara aquí porque la
+  // usan todas las ramas (libre, pago por horas y cálculo normal).
+  const totalDiasQ = rangoQuincena(year, month, q).length;
+  const diasTramo  = (fechasSeg && fechasSeg.length) ? fechasSeg.length : totalDiasQ;
   const empQ = condRef0
     ? Object.assign({}, emp, (()=>{ const o={}; COND_CAMPOS.forEach(k=>o[k]=condRef0[k]); return o; })())
     : emp;   // sin condición aplicable: se usan los campos sueltos como respaldo
@@ -1917,12 +1926,14 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
     // El pago por feriado es acumulable también para empleados libres.
     const liq = construirLiquidacion({base:0, bonoPuntualidad:0, esLibre:true});
     return { dias, tot, base:0, totalPagar:liq.totalPagar, esLibre:true, sueldoHora:sh, libreSinSueldoHora,
+             condicion: condRef0 || null,
+             sueldoPlanilla: (Number(empQ.sueldoPlanilla)||0) * (diasTramo/totalDiasQ),
+             afpComision: Number(empQ.afpComision)||0,
+             ajustePlanilla: Number(empQ.ajustePlanilla)||0,
              payments:liq.payments, discounts:liq.discounts, totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos };
   }
 
   const fechasQ    = rangoQuincena(year, month, q);
-  const totalDiasQ = fechasQ.length;
-  const diasTramo  = (fechasSeg && fechasSeg.length) ? fechasSeg.length : totalDiasQ;
 
   /* Quincena INCOMPLETA para esta condición (ingreso fuera de 1/16 o cese
      dentro del período): se paga por horas efectivamente trabajadas, no con
@@ -1960,6 +1971,10 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
       ': quincena incompleta por '+motivoParcial+' → pago por horas ('+tot.horasEf+'h × '+shP+').');
     return { dias, tot, base:0, totalPagar:liqP.totalPagar, esLibre:false,
              pagoPorHoras:true, motivoParcial, sueldoHora:shP, libreSinSueldoHora:sinSH,
+             condicion: condRef0 || null,
+             sueldoPlanilla: (Number(empQ.sueldoPlanilla)||0) * (diasTramo/totalDiasQ),
+             afpComision: Number(empQ.afpComision)||0,
+             ajustePlanilla: Number(empQ.ajustePlanilla)||0,
              payments:liqP.payments, discounts:liqP.discounts,
              totalPagos:liqP.totalPagos, totalDescuentos:liqP.totalDescuentos };
   }
@@ -1974,7 +1989,16 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
   // verdad compartida con la Boleta, sin sumatorias paralelas.
   const liq = construirLiquidacion({base, bonoPuntualidad, esLibre:false});
   const totalPagar = liq.totalPagar;
+  /* Se exponen los datos económicos de la CONDICIÓN aplicada al período para
+     que Boleta y Consolidado no tengan que releerlos del empleado (cuyos
+     campos sueltos son el espejo de la condición VIGENTE HOY, no la del
+     período consultado). Así todos los módulos consumen la misma fuente. */
   return { dias, tot, base, totalPagar, esLibre:false, bonoPuntualidad,
+           condicion: condRef0 || null,
+           sueldoPlanilla: (Number(empQ.sueldoPlanilla)||0) * (diasTramo/totalDiasQ),
+           sueldoHora: Number(empQ.sueldoHora)||0,
+           afpComision: Number(empQ.afpComision)||0,
+           ajustePlanilla: Number(empQ.ajustePlanilla)||0,
            payments:liq.payments, discounts:liq.discounts,
            totalPagos:liq.totalPagos, totalDescuentos:liq.totalDescuentos,
            retrasoMensualMinutos:evBono.minutosAcum,
@@ -6426,10 +6450,12 @@ function renderConsolidado(serie){
       erroresCons.push(emp.nombre);
       return null;
     }
-    const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
+    // Igual que en la Boleta: el importe proviene de la condición del período.
+    const sueldoPlanilla = Number(r.sueldoPlanilla ?? emp.sueldoPlanilla) || 0;
     // Sueldo transferencia = Total a pagar - Sueldo planilla
     const sueldoTransfer = r.totalPagar - sueldoPlanilla;
-    return {nombre:emp.nombre, esLibre:r.esLibre===true, sueldoHora:Number(emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
+    return {nombre:emp.nombre, esLibre:r.esLibre===true,
+      sueldoHora:Number(r.sueldoHora ?? emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
       horasExtra:r.tot.horasExtra, pagoExtraHoras:r.tot.pagoExtraHoras, descAuto:r.tot.descAuto,
       descManual:r.tot.descManual, pagoManual:r.tot.pagoManual,
       // Concepto tomado de la MISMA liquidación (no recalculado), para que las
@@ -6625,7 +6651,13 @@ function renderBoleta(){
       pagos: r.payments, descuentos: r.discounts });
   }
 
-  const sueldoPlanilla = Number(emp.sueldoPlanilla)||0;
+  /* CAUSA RAÍZ: aquí se leía emp.sueldoPlanilla, el campo suelto del empleado
+     — un ESPEJO de la condición VIGENTE HOY, no de la del período consultado.
+     Por eso el sueldo quincenal base salía bien (lo entrega el cálculo, que sí
+     resuelve por fecha) mientras el sueldo planilla salía en 0 (valor de la
+     condición de septiembre). Ahora se toma del resultado del cálculo, que ya
+     lo resolvió con la condición correcta. */
+  const sueldoPlanilla = Number(r.sueldoPlanilla ?? emp.sueldoPlanilla) || 0;
   const sueldoTransfer = r.totalPagar - sueldoPlanilla;
   const titulo=`${MESES[PER.month-1]} ${PER.year} · ${PER.q==1?'1ª quincena (1-15)':'2ª quincena (16-fin)'}`;
 
