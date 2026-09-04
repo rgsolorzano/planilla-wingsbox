@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sistema de Planilla Quincenal</title>
+<meta name="app-version" content="2026-09-04.3">
 <!-- SheetJS para leer archivos .xlsx -->
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <!-- Google Identity Services (login con Google para sincronizar con Google Sheets) -->
@@ -10435,13 +10436,22 @@ K.gsheetId = 'pl_gsheetId';
 let gsState = { tokenClient:null, accessToken:null, tokenExpiry:0, email:null, spreadsheetId:null, lastSync:null };
 
 // Claves de sesión en localStorage.
-const AUTH_KEYS = { token:'pl_auth_token', exp:'pl_auth_token_exp', email:'pl_auth_email' };
-// Guarda la sesión actual (token + expiración + correo) para sobrevivir a un refresh.
+const AUTH_KEYS = {
+  token:'pl_auth_token',
+  exp:'pl_auth_token_exp',
+  email:'pl_auth_email',
+  appSessionExp:'pl_auth_session_exp',
+  appSessionStart:'pl_auth_session_start'
+};
+// Guarda la sesión actual (token + expiración + correo + TTL de la app = 3h)
 function gsPersistSession(){
   if(gsState.accessToken && gsState.email){
+    const sessionExp = Date.now() + APP_SESSION_TTL_MS;
     localStorage.setItem(AUTH_KEYS.token, gsState.accessToken);
     localStorage.setItem(AUTH_KEYS.exp, String(gsState.tokenExpiry||0));
     localStorage.setItem(AUTH_KEYS.email, gsState.email);
+    localStorage.setItem(AUTH_KEYS.appSessionExp, String(sessionExp));
+    localStorage.setItem(AUTH_KEYS.appSessionStart, String(Date.now()));
   }
 }
 // Borra la sesión persistida.
@@ -10453,9 +10463,13 @@ function gsRestoreSession(){
   const tok = localStorage.getItem(AUTH_KEYS.token);
   const exp = Number(localStorage.getItem(AUTH_KEYS.exp)||0);
   const email = localStorage.getItem(AUTH_KEYS.email);
-  if(tok && email && exp > Date.now()+60000){
+  const appSessionExp = Number(localStorage.getItem(AUTH_KEYS.appSessionExp)||0);
+  if(tok && email && exp > Date.now()+60000 && appSessionExp > Date.now()+60000){
     gsState.accessToken = tok; gsState.tokenExpiry = exp; gsState.email = email;
     return true;
+  }
+  if(tok && email){
+    gsState.accessToken = null; gsState.tokenExpiry = 0; gsState.email = email;
   }
   return false;
 }
@@ -10547,7 +10561,10 @@ const SESION_MARGEN_MS = 30000;
 function gsTokenVigente(){
   if(!gsState.accessToken) return false;
   const exp = Number(gsState.tokenExpiry||0);
-  return exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
+  const appSessionExp = Number(localStorage.getItem(AUTH_KEYS.appSessionExp)||0);
+  const sigueVigente = exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
+  const sesionAppVigente = appSessionExp > 0 ? (appSessionExp - SESION_MARGEN_MS) > Date.now() : false;
+  return sigueVigente && sesionAppVigente;
 }
 function gsIsSignedIn(){ return gsTokenVigente(); }
 // Minutos restantes de sesión (informativo).
@@ -11477,9 +11494,39 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       para no seguir usando código antiguo desde la caché del navegador.
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
-// Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-08-27.1';
+const APP_SESSION_TTL_MS = 3 * 60 * 60 * 1000;
+const APP_VERSION = '2026-09-04.3';
 let sesionExpiradaAvisada = false;
+let appVersionOutdated = false;
+let appGuardBlockStorageWrites = false;
+const originalSetItem = Storage.prototype.setItem;
+const originalRemoveItem = Storage.prototype.removeItem;
+
+Storage.prototype.setItem = function(key, value){
+  if(appGuardBlockStorageWrites){
+    console.warn('[Guard] Bloqueado el guardado local por sesión o versión inválida:', key);
+    return;
+  }
+  return originalSetItem.call(this, key, value);
+};
+Storage.prototype.removeItem = function(key){
+  if(appGuardBlockStorageWrites && !String(key).startsWith('pl_auth_') && !String(key).startsWith('ses_')){
+    console.warn('[Guard] Bloqueado la eliminación local por sesión o versión inválida:', key);
+    return;
+  }
+  return originalRemoveItem.call(this, key);
+};
+
+function appVersionMetaValue(){
+  const meta = document.querySelector('meta[name="app-version"]');
+  return meta ? meta.getAttribute('content') : APP_VERSION;
+}
+function appVersionFromText(txt){
+  const metaMatch = txt.match(/<meta[^>]+name=["']app-version["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if(metaMatch && metaMatch[1]) return metaMatch[1];
+  const constMatch = txt.match(/const APP_VERSION = ['"]([^'"]+)['"]/);
+  return constMatch ? constMatch[1] : null;
+}
 
 // ── Borradores de formulario ──────────────────────────────────────────────
 // Captura los campos visibles del módulo activo (input/select/textarea con id).
@@ -11579,37 +11626,75 @@ function sesMostrarAvisoBorrador(b, n){
   if(btn) btn.onclick = ()=>{ sesDescartarBorrador(); d.remove(); toast('Datos pendientes descartados','warn'); };
 }
 
-// ── Expiración de sesión ──────────────────────────────────────────────────
-// Punto ÚNICO de reacción: conserva el borrador, invalida el token y pide login.
-function sesManejarExpiracion(motivo){
-  if(sesionExpiradaAvisada) return;      // evita avisos duplicados y bucles
+function sesBloquearGuardadoLocal(motivo){
+  appGuardBlockStorageWrites = true;
   sesionExpiradaAvisada = true;
-  const habiaDatos = sesCapturarBorrador();
+  const msg = motivo === 'version'
+    ? 'Hay una nueva versión de la aplicación disponible. La página se actualizará para cargar la versión más reciente.'
+    : 'Tu sesión ha vencido. La página se actualizará para que puedas iniciar sesión nuevamente.';
+  toast(msg, 'error');
+  setTimeout(() => { window.location.reload(true); }, 1200);
+}
+
+function sesValidarSesionYVersion(motivo='actividad'){
+  if(!document.body.classList.contains('authed') || !gsState.accessToken){
+    return true;
+  }
+  if(!gsTokenVigente()){
+    if(!sesionExpiradaAvisada){
+      gsState.accessToken = null;
+      gsClearSession();
+      sesBloquearGuardadoLocal('session');
+      console.warn('[Sesión] Expirada ('+motivo+').');
+    }
+    return false;
+  }
+  if(appVersionOutdated){
+    if(!sesionExpiradaAvisada){
+      sesBloquearGuardadoLocal('version');
+      console.warn('[Versión] Aplicación desactualizada ('+motivo+').');
+    }
+    return false;
+  }
+  return true;
+}
+
+// ── Expiración de sesión ──────────────────────────────────────────────────
+// Punto ÚNICO de reacción: bloquea inmediatamente y fuerza login. No guarda
+// borradores ni deja información pendiente en localStorage para ese caso.
+function sesManejarExpiracion(motivo){
+  if(sesionExpiradaAvisada) return;
+  sesionExpiradaAvisada = true;
+  appGuardBlockStorageWrites = true;
   gsState.accessToken = null;
   gsClearSession();
+  localStorage.removeItem(SES_KEYS.borrador);
   try{ if(typeof gsRenderControls==='function') gsRenderControls(); }catch(e){}
-  toast('Tu sesión ha expirado. Inicia sesión nuevamente para continuar.' +
-        (habiaDatos?' Tus datos sin guardar se conservaron.':''), 'error');
+  toast('Tu sesión ha vencido. La página se actualizará para que puedas iniciar sesión nuevamente.', 'error');
   console.warn('[Sesión] Expirada ('+motivo+').');
-  try{ if(typeof RENDERERS[currentPage]==='function') RENDERERS[currentPage](); }catch(e){}
+  setTimeout(()=>window.location.reload(true), 1200);
 }
 
 // ── Versión de la aplicación ──────────────────────────────────────────────
 // Descarga el propio documento sin caché y compara la versión declarada.
 async function sesHayNuevaVersion(){
   try{
-    const r = await fetch(window.location.pathname + '?v=' + Date.now(), { cache:'no-store' });
+    const url = new URL(window.location.href);
+    url.searchParams.set('v', String(Date.now()));
+    const r = await fetch(url.toString(), { cache:'no-store', credentials:'same-origin' });
     if(!r.ok) return false;
     const txt = await r.text();
-    const m = txt.match(/const APP_VERSION = '([^']+)'/);
-    return !!(m && m[1] && m[1] !== APP_VERSION);
-  }catch(e){ return false; }   // sin red: no se fuerza recarga
+    const remoteVersion = appVersionFromText(txt);
+    return !!(remoteVersion && remoteVersion !== APP_VERSION);
+  }catch(e){ return false; }
 }
 async function sesAplicarNuevaVersionSiHay(){
-  if(await sesHayNuevaVersion()){
-    sesCapturarBorrador();                 // nunca perder lo tecleado
-    toast('Hay una versión más reciente. Actualizando…','info');
-    setTimeout(()=>window.location.reload(true), 800);
+  const hay = await sesHayNuevaVersion();
+  appVersionOutdated = hay;
+  if(hay){
+    sesCapturarBorrador();
+    toast('Hay una nueva versión de la aplicación disponible. La página se actualizará para cargar la versión más reciente.','info');
+    setTimeout(()=>window.location.reload(true), 900);
     return true;
   }
   return false;
@@ -11618,7 +11703,7 @@ async function sesAplicarNuevaVersionSiHay(){
 // ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
 let sesUltimaValidacion = 0;
 async function sesValidarAlReactivar(){
-  if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
+  if(Date.now() - sesUltimaValidacion < 5000) return;
   sesUltimaValidacion = Date.now();
   const habiaToken = !!gsState.accessToken;
   if(habiaToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación'); return; }
@@ -11627,40 +11712,65 @@ async function sesValidarAlReactivar(){
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
 window.addEventListener('focus', sesValidarAlReactivar);
 window.addEventListener('online', sesValidarAlReactivar);
-// pageshow cubre la restauración desde la caché de retroceso (bfcache), donde
-// no siempre se emite visibilitychange.
 window.addEventListener('pageshow', (e)=>{ if(e.persisted) sesValidarAlReactivar(); });
 
-/* Detector de SUSPENSIÓN por salto de reloj. Es el mecanismo clave del caso
-   "portátil suspendido toda la noche": si solo se bloquea la pantalla y la
-   pestaña sigue visible, el navegador no emite visibilitychange ni focus, y
-   los timers no corren mientras el equipo duerme. Al despertar, el intervalo
-   detecta que pasó mucho más tiempo del esperado y revalida la sesión. */
+/* Detector de SUSPENSIÓN por salto de reloj. ... */
 let sesUltimoTick = Date.now();
 if(!window.__sesTickTimer){
   window.__sesTickTimer = setInterval(()=>{
     const ahora = Date.now();
     const salto = ahora - sesUltimoTick;
     sesUltimoTick = ahora;
-    if(salto > 120000){            // el equipo estuvo suspendido
+    if(salto > 120000){
       console.warn('[Sesión] Reanudación detectada tras '+Math.round(salto/60000)+' min de inactividad.');
-      sesUltimaValidacion = 0;     // fuerza la revalidación inmediata
+      sesUltimaValidacion = 0;
       sesValidarAlReactivar();
     }
   }, 30000);
 }
-// Chequeo periódico ligero (sin recargar): un único timer.
 if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
     if(gsState.accessToken && !gsTokenVigente()) sesManejarExpiracion('vencimiento en uso');
   }, 60000);
 }
-// Coherencia entre pestañas: si una cierra sesión, las demás lo reflejan.
 window.addEventListener('storage', (e)=>{
   if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){
     sesManejarExpiracion('cierre de sesión en otra pestaña');
   }
 });
+
+window.addEventListener('click', (e)=>{
+  const target = e.target.closest && e.target.closest('button, input, select, textarea, a');
+  if(target && document.body.classList.contains('authed') && !sesValidarSesionYVersion('interacción')){
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }
+}, true);
+window.addEventListener('change', (e)=>{
+  const target = e.target;
+  if(target && document.body.classList.contains('authed') && !sesValidarSesionYVersion('cambio')){
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+window.addEventListener('input', (e)=>{
+  const target = e.target;
+  if(target && document.body.classList.contains('authed') && !sesValidarSesionYVersion('entrada')){
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+window.addEventListener('keydown', (e)=>{
+  const active = document.activeElement;
+  if(active && document.body.classList.contains('authed') && !sesValidarSesionYVersion('teclado')){
+    const isEditable = ['INPUT','SELECT','TEXTAREA'].includes(active.tagName) || active.isContentEditable;
+    if(isEditable || e.key === 'Enter' || e.key === ' '){
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+}, true);
 
 /* ── DIAGNÓSTICO: registros de stock posiblemente autogenerados ───────────
    SOLO LECTURA: identifica y lista, nunca borra ni modifica nada.
