@@ -1127,10 +1127,9 @@ function toast(msg, type='info'){
 /* ---------- Navegación entre módulos ---------- */
 const RENDERERS = {};
 let currentPage='empleados';
-/* Guarda de sesión para acciones del usuario. Devuelve false si la sesión
-   expiró (conservando lo tecleado y pidiendo login). Se usa al navegar y
-   antes de cualquier operación autenticada, de modo que la expiración se
-   detecta al primer movimiento y no al fallar un guardado. */
+/* Guarda central de sesión para acciones del usuario. Devuelve false si la sesión
+   expiró; la aplicación ya NO conserva borradores temporales ni permite seguir
+   trabajando con una sesión inválida. */
 function sesGuardActividad(){
   if(gsState.accessToken && !gsTokenVigente()){
     sesManejarExpiracion('actividad del usuario');
@@ -1147,9 +1146,6 @@ function goto(page){
   // la restricción de acceso por rol: una cuenta autorizada solo puede
   // "enrutar" hacia los módulos de su rol, incluso si goto() se invoca
   // directamente (consola, atajo, etc.) en vez de hacer clic en el menú.
-  // Tras pintar el módulo, repone los datos que quedaron sin guardar cuando
-  // expiró la sesión (solo del mismo módulo). No se consideran guardados.
-  setTimeout(()=>{ try{ if(isAuthorized()) sesRestaurarBorrador(); }catch(e){} }, 0);
   if(isAuthorized() && !moduloPermitido(page)){
     toast('No tienes acceso a este módulo con esta cuenta.','error');
     page = paginaPorDefecto();
@@ -10432,15 +10428,18 @@ K.gsheetId = 'pl_gsheetId';
 
 // Estado de sesión Google. El access token se persiste (con su expiración) para
 // mantener la sesión al refrescar; los tokens de Google duran ~1 hora.
-let gsState = { tokenClient:null, accessToken:null, tokenExpiry:0, email:null, spreadsheetId:null, lastSync:null };
+let gsState = { tokenClient:null, accessToken:null, tokenExpiry:0, sessionExpiry:0, email:null, spreadsheetId:null, lastSync:null };
 
 // Claves de sesión en localStorage.
-const AUTH_KEYS = { token:'pl_auth_token', exp:'pl_auth_token_exp', email:'pl_auth_email' };
+const AUTH_KEYS = { token:'pl_auth_token', exp:'pl_auth_token_exp', sessionExp:'pl_auth_session_exp', email:'pl_auth_email' };
+const SESSION_DURATION_MS = 3 * 60 * 60 * 1000;
+
 // Guarda la sesión actual (token + expiración + correo) para sobrevivir a un refresh.
 function gsPersistSession(){
   if(gsState.accessToken && gsState.email){
     localStorage.setItem(AUTH_KEYS.token, gsState.accessToken);
     localStorage.setItem(AUTH_KEYS.exp, String(gsState.tokenExpiry||0));
+    localStorage.setItem(AUTH_KEYS.sessionExp, String(gsState.sessionExpiry||0));
     localStorage.setItem(AUTH_KEYS.email, gsState.email);
   }
 }
@@ -10452,9 +10451,13 @@ function gsClearSession(){
 function gsRestoreSession(){
   const tok = localStorage.getItem(AUTH_KEYS.token);
   const exp = Number(localStorage.getItem(AUTH_KEYS.exp)||0);
+  const sessionExp = Number(localStorage.getItem(AUTH_KEYS.sessionExp)||0);
   const email = localStorage.getItem(AUTH_KEYS.email);
-  if(tok && email && exp > Date.now()+60000){
-    gsState.accessToken = tok; gsState.tokenExpiry = exp; gsState.email = email;
+  if(tok && email && sessionExp > Date.now()+SESION_MARGEN_MS){
+    gsState.accessToken = tok;
+    gsState.tokenExpiry = exp;
+    gsState.sessionExpiry = sessionExp;
+    gsState.email = email;
     return true;
   }
   return false;
@@ -10493,6 +10496,7 @@ function gsRequestToken(interactive=true){
       if(resp && resp.error){ reject(new Error(resp.error)); return; }
       gsState.accessToken = resp.access_token;
       gsState.tokenExpiry = Date.now() + ((Number(resp.expires_in)||3600)*1000);
+      if(!gsState.sessionExpiry) gsState.sessionExpiry = Date.now() + SESSION_DURATION_MS;
       resolve(resp.access_token);
     };
     try{ tc.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
@@ -10506,6 +10510,7 @@ async function gsSignIn(){
     gsUpdateSyncStatus('Conectando con Google…','info');
     await gsWaitForLib();
     await gsRequestToken(true);
+    gsState.sessionExpiry = Date.now() + SESSION_DURATION_MS;
     await gsFetchUserEmail();
     toast('Sesión de Google iniciada','success');
     gsUpdateSyncStatus('Sesión iniciada. Detectando hoja…','info');
@@ -10532,6 +10537,7 @@ function gsSignOut(){
   gsState.accessToken = null;
   gsState.email = null;
   gsState.tokenExpiry = 0;
+  gsState.sessionExpiry = 0;
   gsClearSession();
   toast('Sesión de Google cerrada','warn');
   gsUpdateSyncStatus('Sin sesión.','info');
@@ -10539,20 +10545,25 @@ function gsSignOut(){
 }
 
 /* ── VIGENCIA DE SESIÓN ────────────────────────────────────────────────────
-   Antes bastaba con que existiera un accessToken en memoria, sin mirar su
-   expiración: por eso, tras horas de suspensión, la app parecía operativa con
-   un token ya vencido y el usuario solo lo descubría al fallar un guardado.
-   Ahora la caducidad forma parte de la comprobación, con 30 s de margen. */
+   La sesión de la aplicación dura 3 horas desde el inicio de sesión explícito.
+   El access token de Google puede tener una expiración más corta; mientras la
+   sesión de la aplicación siga vigente, se puede renovar silenciosamente antes
+   de una operación autenticada. Cuando vence la sesión de 3 horas, NO se
+   conserva ni se restaura trabajo pendiente: se bloquea y se solicita login. */
 const SESION_MARGEN_MS = 30000;
 function gsTokenVigente(){
   if(!gsState.accessToken) return false;
   const exp = Number(gsState.tokenExpiry||0);
   return exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
 }
-function gsIsSignedIn(){ return gsTokenVigente(); }
-// Minutos restantes de sesión (informativo).
+function gsSesionVigente(){
+  const exp = Number(gsState.sessionExpiry||0);
+  return exp > Date.now() + SESION_MARGEN_MS;
+}
+function gsIsSignedIn(){ return gsSesionVigente() && !!gsState.accessToken; }
+// Minutos restantes de sesión de aplicación (3 h).
 function gsMinutosRestantes(){
-  const exp = Number(gsState.tokenExpiry||0);
+  const exp = Number(gsState.sessionExpiry||0);
   return exp ? Math.max(0, Math.round((exp-Date.now())/60000)) : null;
 }
 
@@ -10568,25 +10579,35 @@ async function gsFetchUserEmail(){
 
 /* ---------- Wrapper de fetch con manejo de token expirado (401) ---------- */
 async function gsApiFetch(url, options={}){
-  if(!gsState.accessToken) throw new Error('NO_SESSION');
-  // Detección temprana: si el token ya caducó no se envía la petición; se
-  // conserva lo tecleado y se pide login antes de tocar el backend.
-  if(!gsTokenVigente()){ sesManejarExpiracion('operación con token vencido'); throw new Error('SESSION_EXPIRED'); }
+  if(!gsSesionVigente()){ sesManejarExpiracion('sesión de aplicación vencida'); throw new Error('SESSION_EXPIRED'); }
+  if(!gsState.accessToken){ throw new Error('NO_SESSION'); }
   const opt = Object.assign({}, options);
   opt.headers = Object.assign({}, options.headers, { 'Authorization':'Bearer '+gsState.accessToken });
-  let r = await fetch(url, opt);
-  if(r.status === 401){
-    // token expirado: intentar renovar silenciosamente una vez
+  // El access token de Google puede vencer antes de las 3 h. Mientras la
+  // sesión de la aplicación siga vigente, se renueva silenciosamente.
+  if(!gsTokenVigente()){
     try{
       await gsRequestToken(false);
-      gsPersistSession(); // guarda el token renovado
+      gsPersistSession();
+      opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
+    }catch(e){
+      sesManejarExpiracion('no fue posible renovar el token de Google');
+      throw new Error('SESSION_EXPIRED');
+    }
+  }
+  let r = await fetch(url, opt);
+  if(r.status === 401){
+    // Una segunda oportunidad de renovación solo si la sesión de 3 h sigue válida.
+    try{
+      await gsRequestToken(false);
+      gsPersistSession();
       opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
       r = await fetch(url, opt);
     }catch(e){
-      gsState.accessToken = null; gsClearSession();
+      sesManejarExpiracion('respuesta 401 y renovación fallida');
       throw new Error('SESSION_EXPIRED');
     }
-    if(r.status === 401){ gsState.accessToken = null; gsClearSession(); throw new Error('SESSION_EXPIRED'); }
+    if(r.status === 401){ sesManejarExpiracion('respuesta 401 persistente'); throw new Error('SESSION_EXPIRED'); }
   }
   return r;
 }
@@ -11040,10 +11061,8 @@ function gsMatrizValida(sheetName, matrix){
 const GS_BORRADO_MASIVO_MIN = 5;   // se ignora en hojas muy pequeñas
 
 async function gsSaveSheet(domain, sheetName, matrix){
-  // Guarda de sesión: con el token vencido no se intenta escribir ni se
-  // reporta éxito; se conserva lo ingresado y se solicita iniciar sesión.
-  if(gsState.accessToken && !gsTokenVigente()){
-    sesManejarExpiracion('guardado con token vencido');
+  if(!gsSesionVigente() || !gsState.accessToken){
+    sesManejarExpiracion('intento de guardado sin sesión válida');
     return false;
   }
   if(!isAuthorized()) return false;
@@ -11109,7 +11128,6 @@ async function gsSaveSheet(domain, sheetName, matrix){
       if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
     }
     gsState.lastSync = new Date();
-    sesDescartarBorrador();   // guardado confirmado: el borrador ya no aplica
     console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas'+
       (preservados?', '+preservados+' preservadas del remoto':'')+')');
     gsUpdateSyncStatus('"'+sheetName+'" guardado.','success');
@@ -11465,203 +11483,196 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   GESTIÓN DE SESIÓN, BORRADORES Y VERSIÓN
-   Mecanismo genérico y transversal: no toca la lógica de ningún módulo.
-   1) Borrador: al detectar expiración se capturan los campos del módulo
-      activo (por su id/clase) en localStorage. NO son datos guardados: se
-      restauran tras el nuevo login y solo se descartan cuando el usuario
-      guarda correctamente o los descarta de forma explícita.
-   2) Reactivación: al volver de suspensión o recuperar el foco se valida
-      sesión y versión antes de permitir seguir trabajando.
-   3) Versión: se compara la versión del archivo servido con la cargada,
-      para no seguir usando código antiguo desde la caché del navegador.
+   GESTIÓN TRANSVERSAL DE SESIÓN Y VERSIÓN
+   - No existen borradores temporales de formularios.
+   - Una sesión de aplicación dura 3 horas desde el login explícito.
+   - El access token de Google puede renovarse silenciosamente mientras la
+     sesión de aplicación de 3 horas siga vigente.
+   - Si la sesión de 3 horas vence, se bloquea la interacción, se limpian las
+     credenciales y se fuerza un refresh que lleva al login.
+   - La versión del HTML se valida contra el documento servido sin caché.
+   - Cada 15 min se refresca la página para asegurar que se use la versión más
+     reciente. También se valida al recuperar foco/visibilidad/online.
    ════════════════════════════════════════════════════════════════════════ */
-const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
-// Versión de la app embebida en el propio archivo.
+const SES_VERSION_KEY = 'ses_appVersion';
 const APP_VERSION = '2026-08-27.1';
+const SES_VERSION_CHECK_MS = 15 * 60 * 1000;
 let sesionExpiradaAvisada = false;
+let sesVersionState = 'checking'; // checking | current | stale
+let sesUltimaVersionCheck = 0;
+let sesUltimaValidacion = 0;
 
-// ── Borradores de formulario ──────────────────────────────────────────────
-// Captura los campos visibles del módulo activo (input/select/textarea con id).
-/* Clave ÚNICA de un campo dentro del formulario.
-   CORRECCIÓN CRÍTICA: antes se componía solo de clase + data-insumo, y los
-   inputs de Stock inicial y Stock cierre (misma clase, mismo insumo, distinto
-   data-campo) colisionaban: al capturar, uno sobrescribía al otro y, al
-   restaurar, el mismo valor se escribía en AMBOS campos. Eso generaba
-   registros con stockInicial === stockCierre que el usuario nunca ingresó.
-   Ahora se incluyen TODOS los discriminadores del input. */
-function sesClaveCampo(el){
-  if(el.id) return 'id:'+el.id;
-  if(!el.className || !el.dataset) return '';
-  const d = el.dataset;
-  const partes = [el.className.split(' ')[0],
-    d.insumo||'', d.art||'', d.prod||'', d.id||'', d.bebida||'', d.licor||'',
-    d.campo||'', d.unit||'', d.unidad||'', d.momento||'', d.tipo||'', d.idx||''];
-  const cuerpo = partes.slice(1).join('|');
-  return cuerpo.replace(/\|+$/,'')==='' ? '' : partes.join('|');
-}
-// Fecha del formulario activo (para no restaurar en un día distinto).
-function sesFechaFormulario(){
-  const cont = document.getElementById('page') || document.body;
-  const f = cont.querySelector('input[type="date"]');
-  return f && f.value ? f.value : '';
-}
-function sesCapturarBorrador(){
-  try{
-    const cont = document.getElementById('page') || document.body;
-    const campos = {};
-    cont.querySelectorAll('input, select, textarea').forEach(el=>{
-      // Los campos deshabilitados no son datos del usuario: no se capturan.
-      if(el.disabled) return;
-      const clave = sesClaveCampo(el);
-      if(!clave) return;
-      if(el.type==='checkbox' || el.type==='radio'){ campos[clave] = el.checked ? '1':'0'; }
-      else if(String(el.value??'').trim()!==''){ campos[clave] = el.value; }
-    });
-    if(!Object.keys(campos).length) return false;
-    localStorage.setItem(SES_KEYS.borrador, JSON.stringify({
-      v: SES_BORRADOR_VERSION, modulo: currentPage, fecha: new Date().toISOString(),
-      fechaForm: sesFechaFormulario(), campos }));
-    console.warn('[Sesión] Borrador conservado de "'+currentPage+'" ('+Object.keys(campos).length+' campos). No se guardó en el Spreadsheet.');
-    return true;
-  }catch(e){ console.error('[Sesión] No se pudo conservar el borrador:', e); return false; }
-}
-// Los borradores creados con el formato anterior (clave colisionada) se
-// descartan: podrían repoblar Stock inicial y Stock cierre con el mismo valor.
-const SES_BORRADOR_VERSION = 2;
-function sesLeerBorrador(){
-  try{
-    const raw = localStorage.getItem(SES_KEYS.borrador);
-    if(!raw) return null;
-    const b = JSON.parse(raw);
-    if(!b || b.v !== SES_BORRADOR_VERSION){
-      console.warn('[Sesión] Borrador con formato antiguo descartado (no se restaura para evitar datos incorrectos).');
-      localStorage.removeItem(SES_KEYS.borrador);
-      return null;
-    }
-    return b;
-  }catch(e){ return null; }
-}
-function sesDescartarBorrador(){ localStorage.removeItem(SES_KEYS.borrador); }
-// Repuebla los campos del módulo si hay un borrador de ese mismo módulo.
-function sesRestaurarBorrador(){
-  const b = sesLeerBorrador();
-  if(!b || b.modulo!==currentPage) return false;
-  // El borrador pertenece a la fecha en que se capturó: si el formulario está
-  // en otro día, NO se restaura (evita que datos del 27 aparezcan como del 28).
-  const fechaActual = sesFechaFormulario();
-  if(b.fechaForm && fechaActual && b.fechaForm !== fechaActual) return false;
-  let repuestos = 0;
-  const cont = document.getElementById('page') || document.body;
-  cont.querySelectorAll('input, select, textarea').forEach(el=>{
-    // Nunca se repone en un campo no editable: el usuario no pudo escribirlo.
-    if(el.disabled) return;
-    const clave = sesClaveCampo(el);
-    if(!clave || !(clave in b.campos)) return;
-    if(el.type==='checkbox' || el.type==='radio') el.checked = b.campos[clave]==='1';
-    else el.value = b.campos[clave];
-    repuestos++;
-  });
-  if(repuestos) sesMostrarAvisoBorrador(b, repuestos);
-  return repuestos>0;
-}
-// Aviso no intrusivo con opción de descartar.
-function sesMostrarAvisoBorrador(b, n){
-  if(document.getElementById('sesBorradorAviso')) return;
-  const d = document.createElement('div');
-  d.id = 'sesBorradorAviso';
-  d.style.cssText='margin:0 0 12px;padding:10px 14px;border-radius:10px;background:#fef3c7;border:1px solid #fde68a;color:#92400e;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap';
-  d.innerHTML = `<span>📝 Se recuperaron <b>${n} dato(s)</b> que habías ingresado antes de que expirara la sesión (del ${fmtFecha(b.fecha.slice(0,10))}). <b>Aún no están guardados</b>: revísalos y pulsa Guardar.</span>
-    <button class="btn btn-ghost btn-sm" id="sesBorradorDescartar">Descartar</button>`;
-  const cont = document.getElementById('page') || document.body;
-  cont.insertBefore(d, cont.firstChild);
-  const btn = document.getElementById('sesBorradorDescartar');
-  if(btn) btn.onclick = ()=>{ sesDescartarBorrador(); d.remove(); toast('Datos pendientes descartados','warn'); };
-}
-
-// ── Expiración de sesión ──────────────────────────────────────────────────
-// Punto ÚNICO de reacción: conserva el borrador, invalida el token y pide login.
-function sesManejarExpiracion(motivo){
-  if(sesionExpiradaAvisada) return;      // evita avisos duplicados y bucles
-  sesionExpiradaAvisada = true;
-  const habiaDatos = sesCapturarBorrador();
-  gsState.accessToken = null;
-  gsClearSession();
-  try{ if(typeof gsRenderControls==='function') gsRenderControls(); }catch(e){}
-  toast('Tu sesión ha expirado. Inicia sesión nuevamente para continuar.' +
-        (habiaDatos?' Tus datos sin guardar se conservaron.':''), 'error');
-  console.warn('[Sesión] Expirada ('+motivo+').');
-  try{ if(typeof RENDERERS[currentPage]==='function') RENDERERS[currentPage](); }catch(e){}
-}
-
-// ── Versión de la aplicación ──────────────────────────────────────────────
-// Descarga el propio documento sin caché y compara la versión declarada.
-async function sesHayNuevaVersion(){
-  try{
-    const r = await fetch(window.location.pathname + '?v=' + Date.now(), { cache:'no-store' });
-    if(!r.ok) return false;
-    const txt = await r.text();
-    const m = txt.match(/const APP_VERSION = '([^']+)'/);
-    return !!(m && m[1] && m[1] !== APP_VERSION);
-  }catch(e){ return false; }   // sin red: no se fuerza recarga
-}
-async function sesAplicarNuevaVersionSiHay(){
-  if(await sesHayNuevaVersion()){
-    sesCapturarBorrador();                 // nunca perder lo tecleado
-    toast('Hay una versión más reciente. Actualizando…','info');
-    setTimeout(()=>window.location.reload(true), 800);
-    return true;
+function sesBloquearInteraccion(motivo){
+  if(document.activeElement && typeof document.activeElement.blur==='function'){
+    try{ document.activeElement.blur(); }catch(e){}
   }
+  console.warn('[Sesión] Interacción bloqueada: '+motivo);
   return false;
 }
 
-// ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
-let sesUltimaValidacion = 0;
-async function sesValidarAlReactivar(){
-  if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
-  sesUltimaValidacion = Date.now();
-  const habiaToken = !!gsState.accessToken;
-  if(habiaToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación'); return; }
-  if(habiaToken) await sesAplicarNuevaVersionSiHay();
+function sesManejarExpiracion(motivo){
+  if(sesionExpiradaAvisada) return;
+  sesionExpiradaAvisada = true;
+  gsState.accessToken = null;
+  gsState.tokenExpiry = 0;
+  gsState.sessionExpiry = 0;
+  gsState.email = null;
+  gsClearSession();
+  document.body.classList.remove('authed');
+  try{ if(typeof gsRenderControls==='function') gsRenderControls(); }catch(e){}
+  authSetMsg('Tu sesión ha vencido. La página se actualizará para que puedas iniciar sesión nuevamente.','error');
+  toast('Tu sesión ha vencido. Actualizando…','error');
+  console.warn('[Sesión] Expirada ('+motivo+').');
+  setTimeout(()=>{ window.location.replace(window.location.href.split('#')[0] + (window.location.href.includes('?')?'&':'?') + 'v=' + Date.now()); }, 500);
 }
+
+function sesManejarVersionDesactualizada(){
+  if(sesVersionState==='stale') return true;
+  sesVersionState='stale';
+  sesBloquearInteraccion('versión desactualizada');
+  toast('Hay una nueva versión de la aplicación. Actualizando…','info');
+  setTimeout(()=>{ window.location.replace(window.location.href.split('#')[0] + (window.location.href.includes('?')?'&':'?') + 'v=' + Date.now()); }, 500);
+  return true;
+}
+
+async function sesHayNuevaVersion(){
+  try{
+    const r = await fetch(window.location.href.split('#')[0] + '?v=' + Date.now(), { cache:'no-store', credentials:'same-origin' });
+    if(!r.ok) return false;
+    const txt = await r.text();
+    const m = txt.match(/const APP_VERSION = ['"]([^'"]+)['"]/);
+    if(!m || !m[1]) return false;
+    return m[1] !== APP_VERSION;
+  }catch(e){
+    console.warn('[Versión] No se pudo comprobar la versión:', e);
+    return false;
+  }
+}
+
+async function sesAplicarNuevaVersionSiHay(){
+  const nueva = await sesHayNuevaVersion();
+  sesUltimaVersionCheck = Date.now();
+  if(nueva){
+    sesManejarVersionDesactualizada();
+    return true;
+  }
+  sesVersionState='current';
+  try{ localStorage.setItem(SES_VERSION_KEY, APP_VERSION); }catch(e){}
+  return false;
+}
+
+function sesValidarActividadSync(){
+  if(!gsSesionVigente()){
+    sesManejarExpiracion('interacción con sesión vencida');
+    return false;
+  }
+  if(sesVersionState==='stale'){
+    sesManejarVersionDesactualizada();
+    return false;
+  }
+  // Mientras la versión todavía se comprueba después del login, se permite
+  // que el flujo de autenticación termine, pero no se habilitan acciones de
+  // datos hasta que la validación remota marque current.
+  if(sesVersionState==='checking') return sesBloquearInteraccion('verificación de versión en curso');
+  return true;
+}
+
+function sesGuardActividad(){
+  if(!gsSesionVigente()){
+    sesManejarExpiracion('actividad del usuario');
+    return false;
+  }
+  if(sesVersionState==='stale'){
+    sesManejarVersionDesactualizada();
+    return false;
+  }
+  return true;
+}
+
+async function sesValidarAlReactivar(){
+  if(Date.now() - sesUltimaValidacion < 5000) return;
+  sesUltimaValidacion = Date.now();
+  if(!gsSesionVigente()){
+    sesManejarExpiracion('reactivación');
+    return;
+  }
+  if(!gsTokenVigente()){
+    try{
+      await gsRequestToken(false);
+      gsPersistSession();
+    }catch(e){
+      sesManejarExpiracion('token de Google no renovable tras reactivación');
+      return;
+    }
+  }
+  await sesAplicarNuevaVersionSiHay();
+}
+
+// Intercepta interacciones relevantes ANTES de que los handlers de cada módulo
+// se ejecuten. La validación es transversal y evita que un formulario siga
+// funcionando con una sesión vencida o una versión marcada como obsoleta.
+(function instalarGuardaInteraccion(){
+  const eventos = ['click','change','input','submit','pointerdown','keydown'];
+  const permitido = new Set(['authLoginBtn','authLogoutBtn']);
+  eventos.forEach(tipo=>{
+    document.addEventListener(tipo, e=>{
+      if(!document.body.classList.contains('authed')) return;
+      const t = e.target && (e.target.closest ? e.target.closest('button,input,select,textarea,a,[role="button"]') : null);
+      if(t && permitido.has(t.id)) return;
+      if(!sesValidarActividadSync()){
+        try{ e.preventDefault(); }catch(_e){}
+        try{ e.stopImmediatePropagation(); }catch(_e){}
+      }
+    }, true);
+  });
+})();
+
+// Recuperación de foco/visibilidad y reconexión de red. Esto cubre el caso
+// portátil/tablet suspendida durante horas.
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
 window.addEventListener('focus', sesValidarAlReactivar);
 window.addEventListener('online', sesValidarAlReactivar);
-// pageshow cubre la restauración desde la caché de retroceso (bfcache), donde
-// no siempre se emite visibilitychange.
 window.addEventListener('pageshow', (e)=>{ if(e.persisted) sesValidarAlReactivar(); });
 
-/* Detector de SUSPENSIÓN por salto de reloj. Es el mecanismo clave del caso
-   "portátil suspendido toda la noche": si solo se bloquea la pantalla y la
-   pestaña sigue visible, el navegador no emite visibilitychange ni focus, y
-   los timers no corren mientras el equipo duerme. Al despertar, el intervalo
-   detecta que pasó mucho más tiempo del esperado y revalida la sesión. */
+// Detector de suspensión por salto de reloj.
 let sesUltimoTick = Date.now();
 if(!window.__sesTickTimer){
   window.__sesTickTimer = setInterval(()=>{
     const ahora = Date.now();
     const salto = ahora - sesUltimoTick;
     sesUltimoTick = ahora;
-    if(salto > 120000){            // el equipo estuvo suspendido
+    if(salto > 120000){
       console.warn('[Sesión] Reanudación detectada tras '+Math.round(salto/60000)+' min de inactividad.');
-      sesUltimaValidacion = 0;     // fuerza la revalidación inmediata
+      sesUltimaValidacion = 0;
       sesValidarAlReactivar();
     }
   }, 30000);
 }
-// Chequeo periódico ligero (sin recargar): un único timer.
-if(!window.__sesTimer){
-  window.__sesTimer = setInterval(()=>{
-    if(gsState.accessToken && !gsTokenVigente()) sesManejarExpiracion('vencimiento en uso');
-  }, 60000);
-}
-// Coherencia entre pestañas: si una cierra sesión, las demás lo reflejan.
-window.addEventListener('storage', (e)=>{
-  if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){
-    sesManejarExpiracion('cierre de sesión en otra pestaña');
-  }
-});
 
+// Control de sesión frecuente: el usuario no puede permanecer con una sesión
+// de aplicación vencida esperando hasta el próximo click.
+if(!window.__sesSessionTimer){
+  window.__sesSessionTimer = setInterval(()=>{
+    if(gsState.accessToken && !gsSesionVigente()) sesManejarExpiracion('vencimiento automático de la sesión');
+  }, 30000);
+}
+
+// Refresco periódico solicitado: cada 15 minutos se comprueba la versión y se
+// recarga la página. Si la sesión de 3 h venció, authTrySilent no podrá restaurarla
+// y aparecerá el login. Si sigue vigente, se restaura la sesión automáticamente.
+if(!window.__sesRefresh15Timer){
+  window.__sesRefresh15Timer = setInterval(async ()=>{
+    if(!gsState.accessToken) return;
+    if(!gsSesionVigente()){
+      sesManejarExpiracion('refresco periódico con sesión vencida');
+      return;
+    }
+    const stale = await sesAplicarNuevaVersionSiHay();
+    if(!stale) window.location.reload();
+  }, SES_VERSION_CHECK_MS);
+}
+
+/* ── DIAGNÓSTICO: registros de stock posiblemente autogenerados ─────────── */
 /* ── DIAGNÓSTICO: registros de stock posiblemente autogenerados ───────────
    SOLO LECTURA: identifica y lista, nunca borra ni modifica nada.
    Criterio (huella del defecto de borrador ya corregido):
@@ -11741,7 +11752,7 @@ window.limpiarMarcacionesDuplicadas = limpiarMarcacionesDuplicadas;
 
 function gsHandleError(err, accion){
   if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
-    // Punto único: conserva lo tecleado, invalida la sesión y pide login.
+    // Punto único: invalida la sesión y pide login; no conserva datos temporales.
     sesManejarExpiracion('respuesta 401 del servidor');
     gsUpdateSyncStatus('Sesión expirada. Inicia sesión de nuevo.','error');
   }else{
@@ -12023,16 +12034,24 @@ async function authSignIn(){
 // refrescada con una sesión que YA estaba activa, no un inicio de sesión.
 async function authTrySilent(){
   if(!localStorage.getItem(AUTH_KEYS.email)) return; // sin sesión previa: mostrar login
-  // 1) Restaurar un token aún válido sin contactar a Google (mantiene la sesión al refrescar).
-  if(gsRestoreSession() && isAuthorized()){ authGrant(false); return; }
-  // 2) Renovación silenciosa si el token expiró.
-  try{
-    await gsWaitForLib();
-    await gsRequestToken(false); // sin prompt
-    await gsFetchUserEmail();
-    if(isAuthorized()) authGrant(false);
-    else authDeny(gsState.email);
-  }catch(e){ /* se requiere login manual */ }
+  // 1) Restaurar la sesión de aplicación de 3 h si sigue vigente.
+  if(gsRestoreSession() && isAuthorized()){
+    if(gsTokenVigente()){ authGrant(false); return; }
+    // El access token de Google puede haber vencido aunque la sesión de 3 h siga viva.
+    try{
+      await gsWaitForLib();
+      await gsRequestToken(false);
+      await gsFetchUserEmail();
+      if(isAuthorized() && gsSesionVigente()) authGrant(false);
+      else authDeny(gsState.email);
+    }catch(e){
+      // Sin renovación del token subyacente no se puede seguir, aunque la sesión de app no haya vencido.
+      authDeny(gsState.email);
+    }
+    return;
+  }
+  // Sesión de aplicación vencida o ausente: NO se renueva silenciosamente.
+  gsClearSession();
 }
 
 // Concede acceso: muestra la app (con el menú filtrado por rol) y habilita
@@ -12047,30 +12066,20 @@ async function authTrySilent(){
 function authGrant(viaLogin){
   document.body.classList.add('authed');
   sesionExpiradaAvisada = false;             // nueva sesión: se rearma el aviso
+  if(!gsState.sessionExpiry) gsState.sessionExpiry = Date.now() + SESSION_DURATION_MS;
+  sesVersionState = 'checking';
   gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
-  // Al iniciar sesión se comprueba que se esté usando la última versión: si
-  // hay una más reciente, se recarga (conservando antes cualquier borrador)
-  // para evitar trabajar con código antiguo servido desde la caché.
-  if(viaLogin) sesAplicarNuevaVersionSiHay();
-  authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
-  toast('Bienvenido, '+gsState.email,'success');
-  gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
+  authSetMsg('Acceso concedido. Verificando sesión y versión…','info');
 
   const role = currentRole();
   const domain = role ? role.domain : 'planilla';
   const isCombined = domain === 'planilla+inventario';
 
   reloadState();
-  // Para dominio combinado: cargar ambos; para dominios únicos: limpiar el otro
   if(!isCombined){
     if(domain==='inventario') limpiarEstadoDominio('planilla');
     else limpiarEstadoDominio('inventario');
   }
-  // Si el rol trae Spreadsheets fijos (hardcodeados), guardarlos/forzarlos como
-  // los únicos IDs válidos de cada dominio. Esto sobrescribe cualquier ID
-  // incorrecto que haya quedado en localStorage de una sesión anterior (p.ej.
-  // el ID de un Spreadsheet creado accidentalmente o buscado por nombre).
-  // El ID fijo del rol es siempre la fuente de verdad.
   if(role){
     [ ['inventario', role.inventarioGsheetId, K.gsheetIdInv],
       ['planilla',   role.planillaGsheetId,   K.gsheetId   ] ].forEach(([dom, fixedId, key])=>{
@@ -12087,23 +12096,41 @@ function authGrant(viaLogin){
   aplicarTextosFooterPorRol();
   goto(moduloPermitido(currentPage) ? currentPage : paginaPorDefecto());
 
-  if(isCombined){
-    // Sincronizar ambos dominios en paralelo
-    const ensurePl  = gsEnsureSpreadsheet('planilla').catch(()=>{});
-    const ensureInv = gsEnsureSpreadsheet('inventario').catch(()=>{});
-    ensurePl.then(()=>  gsLoadFromSheets('planilla',  {auto:true})).catch(()=>{});
-    ensureInv.then(()=> gsLoadFromSheets('inventario', {auto:true})).catch(()=>{});
-  } else {
-    const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
-    ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
-  }
-  gsRenderControls();
+  // No empieces la sincronización de datos hasta que la comprobación de versión
+  // haya terminado. Si el HTML servido es antiguo, el flujo se detiene y se
+  // recarga primero para evitar trabajar o guardar con código desactualizado.
+  const continuarConSincronizacion = async()=>{
+    const stale = await sesAplicarNuevaVersionSiHay();
+    if(stale) return;
+    if(!gsSesionVigente()){
+      sesManejarExpiracion('sesión vencida durante la validación inicial');
+      return;
+    }
+    authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
+    toast('Bienvenido, '+gsState.email,'success');
+    gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
+    if(isCombined){
+      const ensurePl  = gsEnsureSpreadsheet('planilla').catch(()=>{});
+      const ensureInv = gsEnsureSpreadsheet('inventario').catch(()=>{});
+      ensurePl.then(()=>  gsLoadFromSheets('planilla',  {auto:true})).catch(()=>{});
+      ensureInv.then(()=> gsLoadFromSheets('inventario', {auto:true})).catch(()=>{});
+    } else {
+      const ensure = gsEnsureSpreadsheet(domain).catch(()=>{});
+      ensure.then(()=> gsLoadFromSheets(domain, { auto:true })).catch(()=>{});
+    }
+    gsRenderControls();
+  };
+
+  // Tanto el login explícito como la restauración de una sesión ya existente
+  // verifican la versión antes de comenzar a operar. Solo el login explícito
+  // crea una nueva ventana de sesión de 3 h; el refresh conserva la existente.
+  continuarConSincronizacion();
 }
 
 // Deniega acceso: revoca el token y mantiene la app oculta.
 function authDeny(email){
   gsRevokeToken();
-  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
+  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0; gsState.sessionExpiry=0;
   document.body.classList.remove('authed');
   gsClearSession();
   limpiarEstadoDominio('planilla'); limpiarEstadoDominio('inventario');
@@ -12114,7 +12141,7 @@ function authDeny(email){
 // Cierra sesión: bloquea la app y vuelve al login.
 function authLogout(){
   gsRevokeToken();
-  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
+  gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0; gsState.sessionExpiry=0;
   gsClearSession();
   document.body.classList.remove('authed');
   limpiarEstadoDominio('planilla'); limpiarEstadoDominio('inventario');
