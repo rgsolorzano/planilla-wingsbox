@@ -9594,7 +9594,12 @@ RENDERERS.cotejoLicores = function(){
       const tieneEnt = !!r && (r.entradaOzs||r.entradaBots);
       const tieneSal = !!r && (r.salidaOzs||r.salidaBots);
       const consumo  = tieneEnt || tieneSal ? sEnt - sSal : null;
-      return { sEnt, sSal, consumo, tieneEnt:!!tieneEnt, tieneSal:!!tieneSal };
+      /* Valores ORIGINALES tal como se registraron, sin convertir botellas a
+         onzas. Solo se usan para mostrar; el consumo sigue calculándose con
+         stockLicor(), que sí totaliza en onzas. */
+      return { sEnt, sSal, consumo, tieneEnt:!!tieneEnt, tieneSal:!!tieneSal,
+        entBot: r ? (r.entradaBots||0) : null, entOz: r ? (r.entradaOzs||0) : null,
+        salBot: r ? (r.salidaBots||0)  : null, salOz: r ? (r.salidaOzs||0)  : null };
     });
 
     // Consumo acumulado = SUMA de consumos diarios
@@ -9629,14 +9634,19 @@ RENDERERS.cotejoLicores = function(){
   const DIAS_SEMANA_ES = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
   const hdrFechas = fechas.map(f=>{
     const dow = DIAS_SEMANA_ES[new Date(f+'T12:00:00').getDay()];
-    return `<th colspan="3" class="num" style="text-align:center;background:#ede9fe;border-left:2px solid #c4b5fd;padding:4px 2px">` +
+    return `<th colspan="5" class="num" style="text-align:center;background:#ede9fe;border-left:2px solid #c4b5fd;padding:4px 2px">` +
            `<div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>` +
            `<div style="font-weight:400;font-size:10px;color:#7c3aed;margin-top:1px">${dow}</div></th>`;
   }).join('');
+  /* Entrada y Salida se desagregan en BOT y OZ mostrando el dato original;
+     Consumo permanece en onzas, con su cálculo intacto. */
+  const subEst = (extra='')=>`font-size:10px;font-weight:600;white-space:nowrap;background:#f5f3ff;color:#6d28d9;${extra}`;
   const hdrSub = fechas.map(()=>
-    `<th class="num" style="font-size:10px;font-weight:600;border-left:2px solid #c4b5fd;white-space:nowrap;background:#f5f3ff;color:#6d28d9">Entrada</th>` +
-    `<th class="num" style="font-size:10px;font-weight:600;white-space:nowrap;background:#f5f3ff;color:#6d28d9">Salida</th>` +
-    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff">Consumo</th>`
+    `<th class="num" style="${subEst('border-left:2px solid #c4b5fd')}" title="Entrada: botellas registradas">Ent.<br>bot</th>` +
+    `<th class="num" style="${subEst()}" title="Entrada: onzas registradas">Ent.<br>oz</th>` +
+    `<th class="num" style="${subEst('border-left:1px solid #ddd6fe')}" title="Salida: botellas registradas">Sal.<br>bot</th>` +
+    `<th class="num" style="${subEst()}" title="Salida: onzas registradas">Sal.<br>oz</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff;border-left:1px solid #ddd6fe" title="Consumo del día en onzas">Consumo<br>oz</th>`
   ).join('');
 
   // Estilos de encabezados sticky con colores explícitos (no dependen de herencia)
@@ -9645,10 +9655,15 @@ RENDERERS.cotejoLicores = function(){
 
   // Filas de datos
   const filasHTML = filasDatos.length ? filasDatos.map(f=>{
+    // Sin registro se conserva el guion actual; los valores se muestran tal
+    // como fueron registrados, sin conversión alguna.
+    const val = v => (v===null || v===undefined) ? '&#8212;' : v;
     const celdas = f.dias.map(d=>
-      `<td class="num" style="border-left:2px solid #e9d5ff">${d.tieneEnt ? d.sEnt.toFixed(1) : '&#8212;'}</td>` +
-      `<td class="num">${d.tieneSal ? d.sSal.toFixed(1) : '&#8212;'}</td>` +
-      `<td class="num" style="color:${d.consumo!==null&&d.consumo>0?'#059669':d.consumo!==null&&d.consumo<0?'#dc2626':'inherit'}">${d.consumo!==null ? d.consumo.toFixed(1) : '&#8212;'}</td>`
+      `<td class="num" style="border-left:2px solid #e9d5ff">${d.tieneEnt ? val(d.entBot) : '&#8212;'}</td>` +
+      `<td class="num">${d.tieneEnt ? val(d.entOz) : '&#8212;'}</td>` +
+      `<td class="num" style="border-left:1px solid #ede9fe">${d.tieneSal ? val(d.salBot) : '&#8212;'}</td>` +
+      `<td class="num">${d.tieneSal ? val(d.salOz) : '&#8212;'}</td>` +
+      `<td class="num" style="border-left:1px solid #ede9fe;color:${d.consumo!==null&&d.consumo>0?'#059669':d.consumo!==null&&d.consumo<0?'#dc2626':'inherit'}">${d.consumo!==null ? d.consumo.toFixed(1) : '&#8212;'}</td>`
     ).join('');
     const acumCell = f.acumulado!==null
       ? `<td class="num" style="font-weight:700;border-left:3px solid #4c1d95;color:${f.acumulado>0?'#059669':f.acumulado<0?'#dc2626':'inherit'}">${f.acumulado.toFixed(1)} oz</td>`
@@ -9660,7 +9675,7 @@ RENDERERS.cotejoLicores = function(){
     const cls = sinDatos ? 'row-vac' : '';
     const bg  = sinDatos ? '#f5f3ff' : '#fff';
     return `<tr class="${cls}"><td class="cotejo-col-licor" style="background:${bg}">${f.lic.nombre}</td>${celdas}${acumCell}${totalCell}</tr>`;
-  }).join('') : `<tr><td colspan="${3*fechas.length+3}" class="empty">No hay licores registrados.</td></tr>`;
+  }).join('') : `<tr><td colspan="${5*fechas.length+3}" class="empty">No hay licores registrados.</td></tr>`;
 
   // Fila Total
   const totCeldas = totDias.map(t=>
@@ -11522,7 +11537,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-04.2';
+const APP_VERSION = '2026-09-04.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
