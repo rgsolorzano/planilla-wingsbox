@@ -7840,6 +7840,35 @@ function insumoRendMax(ins){
 /* ¿Ese rendimiento está fuera del rango del insumo? Límites INCLUSIVOS:
    alerta si rend <= mín o rend >= máx. Un rendimiento vacío (null) NUNCA es
    alerta; un 0 calculado sí se evalúa contra los umbrales.                */
+/* Umbral de la regla de AUSENCIA DE CONSUMO: sin porciones vendidas, una
+   variación de inventario mayor a ±15 delata una inconsistencia. */
+const CONSUMO_SIN_VENTA_TOL = 15;
+
+/* Porciones consumidas para la tabla Consumo y rendimiento.
+   Dentro de ESTA tabla la ausencia de registro se interpreta como 0 (no hubo
+   ventas), de modo que pueda operar en los cálculos posteriores. La función
+   porcionesDe() se mantiene intacta: sigue devolviendo null cuando no hay
+   registro, para los usos que necesitan distinguir ambos casos. */
+function porcionesTabla(nombreInsumo, fecha){
+  const p = porcionesDe(nombreInsumo, fecha);
+  return (p===null || p===undefined) ? 0 : p;
+}
+
+/* ¿Este día está en alerta? Las condiciones son ACUMULATIVAS:
+     1) rendimiento <= umbral mínimo del insumo
+     2) rendimiento >= umbral máximo del insumo
+     3) porciones = 0 y |cant. consumida| > 15  (ausencia de consumo)
+   Basta que se cumpla una. La regla 3 solo aplica cuando NO hubo porciones;
+   si hubo ventas, se evalúan únicamente las reglas de rendimiento. */
+function diaEsAlertaRendimiento(ins, porciones, cant, rend){
+  if(rendimientoEsAlerta(ins, rend)) return true;
+  const por = (porciones===null || porciones===undefined) ? 0 : porciones;
+  if(por === 0 && cant !== null && cant !== undefined && Number.isFinite(cant)){
+    return Math.abs(cant) > CONSUMO_SIN_VENTA_TOL;
+  }
+  return false;
+}
+
 function rendimientoEsAlerta(ins, rend){
   if(rend===null || rend===undefined || !Number.isFinite(rend)) return false;
   return rend <= insumoRendMin(ins) || rend >= insumoRendMax(ins);
@@ -8813,10 +8842,10 @@ RENDERERS.inventarioConsolidado = function(){
   // Reutiliza rendimientoEsAlerta() y la fórmula vigente; no las duplica.
   const insTieneAlertaRend = (ins)=>
     insumoAlertaRendimiento(ins) && fechas.some(f=>{
-      const por  = porcionesDe(ins.nombre, f);
+      const por  = porcionesTabla(ins.nombre, f);   // sin registro = 0
       const cant = cantConsumidaDe(ins, f);
-      const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
-      return rendimientoEsAlerta(ins, rend);
+      const rend = (por>0 && cant!==null) ? (cant/por) : null;
+      return diaEsAlertaRendimiento(ins, por, cant, rend);
     });
 
   const insumosBase = insumosOrdenados();   // orden maestro del catálogo
@@ -8879,15 +8908,17 @@ RENDERERS.inventarioConsolidado = function(){
     sub('Rendimiento', false, 'Cantidad consumida ÷ porciones consumidas')).join('');
   const filasIndicadores = insumosIndicadores.map(ins=>{
     const celdas = fechas.map(f=>{
-      const por  = porcionesDe(ins.nombre, f);      // ventas (sin cambios)
+      const por  = porcionesTabla(ins.nombre, f);   // ventas; sin registro = 0
       const cant = cantConsumidaDe(ins, f);         // inventario (sin cambios)
-      // División protegida: porciones 0/nulas o cantidad nula → vacío.
-      const rend = (por!==null && por>0 && cant!==null) ? (cant/por) : null;
-      // Fuera del rango configurado (límites inclusivos) → celda resaltada.
-      const alerta = rendimientoEsAlerta(ins, rend);
-      return `<td class="num inv-dia-ini" style="color:#7c3aed;font-weight:600">${por===null?'':por}</td>`+
+      // División protegida: porciones 0 o cantidad nula → rendimiento vacío.
+      const rend = (por>0 && cant!==null) ? (cant/por) : null;
+      // En alerta por umbral de rendimiento o por ausencia de consumo.
+      const alerta = diaEsAlertaRendimiento(ins, por, cant, rend);
+      return `<td class="num inv-dia-ini" style="color:#7c3aed;font-weight:600">${por}</td>`+
              `<td class="num" style="color:#0f766e;font-weight:600">${cant===null?'':cant}</td>`+
-             `<td class="num${alerta?' inv-cell-alerta':''}" style="${alerta?'':'color:#b45309;'}font-weight:600"${alerta?` title="Fuera del rango ${insumoRendMin(ins)}–${insumoRendMax(ins)}"`:''}>${rend===null?'':(Math.round(rend*100)/100)}</td>`;
+             `<td class="num${alerta?' inv-cell-alerta':''}" style="${alerta?'':'color:#b45309;'}font-weight:600"${alerta?` title="${(por===0 && cant!==null && Math.abs(cant)>CONSUMO_SIN_VENTA_TOL)
+        ? 'Sin porciones consumidas pero el inventario varió '+cant+' (más de ±'+CONSUMO_SIN_VENTA_TOL+')'
+        : 'Fuera del rango '+insumoRendMin(ins)+'–'+insumoRendMax(ins)}"`:''}>${rend===null?'':(Math.round(rend*100)/100)}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}</tr>`;
   }).join('');
@@ -8946,7 +8977,9 @@ RENDERERS.inventarioConsolidado = function(){
       <p class="hint" style="margin-top:0">
         Indicadores derivados por insumo y día: <b>Porciones consumidas</b> (ventas), <b>Cant. consumida</b> (stock + producción − stock del día siguiente) y
         <b>Rendimiento</b> (cant. consumida ÷ porciones consumidas). Se muestran los insumos con <b>Alerta por rendimiento</b> activa en Administración de insumos; comparte el rango de fechas y el filtro de insumo de la tabla anterior.
-        <b>Filtra alertas</b> (en la barra superior) es un filtro global: cuando está activo, ambas tablas muestran solo los insumos con algún día fuera de su rango configurado (límites inclusivos); un rendimiento vacío nunca es alerta.
+        <b>Filtra alertas</b> (en la barra superior) es un filtro global: cuando está activo, ambas tablas muestran solo los insumos con algún día en alerta.
+        Un día está en alerta si su rendimiento queda fuera del rango configurado (límites inclusivos) <b>o</b> si no hubo porciones consumidas y la cantidad consumida varió más de ±${CONSUMO_SIN_VENTA_TOL}, lo que delata una inconsistencia de inventario.
+        Sin registro de ventas, las porciones se muestran como <b>0</b>.
       </p>
       ${insumosIndicadores.length===0
         ? `<div class="mx-outer"><table class="mx-table">
@@ -11489,7 +11522,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-04.1';
+const APP_VERSION = '2026-09-04.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
