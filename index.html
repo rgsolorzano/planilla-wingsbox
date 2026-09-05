@@ -1147,9 +1147,6 @@ function goto(page){
   // la restricción de acceso por rol: una cuenta autorizada solo puede
   // "enrutar" hacia los módulos de su rol, incluso si goto() se invoca
   // directamente (consola, atajo, etc.) en vez de hacer clic en el menú.
-  // Tras pintar el módulo, repone los datos que quedaron sin guardar cuando
-  // expiró la sesión (solo del mismo módulo). No se consideran guardados.
-  setTimeout(()=>{ try{ if(isAuthorized()) sesRestaurarBorrador(); }catch(e){} }, 0);
   if(isAuthorized() && !moduloPermitido(page)){
     toast('No tienes acceso a este módulo con esta cuenta.','error');
     page = paginaPorDefecto();
@@ -10435,7 +10432,7 @@ K.gsheetId = 'pl_gsheetId';
 let gsState = { tokenClient:null, accessToken:null, tokenExpiry:0, email:null, spreadsheetId:null, lastSync:null };
 
 // Claves de sesión en localStorage.
-const AUTH_KEYS = { token:'pl_auth_token', exp:'pl_auth_token_exp', email:'pl_auth_email' };
+const AUTH_KEYS = { inicio:'gs_ses_inicio', token:'pl_auth_token', exp:'pl_auth_token_exp', email:'pl_auth_email' };
 // Guarda la sesión actual (token + expiración + correo) para sobrevivir a un refresh.
 function gsPersistSession(){
   if(gsState.accessToken && gsState.email){
@@ -10492,7 +10489,17 @@ function gsRequestToken(interactive=true){
     tc.callback = (resp)=>{
       if(resp && resp.error){ reject(new Error(resp.error)); return; }
       gsState.accessToken = resp.access_token;
-      gsState.tokenExpiry = Date.now() + ((Number(resp.expires_in)||3600)*1000);
+      /* El token de Google caduca en 1 h (expires_in) y ese valor no lo
+         controla la app. La vigencia EFECTIVA de la sesión la fija la
+         aplicación en SESION_MAX_MS (3 h) desde el inicio de sesión: mientras
+         no se agote, el token de Google se renueva en silencio; cuando se
+         agota, la sesión termina aunque el token siguiese vivo. */
+      const expGoogle = Date.now() + ((Number(resp.expires_in)||3600)*1000);
+      if(!gsState.sesionInicio) gsState.sesionInicio = Date.now();
+      const limiteSesion = gsState.sesionInicio + SESION_MAX_MS;
+      gsState.tokenExpiry = Math.min(expGoogle, limiteSesion);
+      gsState.sesionFin   = limiteSesion;
+      try{ localStorage.setItem(AUTH_KEYS.inicio, String(gsState.sesionInicio)); }catch(e){}
       resolve(resp.access_token);
     };
     try{ tc.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
@@ -10544,8 +10551,13 @@ function gsSignOut(){
    un token ya vencido y el usuario solo lo descubría al fallar un guardado.
    Ahora la caducidad forma parte de la comprobación, con 30 s de margen. */
 const SESION_MARGEN_MS = 30000;
+// Vigencia efectiva de la sesión fijada por la aplicación: 3 horas.
+const SESION_MAX_MS = 3*60*60*1000;
 function gsTokenVigente(){
   if(!gsState.accessToken) return false;
+  // Límite duro de 3 h desde el inicio de sesión, independiente del token.
+  const fin = Number(gsState.sesionFin||0);
+  if(fin > 0 && Date.now() >= fin) return false;
   const exp = Number(gsState.tokenExpiry||0);
   return exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
 }
@@ -11109,7 +11121,6 @@ async function gsSaveSheet(domain, sheetName, matrix){
       if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
     }
     gsState.lastSync = new Date();
-    sesDescartarBorrador();   // guardado confirmado: el borrador ya no aplica
     console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas'+
       (preservados?', '+preservados+' preservadas del remoto':'')+')');
     gsUpdateSyncStatus('"'+sheetName+'" guardado.','success');
@@ -11478,7 +11489,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-08-27.1';
+const APP_VERSION = '2026-09-04.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -11506,92 +11517,69 @@ function sesFechaFormulario(){
   const f = cont.querySelector('input[type="date"]');
   return f && f.value ? f.value : '';
 }
-function sesCapturarBorrador(){
-  try{
-    const cont = document.getElementById('page') || document.body;
-    const campos = {};
-    cont.querySelectorAll('input, select, textarea').forEach(el=>{
-      // Los campos deshabilitados no son datos del usuario: no se capturan.
-      if(el.disabled) return;
-      const clave = sesClaveCampo(el);
-      if(!clave) return;
-      if(el.type==='checkbox' || el.type==='radio'){ campos[clave] = el.checked ? '1':'0'; }
-      else if(String(el.value??'').trim()!==''){ campos[clave] = el.value; }
-    });
-    if(!Object.keys(campos).length) return false;
-    localStorage.setItem(SES_KEYS.borrador, JSON.stringify({
-      v: SES_BORRADOR_VERSION, modulo: currentPage, fecha: new Date().toISOString(),
-      fechaForm: sesFechaFormulario(), campos }));
-    console.warn('[Sesión] Borrador conservado de "'+currentPage+'" ('+Object.keys(campos).length+' campos). No se guardó en el Spreadsheet.');
-    return true;
-  }catch(e){ console.error('[Sesión] No se pudo conservar el borrador:', e); return false; }
-}
+
 // Los borradores creados con el formato anterior (clave colisionada) se
 // descartan: podrían repoblar Stock inicial y Stock cierre con el mismo valor.
 const SES_BORRADOR_VERSION = 2;
-function sesLeerBorrador(){
-  try{
-    const raw = localStorage.getItem(SES_KEYS.borrador);
-    if(!raw) return null;
-    const b = JSON.parse(raw);
-    if(!b || b.v !== SES_BORRADOR_VERSION){
-      console.warn('[Sesión] Borrador con formato antiguo descartado (no se restaura para evitar datos incorrectos).');
-      localStorage.removeItem(SES_KEYS.borrador);
-      return null;
-    }
-    return b;
-  }catch(e){ return null; }
-}
+
 function sesDescartarBorrador(){ localStorage.removeItem(SES_KEYS.borrador); }
 // Repuebla los campos del módulo si hay un borrador de ese mismo módulo.
-function sesRestaurarBorrador(){
-  const b = sesLeerBorrador();
-  if(!b || b.modulo!==currentPage) return false;
-  // El borrador pertenece a la fecha en que se capturó: si el formulario está
-  // en otro día, NO se restaura (evita que datos del 27 aparezcan como del 28).
-  const fechaActual = sesFechaFormulario();
-  if(b.fechaForm && fechaActual && b.fechaForm !== fechaActual) return false;
-  let repuestos = 0;
-  const cont = document.getElementById('page') || document.body;
-  cont.querySelectorAll('input, select, textarea').forEach(el=>{
-    // Nunca se repone en un campo no editable: el usuario no pudo escribirlo.
-    if(el.disabled) return;
-    const clave = sesClaveCampo(el);
-    if(!clave || !(clave in b.campos)) return;
-    if(el.type==='checkbox' || el.type==='radio') el.checked = b.campos[clave]==='1';
-    else el.value = b.campos[clave];
-    repuestos++;
-  });
-  if(repuestos) sesMostrarAvisoBorrador(b, repuestos);
-  return repuestos>0;
-}
-// Aviso no intrusivo con opción de descartar.
-function sesMostrarAvisoBorrador(b, n){
-  if(document.getElementById('sesBorradorAviso')) return;
-  const d = document.createElement('div');
-  d.id = 'sesBorradorAviso';
-  d.style.cssText='margin:0 0 12px;padding:10px 14px;border-radius:10px;background:#fef3c7;border:1px solid #fde68a;color:#92400e;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap';
-  d.innerHTML = `<span>📝 Se recuperaron <b>${n} dato(s)</b> que habías ingresado antes de que expirara la sesión (del ${fmtFecha(b.fecha.slice(0,10))}). <b>Aún no están guardados</b>: revísalos y pulsa Guardar.</span>
-    <button class="btn btn-ghost btn-sm" id="sesBorradorDescartar">Descartar</button>`;
-  const cont = document.getElementById('page') || document.body;
-  cont.insertBefore(d, cont.firstChild);
-  const btn = document.getElementById('sesBorradorDescartar');
-  if(btn) btn.onclick = ()=>{ sesDescartarBorrador(); d.remove(); toast('Datos pendientes descartados','warn'); };
-}
 
-// ── Expiración de sesión ──────────────────────────────────────────────────
-// Punto ÚNICO de reacción: conserva el borrador, invalida el token y pide login.
-function sesManejarExpiracion(motivo){
-  if(sesionExpiradaAvisada) return;      // evita avisos duplicados y bucles
-  sesionExpiradaAvisada = true;
-  const habiaDatos = sesCapturarBorrador();
+// Aviso no intrusivo con opción de descartar.
+
+
+/* ── BLOQUEO POR SESIÓN VENCIDA O VERSIÓN ANTIGUA ─────────────────────────
+   Política: la integridad de los datos manda sobre la comodidad. Ante una
+   sesión inválida o una versión desactualizada NO se guarda nada en local,
+   no se difiere ninguna sincronización y no se permite seguir trabajando:
+   se informa y se recarga la página para forzar un estado limpio.
+   Se eliminó el mecanismo de borradores que conservaba lo tecleado durante
+   una sesión inválida: podía reponer datos que después no se guardarían. */
+let sesBloqueada = false;
+function sesBloquearYRecargar(titulo, mensaje, motivo){
+  if(sesBloqueada) return;               // un solo bloqueo, sin bucles
+  sesBloqueada = true;
   gsState.accessToken = null;
   gsClearSession();
-  try{ if(typeof gsRenderControls==='function') gsRenderControls(); }catch(e){}
-  toast('Tu sesión ha expirado. Inicia sesión nuevamente para continuar.' +
-        (habiaDatos?' Tus datos sin guardar se conservaron.':''), 'error');
-  console.warn('[Sesión] Expirada ('+motivo+').');
-  try{ if(typeof RENDERERS[currentPage]==='function') RENDERERS[currentPage](); }catch(e){}
+  try{ localStorage.removeItem(SES_KEYS.borrador); }catch(e){}   // nada pendiente
+  console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…');
+  sesMostrarBloqueo(titulo, mensaje);
+  // Margen breve para que el usuario lea el aviso antes de recargar.
+  setTimeout(()=>{
+    try{
+      // Cache-busting: garantiza que tras el refresco se sirva la última versión.
+      const u = new URL(window.location.href);
+      u.searchParams.set('v', Date.now());
+      window.location.replace(u.toString());
+    }catch(e){ window.location.reload(true); }
+  }, 2500);
+}
+// Capa a pantalla completa: impide seguir interactuando mientras se recarga.
+function sesMostrarBloqueo(titulo, mensaje){
+  if(document.getElementById('sesBloqueo')) return;
+  const d = document.createElement('div');
+  d.id = 'sesBloqueo';
+  d.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(27,19,64,.92);'+
+    'display:flex;align-items:center;justify-content:center;padding:24px;backdrop-filter:blur(2px)';
+  d.innerHTML = `<div style="background:#fff;border-radius:14px;max-width:460px;padding:28px 30px;text-align:center;box-shadow:0 18px 50px rgba(0,0,0,.35)">
+      <div style="font-size:34px;line-height:1;margin-bottom:12px">🔒</div>
+      <h2 style="margin:0 0 10px;font-size:19px;color:#1f1638">${titulo}</h2>
+      <p style="margin:0 0 16px;font-size:14px;color:#6b6385;line-height:1.5">${mensaje}</p>
+      <div style="font-size:12px;color:#8b83a8">Actualizando…</div>
+    </div>`;
+  document.body.appendChild(d);
+}
+// Punto ÚNICO de reacción ante sesión vencida.
+function sesManejarExpiracion(motivo){
+  sesBloquearYRecargar('Tu sesión ha vencido',
+    'La página se actualizará para que puedas iniciar sesión nuevamente. Los cambios que no hayas guardado no se conservarán.',
+    motivo);
+}
+// Punto ÚNICO de reacción ante versión desactualizada.
+function sesManejarVersionAntigua(motivo){
+  sesBloquearYRecargar('Hay una nueva versión disponible',
+    'La página se actualizará para cargar la versión más reciente de la aplicación.',
+    motivo);
 }
 
 // ── Versión de la aplicación ──────────────────────────────────────────────
@@ -11605,25 +11593,62 @@ async function sesHayNuevaVersion(){
     return !!(m && m[1] && m[1] !== APP_VERSION);
   }catch(e){ return false; }   // sin red: no se fuerza recarga
 }
-async function sesAplicarNuevaVersionSiHay(){
-  if(await sesHayNuevaVersion()){
-    sesCapturarBorrador();                 // nunca perder lo tecleado
-    toast('Hay una versión más reciente. Actualizando…','info');
-    setTimeout(()=>window.location.reload(true), 800);
-    return true;
-  }
-  return false;
-}
+
 
 // ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
 let sesUltimaValidacion = 0;
 async function sesValidarAlReactivar(){
+  if(sesBloqueada) return;
   if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
   sesUltimaValidacion = Date.now();
-  const habiaToken = !!gsState.accessToken;
-  if(habiaToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación'); return; }
-  if(habiaToken) await sesAplicarNuevaVersionSiHay();
+  if(!gsState.accessToken) return;
+  // Caso equipo suspendido: al volver, lo primero es validar la sesión.
+  if(!gsTokenVigente()){ sesManejarExpiracion('reactivación tras inactividad'); return; }
+  if(await sesHayNuevaVersion()) sesManejarVersionAntigua('reactivación');
 }
+/* ══ INTERCEPTOR CENTRAL DE INTERACCIONES ═════════════════════════════════
+   Un único listener en fase de CAPTURA sobre document. Al capturar, se ejecuta
+   ANTES que cualquier handler (incluidos los ~140 onclick/onchange inline de
+   los módulos), de modo que ninguna interacción puede escapar a la validación
+   y no hace falta tocar módulo por módulo.
+   Si la sesión venció, detiene el evento y bloquea la aplicación.
+   Cubre: clicks en botones, cambios de filtro, fechas, dropdowns, checkboxes,
+   escritura en campos, navegación entre módulos, guardados, importaciones,
+   eliminaciones y cualquier otra acción del usuario.                       */
+function sesInterceptarInteraccion(ev){
+  if(sesBloqueada){ ev.stopPropagation(); ev.preventDefault(); return; }
+  // Sin sesión iniciada aún (pantalla de login): no hay nada que validar.
+  if(!gsState.accessToken) return;
+  if(!gsTokenVigente()){
+    ev.stopPropagation();
+    ev.preventDefault();
+    sesManejarExpiracion('interacción del usuario');
+    return;
+  }
+  // Comprobación de versión: en segundo plano y con antirrebote, para no
+  // penalizar cada click con una petición de red.
+  sesVerificarVersionConAntirrebote();
+}
+['click','change','input','keydown','submit'].forEach(tipo=>{
+  document.addEventListener(tipo, sesInterceptarInteraccion, true);   // true = captura
+});
+
+/* Comprobación de versión disparada por la actividad del usuario, como máximo
+   una vez cada VERSION_INTERVALO_MS. Consulta el servidor (no una variable
+   local), por lo que detecta despliegues nuevos de forma fiable. */
+const VERSION_INTERVALO_MS = 5*60*1000;
+let sesUltimaVersionChk = Date.now();
+let sesVersionEnCurso = false;
+function sesVerificarVersionConAntirrebote(){
+  if(sesVersionEnCurso || sesBloqueada) return;
+  if(Date.now() - sesUltimaVersionChk < VERSION_INTERVALO_MS) return;
+  sesUltimaVersionChk = Date.now();
+  sesVersionEnCurso = true;
+  sesHayNuevaVersion()
+    .then(hay=>{ if(hay) sesManejarVersionAntigua('nueva versión desplegada'); })
+    .finally(()=>{ sesVersionEnCurso = false; });
+}
+
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
 window.addEventListener('focus', sesValidarAlReactivar);
 window.addEventListener('online', sesValidarAlReactivar);
@@ -11652,6 +11677,7 @@ if(!window.__sesTickTimer){
 // Chequeo periódico ligero (sin recargar): un único timer.
 if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
+    if(sesBloqueada) return;
     if(gsState.accessToken && !gsTokenVigente()) sesManejarExpiracion('vencimiento en uso');
   }, 60000);
 }
@@ -12048,10 +12074,14 @@ function authGrant(viaLogin){
   document.body.classList.add('authed');
   sesionExpiradaAvisada = false;             // nueva sesión: se rearma el aviso
   gsPersistSession(); // guarda token + expiración + correo para sobrevivir al refresh
-  // Al iniciar sesión se comprueba que se esté usando la última versión: si
-  // hay una más reciente, se recarga (conservando antes cualquier borrador)
-  // para evitar trabajar con código antiguo servido desde la caché.
-  if(viaLogin) sesAplicarNuevaVersionSiHay();
+  /* Al iniciar sesión se comprueba contra el SERVIDOR que se esté usando la
+     última versión; si no, se bloquea y se recarga para no trabajar con
+     código antiguo servido desde la caché. */
+  if(viaLogin){
+    gsState.sesionInicio = gsState.sesionInicio || Date.now();
+    gsState.sesionFin    = gsState.sesionInicio + SESION_MAX_MS;
+    sesHayNuevaVersion().then(hay=>{ if(hay) sesManejarVersionAntigua('inicio de sesión'); });
+  }
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
