@@ -6690,6 +6690,179 @@ function renderBoleta(){
    Exporta Empleados, Horarios, Descuentos, Pagos extra, Días libres y ConsiderarHoraExtra
    en un Excel multi-hoja que la propia app puede reimportar.
    ================================================================ */
+/* ════════════════════════════════════════════════════════════════════════
+   ACTUALIZACIÓN DE DATOS DE VENTAS (estrictamente ADITIVA)
+   Anexa filas de un Excel al final de una pestaña del Spreadsheet de
+   Analítica. Usa values:append con insertDataOption=INSERT_ROWS: la API
+   localiza ella misma la última fila con datos e INSERTA debajo, por lo que
+   es imposible sobrescribir, limpiar o reordenar lo existente.
+   No se emplea aquí ninguna operación de clear, delete o rewrite.
+
+   Deduplicación: la clave es la HUELLA de la fila completa de datos (todas
+   las columnas del archivo, normalizadas), excluyendo las columnas de
+   fórmula. Es inequívoca y no exige suponer qué campo identifica una venta.
+   Si más adelante se confirma que existe un identificador único, basta con
+   indicar sus índices en `clave` de la configuración.
+   ════════════════════════════════════════════════════════════════════════ */
+const VENTAS_CARGA = {
+  ventas: {
+    hoja: 'VENTAS_DETALLE',
+    etiqueta: 'Ventas',
+    // Columnas AR y AS (índices 43 y 44) contienen fórmulas: se excluyen de
+    // los datos escritos y de la huella, y se regeneran por fila.
+    colsFormula: [43, 44],
+    clave: null            // null = huella de la fila completa
+  },
+  ventasDet: {
+    hoja: 'VENTAS_PRODUCTO_DETALLE',
+    etiqueta: 'Ventas Detalladas',
+    colsFormula: [],
+    clave: null
+  }
+};
+// Normaliza un valor para comparar filas entre Excel y Spreadsheet.
+function vcNorm(v){
+  if(v===null || v===undefined) return '';
+  if(v instanceof Date) return v.toISOString().slice(0,10);
+  return String(v).trim().replace(/\s+/g,' ').toUpperCase();
+}
+// Huella de una fila: sus columnas de datos, sin las de fórmula.
+function vcHuella(fila, cfg){
+  const cols = [];
+  const n = Math.max(fila.length, 0);
+  for(let i=0;i<n;i++){
+    if(cfg.colsFormula.includes(i)) continue;
+    cols.push(vcNorm(fila[i]));
+  }
+  // Se recortan los vacíos finales para que una fila con celdas de más al
+  // final no se considere distinta de la misma fila ya guardada.
+  while(cols.length && cols[cols.length-1]==='') cols.pop();
+  return cols.join('\u0001');
+}
+// Lee una pestaña completa del Spreadsheet de Analítica (valores calculados).
+async function vcLeerHoja(hoja){
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+
+    ANALITICA_PROC_SS_ID+'/values/'+encodeURIComponent(hoja+'!A1:BZ200000')+
+    '?valueRenderOption=UNFORMATTED_VALUE');
+  if(r.status===404) throw new Error('No se encontró la pestaña "'+hoja+'" en el Spreadsheet.');
+  if(!r.ok) throw new Error('No se pudo leer "'+hoja+'" (HTTP '+r.status+').');
+  return (await r.json()).values || [];
+}
+/* Lee las fórmulas de AR2 y AS2 y las traslada a otra fila ajustando las
+   referencias relativas (A2 → A2001). Las referencias absolutas ($A$2) se
+   respetan tal cual, como haría el propio Sheets al copiar una fórmula. */
+async function vcFormulasBase(hoja){
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+
+    ANALITICA_PROC_SS_ID+'/values/'+encodeURIComponent(hoja+'!AR2:AS2')+
+    '?valueRenderOption=FORMULA');
+  if(!r.ok) return null;
+  const v = ((await r.json()).values || [])[0] || [];
+  const ar = typeof v[0]==='string' && v[0].startsWith('=') ? v[0] : null;
+  const as = typeof v[1]==='string' && v[1].startsWith('=') ? v[1] : null;
+  return (ar || as) ? { ar, as, filaBase: 2 } : null;
+}
+function vcTrasladarFormula(formula, filaBase, filaDestino){
+  if(!formula) return '';
+  const delta = filaDestino - filaBase;
+  // Ajusta solo referencias con fila RELATIVA: $A$2 y A$2 quedan intactas.
+  return formula.replace(/(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g, (m, dc, col, df, fila)=>{
+    if(df === '$') return m;                 // fila absoluta: no se mueve
+    return dc + col + df + (Number(fila) + delta);
+  });
+}
+/* Procesa un archivo Excel y anexa sus filas nuevas. Devuelve el resumen.
+   Toda la validación ocurre ANTES de cualquier escritura. */
+async function vcProcesarArchivo(file, cfgKey){
+  const cfg = VENTAS_CARGA[cfgKey];
+  if(!file) throw new Error('Selecciona un archivo .xlsx primero.');
+  if(!/\.xlsx?$/i.test(file.name)) throw new Error('El archivo debe ser un Excel (.xlsx).');
+  if(!isAuthorized()) throw new Error('Inicia sesión con la cuenta de Google autorizada.');
+
+  // 1) Leer el Excel
+  let filas;
+  try{
+    const buf = await file.arrayBuffer();
+    const wb  = XLSX.read(new Uint8Array(buf), {type:'array'});
+    const ws  = wb.Sheets[wb.SheetNames[0]];
+    if(!ws) throw new Error('vacío');
+    filas = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:''});
+  }catch(e){ throw new Error('No se pudo leer el archivo: parece dañado o no es un Excel válido.'); }
+  if(!filas.length) throw new Error('El archivo está vacío.');
+
+  // 2) La PRIMERA fila es el encabezado: se descarta
+  const encabezadoXlsx = filas[0].map(vcNorm);
+  const cuerpo = filas.slice(1).filter(f=>f.some(c=>String(c??'').trim()!==''));
+  if(!cuerpo.length) throw new Error('El archivo solo contiene encabezados: no hay registros que agregar.');
+
+  // 3) Leer el destino y VALIDAR la estructura antes de tocar nada
+  const remoto = await vcLeerHoja(cfg.hoja);
+  if(!remoto.length) throw new Error('La pestaña "'+cfg.hoja+'" no tiene encabezados; se cancela por seguridad.');
+  const encabezadoHoja = remoto[0].map(vcNorm);
+  // Columnas esperadas: las del destino sin las de fórmula (que el Excel no trae).
+  const esperadas = encabezadoHoja.filter((_,i)=>!cfg.colsFormula.includes(i));
+  const recibidas = encabezadoXlsx.slice();
+  while(recibidas.length && recibidas[recibidas.length-1]==='') recibidas.pop();
+  const espRec = esperadas.slice();
+  while(espRec.length && espRec[espRec.length-1]==='') espRec.pop();
+  if(recibidas.length !== espRec.length){
+    throw new Error('La estructura no coincide con "'+cfg.hoja+'": el archivo trae '+
+      recibidas.length+' columna(s) y se esperaban '+espRec.length+'. No se modificó nada.');
+  }
+  const distinta = espRec.findIndex((h,i)=> h !== recibidas[i]);
+  if(distinta >= 0){
+    throw new Error('La estructura no coincide con "'+cfg.hoja+'": la columna '+(distinta+1)+
+      ' es "'+recibidas[distinta]+'" y se esperaba "'+espRec[distinta]+'". No se modificó nada.');
+  }
+
+  // 4) Deduplicar contra lo existente Y dentro del propio archivo
+  const vistos = new Set();
+  remoto.slice(1).forEach(f=>{ const h = vcHuella(f, cfg); if(h) vistos.add(h); });
+  const nuevas = [];
+  let duplicados = 0;
+  cuerpo.forEach(f=>{
+    const h = vcHuella(f, cfg);
+    if(!h) return;
+    if(vistos.has(h)){ duplicados++; return; }
+    vistos.add(h);                       // evita duplicados dentro del Excel
+    nuevas.push(f);
+  });
+  const resumen = { encontrados: cuerpo.length, duplicados, agregados: 0, hoja: cfg.hoja };
+  if(!nuevas.length) return resumen;     // nada que escribir: no se toca la hoja
+
+  // 5) Preparar las filas. Para VENTAS_DETALLE se reconstruyen las columnas de
+  //    fórmula en su posición, con la referencia trasladada a su fila real.
+  const primeraFilaNueva = remoto.length + 1;   // 1-based, justo debajo de lo existente
+  let base = null;
+  if(cfg.colsFormula.length) base = await vcFormulasBase(cfg.hoja);
+  const valores = nuevas.map((f, idx)=>{
+    if(!cfg.colsFormula.length) return f;
+    const fila = f.slice();
+    const nFila = primeraFilaNueva + idx;
+    // Inserta las fórmulas en AR y AS (índices 43 y 44)
+    fila[43] = base && base.ar ? vcTrasladarFormula(base.ar, base.filaBase, nFila) : '';
+    fila[44] = base && base.as ? vcTrasladarFormula(base.as, base.filaBase, nFila) : '';
+    return fila;
+  });
+
+  // 6) UNA sola escritura: append con inserción de filas. La API sitúa los
+  //    datos después de la última fila ocupada; no puede pisar lo existente.
+  const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+
+    ANALITICA_PROC_SS_ID+'/values/'+encodeURIComponent(cfg.hoja+'!A1')+
+    ':append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS',
+    { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ majorDimension:'ROWS', values: valores }) });
+  if(!r.ok){
+    let det=''; try{ det = (await r.json()).error?.message || ''; }catch(e){}
+    throw new Error('No se pudieron agregar los registros (HTTP '+r.status+'). '+det+
+      ' No se modificó la información existente.');
+  }
+  resumen.agregados = valores.length;
+  resumen.desdeFila = primeraFilaNueva;
+  console.log('[Ventas] '+cfg.etiqueta+': '+resumen.agregados+' fila(s) agregadas en "'+
+    cfg.hoja+'" desde la fila '+primeraFilaNueva+'. Duplicados omitidos: '+duplicados+'.');
+  return resumen;
+}
+
 RENDERERS.admin = function(){
   const el=document.getElementById('page-admin');
   el.innerHTML=`
@@ -6698,6 +6871,31 @@ RENDERERS.admin = function(){
       <h2>Descargar información</h2>
       <p class="hint" style="margin-top:0">Genera un Excel con las hojas: Empleados (con tipo), Horarios, Descuentos, PagosExtra, DiasLibres, Propinas, ValidacionTarjeta y ConsiderarHoraExtra. El mismo archivo sirve como input para volver a cargarlo.</p>
       <div class="actions"><button class="btn btn-green" id="admExport">⬇ Descargar Excel</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Actualización de datos de ventas</h2>
+      <p class="hint" style="margin-top:0">
+        Agrega registros al Spreadsheet de analítica desde archivos Excel. La primera fila de cada archivo se ignora por ser el encabezado.
+        <b>La operación solo añade</b>: nunca borra, reemplaza ni reordena la información existente, y los registros que ya estén cargados se omiten automáticamente.
+        Cada archivo se procesa por separado.
+      </p>
+      <div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
+        <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
+          <h3 style="margin:0 0 4px;font-size:14px">Ventas</h3>
+          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_DETALLE</code>. Las columnas AR y AS reciben sus fórmulas automáticamente.</p>
+          <input type="file" id="vcFileVentas" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
+          <button class="btn btn-primary btn-sm" id="vcBtnVentas">⬆ Cargar ventas</button>
+          <div id="vcMsgVentas" style="margin-top:10px;font-size:12.5px"></div>
+        </div>
+        <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
+          <h3 style="margin:0 0 4px;font-size:14px">Ventas Detalladas</h3>
+          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Sin fórmulas asociadas.</p>
+          <input type="file" id="vcFileVentasDet" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
+          <button class="btn btn-primary btn-sm" id="vcBtnVentasDet">⬆ Cargar ventas detalladas</button>
+          <div id="vcMsgVentasDet" style="margin-top:10px;font-size:12.5px"></div>
+        </div>
+      </div>
     </div>
     <div class="card danger-zone">
       <h2>Cargar información</h2>
@@ -6716,6 +6914,50 @@ RENDERERS.admin = function(){
       </p>
       <div class="actions"><button class="btn btn-primary" id="admSyncAnalytics">📊 Actualizar datos analíticos</button></div>
     </div>`;
+  /* Dos flujos INDEPENDIENTES: cada botón toca exclusivamente su pestaña.
+     El botón se deshabilita mientras dura la operación para evitar cargas
+     dobles, y el resultado se detalla en su propio recuadro. */
+  const vcBind = (idBtn, idFile, idMsg, cfgKey)=>{
+    const btn = document.getElementById(idBtn);
+    if(!btn) return;
+    btn.onclick = async ()=>{
+      const cfg  = VENTAS_CARGA[cfgKey];
+      const msg  = document.getElementById(idMsg);
+      const file = (document.getElementById(idFile)||{}).files?.[0] || null;
+      const pinta = (html2, color)=>{ if(msg) msg.innerHTML =
+        `<div style="padding:9px 11px;border-radius:8px;background:${color.bg};border:1px solid ${color.bd};color:${color.fg}">${html2}</div>`; };
+      const OK   = {bg:'#ecfdf5',bd:'#a7f3d0',fg:'#065f46'};
+      const ERR  = {bg:'#fef2f2',bd:'#fecaca',fg:'#991b1b'};
+      const INFO = {bg:'#eff6ff',bd:'#bfdbfe',fg:'#1e40af'};
+      const textoBtn = btn.textContent;
+      btn.disabled = true; btn.textContent = '⏳ Procesando…';
+      pinta('Validando el archivo y comparando con los registros existentes…', INFO);
+      try{
+        const res = await vcProcesarArchivo(file, cfgKey);
+        const detalle = `<b>Archivo procesado correctamente.</b><br>`+
+          `Registros encontrados: <b>${res.encontrados}</b><br>`+
+          `Duplicados omitidos: <b>${res.duplicados}</b><br>`+
+          `Registros agregados: <b>${res.agregados}</b>`+
+          (res.agregados ? ` <span style="opacity:.75">(desde la fila ${res.desdeFila} de ${res.hoja})</span>` : '');
+        if(res.agregados===0){
+          pinta(detalle+'<br><span style="opacity:.85">Todos los registros ya estaban cargados: el Spreadsheet no se modificó.</span>', INFO);
+          toast(cfg.etiqueta+': sin registros nuevos que agregar.','info');
+        }else{
+          pinta(detalle, OK);
+          toast(cfg.etiqueta+': '+res.agregados+' registro(s) agregado(s).','success');
+        }
+      }catch(err){
+        console.error('[Ventas] '+cfg.etiqueta+':', err);
+        pinta('<b>No se pudo completar la carga.</b><br>'+String(err.message||err), ERR);
+        toast('Error al cargar '+cfg.etiqueta+'.','error');
+      }finally{
+        btn.disabled = false; btn.textContent = textoBtn;
+      }
+    };
+  };
+  vcBind('vcBtnVentas',    'vcFileVentas',    'vcMsgVentas',    'ventas');
+  vcBind('vcBtnVentasDet', 'vcFileVentasDet', 'vcMsgVentasDet', 'ventasDet');
+
   document.getElementById('admExport').onclick=adminExport;
   document.getElementById('admImport').onclick=adminImport;
   document.getElementById('admSyncAnalytics').onclick=async()=>{
@@ -11537,7 +11779,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-04.3';
+const APP_VERSION = '2026-09-05.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
