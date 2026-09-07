@@ -6711,13 +6711,19 @@ const VENTAS_CARGA = {
     // Columnas AR y AS (índices 43 y 44) contienen fórmulas: se excluyen de
     // los datos escritos y de la huella, y se regeneran por fila.
     colsFormula: [43, 44],
-    clave: null            // null = huella de la fila completa
+    clave: null,           // null = huella de la fila completa
+    /* Posición FIJA del encabezado dentro del Excel (1-based). Los datos
+       empiezan siempre en la fila siguiente. No se busca la primera fila no
+       vacía ni se asume que el encabezado está en la fila 1: el formato de
+       estos reportes trae filas de título/metadatos por encima. */
+    filaEncabezado: 6      // Ventas: encabezados en la fila 6, datos desde la 7
   },
   ventasDet: {
     hoja: 'VENTAS_PRODUCTO_DETALLE',
     etiqueta: 'Ventas Detalladas',
     colsFormula: [],
-    clave: null
+    clave: null,
+    filaEncabezado: 7      // Ventas Detalladas: encabezados en la 7, datos desde la 8
   }
 };
 // Normaliza un valor para comparar filas entre Excel y Spreadsheet.
@@ -6789,10 +6795,22 @@ async function vcProcesarArchivo(file, cfgKey){
   }catch(e){ throw new Error('No se pudo leer el archivo: parece dañado o no es un Excel válido.'); }
   if(!filas.length) throw new Error('El archivo está vacío.');
 
-  // 2) La PRIMERA fila es el encabezado: se descarta
-  const encabezadoXlsx = filas[0].map(vcNorm);
-  const cuerpo = filas.slice(1).filter(f=>f.some(c=>String(c??'').trim()!==''));
-  if(!cuerpo.length) throw new Error('El archivo solo contiene encabezados: no hay registros que agregar.');
+  /* 2) Encabezado en su fila FIJA; los datos empiezan en la siguiente.
+        Se descarta todo lo anterior (títulos, filtros, metadatos del reporte). */
+  const filaHdr = Number(cfg.filaEncabezado) || 1;    // 1-based
+  const idxHdr  = filaHdr - 1;                        // 0-based
+  if(filas.length <= idxHdr){
+    throw new Error('El archivo no llega a la fila '+filaHdr+
+      ', donde deben estar los encabezados de "'+cfg.etiqueta+'". Solo tiene '+filas.length+' fila(s).');
+  }
+  const encabezadoXlsx = (filas[idxHdr]||[]).map(vcNorm);
+  if(!encabezadoXlsx.some(h=>h!=='')){
+    throw new Error('La fila '+filaHdr+' del archivo, que debería contener los encabezados de "'+
+      cfg.etiqueta+'", está vacía. No se modificó nada.');
+  }
+  const cuerpo = filas.slice(idxHdr + 1).filter(f=>f.some(c=>String(c??'').trim()!==''));
+  if(!cuerpo.length) throw new Error('El archivo no tiene registros a partir de la fila '+(filaHdr+1)+
+    ': solo se encontraron los encabezados.');
 
   // 3) Leer el destino y VALIDAR la estructura antes de tocar nada
   const remoto = await vcLeerHoja(cfg.hoja);
@@ -6876,21 +6894,21 @@ RENDERERS.admin = function(){
     <div class="card">
       <h2>Actualización de datos de ventas</h2>
       <p class="hint" style="margin-top:0">
-        Agrega registros al Spreadsheet de analítica desde archivos Excel. La primera fila de cada archivo se ignora por ser el encabezado.
+        Agrega registros al Spreadsheet de analítica desde archivos Excel. Cada archivo tiene su propia fila de encabezados y todo lo anterior se ignora.
         <b>La operación solo añade</b>: nunca borra, reemplaza ni reordena la información existente, y los registros que ya estén cargados se omiten automáticamente.
         Cada archivo se procesa por separado.
       </p>
       <div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
           <h3 style="margin:0 0 4px;font-size:14px">Ventas</h3>
-          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_DETALLE</code>. Las columnas AR y AS reciben sus fórmulas automáticamente.</p>
+          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_DETALLE</code>. Encabezados en la <b>fila 6</b>, datos desde la <b>fila 7</b>. Las columnas AR y AS reciben sus fórmulas automáticamente.</p>
           <input type="file" id="vcFileVentas" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
           <button class="btn btn-primary btn-sm" id="vcBtnVentas">⬆ Cargar ventas</button>
           <div id="vcMsgVentas" style="margin-top:10px;font-size:12.5px"></div>
         </div>
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
           <h3 style="margin:0 0 4px;font-size:14px">Ventas Detalladas</h3>
-          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Sin fórmulas asociadas.</p>
+          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Encabezados en la <b>fila 7</b>, datos desde la <b>fila 8</b>. Sin fórmulas asociadas.</p>
           <input type="file" id="vcFileVentasDet" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
           <button class="btn btn-primary btn-sm" id="vcBtnVentasDet">⬆ Cargar ventas detalladas</button>
           <div id="vcMsgVentasDet" style="margin-top:10px;font-size:12.5px"></div>
@@ -11779,7 +11797,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-05.1';
+const APP_VERSION = '2026-09-05.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
