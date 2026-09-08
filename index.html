@@ -2375,7 +2375,8 @@ function analDefaultFilter(){
     mesDesde: 1,
     añoHasta: años.length ? años.at(-1)   : _añoNow,
     mesHasta: 12,
-    grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual'
+    grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual',
+    soloActivos:false            // desmarcado por defecto: se muestran todos
   };
 }
 function gananciaDefaultFilter(){
@@ -2438,9 +2439,35 @@ async function syncAnaliticaFromRAW(){
           Una cabecera con contenido pero NO interpretable detiene el proceso:
           no se adivina el mes ni se desplazan las columnas. */
     const hdrs = matrix[0];
+
+    /* Columnas fijas identificadas por NOMBRE de encabezado, no por posición.
+       Al insertarse ACTIVO en la columna B todo lo posterior se desplazó, y
+       los índices fijos anteriores (0,1,2,3 y meses desde 4) dejaban de
+       apuntar al dato correcto. Buscar por nombre hace que futuras columnas
+       insertadas en el RAW no vuelvan a romper el módulo.
+       Si algún encabezado no aparece, se usa su posición esperada actual. */
+    const norm = v => String(v??'').trim().toUpperCase();
+    const buscaCol = (nombres, porDefecto)=>{
+      const i = hdrs.findIndex(h=>nombres.includes(norm(h)));
+      return i >= 0 ? i : porDefecto;
+    };
+    const cGrupo  = buscaCol(['GRUPO'], 0);
+    const cActivo = buscaCol(['ACTIVO'], 1);
+    const cPlato  = buscaCol(['PLATO','PRODUCTO'], 2);
+    const cPrecio = buscaCol(['PRECIO'], 3);
+    const cMargen = buscaCol(['MARGEN','MARGEN %'], 4);
+    const colsFijas = new Set([cGrupo, cActivo, cPlato, cPrecio, cMargen]);
+    console.log('[Analítica] Columnas RAW → grupo:'+colIndexToLetter(cGrupo)+
+      ' activo:'+colIndexToLetter(cActivo)+' plato:'+colIndexToLetter(cPlato)+
+      ' precio:'+colIndexToLetter(cPrecio)+' margen:'+colIndexToLetter(cMargen));
+
+    /* Los meses son TODAS las columnas restantes cuya cabecera sea una fecha
+       válida, sin partir de un índice fijo: así el bloque mensual puede
+       empezar en cualquier posición. */
     const monthCols = [];
     const invalidas = [];
-    for(let i=4; i<hdrs.length; i++){
+    for(let i=0; i<hdrs.length; i++){
+      if(colsFijas.has(i)) continue;
       const bruto = hdrs[i];
       if(bruto===null || bruto===undefined || String(bruto).trim()==='') continue;  // columna sin cabecera
       const p = analParseCabeceraMes(bruto);
@@ -2463,21 +2490,27 @@ async function syncAnaliticaFromRAW(){
     const facts=[]; const productosSet=new Set();
     for(let r=1; r<matrix.length; r++){
       const row=matrix[r];
-      if(!row||!row[1]) continue;
-      const grupo = String(row[0]||'').trim();
-      const plato = String(row[1]||'').trim();
-      if(!plato) continue;
-      const precio = analNumOrNull(row[2]);
+      if(!row) continue;
+      const grupo = String(row[cGrupo]||'').trim();
+      const plato = String(row[cPlato]||'').trim();
+      if(!plato) continue;                       // la fila es válida si tiene PLATO
+      /* ACTIVO se lee DIRECTAMENTE de su columna; no se infiere de otros
+         datos. Solo un "NO" explícito marca el producto como inactivo: si la
+         celda está vacía se considera activo, para no ocultar productos por
+         un dato ausente. */
+      const activoRaw = String(row[cActivo]??'').trim().toUpperCase();
+      const activo = !(activoRaw === 'NO');
+      const precio = analNumOrNull(row[cPrecio]);
       // Normalizar margen: Google Sheets con formato % devuelve 0.582 (decimal),
       // pero si se ingresó como número plain devuelve 58.2.
       // Normalizamos a porcentaje entero (58.2) para consistencia interna.
-      const rawMargen = analNumOrNull(row[3]);
+      const rawMargen = analNumOrNull(row[cMargen]);
       const margen = rawMargen===null ? null : (rawMargen>0 && rawMargen<1 ? rawMargen*100 : rawMargen);
       productosSet.add(plato);
       for(const col of monthCols){
         const v = col.idx<row.length ? row[col.idx] : undefined;
         facts.push({
-          grupo, plato, precio, margen, año:col.año, mes:col.mes,
+          grupo, plato, activo, precio, margen, año:col.año, mes:col.mes,
           cantidad:(v!==undefined&&v!==null&&v!=='') ? +v : null
         });
       }
@@ -2635,6 +2668,9 @@ RENDERERS.consolidadoVentas = function(){
     const f=r.año*100+r.mes, d=analFilter.añoDesde*100+analFilter.mesDesde, h=analFilter.añoHasta*100+analFilter.mesHasta;
     return f>=d&&f<=h&&
       (!analFilter.grupo||r.grupo===analFilter.grupo)&&
+      // Se COMBINA con los demás filtros; solo excluye los productos cuyo
+      // ACTIVO es NO, y únicamente cuando el checkbox está marcado.
+      (!analFilter.soloActivos || r.activo !== false)&&
       (!analFilter.plato||r.plato.toLowerCase().includes(analFilter.plato.toLowerCase()));
   });
 
@@ -2759,6 +2795,11 @@ RENDERERS.consolidadoVentas = function(){
           </select>
           <input id="anFVal" type="number" min="0" value="${analFilter.cantVal}" style="width:64px">
         </div></div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;align-self:flex-end;padding-bottom:4px"
+               title="Muestra solo los productos marcados como ACTIVO = SI en el RAW">
+          <input type="checkbox" id="anFActivos" ${analFilter.soloActivos?'checked':''} style="width:16px;height:16px;cursor:pointer">
+          <span style="font-size:13px;font-weight:500;color:var(--c-text)">Filtra solo activos</span>
+        </label>
         <button class="btn btn-ghost btn-sm" id="anFClear">🗑 Limpiar</button>
         <button class="btn btn-primary btn-sm" id="anSyncAnalytics" style="align-self:flex-end"
           title="Lee la hoja RAW del Spreadsheet ESTADISTICAS RAW y actualiza los datos que alimentan este reporte">📊 Actualizar datos analíticos</button>
@@ -2801,6 +2842,11 @@ RENDERERS.consolidadoVentas = function(){
   let _analDebounce=null;
   const applyFDebounced=()=>{ clearTimeout(_analDebounce); _analDebounce=setTimeout(applyF,350); };
   if(pEl)pEl.oninput=applyFDebounced; if(vEl)vEl.oninput=applyFDebounced;
+  const chkAct = document.getElementById('anFActivos');
+  if(chkAct) chkAct.onchange = (e)=>{
+    analFilter.soloActivos = e.target.checked;
+    RENDERERS.consolidadoVentas();
+  };
   document.getElementById('anFClear').onclick=()=>{
     analFilter=analDefaultFilter();
     analSort={col:'grupo',dir:'asc'};
@@ -12027,7 +12073,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-08.2';
+const APP_VERSION = '2026-09-08.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
