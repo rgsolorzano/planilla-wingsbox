@@ -6819,6 +6819,24 @@ const VENTAS_CARGA = {
     filaEncabezado: 7      // Ventas Detalladas: encabezados en la 7, datos desde la 8
   }
 };
+/* Columnas VARIABLES de medios de pago. El sistema de facturación añade un
+   bloque de 3 columnas por cada medio de pago usado en la venta, así que su
+   número cambia de un archivo a otro. Se reconocen por su NOMBRE (con o sin
+   número), nunca por su posición ni contando las últimas N columnas, para
+   que siga funcionando con 1, 2, 3 o más bloques. */
+const VC_RE_PAGO = /^(MEDIO|DETALLE|REFERENCIA)\s+DE\s+PAGO(\s*\d+)?$/;
+function vcEsColumnaPago(h){ return VC_RE_PAGO.test(String(h||'').trim()); }
+// Devuelve los índices de las columnas que NO son de medios de pago.
+function vcIdxRelevantes(encabezados, colsFormula){
+  const out = [];
+  encabezados.forEach((h,i)=>{
+    if((colsFormula||[]).includes(i)) return;
+    if(vcEsColumnaPago(h)) return;
+    out.push(i);
+  });
+  return out;
+}
+
 // Normaliza un valor para comparar filas entre Excel y Spreadsheet.
 function vcNorm(v){
   if(v===null || v===undefined) return '';
@@ -6826,12 +6844,20 @@ function vcNorm(v){
   return String(v).trim().replace(/\s+/g,' ').toUpperCase();
 }
 // Huella de una fila: sus columnas de datos, sin las de fórmula.
-function vcHuella(fila, cfg){
+/* Huella de una fila. `idx` indica qué columnas la componen: se pasan los
+   índices RELEVANTES de cada lado (archivo o destino), de modo que un archivo
+   con menos bloques de medios de pago produzca la misma huella que la fila ya
+   guardada. Sin esto, un mismo registro se vería como nuevo al variar el
+   número de columnas de pago. */
+function vcHuella(fila, cfg, idx){
   const cols = [];
-  const n = Math.max(fila.length, 0);
-  for(let i=0;i<n;i++){
-    if(cfg.colsFormula.includes(i)) continue;
-    cols.push(vcNorm(fila[i]));
+  if(Array.isArray(idx)){
+    idx.forEach(i=>cols.push(vcNorm(fila[i])));
+  }else{
+    for(let i=0;i<fila.length;i++){
+      if(cfg.colsFormula.includes(i)) continue;
+      cols.push(vcNorm(fila[i]));
+    }
   }
   // Se recortan los vacíos finales para que una fila con celdas de más al
   // final no se considere distinta de la misma fila ya guardada.
@@ -6909,29 +6935,42 @@ async function vcProcesarArchivo(file, cfgKey){
   const remoto = await vcLeerHoja(cfg.hoja);
   if(!remoto.length) throw new Error('La pestaña "'+cfg.hoja+'" no tiene encabezados; se cancela por seguridad.');
   const encabezadoHoja = remoto[0].map(vcNorm);
-  // Columnas esperadas: las del destino sin las de fórmula (que el Excel no trae).
-  const esperadas = encabezadoHoja.filter((_,i)=>!cfg.colsFormula.includes(i));
-  const recibidas = encabezadoXlsx.slice();
+  /* Se comparan ÚNICAMENTE las columnas relevantes: se excluyen las de
+     fórmula (que el Excel no trae) y los bloques variables de medios de pago,
+     cuyo número difiere legítimamente entre archivo y destino. Las columnas
+     principales siguen validándose de forma estricta: mismo número y mismo
+     orden; si falta o cambia una, el archivo se rechaza. */
+  const idxHojaRel = vcIdxRelevantes(encabezadoHoja, cfg.colsFormula);
+  const idxXlsxRel = vcIdxRelevantes(encabezadoXlsx, []);
+  const espRec   = idxHojaRel.map(i=>encabezadoHoja[i]);
+  const recibidas= idxXlsxRel.map(i=>encabezadoXlsx[i]);
+  while(espRec.length    && espRec[espRec.length-1]==='')       espRec.pop();
   while(recibidas.length && recibidas[recibidas.length-1]==='') recibidas.pop();
-  const espRec = esperadas.slice();
-  while(espRec.length && espRec[espRec.length-1]==='') espRec.pop();
+  const pagosXlsx = encabezadoXlsx.filter(vcEsColumnaPago).length;
+  const pagosHoja = encabezadoHoja.filter(vcEsColumnaPago).length;
   if(recibidas.length !== espRec.length){
     throw new Error('La estructura no coincide con "'+cfg.hoja+'": el archivo trae '+
-      recibidas.length+' columna(s) y se esperaban '+espRec.length+'. No se modificó nada.');
+      recibidas.length+' columna(s) relevante(s) y se esperaban '+espRec.length+
+      ' (sin contar las columnas de medios de pago, que son variables). No se modificó nada.');
   }
   const distinta = espRec.findIndex((h,i)=> h !== recibidas[i]);
   if(distinta >= 0){
-    throw new Error('La estructura no coincide con "'+cfg.hoja+'": la columna '+(distinta+1)+
+    throw new Error('La estructura no coincide con "'+cfg.hoja+'": la columna relevante '+(distinta+1)+
       ' es "'+recibidas[distinta]+'" y se esperaba "'+espRec[distinta]+'". No se modificó nada.');
+  }
+  if(pagosXlsx !== pagosHoja){
+    console.log('[Ventas] '+cfg.etiqueta+': el archivo trae '+pagosXlsx+
+      ' columna(s) de medios de pago y el destino '+pagosHoja+
+      '. Se alinean por nombre; la diferencia no afecta a la validación.');
   }
 
   // 4) Deduplicar contra lo existente Y dentro del propio archivo
   const vistos = new Set();
-  remoto.slice(1).forEach(f=>{ const h = vcHuella(f, cfg); if(h) vistos.add(h); });
+  remoto.slice(1).forEach(f=>{ const h = vcHuella(f, cfg, idxHojaRel); if(h) vistos.add(h); });
   const nuevas = [];
   let duplicados = 0;
   cuerpo.forEach(f=>{
-    const h = vcHuella(f, cfg);
+    const h = vcHuella(f, cfg, idxXlsxRel);
     if(!h) return;
     if(vistos.has(h)){ duplicados++; return; }
     vistos.add(h);                       // evita duplicados dentro del Excel
@@ -6945,13 +6984,28 @@ async function vcProcesarArchivo(file, cfgKey){
   const primeraFilaNueva = remoto.length + 1;   // 1-based, justo debajo de lo existente
   let base = null;
   if(cfg.colsFormula.length) base = await vcFormulasBase(cfg.hoja);
+  /* Cada fila se reconstruye con el LAYOUT DEL DESTINO: el valor de cada
+     columna del archivo se coloca en la posición que esa misma columna ocupa
+     en la hoja, emparejando por nombre de encabezado. Así, si el archivo trae
+     menos bloques de medios de pago que el destino, las columnas faltantes
+     quedan vacías en su sitio y nada se desalinea. */
+  const posDestino = new Map();                 // nombre normalizado → índice
+  encabezadoHoja.forEach((h,i)=>{ if(h!=='' && !posDestino.has(h)) posDestino.set(h, i); });
+  const anchoDestino = encabezadoHoja.length;
   const valores = nuevas.map((f, idx)=>{
-    if(!cfg.colsFormula.length) return f;
-    const fila = f.slice();
-    const nFila = primeraFilaNueva + idx;
-    // Inserta las fórmulas en AR y AS (índices 43 y 44)
-    fila[43] = base && base.ar ? vcTrasladarFormula(base.ar, base.filaBase, nFila) : '';
-    fila[44] = base && base.as ? vcTrasladarFormula(base.as, base.filaBase, nFila) : '';
+    const fila = new Array(anchoDestino).fill('');
+    encabezadoXlsx.forEach((h, iX)=>{
+      if(h==='') return;
+      const iD = posDestino.get(h);
+      if(iD === undefined) return;              // columna que el destino no tiene
+      fila[iD] = f[iX] !== undefined ? f[iX] : '';
+    });
+    if(cfg.colsFormula.length){
+      const nFila = primeraFilaNueva + idx;
+      // Fórmulas en AR y AS (índices 43 y 44), trasladadas a su fila real.
+      fila[43] = base && base.ar ? vcTrasladarFormula(base.ar, base.filaBase, nFila) : '';
+      fila[44] = base && base.as ? vcTrasladarFormula(base.as, base.filaBase, nFila) : '';
+    }
     return fila;
   });
 
@@ -11878,7 +11932,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-07.1';
+const APP_VERSION = '2026-09-08.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
