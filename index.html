@@ -6805,6 +6805,9 @@ const VENTAS_CARGA = {
     // los datos escritos y de la huella, y se regeneran por fila.
     colsFormula: [43, 44],
     clave: null,           // null = huella de la fila completa
+    /* Ventas: dos filas idénticas se consideran el mismo registro, así que se
+       deduplica por contenido (comportamiento vigente, no solicitado cambiar). */
+    dedupPorContenido: true,
     /* Posición FIJA del encabezado dentro del Excel (1-based). Los datos
        empiezan siempre en la fila siguiente. No se busca la primera fila no
        vacía ni se asume que el encabezado está en la fila 1: el formato de
@@ -6816,6 +6819,12 @@ const VENTAS_CARGA = {
     etiqueta: 'Ventas Detalladas',
     colsFormula: [],
     clave: null,
+    /* Ventas Detalladas: CADA FILA ES UNA VENTA INDEPENDIENTE. Dos ventas
+       pueden coincidir en todos sus campos (mismo producto, precio, fecha,
+       hora y medio de pago) y ambas son válidas, así que NO se deduplica por
+       contenido: se cargan todas. El riesgo de reimportar dos veces el mismo
+       archivo se controla aparte, con la huella del ARCHIVO. */
+    dedupPorContenido: false,
     filaEncabezado: 7      // Ventas Detalladas: encabezados en la 7, datos desde la 8
   }
 };
@@ -6835,6 +6844,51 @@ function vcIdxRelevantes(encabezados, colsFormula){
     out.push(i);
   });
   return out;
+}
+
+/* ── CONTROL DE REIMPORTACIÓN (distinto de la deduplicación por contenido) ──
+   Al desactivar la comparación fila a fila en Ventas Detalladas se perdería
+   la única protección frente a cargar dos veces el mismo archivo. Este
+   mecanismo la sustituye a nivel de ARCHIVO: se calcula una huella de todas
+   sus filas de datos y se registra tras cada carga con éxito. Si se vuelve a
+   cargar un archivo con la misma huella, se avisa y se pide confirmación
+   explícita, en lugar de descartar ventas legítimas en silencio. */
+const K_VC_IMPORTS = 'vc_imports';
+function vcHuellaArchivo(cuerpo){
+  // Huella estable del contenido: no depende del nombre del archivo.
+  let h1 = 0x811c9dc5, h2 = 0x01000193, n = 0;
+  cuerpo.forEach(f=>{
+    const s = f.map(vcNorm).join('\u0001');
+    n++;
+    for(let i=0;i<s.length;i++){
+      const c = s.charCodeAt(i);
+      h1 = ((h1 ^ c) * 16777619) >>> 0;
+      h2 = ((h2 + c * 31) ^ (h2 << 5)) >>> 0;
+    }
+  });
+  return n + '-' + h1.toString(16) + h2.toString(16);
+}
+function vcImportsLeer(){
+  try{ const o = JSON.parse(localStorage.getItem(K_VC_IMPORTS)||'{}'); return (o && typeof o==='object') ? o : {}; }
+  catch(e){ return {}; }
+}
+function vcImportYaCargado(hoja, huella){
+  const reg = vcImportsLeer()[hoja];
+  return (reg && reg[huella]) ? reg[huella] : null;   // {fecha, filas} o null
+}
+function vcImportRegistrar(hoja, huella, filas){
+  try{
+    const o = vcImportsLeer();
+    o[hoja] = o[hoja] || {};
+    o[hoja][huella] = { fecha: new Date().toISOString(), filas };
+    // Se conservan las últimas 50 importaciones por hoja.
+    const claves = Object.keys(o[hoja]);
+    if(claves.length > 50){
+      claves.sort((a,b)=> String(o[hoja][a].fecha).localeCompare(String(o[hoja][b].fecha)));
+      claves.slice(0, claves.length-50).forEach(k=>delete o[hoja][k]);
+    }
+    localStorage.setItem(K_VC_IMPORTS, JSON.stringify(o));
+  }catch(e){ console.warn('[Ventas] No se pudo registrar la importación:', e); }
 }
 
 // Normaliza un valor para comparar filas entre Excel y Spreadsheet.
@@ -6897,7 +6951,7 @@ function vcTrasladarFormula(formula, filaBase, filaDestino){
 }
 /* Procesa un archivo Excel y anexa sus filas nuevas. Devuelve el resumen.
    Toda la validación ocurre ANTES de cualquier escritura. */
-async function vcProcesarArchivo(file, cfgKey){
+async function vcProcesarArchivo(file, cfgKey, opciones={}){
   const cfg = VENTAS_CARGA[cfgKey];
   if(!file) throw new Error('Selecciona un archivo .xlsx primero.');
   if(!/\.xlsx?$/i.test(file.name)) throw new Error('El archivo debe ser un Excel (.xlsx).');
@@ -6964,20 +7018,47 @@ async function vcProcesarArchivo(file, cfgKey){
       '. Se alinean por nombre; la diferencia no afecta a la validación.');
   }
 
-  // 4) Deduplicar contra lo existente Y dentro del propio archivo
-  const vistos = new Set();
-  remoto.slice(1).forEach(f=>{ const h = vcHuella(f, cfg, idxHojaRel); if(h) vistos.add(h); });
-  const nuevas = [];
-  let duplicados = 0;
-  cuerpo.forEach(f=>{
-    const h = vcHuella(f, cfg, idxXlsxRel);
-    if(!h) return;
-    if(vistos.has(h)){ duplicados++; return; }
-    vistos.add(h);                       // evita duplicados dentro del Excel
-    nuevas.push(f);
-  });
-  const resumen = { encontrados: cuerpo.length, duplicados, agregados: 0, hoja: cfg.hoja };
+  /* 4) Selección de filas a insertar. Dos conceptos DISTINTOS y separados:
+
+        a) Repetición dentro del archivo / contra lo ya cargado.
+           Solo aplica si la hoja declara dedupPorContenido. En Ventas
+           Detalladas está desactivado porque filas idénticas son ventas
+           independientes y todas deben cargarse.
+
+        b) Reimportación del MISMO archivo, que se controla más abajo con la
+           huella del archivo completo, no comparando fila a fila. */
+  let nuevas, duplicados = 0;
+  if(cfg.dedupPorContenido){
+    const vistos = new Set();
+    remoto.slice(1).forEach(f=>{ const h = vcHuella(f, cfg, idxHojaRel); if(h) vistos.add(h); });
+    nuevas = [];
+    cuerpo.forEach(f=>{
+      const h = vcHuella(f, cfg, idxXlsxRel);
+      if(!h) return;
+      if(vistos.has(h)){ duplicados++; return; }
+      vistos.add(h);                     // evita repeticiones dentro del Excel
+      nuevas.push(f);
+    });
+  }else{
+    // Cada fila con contenido es una venta: se cargan todas, sin comparar.
+    nuevas = cuerpo.slice();
+  }
+  const resumen = { encontrados: cuerpo.length, duplicados, agregados: 0, hoja: cfg.hoja,
+                    dedupPorContenido: !!cfg.dedupPorContenido };
   if(!nuevas.length) return resumen;     // nada que escribir: no se toca la hoja
+
+  /* Control de REIMPORTACIÓN: si este mismo archivo ya se cargó, se pide
+     confirmación explícita. Nunca se descartan filas en silencio. */
+  const huellaArch = vcHuellaArchivo(cuerpo);
+  const previo = vcImportYaCargado(cfg.hoja, huellaArch);
+  if(previo && !opciones.forzarReimport){
+    const e = new Error('Este archivo ya se cargó el '+fmtFecha(String(previo.fecha).slice(0,10))+
+      ' ('+previo.filas+' registro(s)). Volver a cargarlo AÑADIRÍA las ventas de nuevo. '+
+      'No se modificó nada.');
+    e.reimportacion = true;
+    e.resumen = resumen;
+    throw e;
+  }
 
   // 5) Preparar las filas. Para VENTAS_DETALLE se reconstruyen las columnas de
   //    fórmula en su posición, con la referencia trasladada a su fila real.
@@ -7023,6 +7104,7 @@ async function vcProcesarArchivo(file, cfgKey){
   }
   resumen.agregados = valores.length;
   resumen.desdeFila = primeraFilaNueva;
+  vcImportRegistrar(cfg.hoja, huellaArch, valores.length);   // queda registrado
   console.log('[Ventas] '+cfg.etiqueta+': '+resumen.agregados+' fila(s) agregadas en "'+
     cfg.hoja+'" desde la fila '+primeraFilaNueva+'. Duplicados omitidos: '+duplicados+'.');
   return resumen;
@@ -7055,7 +7137,7 @@ RENDERERS.admin = function(){
         </div>
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
           <h3 style="margin:0 0 4px;font-size:14px">Ventas Detalladas</h3>
-          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Encabezados en la <b>fila 7</b>, datos desde la <b>fila 8</b>. Sin fórmulas asociadas.</p>
+          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Encabezados en la <b>fila 7</b>, datos desde la <b>fila 8</b>. Cada fila es una venta independiente: las filas con datos idénticos se cargan todas. Si el archivo ya se cargó antes, se avisa antes de repetirlo.</p>
           <input type="file" id="vcFileVentasDet" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
           <button class="btn btn-primary btn-sm" id="vcBtnVentasDet">⬆ Cargar ventas detalladas</button>
           <div id="vcMsgVentasDet" style="margin-top:10px;font-size:12.5px"></div>
@@ -7094,14 +7176,18 @@ RENDERERS.admin = function(){
       btn.disabled = true; btn.textContent = '⏳ Procesando…';
       pinta('Validando el archivo y comparando con los registros existentes…', INFO);
       try{
-        const res = await vcProcesarArchivo(file, cfgKey);
+        const res = await vcProcesarArchivo(file, cfgKey, {forzarReimport: !!btn.dataset.forzar});
+        delete btn.dataset.forzar;
+        /* El renglón de omitidos solo aparece cuando la hoja realmente
+           deduplica por contenido. En Ventas Detalladas cada fila es una venta
+           independiente, así que no se etiqueta nada como "duplicado". */
         const detalle = `<b>Archivo procesado correctamente.</b><br>`+
           `Registros encontrados: <b>${res.encontrados}</b><br>`+
-          `Duplicados omitidos: <b>${res.duplicados}</b><br>`+
+          (res.dedupPorContenido ? `Omitidos por ya estar cargados: <b>${res.duplicados}</b><br>` : '')+
           `Registros agregados: <b>${res.agregados}</b>`+
           (res.agregados ? ` <span style="opacity:.75">(desde la fila ${res.desdeFila} de ${res.hoja})</span>` : '');
         if(res.agregados===0){
-          pinta(detalle+'<br><span style="opacity:.85">Todos los registros ya estaban cargados: el Spreadsheet no se modificó.</span>', INFO);
+          pinta(detalle+'<br><span style="opacity:.85">No hubo registros que agregar: el Spreadsheet no se modificó.</span>', INFO);
           toast(cfg.etiqueta+': sin registros nuevos que agregar.','info');
         }else{
           pinta(detalle, OK);
@@ -7109,8 +7195,17 @@ RENDERERS.admin = function(){
         }
       }catch(err){
         console.error('[Ventas] '+cfg.etiqueta+':', err);
-        pinta('<b>No se pudo completar la carga.</b><br>'+String(err.message||err), ERR);
-        toast('Error al cargar '+cfg.etiqueta+'.','error');
+        if(err && err.reimportacion){
+          // Reimportación detectada: se ofrece continuar de forma explícita.
+          pinta('<b>Este archivo ya se cargó antes.</b><br>'+String(err.message||err)+
+            '<br><br><button class="btn btn-ghost btn-sm" id="'+idBtn+'Forzar">Cargarlo de todos modos</button>', INFO);
+          const bf = document.getElementById(idBtn+'Forzar');
+          if(bf) bf.onclick = ()=>{ btn.dataset.forzar='1'; btn.click(); };
+          toast(cfg.etiqueta+': el archivo ya se había cargado.','warn');
+        }else{
+          pinta('<b>No se pudo completar la carga.</b><br>'+String(err.message||err), ERR);
+          toast('Error al cargar '+cfg.etiqueta+'.','error');
+        }
       }finally{
         btn.disabled = false; btn.textContent = textoBtn;
       }
@@ -11932,7 +12027,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-08.1';
+const APP_VERSION = '2026-09-08.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
