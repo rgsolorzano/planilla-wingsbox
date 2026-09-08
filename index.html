@@ -2303,6 +2303,65 @@ const ANAL_MESES_NUM = {
 };
 const ANAL_MESES_ABREV = ['','Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Set','Oct','Nov','Dic'];
 
+/* ── Cabeceras mensuales del RAW ───────────────────────────────────────────
+   Antes solo se aceptaba texto ("JULIO 2025"). Ahora la celda es una FECHA
+   real (01/07/2025) que Sheets entrega, con UNFORMATTED_VALUE, como número
+   serie. El formato visual ("julio 2025") NUNCA es la fuente de verdad.
+
+   Devuelve {año, mes} o null si la cabecera no es interpretable. Admite:
+     · serial de Sheets (número)   → fecha real
+     · ISO 'YYYY-MM-DD' o con hora → se toma solo la parte de fecha
+     · 'DD/MM/YYYY'                → fecha en formato local
+     · texto 'MES AÑO'             → compatibilidad con el formato anterior
+   El mes se extrae SIEMPRE con componentes UTC a partir del serial, sin
+   convertir a hora local: así 01/07/2025 no puede desplazarse a junio por
+   una conversión de zona horaria.                                        */
+function analParseCabeceraMes(valor){
+  if(valor===null || valor===undefined || valor==='') return null;
+
+  // a) Serial de Google Sheets (días desde 1899-12-30)
+  if(typeof valor === 'number' && Number.isFinite(valor)){
+    if(valor < 1 || valor > 200000) return null;
+    const d = new Date(Math.round((Math.floor(valor) - 25569) * 86400000));
+    if(isNaN(d.getTime())) return null;
+    return { año: d.getUTCFullYear(), mes: d.getUTCMonth() + 1 };
+  }
+
+  const s = String(valor).trim();
+  if(!s) return null;
+
+  // b) ISO 'YYYY-MM-DD' (con o sin hora): se leen los componentes tal cual
+  let m = s.match(/^(\d{4})-(\d{2})(?:-(\d{2}))?/);
+  if(m){
+    const mes = +m[2];
+    if(mes>=1 && mes<=12) return { año:+m[1], mes };
+    return null;
+  }
+  // c) 'DD/MM/YYYY' o 'D/M/YYYY'
+  m = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/);
+  if(m){
+    const mes = +m[2];
+    if(mes>=1 && mes<=12) return { año:+m[3], mes };
+    return null;
+  }
+  // d) Formato de texto anterior: 'JULIO 2025' (compatibilidad)
+  m = s.toUpperCase().match(/^([A-ZÁÉÍÓÚ]+)\s+(\d{4})$/);
+  if(m){
+    const mes = ANAL_MESES_NUM[m[1]];
+    if(mes) return { año:+m[2], mes };
+  }
+  return null;
+}
+// Etiqueta canónica de una columna mensual, derivada de año+mes.
+function analLabelMes(año, mes){ return ANAL_MESES_ABREV[mes] + ' ' + año; }
+// Índice 0-based → letra de columna de Sheets (0→A, 25→Z, 26→AA), para
+// poder señalar exactamente qué cabecera está mal.
+function colIndexToLetter(i){
+  let n = i + 1, s = '';
+  while(n > 0){ const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
 let analiticaData = [];   // [{grupo,plato,precio,margen,año,mes,cantidad}] null=vacío en RAW
 let analiticaMeta = null; // {lastSync,productos,meses,registros,duracion}
 const _añoNow = new Date().getFullYear();
@@ -2373,15 +2432,32 @@ async function syncAnaliticaFromRAW(){
     const {values:matrix=[]} = await resp.json();
     if(!matrix.length) throw new Error('La hoja RAW está vacía');
 
-    // 2) Detectar columnas de meses (índice ≥ 4, formato "MES AÑO")
+    /* 2) Detectar columnas de meses (índice ≥ 4). La cabecera puede ser una
+          fecha real o el texto antiguo: analParseCabeceraMes() resuelve ambos
+          y devuelve año+mes, que es la única clave usada en adelante.
+          Una cabecera con contenido pero NO interpretable detiene el proceso:
+          no se adivina el mes ni se desplazan las columnas. */
     const hdrs = matrix[0];
     const monthCols = [];
+    const invalidas = [];
     for(let i=4; i<hdrs.length; i++){
-      const h = String(hdrs[i]||'').trim().toUpperCase();
-      const mt = h.match(/^([A-ZÁÉÍÓÚ]+)\s+(\d{4})$/);
-      if(mt){ const mes=ANAL_MESES_NUM[mt[1]]; if(mes) monthCols.push({idx:i, año:+mt[2], mes, label:String(hdrs[i]).trim()}); }
+      const bruto = hdrs[i];
+      if(bruto===null || bruto===undefined || String(bruto).trim()==='') continue;  // columna sin cabecera
+      const p = analParseCabeceraMes(bruto);
+      if(!p){
+        invalidas.push({ col:i, letra:colIndexToLetter(i), valor:String(bruto).slice(0,40) });
+        continue;
+      }
+      monthCols.push({ idx:i, año:p.año, mes:p.mes, label:analLabelMes(p.año,p.mes) });
     }
-    if(!monthCols.length) throw new Error('No se encontraron columnas de meses en RAW (formato esperado: "JULIO 2025")');
+    if(invalidas.length){
+      const det = invalidas.map(v=>'columna '+v.letra+' ("'+v.valor+'")').join(', ');
+      throw new Error('Hay cabecera(s) mensual(es) que no se pueden interpretar como fecha en RAW: '+det+
+        '. No se actualizó nada; corrige esas cabeceras y vuelve a intentarlo.');
+    }
+    if(!monthCols.length) throw new Error('No se encontraron columnas de meses en RAW (se esperan fechas como 01/07/2025 en la fila de cabeceras).');
+    // Orden cronológico REAL por año+mes, no por texto ni por posición.
+    monthCols.sort((a,b)=> a.año!==b.año ? a.año-b.año : a.mes-b.mes);
 
     // 3) Transformar filas → hechos normalizados
     const facts=[]; const productosSet=new Set();
@@ -2684,6 +2760,8 @@ RENDERERS.consolidadoVentas = function(){
           <input id="anFVal" type="number" min="0" value="${analFilter.cantVal}" style="width:64px">
         </div></div>
         <button class="btn btn-ghost btn-sm" id="anFClear">🗑 Limpiar</button>
+        <button class="btn btn-primary btn-sm" id="anSyncAnalytics" style="align-self:flex-end"
+          title="Lee la hoja RAW del Spreadsheet ESTADISTICAS RAW y actualiza los datos que alimentan este reporte">📊 Actualizar datos analíticos</button>
       </div>
     </div>
     <div class="card" style="padding:0;overflow:hidden">
@@ -2727,6 +2805,21 @@ RENDERERS.consolidadoVentas = function(){
     analFilter=analDefaultFilter();
     analSort={col:'grupo',dir:'asc'};
     RENDERERS.consolidadoVentas();
+  };
+  /* Actualización de datos analíticos: MISMA función que antes vivía en
+     Administración general (syncAnaliticaFromRAW). Solo cambió de ubicación;
+     no hay una segunda implementación. Al terminar se repinta el módulo para
+     reflejar los datos y la fecha de sincronización. */
+  const btnSync = document.getElementById('anSyncAnalytics');
+  if(btnSync) btnSync.onclick = async ()=>{
+    const txt = btnSync.textContent;
+    btnSync.disabled = true; btnSync.textContent = '⏳ Sincronizando…';
+    try{
+      await syncAnaliticaFromRAW();
+    }finally{
+      btnSync.disabled = false; btnSync.textContent = txt;
+      RENDERERS.consolidadoVentas();   // refresca datos y metadatos
+    }
   };
 };
 
@@ -6924,14 +7017,10 @@ RENDERERS.admin = function(){
       </div>
       <div id="admMsg"></div>
     </div>
-    ${gsControlsHTML()}
-    <div class="card">
-      <h2>📈 Datos Analíticos</h2>
-      <p class="hint" style="margin-top:0">Lee la hoja <b>RAW</b> del Spreadsheet <code>ESTADISTICAS RAW</code>, la transforma en una estructura OLAP normalizada (tabla de hechos) y la almacena localmente para los módulos de Analítica.
-      ${analiticaMeta?`<br>Última sincronización: <b>${fmtFecha(analiticaMeta.lastSync.slice(0,10))}</b> · ${analiticaMeta.productos} productos · ${analiticaMeta.meses} meses · ${analiticaMeta.registros} registros · ${analiticaMeta.duracion}s`:'<br><b style="color:#dc2626">Sin datos. Sincroniza para habilitar los módulos de Analítica.</b>'}
-      </p>
-      <div class="actions"><button class="btn btn-primary" id="admSyncAnalytics">📊 Actualizar datos analíticos</button></div>
-    </div>`;
+    ${gsControlsHTML()}`;
+    /* La sección "Datos Analíticos" se trasladó a Consolidado General de
+       Ventas, que es el módulo al que alimenta. La función es la misma
+       (syncAnaliticaFromRAW); aquí ya no se declara ni se enlaza. */
   /* Dos flujos INDEPENDIENTES: cada botón toca exclusivamente su pestaña.
      El botón se deshabilita mientras dura la operación para evitar cargas
      dobles, y el resultado se detalla en su propio recuadro. */
@@ -6978,14 +7067,6 @@ RENDERERS.admin = function(){
 
   document.getElementById('admExport').onclick=adminExport;
   document.getElementById('admImport').onclick=adminImport;
-  document.getElementById('admSyncAnalytics').onclick=async()=>{
-    const btn=document.getElementById('admSyncAnalytics');
-    if(!btn) return;
-    btn.disabled=true; btn.textContent='⏳ Sincronizando…';
-    await syncAnaliticaFromRAW();
-    btn.disabled=false; btn.textContent='📊 Actualizar datos analíticos';
-    RENDERERS.admin(); // refrescar para mostrar metadatos actualizados
-  };
   gsBindControls();
 };
 
@@ -11797,7 +11878,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-05.2';
+const APP_VERSION = '2026-09-07.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
