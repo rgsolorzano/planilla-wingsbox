@@ -582,6 +582,9 @@
     <section class="page" id="page-menajeAdmin"></section>
     <section class="page" id="page-invDiarioMenaje"></section>
     <section class="page" id="page-consolidadoMenaje"></section>
+    <section class="page" id="page-cocinaAdmin"></section>
+    <section class="page" id="page-invDiarioCocina"></section>
+    <section class="page" id="page-consolidadoCocina"></section>
     <section class="page" id="page-consolidadoSalon"></section>
     <section class="page" id="page-produccion"></section>
     <section class="page" id="page-insumos"></section>
@@ -624,7 +627,8 @@ const K = {
   // Módulo Inventario Salón
   salonProductos:'inv_salon_prod', salonInventario:'inv_salon_stock', seedSalon:'inv_salon_seedDone',
   // Módulo Inventario Menaje
-  menajeArticulos:'inv_menaje_art', menajeInventario:'inv_menaje_stock', seedMenaje:'inv_menaje_seedDone'
+  menajeArticulos:'inv_menaje_art', menajeInventario:'inv_menaje_stock', seedMenaje:'inv_menaje_seedDone',
+  cocinaProductos:'inv_cocina_prod', cocinaInventario:'inv_cocina_stock', seedCocina:'inv_cocina_seedDone'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -861,7 +865,7 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   migrarCondiciones();   // idempotente: cada empleado tiene al menos una condición
@@ -888,6 +892,9 @@ function reloadState(){
   S.menajeArticulos=menajeNormalizarCatalogo(load(K.menajeArticulos));
   S.menajeInventario=load(K.menajeInventario);
   if(!S.menajeArticulos.length && !localStorage.getItem(K.seedMenaje)) seedMenajeArticulos(true);
+  S.cocinaProductos=cocinaNormalizarCatalogo(load(K.cocinaProductos));
+  S.cocinaInventario=load(K.cocinaInventario);
+  if(!S.cocinaProductos.length && !localStorage.getItem(K.seedCocina)) seedCocinaProductos(true);
   menajeSanearInventario(); // invariantes: sin huérfanos, sin duplicados, enteros
 }
 // Vacía en memoria (NUNCA en localStorage) los datos de un dominio que no
@@ -7839,6 +7846,118 @@ const MENAJE_ARTICULOS_INICIALES = [
 ];
 
 // ── Seed inicial ──────────────────────────────────────────────────
+/* ════════════════════════════════════════════════════════════════════════
+   INVENTARIO DE COCINA
+   Categoría independiente (no se mezcla con Insumos, Licores, Bebidas, Salón
+   ni Menaje). Sigue el mismo patrón que Menaje: catálogo con ID propio +
+   registros diarios identificados por (productoId, fecha).
+
+   IDENTIDAD: la clave lógica es el productId, NUNCA el nombre. Por eso pueden
+   coexistir dos productos llamados "Aceite" con unidades distintas, y así se
+   tratan en catálogo, registro diario y consolidado.
+   ════════════════════════════════════════════════════════════════════════ */
+const COCINA_PRODUCTOS_INICIALES = [
+  ['coc_sal','Sal','bolsa 1kg'],
+  ['coc_ketchup','Ketchup','pqt 2kg'],
+  ['coc_mostaza','Mostaza','pqt 2kg'],
+  ['coc_mayonesa','Mayonesa base','bolsa 1kg'],
+  ['coc_bbq','BBQ','bolsa 1kg'],
+  ['coc_leche','Leche','bolsa 800ml'],
+  ['coc_harina','Harina','pqt 1kg'],
+  ['coc_arroz','Arroz','bolsa 5kg'],
+  ['coc_azucar','Azúcar blanca','bolsa 5kg'],
+  // Dos productos DISTINTOS con el mismo nombre: se distinguen por su id.
+  ['coc_aceite_bot','Aceite','botella 900ml'],
+  ['coc_vinagre_man','Vinagre de manzana','botella 1lt'],
+  ['coc_salsa_ing','Salsa inglesa','botella 500ml'],
+  ['coc_miel','Miel','botella 480gr'],
+  ['coc_ajo_polvo','Ajo en polvo','frasco 297.7gr'],
+  ['coc_cebolla_polvo','Cebolla en polvo','frasco 787gr'],
+  ['coc_louisana','Salsa Louisana','botella 90ml'],
+  ['coc_vinagre_tinto','Vinagre tinto','galon 5lt'],
+  ['coc_pan_molido','Pan molido','bolsa 1kg'],
+  ['coc_oregano','Orégano en polvo','bolsa 750gr'],
+  ['coc_pimienta','Pimienta negra','pqt 500gr'],
+  ['coc_ajonjoli','Ajonjolí','pqt 500gr'],
+  ['coc_chuno','Chuño','pqt 1kg'],
+  ['coc_galleta_soda','Galleta de soda','pqt 40gr'],
+  ['coc_fettuccini','Fettuccini','pqt 500gr'],
+  ['coc_spaguetti','Spaguetti','pqt 950gr'],
+  ['coc_ajonjoli_negro','Ajonjolí negro','pqt 690gr'],
+  ['coc_aceite_balde','Aceite','balde 20t'],
+  ['coc_papel_toalla','Papel toalla','rollo'],
+  ['coc_taper3','Taper #3','un'],
+  ['coc_taper4','Taper #4','un'],
+  ['coc_taper15','Taper #15','un']
+];
+function seedCocinaProductos(sincronizar){
+  S.cocinaProductos = COCINA_PRODUCTOS_INICIALES.map(([id,nombre,unidad],i)=>({id,nombre,unidad,orden:i}));
+  save(K.cocinaProductos, S.cocinaProductos);
+  localStorage.setItem(K.seedCocina,'1');
+  if(sincronizar && isAuthorized()) syncCocinaProductos();
+  return S.cocinaProductos.length;
+}
+// Normaliza el catálogo: garantiza id, unidad y orden en todos los productos.
+function cocinaNormalizarCatalogo(lista){
+  const arr = Array.isArray(lista) ? lista : [];
+  return arr.map((p,i)=>({
+    id: String(p.id || uid()),
+    nombre: String(p.nombre ?? '').trim(),
+    unidad: String(p.unidad ?? '').trim(),
+    orden: Number.isFinite(Number(p.orden)) ? Number(p.orden) : i
+  })).filter(p=>p.nombre!=='');
+}
+// EL orden de presentación, compartido por los tres módulos de Cocina.
+function cocinaOrdenados(){
+  return S.cocinaProductos.slice().sort((a,b)=>{
+    const oa=Number.isFinite(Number(a.orden))?Number(a.orden):0;
+    const ob=Number.isFinite(Number(b.orden))?Number(b.orden):0;
+    return oa!==ob ? oa-ob : String(a.nombre).localeCompare(String(b.nombre));
+  });
+}
+function cocinaReindexar(){ cocinaOrdenados().forEach((p,i)=>{ p.orden=i; }); }
+// Etiqueta que distingue visualmente dos productos con el mismo nombre.
+function cocinaEtiqueta(p){ return p ? (p.nombre + (p.unidad ? ' ('+p.unidad+')' : '')) : ''; }
+// Registro diario: la identidad es (productoId, fecha).
+function getInvCocina(productoId, fecha){
+  return S.cocinaInventario.find(r=>r.productoId===productoId && r.fecha===fecha);
+}
+/* Cantidad registrada, o null si NO hay registro. Se distingue la ausencia de
+   registro (celda vacía) de un 0 registrado explícitamente. */
+function cocinaCantidad(productoId, fecha){
+  const r = getInvCocina(productoId, fecha);
+  if(!r) return null;
+  return numOrNull(r.cantidad);
+}
+/* Upsert: si existe (productoId, fecha) se actualiza; si no, se crea. Nunca
+   se generan duplicados al volver a guardar el mismo día.
+   `cantidad` null elimina el registro (el usuario vació el campo). */
+function cocinaUpsert(productoId, fecha, cantidad){
+  const existente = getInvCocina(productoId, fecha);
+  if(cantidad === null || cantidad === undefined || cantidad === ''){
+    if(existente){
+      S.cocinaInventario = S.cocinaInventario.filter(r=>r!==existente);
+      if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('InvCocina', existente);
+      return 'eliminado';
+    }
+    return 'sin cambios';
+  }
+  if(existente){ existente.cantidad = cantidad; return 'actualizado'; }
+  S.cocinaInventario.push({ id:uid(), productoId, fecha, cantidad });
+  return 'nuevo';
+}
+/* Valida una cantidad de inventario de cocina: entero, no negativo.
+   Devuelve {ok, valor, error}. Un campo vacío es válido y significa
+   "sin registro" (valor null). */
+function cocinaValidarCantidad(raw){
+  const s = String(raw ?? '').trim();
+  if(s === '') return { ok:true, valor:null };
+  if(!/^\d+$/.test(s)) return { ok:false, error:'Solo se permiten números enteros no negativos (sin decimales).' };
+  const n = Number(s);
+  if(!Number.isInteger(n) || n < 0) return { ok:false, error:'La cantidad debe ser un entero mayor o igual a 0.' };
+  return { ok:true, valor:n };
+}
+
 function seedMenajeArticulos(sincronizar){
   S.menajeArticulos = MENAJE_ARTICULOS_INICIALES.map(([id,nombre])=>({id,nombre}));
   save(K.menajeArticulos, S.menajeArticulos);
@@ -7910,12 +8029,235 @@ function menajeEntero(v){
 // ── Sync (independiente de otros módulos) ─────────────────────────
 function syncMenajeArticulos()  { _syncSheet('inventario','MenajeArticulos', 'MenajeArticulos', S.menajeArticulos.length); }
 function syncMenajeInventario() { _syncSheet('inventario','MenajeInventario','MenajeInventario',S.menajeInventario.length); }
+function syncCocinaProductos()  { _syncSheet('inventario','Cocina',   'Cocina',    S.cocinaProductos.length); }
+function syncCocinaInventario() { _syncSheet('inventario','InvCocina','InvCocina', S.cocinaInventario.length); }
 
 // ── Estado de edición ─────────────────────────────────────────────
 let editMenajeArtId = null;
 let menajeFecha = fechaHoy();
 
 // ── RENDERER: Administración — Menaje ─────────────────────────────
+// ── Estado de edición de Cocina ───────────────────────────────────
+let editCocinaProdId = null;
+let cocinaFecha = fechaHoy();
+let cocinaConsFilter = (function(){
+  const hoy = fechaEnLima();
+  return { desde: fechaMasDias(hoy,-6), hasta: hoy };   // últimos 7 días con hoy
+})();
+
+/* ── ADMINISTRACIÓN Y CONFIGURACIÓN → COCINA ─────────────────────────────
+   Catálogo maestro. Cada producto tiene un id propio, de modo que dos
+   productos pueden compartir nombre y seguir siendo independientes. */
+RENDERERS.cocinaAdmin = function(){
+  const el=document.getElementById('page-cocinaAdmin');
+  if(!el) return;
+  const editando = editCocinaProdId ? S.cocinaProductos.find(p=>p.id===editCocinaProdId) : null;
+  const lista = cocinaOrdenados();
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🍳 Administración de Cocina</h1>
+      <p>Catálogo de productos de inventario de cocina. Los cambios se reflejan en <b>Inv. Cocina</b> y en <b>Consolidado Cocina</b>.</p></div></div>
+    <div class="card">
+      <h2>${editando?'Editar producto':'Nuevo producto'}</h2>
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Nombre *</label><input id="cocNombre" value="${editando?String(editando.nombre).replace(/"/g,'&quot;'):''}" placeholder="Ej: Sal" style="min-width:220px"></div>
+        <div class="field"><label>Unidad *</label><input id="cocUnidad" value="${editando?String(editando.unidad||'').replace(/"/g,'&quot;'):''}" placeholder="Ej: bolsa 1kg" style="min-width:180px"></div>
+        <button class="btn btn-primary" id="cocSave">${editando?'Actualizar':'Guardar'}</button>
+        ${editando?'<button class="btn btn-ghost" id="cocCancel">Cancelar</button>':''}
+      </div>
+      <p class="hint" style="margin-bottom:0">Pueden existir dos productos con el <b>mismo nombre</b> y distinta unidad (por ejemplo <b>Aceite</b> en botella y en balde): se identifican internamente por un código propio, no por su nombre.</p>
+    </div>
+    <div class="card">
+      <h2>Productos (${lista.length})</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th style="width:74px">Orden</th><th>Producto</th><th>Unidad</th><th>Acciones</th></tr></thead>
+        <tbody>${lista.length? lista.map((p,pos)=>`
+          <tr>
+            <td style="white-space:nowrap">
+              <button class="btn-icon" onclick="cocinaMover('${p.id}',-1)" title="Subir" ${pos===0?'disabled style="opacity:.3;cursor:default"':''}>⬆️</button>
+              <button class="btn-icon" onclick="cocinaMover('${p.id}',1)" title="Bajar" ${pos===lista.length-1?'disabled style="opacity:.3;cursor:default"':''}>⬇️</button>
+            </td>
+            <td>${p.nombre}</td>
+            <td><span class="badge b-free">${p.unidad||'—'}</span></td>
+            <td style="white-space:nowrap">
+              <button class="btn-icon" onclick="cocinaEdit('${p.id}')">✏️ Editar</button>
+              <button class="btn-icon del" onclick="cocinaDel('${p.id}')">🗑️ Eliminar</button>
+            </td>
+          </tr>`).join('') : `<tr><td colspan="4" class="empty">No hay productos. Crea el primero arriba.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>`;
+
+  document.getElementById('cocSave').onclick = ()=>{
+    const nombre=document.getElementById('cocNombre').value.trim();
+    const unidad=document.getElementById('cocUnidad').value.trim();
+    if(!nombre){ toast('El nombre del producto es obligatorio','error'); return; }
+    if(!unidad){ toast('La unidad es obligatoria','error'); return; }
+    if(editCocinaProdId){
+      const p=S.cocinaProductos.find(x=>x.id===editCocinaProdId);
+      if(p){ p.nombre=nombre; p.unidad=unidad; }
+      editCocinaProdId=null;
+      toast('Producto actualizado','success');
+    }else{
+      // ID propio: dos productos con el mismo nombre son distintos.
+      S.cocinaProductos.push({ id:uid(), nombre, unidad, orden:S.cocinaProductos.length });
+      toast('Producto agregado','success');
+    }
+    cocinaReindexar();
+    save(K.cocinaProductos,S.cocinaProductos); syncCocinaProductos();
+    RENDERERS.cocinaAdmin();
+  };
+  const btnC=document.getElementById('cocCancel');
+  if(btnC) btnC.onclick=()=>{ editCocinaProdId=null; RENDERERS.cocinaAdmin(); };
+};
+window.cocinaEdit = function(id){ editCocinaProdId=id; RENDERERS.cocinaAdmin(); window.scrollTo({top:0,behavior:'smooth'}); };
+window.cocinaMover = function(id, delta){
+  const lista=cocinaOrdenados(); const i=lista.findIndex(p=>p.id===id);
+  const j=i+delta;
+  if(i<0 || j<0 || j>=lista.length) return;
+  const a=lista[i].orden, b=lista[j].orden;
+  lista[i].orden=b; lista[j].orden=a;
+  cocinaReindexar();
+  save(K.cocinaProductos,S.cocinaProductos); syncCocinaProductos();
+  RENDERERS.cocinaAdmin();
+};
+/* Eliminar un producto NO borra su histórico: los registros conservan su
+   productoId y siguen visibles en el Consolidado. */
+window.cocinaDel = function(id){
+  const p=S.cocinaProductos.find(x=>x.id===id); if(!p) return;
+  const hist=S.cocinaInventario.filter(r=>r.productoId===id).length;
+  if(!confirm('¿Eliminar "'+cocinaEtiqueta(p)+'" del catálogo?'+
+    (hist? '\n\nSus '+hist+' registro(s) históricos se conservarán y seguirán apareciendo en Consolidado Cocina.' : ''))) return;
+  S.cocinaProductos=S.cocinaProductos.filter(x=>x.id!==id);
+  cocinaReindexar();
+  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('Cocina', p);
+  save(K.cocinaProductos,S.cocinaProductos); syncCocinaProductos();
+  toast('Producto eliminado del catálogo','success');
+  RENDERERS.cocinaAdmin();
+};
+
+/* ── REGISTRO DIARIO → INV. COCINA ───────────────────────────────────────
+   Una fila por producto del catálogo (en su orden) y una cantidad entera por
+   día. Campo vacío = sin registro; un 0 escrito se conserva como 0. */
+RENDERERS.invDiarioCocina = function(){
+  const el=document.getElementById('page-invDiarioCocina');
+  if(!el) return;
+  const lista = cocinaOrdenados();
+  const filas = lista.map(p=>{
+    const v = cocinaCantidad(p.id, cocinaFecha);
+    return `<tr>
+      <td class="mx-fix">${p.nombre} <span class="badge b-free">${p.unidad||'—'}</span></td>
+      <td class="num"><input type="number" min="0" step="1" class="cocina-inp"
+        data-prod="${p.id}" value="${v===null?'':v}" placeholder="" style="min-width:90px"></td>
+    </tr>`;
+  }).join('');
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🍳 Inv. Cocina</h1>
+      <p>Registro diario del inventario de cocina. Deja el campo vacío si no hay inventario registrado ese día; un <b>0</b> ingresado se guarda como cero.</p></div></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Fecha</label><input type="date" id="cocFecha" value="${cocinaFecha}"></div>
+        <button class="btn btn-primary" id="cocGuardar">💾 Guardar inventario</button>
+      </div>
+      ${lista.length? `<div class="mx-outer"><table class="mx-table">
+        <thead><tr><th class="mx-fix">Producto</th><th class="num">Cantidad</th></tr></thead>
+        <tbody>${filas}</tbody>
+      </table></div>` : `<p class="empty">No hay productos en el catálogo. Créalos en <b>Administración y configuración → Cocina</b>.</p>`}
+      <p class="hint">Las cantidades son <b>números enteros</b> no negativos: la unidad (por ejemplo <i>bolsa 1kg</i>) describe la presentación, y aquí se registra cuántas hay.</p>
+    </div>`;
+
+  document.getElementById('cocFecha').onchange=(e)=>{ cocinaFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioCocina(); };
+  document.getElementById('cocGuardar').onclick=()=>{
+    const inputs=[...document.querySelectorAll('.cocina-inp')];
+    // Validación ANTES de guardar nada: un decimal aborta toda la operación.
+    for(const inp of inputs){
+      const v=cocinaValidarCantidad(inp.value);
+      if(!v.ok){
+        const p=S.cocinaProductos.find(x=>x.id===inp.dataset.prod);
+        toast((p?cocinaEtiqueta(p)+': ':'')+v.error,'error');
+        inp.focus();
+        return;
+      }
+    }
+    let nuevos=0, act=0, elim=0;
+    inputs.forEach(inp=>{
+      const v=cocinaValidarCantidad(inp.value);
+      const res=cocinaUpsert(inp.dataset.prod, cocinaFecha, v.valor);
+      if(res==='nuevo') nuevos++; else if(res==='actualizado') act++; else if(res==='eliminado') elim++;
+    });
+    save(K.cocinaInventario,S.cocinaInventario); syncCocinaInventario();
+    toast('Inventario guardado: '+nuevos+' nuevo(s), '+act+' actualizado(s)'+(elim?', '+elim+' sin registro':'')+'.','success');
+    RENDERERS.invDiarioCocina();
+  };
+};
+
+/* ── CONSOLIDADOS Y COTEJOS → CONSOLIDADO COCINA ─────────────────────────
+   Matriz: productos en filas, fechas en columnas. Incluye los productos que
+   ya no están en el catálogo pero conservan histórico. */
+RENDERERS.consolidadoCocina = function(){
+  const el=document.getElementById('page-consolidadoCocina');
+  if(!el) return;
+  const desde=cocinaConsFilter.desde, hasta=cocinaConsFilter.hasta;
+  const fechas=(desde&&hasta&&desde<=hasta)? rangoFechas(desde,hasta).slice(-60) : [];
+
+  /* Productos a mostrar: los del catálogo en su orden, más los que solo
+     existen en el histórico (eliminados del catálogo) para no perder datos. */
+  const delCatalogo = cocinaOrdenados();
+  const idsCatalogo = new Set(delCatalogo.map(p=>p.id));
+  const huerfanos = [];
+  S.cocinaInventario.forEach(r=>{
+    if(idsCatalogo.has(r.productoId)) return;
+    if(huerfanos.some(h=>h.id===r.productoId)) return;
+    if(!fechas.includes(r.fecha)) return;
+    huerfanos.push({ id:r.productoId, nombre:'(producto eliminado)', unidad:'', eliminado:true });
+  });
+  const productos = delCatalogo.concat(huerfanos);
+
+  const thFechas = fechas.map(f=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap;border-left:2px solid #c4b5fd">
+      <div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>
+      <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
+    </th>`).join('');
+  const filas = productos.map(p=>{
+    const celdas = fechas.map(f=>{
+      const v = cocinaCantidad(p.id, f);
+      // Sin registro = celda vacía; un 0 registrado se muestra como 0.
+      return `<td class="num" style="border-left:2px solid #e9d5ff">${v===null?'':v}</td>`;
+    }).join('');
+    return `<tr><td class="mx-fix">${p.nombre}${p.unidad?` <span class="badge b-free">${p.unidad}</span>`:''}${p.eliminado?' <span class="badge b-late" style="font-size:9px">Histórico</span>':''}</td>${celdas}</tr>`;
+  }).join('');
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🍳 Consolidado Cocina</h1>
+      <p>Histórico diario del inventario de cocina: una fila por producto y una columna por fecha.</p></div></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Desde</label><input type="date" id="cocCDesde" value="${desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="cocCHasta" value="${hasta}"></div>
+        <button class="btn btn-ghost btn-sm" id="cocCUlt7" style="align-self:flex-end">Últimos 7 días</button>
+      </div>
+      <h2 style="margin-bottom:6px">Historial por producto (${fechas.length} día${fechas.length===1?'':'s'}, ${productos.length} producto${productos.length===1?'':'s'})</h2>
+      ${(!fechas.length || !productos.length)
+        ? `<p class="empty">${!fechas.length?'Selecciona un rango de fechas válido.':'No hay productos registrados.'}</p>`
+        : `<div class="mx-outer"><table class="mx-table">
+             <thead><tr><th class="mx-fix">Producto</th>${thFechas}</tr></thead>
+             <tbody>${filas}</tbody>
+           </table></div>`}
+    </div>`;
+
+  const aplicar=()=>{
+    const d=document.getElementById('cocCDesde').value, h=document.getElementById('cocCHasta').value;
+    if(d&&h&&d>h){ toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error'); return; }
+    cocinaConsFilter={desde:d,hasta:h};
+    RENDERERS.consolidadoCocina();
+  };
+  document.getElementById('cocCDesde').onchange=aplicar;
+  document.getElementById('cocCHasta').onchange=aplicar;
+  document.getElementById('cocCUlt7').onclick=()=>{
+    const hoy=fechaEnLima();
+    cocinaConsFilter={ desde:fechaMasDias(hoy,-6), hasta:hoy };
+    RENDERERS.consolidadoCocina();
+  };
+};
+
 RENDERERS.menajeAdmin = function(){
   const el=document.getElementById('page-menajeAdmin');
   if(!el) return;
@@ -10967,7 +11309,8 @@ const ACCOUNT_ROLES = {
       'syncInventario','licores','invDiarioLicores','cotejoLicores',
       'bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas',
       'efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon',
-      'menajeAdmin','invDiarioMenaje','consolidadoMenaje'
+      'menajeAdmin','invDiarioMenaje','consolidadoMenaje',
+      'cocinaAdmin','invDiarioCocina','consolidadoCocina'
     ]
   },
   'wingsbox.oficial@gmail.com': {
@@ -10976,7 +11319,7 @@ const ACCOUNT_ROLES = {
     // la propietaria del archivo). Es el ÚNICO spreadsheet válido para todos
     // los módulos de Inventario: NUNCA se debe crear uno nuevo ni buscar por nombre.
     inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
-    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon','menajeAdmin','invDiarioMenaje','consolidadoMenaje']
+    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon','menajeAdmin','invDiarioMenaje','consolidadoMenaje','cocinaAdmin','invDiarioCocina','consolidadoCocina']
   }
 };
 // ── OAuth scope ──────────────────────────────────────────────────────────────
@@ -11005,7 +11348,7 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -11448,6 +11791,11 @@ function gsSerializeInventario(){
     StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
     SalonProductos: gsRowsToMatrix(['id','nombre','unidades'], S.salonProductos.map(p=>({...p, unidades:p.unidades.join(',')}))),
     SalonInventario: gsRowsToMatrix(['id','productoId','fecha','unidad','cantidad'], S.salonInventario),
+    // Cocina: catálogo y registros en tabs PROPIOS, sin mezclarse con otros.
+    Cocina: gsRowsToMatrix(['id','nombre','unidad','orden'],
+      cocinaOrdenados().map((p,i)=>({ id:p.id, nombre:p.nombre, unidad:p.unidad||'', orden:i }))),
+    InvCocina: gsRowsToMatrix(['id','productoId','fecha','cantidad'],
+      S.cocinaInventario.map(r=>({ id:r.id, productoId:r.productoId, fecha:r.fecha, cantidad:r.cantidad }))),
     MenajeArticulos: gsRowsToMatrix(['id','nombre'], S.menajeArticulos),
     MenajeInventario: gsRowsToMatrix(['id','articuloId','fecha','cantidad','rotas','rajadas'],
       S.menajeInventario.map(r=>({...r, rotas:menajeVal(r,'rotas'), rajadas:menajeVal(r,'rajadas')}))),
@@ -11569,6 +11917,9 @@ const GS_SHEET_KEYS = {
   StockBebidas:['bebidaId','fecha'],
   SalonInventario:['productoId','fecha','unidad'],
   MenajeInventario:['articuloId','fecha'],
+  Cocina:['id'],
+  // Un registro por producto y día: volver a guardar actualiza, no duplica.
+  InvCocina:['productoId','fecha'],
   EfectivoCaja:['fecha']
 };
 function gsClaveDe(sheetName, obj){
@@ -11970,6 +12321,22 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         cantidad:menajeEntero(r.cantidad), rotas:menajeEntero(r.rotas), rajadas:menajeEntero(r.rajadas)
       }));
       if(menajeSanearInventario() > 0) syncMenajeInventario();
+
+      // ── Cocina: catálogo y registros diarios ──
+      if(puedeAplicar('Cocina', S.cocinaProductos))
+      S.cocinaProductos = cocinaNormalizarCatalogo((byName['Cocina']||[]).map(r=>({
+        id:String(r.id||uid()), nombre:String(r.nombre||'').trim(),
+        unidad:String(r.unidad||'').trim(), orden:Number(r.orden)
+      })));
+      if(puedeAplicar('InvCocina', S.cocinaInventario))
+      S.cocinaInventario = (byName['InvCocina']||[]).map(r=>({
+        id:String(r.id||uid()), productoId:String(r.productoId||''),
+        fecha:normFechaGS(r.fecha),
+        // null si no hay dato: la ausencia de registro no es un 0.
+        cantidad:numOrNull(r.cantidad)
+      })).filter(r=>r.productoId && r.fecha);
+      save(K.cocinaProductos, S.cocinaProductos);
+      save(K.cocinaInventario, S.cocinaInventario);
       // Duplicados heredados de sincronizaciones anteriores: se consolidan en
       // memoria. No se reescribe la hoja aquí; el usuario decide cuándo con
       // "Guardar en Google Sheets" o limpiarMarcacionesDuplicadas().
@@ -12073,7 +12440,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-08.3';
+const APP_VERSION = '2026-09-09.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -12467,11 +12834,11 @@ const PLANILLA_NAV_HTML = document.getElementById('nav').innerHTML; // fallback 
 // ── Grupos accordion del dominio INVENTARIO (Wingsbox) ──
 const NAV_GROUPS_INVENTARIO = [
   { id:'inv-admin',  ico:'📂', label:'Administración y Configuración',
-    modules:['insumos','licores','bebidasAdmin','salonAdmin','menajeAdmin','syncInventario'] },
+    modules:['insumos','licores','bebidasAdmin','salonAdmin','menajeAdmin','cocinaAdmin','syncInventario'] },
   { id:'inv-diario', ico:'📝', label:'Registro Diario',
-    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje'] },
+    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje','invDiarioCocina'] },
   { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
-    modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon','consolidadoMenaje'] },
+    modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon','consolidadoMenaje','consolidadoCocina'] },
   { id:'inv-caja',   ico:'💰', label:'Caja',
     modules:['efectivoCaja','consolidadoCaja'] }
 ];
@@ -12500,6 +12867,7 @@ const NAV_MODULE_LABELS = {
   consolidadoStockBebidas:['📊','Consolidado Bebidas'], consolidadoSalon:['📊','Consolidado Salón'],
   salonAdmin:['🛎️','Salón'], invDiarioSalon:['📋','Inv. Salón'],
   menajeAdmin:['🍽️','Menaje'], invDiarioMenaje:['📋','Inventario Menaje'], consolidadoMenaje:['📊','Consolidado Menaje'],
+  cocinaAdmin:['🍳','Cocina'], invDiarioCocina:['🍳','Inv. Cocina'], consolidadoCocina:['📊','Consolidado Cocina'],
   consolidadoStockBebidas:['📊','Consolidado Bebidas'],
   efectivoCaja:['💰','Control de Caja'], consolidadoCaja:['📋','Consolidado Caja'],
   // Planilla
