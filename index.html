@@ -163,7 +163,14 @@
   .mx-table tfoot .mx-fix{
     z-index:3;background:#2e1065;color:#e9d5ff;font-weight:700
   }
-  .mx-table tbody tr:hover .mx-fix{background:#1e1b4b}  /* NO hover change — consolidados son solo lectura */
+  /* Al pasar el ratón, esta regla oscurece el fondo de la columna fija, pero
+     el color del texto lo fija `.mx-table td{color:#111827}` (más específica
+     que .mx-fix), así que quedaba texto oscuro sobre fondo oscuro y el nombre
+     del producto desaparecía. Se fija también el color: fondo y texto viajan
+     SIEMPRE juntos, de modo que ninguna tabla que use .mx-fix pueda volver a
+     perder contraste en hover. */
+  .mx-table tbody tr:hover .mx-fix{ background:#1e1b4b; color:#e9d5ff }
+  .mx-table tbody tr:hover .mx-fix .badge{ opacity:1 }
   .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
   .mx-table tbody tr:hover td:not(.mx-fix){background:#fff}  /* sin hover en consolidados */
   /* ── Administración de insumos: encabezados legibles ─────────────────────
@@ -249,7 +256,9 @@
   #page-consolidadoMenaje tr:hover td,
   #page-alertaInsumos tr:hover td,
   #page-cotejoLicores tr:hover td,
-  #page-consolidadoCaja tr:hover td{ background:inherit !important }
+  #page-consolidadoCaja tr:hover td,
+  #page-consolidadoCocina tr:hover td,
+  #page-invDiarioCocina tr:hover td{ background:inherit !important }
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   tfoot td{font-weight:700;background:#f1ecfa}
   /* Consolidado de Inventario: alertas (mismos colores que .b-miss) */
@@ -401,7 +410,17 @@
   .anal-row-grupo td{font-size:12px;padding:5px 10px;position:sticky;left:0;z-index:2;border-bottom:2px solid #c4b5fd}
   .anal-subtotal{background:#faf5ff;font-weight:600;color:#4c1d95}
   .anal-grand{background:#ede9fe;font-weight:700;color:#1e1b4b}
-  .anal-tfoot{font-weight:700;background:var(--panel);position:sticky;bottom:0;z-index:3;border-top:2px solid #c4b5fd}
+  /* En la fila de totales, subtotal y total general conservan su fondo CLARO,
+     así que su texto debe seguir siendo oscuro: se declaran después y con la
+     especificidad necesaria para no heredar el texto claro del footer. */
+  .anal-tfoot.anal-subtotal, .anal-tfoot.anal-subtotal *{ background:#faf5ff; color:#4c1d95 }
+  .anal-tfoot.anal-grand,    .anal-tfoot.anal-grand *   { background:#ede9fe; color:#1e1b4b }
+  /* Fondo morado oscuro (--panel) con texto que heredaba el color oscuro de
+     la tabla: los totales resultaban ilegibles. Se declara aquí el color del
+     texto junto al fondo para que el contraste no dependa de la celda. */
+  .anal-tfoot{font-weight:700;background:var(--panel);color:#e9d5ff;
+    position:sticky;bottom:0;z-index:3;border-top:2px solid #c4b5fd}
+  .anal-tfoot.num, .anal-tfoot *{ color:#e9d5ff }
   .anal-table .num{text-align:right;padding:3px 6px;white-space:nowrap}
   /* Filas alternas (opcional, mejora lectura) */
   .cotejo-table tbody tr:nth-child(even) .cotejo-col-licor,
@@ -12440,7 +12459,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.1';
+const APP_VERSION = '2026-09-09.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
