@@ -415,6 +415,12 @@
   /* Fondo morado oscuro (--panel) con texto que heredaba el color oscuro de
      la tabla: los totales resultaban ilegibles. Se declara aquí el color del
      texto junto al fondo para que el contraste no dependa de la celda. */
+  /* Fila Total de Evolución de gastos: mismo lenguaje que el pie de .mx-table
+     (morado oscuro con texto lila claro). Fondo y color se declaran juntos
+     para que el contraste no dependa de reglas heredadas — es lo que dejaba
+     los importes casi invisibles sobre el fondo claro anterior. */
+  .mx-table tfoot .gastos-total{ background:#2e1065; color:#e9d5ff; font-weight:700 }
+  .mx-table tbody tr:hover .gastos-total{ background:#2e1065 }
   .anal-tfoot{font-weight:700;background:var(--panel);color:#e9d5ff;
     position:sticky;bottom:0;z-index:3;border-top:2px solid #c4b5fd}
   .anal-tfoot.num, .anal-tfoot *{ color:#e9d5ff }
@@ -4431,6 +4437,14 @@ function gastosRangoPorDefecto(){
   return { desde: a+'-'+String(m).padStart(2,'0'), hasta: hoy.slice(0,7) };
 }
 let gastosFilter = Object.assign(gastosRangoPorDefecto(), { tipo:'' });   // '' = Todos
+/* Criterio de orden ÚNICO: 'detalle' (alfabético) o 'total' (por monto).
+   Mismo patrón e indicadores que el Consolidado de Ventas. */
+let gastosSort = { col:'total', dir:'desc' };
+window.gastosToggleSort = function(col){
+  if(gastosSort.col===col) gastosSort.dir = gastosSort.dir==='asc' ? 'desc' : 'asc';
+  else { gastosSort.col=col; gastosSort.dir = col==='detalle' ? 'asc' : 'desc'; }
+  RENDERERS.evolucionGastos();
+};
 
 // Lista de meses YYYY-MM del rango, en orden cronológico.
 function gastosMesesDelRango(desde, hasta){
@@ -4466,9 +4480,19 @@ function gastosAgrupar(meses, tipoSel){
     total += Number(f.monto)||0;
   });
   const lista=[...filas.values()];
-  // Mayor gasto primero: lo más relevante queda arriba.
   lista.forEach(f=>{ f.total=[...f.porMes.values()].reduce((a,b)=>a+b,0); });
-  lista.sort((a,b)=> b.total-a.total || String(a.label).localeCompare(String(b.label)));
+  /* El orden solo reorganiza las filas: los valores mensuales, los totales y
+     la agrupación quedan intactos. La fila de Total se pinta aparte, en el
+     <tfoot>, así que nunca entra en esta ordenación. */
+  const sd = gastosSort.dir==='asc' ? 1 : -1;
+  lista.sort((a,b)=>{
+    if(gastosSort.col==='detalle'){
+      const c = String(a.label).localeCompare(String(b.label), 'es', {sensitivity:'base'});
+      return c!==0 ? sd*c : b.total-a.total;
+    }
+    const c = a.total-b.total;                       // por monto
+    return c!==0 ? sd*c : String(a.label).localeCompare(String(b.label), 'es', {sensitivity:'base'});
+  });
   return { filas:lista, total };
 }
 
@@ -4489,6 +4513,9 @@ RENDERERS.evolucionGastos = function(){
   const tipos = [...new Set(comprasFacts.map(f=>f.tipo).filter(Boolean))].sort();
   const { filas, total } = gastosAgrupar(meses, tipoSel);
   const money = n => 'S/ '+(Math.round(n*100)/100).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
+  // Indicador de orden idéntico al de los demás módulos de Analítica.
+  const si=(col)=>gastosSort.col===col?(gastosSort.dir==='asc'?'↑':'↓'):'<span style="opacity:.25">⇅</span>';
+  const sh=(col,lbl)=>`<span style="cursor:pointer;user-select:none;white-space:nowrap" onclick="gastosToggleSort('${col}')">${lbl}&nbsp;${si(col)}</span>`;
 
   const thMeses = meses.map(ym=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap;border-left:2px solid #c4b5fd">${gastosLabelMes(ym)}</th>`).join('');
   const cuerpo = filas.map(f=>{
@@ -4501,7 +4528,8 @@ RENDERERS.evolucionGastos = function(){
   }).join('');
   const totPorMes = meses.map(ym=>{
     const s = filas.reduce((a,f)=>a+(f.porMes.get(ym)||0),0);
-    return `<td class="num anal-tfoot">${money(s)}</td>`;
+    // Fondo y color declarados juntos: la fila Total siempre legible.
+    return `<td class="num gastos-total">${money(s)}</td>`;
   }).join('');
 
   el.innerHTML=`
@@ -4531,9 +4559,9 @@ RENDERERS.evolucionGastos = function(){
           : (!filas.length
             ? `<p class="empty">No hay gastos registrados en el período seleccionado${tipoSel?' para el tipo "'+tipoSel+'"':''}.</p>`
             : `<div class="mx-outer"><table class="mx-table">
-                 <thead><tr><th class="mx-fix">${tipoSel?'Detalle':'Tipo de gasto'}</th>${thMeses}<th class="num" style="background:#f8f5ff;font-size:10px;font-weight:600">TOTAL</th></tr></thead>
+                 <thead><tr><th class="mx-fix">${sh('detalle', tipoSel?'Detalle':'Tipo de gasto')}</th>${thMeses}<th class="num" style="background:#f8f5ff;font-size:10px;font-weight:600">${sh('total','TOTAL')}</th></tr></thead>
                  <tbody>${cuerpo}</tbody>
-                 <tfoot><tr><td class="mx-fix">Total</td>${totPorMes}<td class="num anal-tfoot">${money(total)}</td></tr></tfoot>
+                 <tfoot><tr><td class="mx-fix">Total</td>${totPorMes}<td class="num gastos-total">${money(total)}</td></tr></tfoot>
                </table></div>`))}
     </div>`;
 
@@ -12628,7 +12656,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.5';
+const APP_VERSION = '2026-09-09.6';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
