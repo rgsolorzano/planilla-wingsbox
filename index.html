@@ -593,6 +593,7 @@
     <section class="page" id="page-evolucionVentas"></section>
     <section class="page" id="page-estadisticasDiaSemana"></section>
     <section class="page" id="page-flujoCaja"></section>
+    <section class="page" id="page-evolucionGastos"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
     <section class="page" id="page-menajeAdmin"></section>
@@ -4181,7 +4182,8 @@ const COMPRAS_SHEET_FACTS = 'COMPRAS_FACTS'; // tabla procesada → ANALITICA_PR
 const K_COMPRAS_DATA = 'compras_facts';
 const K_COMPRAS_META = 'compras_meta';
 // Índices 0-based según especificación: B=1 fecha, F=5 tipo, I=8 monto, K=10 filtro
-const COMPRAS_COL = { fecha:1, tipo:5, monto:8, filtro:10 };
+// G=6 detalle: lo usa Evolución de gastos; Flujo de Caja lo ignora.
+const COMPRAS_COL = { fecha:1, tipo:5, detalle:6, monto:8, filtro:10 };
 
 let comprasFacts = [];  // [{fecha:'YYYY-MM-DD', tipo, monto}] agregado por (día, tipo)
 let comprasMeta  = null;
@@ -4220,12 +4222,17 @@ async function comprasSync(){
       wb++;
       // Tipo de gasto DINÁMICO desde la columna F (sin catálogo fijo).
       const tipo=String(row[COMPRAS_COL.tipo]??'').trim() || 'Sin clasificar';
-      const k=fecha+'|'+tipo;
+      /* Se agrega también por DETALLE (col. G) para que Evolución de gastos
+         pueda desglosar dentro de un tipo. La granularidad es mayor, pero las
+         sumas por (día, tipo) son idénticas, así que Flujo de Caja —que suma
+         sobre estos mismos hechos— no se ve afectado. */
+      const detalle=String(row[COMPRAS_COL.detalle]??'').trim() || 'Sin detalle';
+      const k=fecha+'\u0001'+tipo+'\u0001'+detalle;
       porClave.set(k,(porClave.get(k)||0)+num(row[COMPRAS_COL.monto]));
     });
     comprasFacts=[...porClave.entries()].map(([k,monto])=>{
-      const i=k.indexOf('|');
-      return {fecha:k.slice(0,i), tipo:k.slice(i+1), monto};
+      const [fecha,tipo,detalle]=k.split('\u0001');
+      return {fecha, tipo, detalle, monto};
     }).sort((a,b)=>a.fecha<b.fecha?-1:1);
     comprasMeta={ lastSync:new Date().toISOString(), filasWB:wb,
       registros:comprasFacts.length, tipos:new Set(comprasFacts.map(f=>f.tipo)).size,
@@ -4252,7 +4259,7 @@ async function comprasSync(){
 // Tabla procesada con los egresos agregados. SIEMPRE en el spreadsheet de
 // ANALÍTICA; jamás toca COMPRAS ni ninguna pestaña del RAW.
 async function comprasWriteFactsSheet(){
-  const matrix=[['Fecha','Tipo','Monto'], ...comprasFacts.map(f=>[f.fecha,f.tipo,f.monto])];
+  const matrix=[['Fecha','Tipo','Detalle','Monto'], ...comprasFacts.map(f=>[f.fecha,f.tipo,f.detalle||'',f.monto])];
   return analiticaWriteProcessedSheet(COMPRAS_SHEET_FACTS, matrix, 'A:C');
 }
 
@@ -4383,6 +4390,141 @@ function flujoGananciaSVG(serie){
 }
 
 // ── Renderer ──────────────────────────────────────────────────────
+/* ════════════════════════════════════════════════════════════════════════
+   ANALÍTICA → EVOLUCIÓN DE GASTOS
+   Fuente: la MISMA que Flujo de Caja (tab COMPRAS del Spreadsheet RAW, ya
+   filtrado por K="WB" y cacheado en comprasFacts). No se hace ninguna lectura
+   adicional: los datos se filtran y agrupan en memoria, así que cambiar de
+   filtro no dispara consultas.
+     Fecha=B · Tipo=F · Detalle=G · Importe=I · Filtro=K
+   ════════════════════════════════════════════════════════════════════════ */
+/* Rango por defecto, dinámico según el mes en curso (hora de Lima):
+     · may–dic → enero del año actual hasta el mes actual
+     · ene–abr → últimos 6 meses, incluido el actual                       */
+function gastosRangoPorDefecto(){
+  const hoy = fechaEnLima();                    // 'YYYY-MM-DD' en America/Lima
+  const año = Number(hoy.slice(0,4)), mes = Number(hoy.slice(5,7));
+  if(mes >= 5) return { desde: año+'-01', hasta: hoy.slice(0,7) };
+  // Enero–abril: se retrocede 5 meses para incluir 6 en total.
+  let m = mes - 5, a = año;
+  while(m <= 0){ m += 12; a--; }
+  return { desde: a+'-'+String(m).padStart(2,'0'), hasta: hoy.slice(0,7) };
+}
+let gastosFilter = Object.assign(gastosRangoPorDefecto(), { tipo:'' });   // '' = Todos
+
+// Lista de meses YYYY-MM del rango, en orden cronológico.
+function gastosMesesDelRango(desde, hasta){
+  if(!desde || !hasta || desde > hasta) return [];
+  const out=[]; let [a,m]=desde.split('-').map(Number);
+  const [af,mf]=hasta.split('-').map(Number);
+  while(a<af || (a===af && m<=mf)){
+    out.push(a+'-'+String(m).padStart(2,'0'));
+    m++; if(m>12){ m=1; a++; }
+    if(out.length>240) break;                   // salvaguarda
+  }
+  return out;
+}
+function gastosLabelMes(ym){
+  const [a,m]=ym.split('-').map(Number);
+  return ANAL_MESES_ABREV[m].toUpperCase()+' '+a;
+}
+/* Agrupa los gastos del rango. `porDetalle` decide el nivel de la fila.
+   Una sola pasada sobre los hechos ya cacheados: sin consultas por celda. */
+function gastosAgrupar(meses, tipoSel){
+  const mesesSet = new Set(meses);
+  const filas = new Map();                      // clave → {label, porMes:Map}
+  let total = 0;
+  comprasFacts.forEach(f=>{
+    const ym = String(f.fecha||'').slice(0,7);
+    if(!mesesSet.has(ym)) return;               // fuera del rango
+    if(tipoSel && f.tipo !== tipoSel) return;   // tipo específico
+    // Con "Todos" las filas son tipos; con un tipo elegido, sus detalles.
+    const clave = tipoSel ? (f.detalle || 'Sin detalle') : f.tipo;
+    if(!filas.has(clave)) filas.set(clave, { label:clave, porMes:new Map() });
+    const fila = filas.get(clave);
+    fila.porMes.set(ym, (fila.porMes.get(ym)||0) + (Number(f.monto)||0));
+    total += Number(f.monto)||0;
+  });
+  const lista=[...filas.values()];
+  // Mayor gasto primero: lo más relevante queda arriba.
+  lista.forEach(f=>{ f.total=[...f.porMes.values()].reduce((a,b)=>a+b,0); });
+  lista.sort((a,b)=> b.total-a.total || String(a.label).localeCompare(String(b.label)));
+  return { filas:lista, total };
+}
+
+RENDERERS.evolucionGastos = function(){
+  const el=document.getElementById('page-evolucionGastos');
+  if(!el) return;
+  const meses = gastosMesesDelRango(gastosFilter.desde, gastosFilter.hasta);
+  const tipoSel = gastosFilter.tipo || '';
+  // Tipos SIEMPRE dinámicos desde la fuente (K=WB ya aplicado en el sync).
+  const tipos = [...new Set(comprasFacts.map(f=>f.tipo).filter(Boolean))].sort();
+  const { filas, total } = gastosAgrupar(meses, tipoSel);
+  const money = n => 'S/ '+(Math.round(n*100)/100).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+  const thMeses = meses.map(ym=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap;border-left:2px solid #c4b5fd">${gastosLabelMes(ym)}</th>`).join('');
+  const cuerpo = filas.map(f=>{
+    const celdas = meses.map(ym=>{
+      // El grupo existe en el período: un mes sin gasto se muestra como 0.
+      const v = f.porMes.get(ym) || 0;
+      return `<td class="num" style="border-left:2px solid #e9d5ff">${money(v)}</td>`;
+    }).join('');
+    return `<tr><td class="mx-fix">${f.label}</td>${celdas}<td class="num" style="background:#faf5ff;font-weight:600;color:#4c1d95">${money(f.total)}</td></tr>`;
+  }).join('');
+  const totPorMes = meses.map(ym=>{
+    const s = filas.reduce((a,f)=>a+(f.porMes.get(ym)||0),0);
+    return `<td class="num anal-tfoot">${money(s)}</td>`;
+  }).join('');
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>📉 Evolución de gastos</h1>
+      <p>Gasto mensual por tipo y detalle, a partir de las compras registradas.
+      ${comprasMeta?`<br>Última sincronización: <b>${fmtFecha(String(comprasMeta.lastSync).slice(0,10))}</b> · ${comprasMeta.filasWB} compras · ${comprasMeta.tipos} tipos`:''}</p></div></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Desde</label><input type="month" id="gasDesde" value="${gastosFilter.desde}"></div>
+        <div class="field"><label>Hasta</label><input type="month" id="gasHasta" value="${gastosFilter.hasta}"></div>
+        <div class="field"><label>Tipo de gasto</label>
+          <select id="gasTipo" style="min-width:210px">
+            <option value="">Todos</option>
+            ${tipos.map(t=>`<option value="${t}" ${tipoSel===t?'selected':''}>${t}</option>`).join('')}
+          </select></div>
+        <button class="btn btn-ghost btn-sm" id="gasClear" style="align-self:flex-end">🗑 Limpiar</button>
+      </div>
+      <h2 style="margin-bottom:6px">
+        ${tipoSel? `Tipo de gasto: <span style="color:#6d28d9">${tipoSel}</span> · detalle por mes`
+                 : 'Todos los tipos de gasto'}
+        <span style="font-weight:400;font-size:13px;color:var(--c-muted)"> · ${filas.length} fila(s), ${meses.length} mes(es) · total ${money(total)}</span>
+      </h2>
+      ${(!meses.length)
+        ? `<p class="empty">Selecciona un rango de meses válido.</p>`
+        : (!comprasFacts.length
+          ? `<p class="empty">No hay datos de compras. Sincroniza desde <b>Flujo de Caja</b> para cargarlos.</p>`
+          : (!filas.length
+            ? `<p class="empty">No hay gastos registrados en el período seleccionado${tipoSel?' para el tipo "'+tipoSel+'"':''}.</p>`
+            : `<div class="mx-outer"><table class="mx-table">
+                 <thead><tr><th class="mx-fix">${tipoSel?'Detalle':'Tipo de gasto'}</th>${thMeses}<th class="num" style="background:#f8f5ff;font-size:10px;font-weight:600">TOTAL</th></tr></thead>
+                 <tbody>${cuerpo}</tbody>
+                 <tfoot><tr><td class="mx-fix">Total</td>${totPorMes}<td class="num anal-tfoot">${money(total)}</td></tr></tfoot>
+               </table></div>`))}
+    </div>`;
+
+  // Actualización AUTOMÁTICA: cualquier filtro repinta al instante, sin botón.
+  const aplicar=()=>{
+    const d=document.getElementById('gasDesde').value, h=document.getElementById('gasHasta').value;
+    if(d&&h&&d>h){ toast('Rango inválido: "Desde" no puede ser posterior a "Hasta".','error'); return; }
+    gastosFilter={ desde:d, hasta:h, tipo:document.getElementById('gasTipo').value||'' };
+    RENDERERS.evolucionGastos();
+  };
+  document.getElementById('gasDesde').onchange=aplicar;
+  document.getElementById('gasHasta').onchange=aplicar;
+  document.getElementById('gasTipo').onchange=aplicar;
+  document.getElementById('gasClear').onclick=()=>{
+    gastosFilter=Object.assign(gastosRangoPorDefecto(),{tipo:''});
+    RENDERERS.evolucionGastos();
+  };
+};
+
 RENDERERS.flujoCaja = function(){
   const el=document.getElementById('page-flujoCaja');
   if(!el) return;
@@ -11320,6 +11462,8 @@ const ACCOUNT_ROLES = {
       'empleados','horarios','cuadrante','marcaciones','propinas',
       'propinasConsolidado','descuentos','pagos','libres','calculo',
       'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja',
+      'evolucionGastos',   // Analítica de gastos: exclusiva de multiboxes.peru
+
       // ── INVENTARIO ────────────────────────────────────────────────────────
       'produccion','insumos','inventarioConsolidado','alertaInsumos',
       'syncInventario','licores','invDiarioLicores','cotejoLicores',
@@ -12456,7 +12600,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.3';
+const APP_VERSION = '2026-09-09.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -12870,7 +13014,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja'] }
+    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja','evolucionGastos'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -12898,7 +13042,7 @@ const NAV_MODULE_LABELS = {
   gananciaGrupo:['💰','Ganancia por Grupo'],
   evolucionVentas:['📉','Evolución de Ventas'],
   estadisticasDiaSemana:['🗓️','Estadísticas por Día'],
-  flujoCaja:['💵','Flujo de Caja']
+  flujoCaja:['💵','Flujo de Caja'], evolucionGastos:['📉','Evolución de gastos']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
