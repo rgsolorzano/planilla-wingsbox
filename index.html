@@ -4181,6 +4181,13 @@ const COMPRAS_SHEET_RAW   = 'COMPRAS';       // pestaña RAW: solo lectura
 const COMPRAS_SHEET_FACTS = 'COMPRAS_FACTS'; // tabla procesada → ANALITICA_PROC_SS_ID
 const K_COMPRAS_DATA = 'compras_facts';
 const K_COMPRAS_META = 'compras_meta';
+/* Versión del FORMATO de comprasFacts. Debe subir cada vez que cambie la
+   forma de los hechos (campos nuevos, otra granularidad…). El caché de
+   localStorage guarda esta versión: si no coincide, se descarta y se vuelve a
+   leer la fuente. Sin esto, un caché con el formato anterior seguía usándose
+   indefinidamente — por eso el desglose por Personal/Insumo mostraba
+   "Sin detalle": los hechos guardados no traían aún el campo `detalle`. */
+const COMPRAS_FACTS_VERSION = 2;   // v2 = agrega el detalle (columna G)
 // Índices 0-based según especificación: B=1 fecha, F=5 tipo, I=8 monto, K=10 filtro
 // G=6 detalle: lo usa Evolución de gastos; Flujo de Caja lo ignora.
 const COMPRAS_COL = { fecha:1, tipo:5, detalle:6, monto:8, filtro:10 };
@@ -4192,8 +4199,21 @@ let flujoAutoSyncIntentado = false;
 function comprasLoadFromStorage(){
   try{
     const d=localStorage.getItem(K_COMPRAS_DATA), m=localStorage.getItem(K_COMPRAS_META);
-    if(d) comprasFacts=JSON.parse(d);
-    if(m) comprasMeta=JSON.parse(m);
+    const facts = d ? JSON.parse(d) : [];
+    const meta  = m ? JSON.parse(m) : null;
+    /* Se acepta el caché solo si su formato es el vigente. La comprobación es
+       doble: la versión declarada y, por si acaso, que los hechos traigan
+       realmente el campo esperado. */
+    const versionOk  = meta && Number(meta.version) === COMPRAS_FACTS_VERSION;
+    const formatoOk  = !facts.length || Object.prototype.hasOwnProperty.call(facts[0], 'detalle');
+    if(versionOk && formatoOk){
+      comprasFacts = facts; comprasMeta = meta;
+    }else{
+      comprasFacts = []; comprasMeta = null;
+      localStorage.removeItem(K_COMPRAS_DATA);
+      localStorage.removeItem(K_COMPRAS_META);
+      if(facts.length) console.warn('[Compras] Caché con formato anterior descartado: se volverá a leer '+COMPRAS_SHEET_RAW+' para incorporar el desglose por Personal/Insumo.');
+    }
   }catch(e){ comprasFacts=[]; comprasMeta=null; }
 }
 comprasLoadFromStorage();
@@ -4234,7 +4254,7 @@ async function comprasSync(){
       const [fecha,tipo,detalle]=k.split('\u0001');
       return {fecha, tipo, detalle, monto};
     }).sort((a,b)=>a.fecha<b.fecha?-1:1);
-    comprasMeta={ lastSync:new Date().toISOString(), filasWB:wb,
+    comprasMeta={ version:COMPRAS_FACTS_VERSION, lastSync:new Date().toISOString(), filasWB:wb,
       registros:comprasFacts.length, tipos:new Set(comprasFacts.map(f=>f.tipo)).size,
       duracion:((Date.now()-t0)/1000).toFixed(1) };
     try{
@@ -4452,9 +4472,17 @@ function gastosAgrupar(meses, tipoSel){
   return { filas:lista, total };
 }
 
+let gastosAutoSyncIntentado = false;
 RENDERERS.evolucionGastos = function(){
   const el=document.getElementById('page-evolucionGastos');
   if(!el) return;
+  /* Si no hay hechos (primera visita o caché descartado por cambio de
+     formato), se sincroniza una vez y se repinta. Mismo patrón que usa
+     Flujo de Caja: una sola lectura, nunca una por celda. */
+  if(!comprasFacts.length && !gastosAutoSyncIntentado && isAuthorized()){
+    gastosAutoSyncIntentado = true;
+    comprasSync().then(()=>{ if(currentPage==='evolucionGastos') RENDERERS.evolucionGastos(); });
+  }
   const meses = gastosMesesDelRango(gastosFilter.desde, gastosFilter.hasta);
   const tipoSel = gastosFilter.tipo || '';
   // Tipos SIEMPRE dinámicos desde la fuente (K=WB ya aplicado en el sync).
@@ -4499,7 +4527,7 @@ RENDERERS.evolucionGastos = function(){
       ${(!meses.length)
         ? `<p class="empty">Selecciona un rango de meses válido.</p>`
         : (!comprasFacts.length
-          ? `<p class="empty">No hay datos de compras. Sincroniza desde <b>Flujo de Caja</b> para cargarlos.</p>`
+          ? `<p class="empty">${gastosAutoSyncIntentado?'Cargando compras desde el Spreadsheet…':'No hay datos de compras disponibles.'}</p>`
           : (!filas.length
             ? `<p class="empty">No hay gastos registrados en el período seleccionado${tipoSel?' para el tipo "'+tipoSel+'"':''}.</p>`
             : `<div class="mx-outer"><table class="mx-table">
@@ -12600,7 +12628,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.4';
+const APP_VERSION = '2026-09-09.5';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
