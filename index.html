@@ -163,16 +163,17 @@
   .mx-table tfoot .mx-fix{
     z-index:3;background:#2e1065;color:#e9d5ff;font-weight:700
   }
-  /* Al pasar el ratón, esta regla oscurece el fondo de la columna fija, pero
-     el color del texto lo fija `.mx-table td{color:#111827}` (más específica
-     que .mx-fix), así que quedaba texto oscuro sobre fondo oscuro y el nombre
-     del producto desaparecía. Se fija también el color: fondo y texto viajan
-     SIEMPRE juntos, de modo que ninguna tabla que use .mx-fix pueda volver a
-     perder contraste en hover. */
-  .mx-table tbody tr:hover .mx-fix{ background:#1e1b4b; color:#e9d5ff }
-  .mx-table tbody tr:hover .mx-fix .badge{ opacity:1 }
+  /* ── HOVER DE FILA: SOLO FONDO, NUNCA COLOR DE TEXTO ────────────────────
+     Regla única para todas las tablas matriciales. El hover no declara
+     `color` en ninguna parte: el texto conserva exactamente el mismo tono que
+     en reposo, así que el contraste no puede romperse pase lo que pase con el
+     fondo. El realce se consigue con un lila suave, algo más marcado que
+     antes para que la fila bajo el cursor se identifique con claridad. */
+  .mx-table tbody tr:hover td{ background:#ede9fe }
+  .mx-table tbody tr:hover .mx-fix{ background:#e4defc }   /* algo más marcada la columna fija */
   .mx-table td.num,.mx-table th.num{text-align:center;padding:3px 4px;white-space:nowrap;max-width:90px;min-width:58px}
-  .mx-table tbody tr:hover td:not(.mx-fix){background:#fff}  /* sin hover en consolidados */
+  /* (Se retiró la regla que devolvía el fondo a blanco: ahora el hover es
+     uniforme y legible en todas las tablas matriciales.) */
   /* ── Administración de insumos: encabezados legibles ─────────────────────
      Anula el nowrap y el max-width del .num global, que hacían que títulos
      largos como "ALERTA POR CONSUMO" se desbordaran sobre la columna vecina. */
@@ -249,16 +250,11 @@
   th,td{padding:9px 11px;text-align:left;border-bottom:1px solid var(--c-line);white-space:nowrap}
   th{background:#f1ecfa;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--c-muted)}
   /* Hover solo en tablas de edición, no en consolidados de solo lectura */
-  tbody tr:hover{background:#faf8fe}
-  #page-inventarioConsolidado tr:hover td,
-  #page-consolidadoStockBebidas tr:hover td,
-  #page-consolidadoSalon tr:hover td,
-  #page-consolidadoMenaje tr:hover td,
-  #page-alertaInsumos tr:hover td,
-  #page-cotejoLicores tr:hover td,
-  #page-consolidadoCaja tr:hover td,
-  #page-consolidadoCocina tr:hover td,
-  #page-invDiarioCocina tr:hover td{ background:inherit !important }
+  tbody tr:hover{background:#f3efff}   /* solo fondo; el texto no cambia */
+  /* Antes estos módulos anulaban el fondo del hover con `!important`, lo que
+     dejaba la fila sin realce y, combinado con un cambio de color de texto,
+     hacía desaparecer el contenido. Ahora todos comparten el mismo hover:
+     solo fondo, sin tocar el color del texto. */
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
   tfoot td{font-weight:700;background:#f1ecfa}
   /* Consolidado de Inventario: alertas (mismos colores que .b-miss) */
@@ -404,8 +400,9 @@
   .anal-hdr-total{background:#1e1b4b;color:#fff;font-weight:700;white-space:nowrap;padding:4px 8px}
   .anal-fix{position:sticky;background:#fff;z-index:2;padding:4px 8px;white-space:normal;word-break:break-word;font-size:11px;border-right:2px solid #e9d5ff}
   .anal-table thead .anal-fix{background:#f8f7ff;z-index:6}
-  .anal-row:hover .anal-fix{background:#f5f3ff}
-  .anal-row:hover td:not(.anal-fix){background:rgba(109,40,217,.04)}
+  /* Mismo principio: el hover solo altera el fondo, nunca el color del texto. */
+  .anal-row:hover .anal-fix{background:#ede9fe}
+  .anal-row:hover td:not(.anal-fix){background:rgba(109,40,217,.10)}
   .anal-row-grupo{background:#f1ecfa}
   .anal-row-grupo td{font-size:12px;padding:5px 10px;position:sticky;left:0;z-index:2;border-bottom:2px solid #c4b5fd}
   .anal-subtotal{background:#faf5ff;font-weight:600;color:#4c1d95}
@@ -12459,7 +12456,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.2';
+const APP_VERSION = '2026-09-09.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
