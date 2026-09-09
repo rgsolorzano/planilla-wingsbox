@@ -4442,6 +4442,7 @@ let gastosFilter = Object.assign(gastosRangoPorDefecto(), { tipo:'' });   // '' 
 let gastosSort = { col:'total', dir:'desc' };
 window.gastosToggleSort = function(col){
   if(gastosSort.col===col) gastosSort.dir = gastosSort.dir==='asc' ? 'desc' : 'asc';
+  // Importes: se empieza por el mayor; texto: alfabético ascendente.
   else { gastosSort.col=col; gastosSort.dir = col==='detalle' ? 'asc' : 'desc'; }
   RENDERERS.evolucionGastos();
 };
@@ -4485,13 +4486,23 @@ function gastosAgrupar(meses, tipoSel){
      la agrupación quedan intactos. La fila de Total se pinta aparte, en el
      <tfoot>, así que nunca entra en esta ordenación. */
   const sd = gastosSort.dir==='asc' ? 1 : -1;
+  const alfa = (a,b)=>String(a.label).localeCompare(String(b.label), 'es', {sensitivity:'base'});
+  /* Valor por el que se ordena cada fila según la columna activa:
+       'detalle'      → texto de la primera columna
+       'mes:YYYY-MM'  → importe de ESE mes (un mes sin gasto vale 0)
+       'total'        → total de la fila
+     Un empate se resuelve alfabéticamente para que el orden sea estable. */
+  const valorOrden = (f)=>{
+    if(gastosSort.col.startsWith('mes:')) return f.porMes.get(gastosSort.col.slice(4)) || 0;
+    return f.total;
+  };
   lista.sort((a,b)=>{
     if(gastosSort.col==='detalle'){
-      const c = String(a.label).localeCompare(String(b.label), 'es', {sensitivity:'base'});
+      const c = alfa(a,b);
       return c!==0 ? sd*c : b.total-a.total;
     }
-    const c = a.total-b.total;                       // por monto
-    return c!==0 ? sd*c : String(a.label).localeCompare(String(b.label), 'es', {sensitivity:'base'});
+    const c = valorOrden(a) - valorOrden(b);
+    return c!==0 ? sd*c : alfa(a,b);
   });
   return { filas:lista, total };
 }
@@ -4508,6 +4519,12 @@ RENDERERS.evolucionGastos = function(){
     comprasSync().then(()=>{ if(currentPage==='evolucionGastos') RENDERERS.evolucionGastos(); });
   }
   const meses = gastosMesesDelRango(gastosFilter.desde, gastosFilter.hasta);
+  /* Si el criterio activo es un mes que ya no está en el rango (el usuario
+     cambió las fechas), se vuelve al orden por total en lugar de dejar una
+     ordenación sin columna visible. */
+  if(gastosSort.col.startsWith('mes:') && !meses.includes(gastosSort.col.slice(4))){
+    gastosSort = { col:'total', dir:'desc' };
+  }
   const tipoSel = gastosFilter.tipo || '';
   // Tipos SIEMPRE dinámicos desde la fuente (K=WB ya aplicado en el sync).
   const tipos = [...new Set(comprasFacts.map(f=>f.tipo).filter(Boolean))].sort();
@@ -4517,7 +4534,10 @@ RENDERERS.evolucionGastos = function(){
   const si=(col)=>gastosSort.col===col?(gastosSort.dir==='asc'?'↑':'↓'):'<span style="opacity:.25">⇅</span>';
   const sh=(col,lbl)=>`<span style="cursor:pointer;user-select:none;white-space:nowrap" onclick="gastosToggleSort('${col}')">${lbl}&nbsp;${si(col)}</span>`;
 
-  const thMeses = meses.map(ym=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap;border-left:2px solid #c4b5fd">${gastosLabelMes(ym)}</th>`).join('');
+  /* Cada mes es también una columna ordenable. Su clave lleva el prefijo
+     'mes:' + YYYY-MM, de modo que el criterio identifica el mes exacto y no
+     se confunde, por ejemplo, enero de 2025 con enero de 2026. */
+  const thMeses = meses.map(ym=>`<th class="num" style="font-size:10px;font-weight:600;background:#f8f5ff;white-space:nowrap;border-left:2px solid #c4b5fd">${sh('mes:'+ym, gastosLabelMes(ym))}</th>`).join('');
   const cuerpo = filas.map(f=>{
     const celdas = meses.map(ym=>{
       // El grupo existe en el período: un mes sin gasto se muestra como 0.
@@ -12656,7 +12676,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.6';
+const APP_VERSION = '2026-09-09.7';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
