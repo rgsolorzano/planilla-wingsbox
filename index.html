@@ -405,6 +405,17 @@
   .anal-row:hover td:not(.anal-fix){background:rgba(109,40,217,.10)}
   .anal-row-grupo{background:#f1ecfa}
   .anal-row-grupo td{font-size:12px;padding:5px 10px;position:sticky;left:0;z-index:2;border-bottom:2px solid #c4b5fd}
+  /* Estadísticas por día: encabezados de comparación en varias líneas, con
+     ancho mínimo y alineados abajo, para que no se superpongan ni siquiera en
+     pantallas estrechas. */
+  #page-estadisticasDiaSemana th.eds-col-comp{
+    white-space:normal; word-break:normal; overflow-wrap:anywhere;
+    min-width:74px; max-width:110px; vertical-align:bottom;
+    line-height:1.25; font-size:11px; padding:6px 6px; height:auto
+  }
+  @media(max-width:768px){
+    #page-estadisticasDiaSemana th.eds-col-comp{ min-width:62px; font-size:10px; padding:4px }
+  }
   .anal-subtotal{background:#faf5ff;font-weight:600;color:#4c1d95}
   .anal-grand{background:#ede9fe;font-weight:700;color:#1e1b4b}
   /* En la fila de totales, subtotal y total general conservan su fondo CLARO,
@@ -3273,6 +3284,46 @@ function ventasUlt12Meses(){ return ventasUltNMeses(12); }
 function ventasEnRango(desde,hasta){
   return ventasFacts.filter(f=>f.fecha>=desde && f.fecha<=hasta);
 }
+
+/* ── NORMALIZACIÓN DE RANGOS (fuente única para toda ANALÍTICA) ────────────
+   Expande el rango elegido según cómo se vaya a agrupar, para que un período
+   no quede cortado a la mitad:
+     'dia'    → exactamente las fechas seleccionadas
+     'semana' → de LUNES a DOMINGO (la semana completa que contiene cada extremo)
+     'mes'    → del día 1 al último día del mes de cada extremo
+   Toda la aritmética se hace sobre la cadena 'YYYY-MM-DD' con Date.UTC, sin
+   pasar por la hora local: un lunes sigue siendo lunes y el día 1 pertenece
+   siempre a su mes, sin desplazamientos por zona horaria.              */
+function anRangoNormalizado(desde, hasta, modo){
+  if(!desde || !hasta) return { desde, hasta };
+  if(modo==='semana') return { desde: anLunesDe(desde), hasta: anDomingoDe(hasta) };
+  if(modo==='mes')    return { desde: desde.slice(0,7)+'-01', hasta: anFinDeMes(hasta) };
+  return { desde, hasta };                       // 'dia': sin cambios
+}
+// Día de la semana en UTC puro (0=domingo … 6=sábado), sin hora local.
+function anDow(iso){
+  const [y,m,d]=iso.split('-').map(Number);
+  return new Date(Date.UTC(y,m-1,d)).getUTCDay();
+}
+// Lunes de la semana que contiene la fecha (la semana es lunes→domingo).
+function anLunesDe(iso){
+  const dow=anDow(iso);
+  const retro=(dow===0)?6:(dow-1);               // domingo pertenece a la semana que empezó el lunes anterior
+  return fechaMasDias(iso, -retro);
+}
+function anDomingoDe(iso){ return fechaMasDias(anLunesDe(iso), 6); }
+// Último día del mes al que pertenece la fecha.
+function anFinDeMes(iso){
+  const [y,m]=iso.split('-').map(Number);
+  const ultimo=new Date(Date.UTC(y, m, 0)).getUTCDate();   // día 0 del mes siguiente
+  return iso.slice(0,7)+'-'+String(ultimo).padStart(2,'0');
+}
+// Clave YYYY-MM del mes N posiciones antes del indicado (N>0 = hacia atrás).
+function anMesMenos(mk, n){
+  let [y,m]=mk.split('-').map(Number);
+  m-=n; while(m<=0){ m+=12; y--; } while(m>12){ m-=12; y++; }
+  return y+'-'+String(m).padStart(2,'0');
+}
 const fmtSoles = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{maximumFractionDigits:0});
 const fmtSolesDec = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
 // Heatmap rojo→amarillo→verde con escala automática por cuadro.
@@ -3505,9 +3556,14 @@ function vdMediosDisponibles(){
 // Así, con Medio=Tarjeta, el Total sigue siendo todas las ventas mientras las
 // series de canal muestran solo las de ese medio.
 function vdBuildSerie(){
-  const {desde,hasta,agrup,metrica,medio,canal}=vdFilter;
+  const {agrup,metrica,medio,canal}=vdFilter;
+  /* El rango se expande según la agrupación: por semana abarca de lunes a
+     domingo y por mes, meses calendario completos, de modo que un período no
+     se corte por la fecha elegida. Por día se respeta el rango exacto. */
+  const {desde,hasta}=anRangoNormalizado(vdFilter.desde, vdFilter.hasta, agrup);
   const acc=new Map();
-  const clave=f=> agrup==='mes' ? f.slice(0,7) : f;
+  // Clave del período: mes → YYYY-MM · semana → lunes de esa semana · día → fecha
+  const clave=f=> agrup==='mes' ? f.slice(0,7) : (agrup==='semana' ? anLunesDe(f) : f);
   const punto=k=>{ let p=acc.get(k); if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); } return p; };
   vdFacts.forEach(x=>{
     if(x.f<desde || x.f>hasta) return;                 // rango de fechas (común)
@@ -3518,7 +3574,10 @@ function vdBuildSerie(){
     if(x.c) p.porCanal[x.c]=(p.porCanal[x.c]||0)+val;
   });
   const puntos=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1).map(p=>({
-    ...p, label: agrup==='mes' ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4) : fmtFechaCorta(p.key)
+    ...p,
+    label: agrup==='mes'    ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)
+         : agrup==='semana' ? fmtFechaCorta(p.key)+'–'+fmtFechaCorta(anDomingoDe(p.key))
+         : fmtFechaCorta(p.key)
   }));
   return {puntos, canales: canal==='todos' ? VD_CANALES : [canal]};
 }
@@ -3644,6 +3703,7 @@ function vdCardHTML(){
             <option value="numero" ${vdFilter.metrica==='numero'?'selected':''}>Número de ventas</option></select></div>
         <div class="field"><label>Agrupar por</label>
           <select id="vdAgrup"><option value="dia" ${vdFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="semana" ${vdFilter.agrup==='semana'?'selected':''}>Semana</option>
             <option value="mes" ${vdFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
         <div class="field"><label>Canal de Venta</label>
           <select id="vdCanal"><option value="todos" ${vdFilter.canal==='todos'?'selected':''}>Todos</option>
@@ -4002,9 +4062,13 @@ const EDS_DIAS = [ [1,'Lunes'],[2,'Martes'],[3,'Miércoles'],[4,'Jueves'],[5,'Vi
 function edsAgregado(){
   const clave=edsFilter.desde+'|'+edsFilter.hasta+'|'+ventasFacts.length+'|'+(ventasMeta?ventasMeta.lastSync:'');
   if(ventasMensualCache.clave===clave) return ventasMensualCache.datos;
-  const meses=ventasMesesDeRango(edsFilter.desde, edsFilter.hasta);
+  /* Los cuadros están organizados por mes, así que el rango se expande a
+     meses calendario completos: un mes parcial se calcularía con menos días
+     y no sería comparable con los demás. */
+  const {desde:edsDesde, hasta:edsHasta}=anRangoNormalizado(edsFilter.desde, edsFilter.hasta, 'mes');
+  const meses=ventasMesesDeRango(edsDesde, edsHasta);
   const celdas=new Map(); // 'dow|YYYY-MM' → {sumMonto,sumN,dias}
-  ventasEnRango(edsFilter.desde, edsFilter.hasta).forEach(f=>{
+  ventasEnRango(edsDesde, edsHasta).forEach(f=>{
     if((f.total||0)<=0) return; // día sin venta: excluido de TODOS los cálculos
     const dow=new Date(f.fecha+'T12:00:00').getDay();
     const k=dow+'|'+f.fecha.slice(0,7);
@@ -4019,7 +4083,7 @@ function edsAgregado(){
   const mkHoy=fechaHoy().slice(0,7);
   const promMes=new Map();
   meses.forEach(mk=>{
-    const delMes=ventasEnRango(edsFilter.desde, edsFilter.hasta).filter(f=>f.fecha.slice(0,7)===mk);
+    const delMes=ventasEnRango(edsDesde, edsHasta).filter(f=>f.fecha.slice(0,7)===mk);
     if(!delMes.length){ promMes.set(mk,null); return; }
     if(mk===mkHoy){
       const conVenta=delMes.filter(f=>(f.total||0)>0);
@@ -4063,6 +4127,21 @@ function edsMesActualYAnterior(){
   return { mkAct, mkAnt:d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0') };
 }
 
+/* Promedio de los 12 meses ANTERIORES completos al mes indicado. El mes
+   actual queda EXCLUIDO por construcción: se recorre de mk-1 a mk-12.
+   Los meses sin dato no cuentan (no se rellenan con cero), igual que hace el
+   resto del módulo, de modo que el promedio refleje los meses realmente
+   operados. Devuelve null si no hay ninguno. */
+function edsPromedio12M(valorDe, mkActual){
+  const vals=[];
+  for(let i=1;i<=12;i++){
+    const v=valorDe(anMesMenos(mkActual, i));
+    if(v!==null && v!==undefined && Number.isFinite(v)) vals.push(v);
+  }
+  if(!vals.length) return null;
+  return vals.reduce((a,b)=>a+b,0)/vals.length;
+}
+
 function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExtra){
   // Recolectar valores para la escala automática del heatmap de ESTE cuadro
   // (solo las filas de días; la fila extra no altera la escala del heatmap)
@@ -4084,13 +4163,19 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExt
   // venta > 0 según CAJA (celdas ya excluye los días en 0), no el calendario.
   const diasMesActual=dow=>{ const c=celdas.get(dow+'|'+mkAct); return c?c.dias:0; };
   const diasCell=n=>`<td class="num" style="font-size:12px;font-weight:600;color:#4b5563;border-left:1px solid var(--c-line)">${mesActEnRango? n : '—'}</td>`;
+  /* Los encabezados de las últimas columnas son largos y con `nowrap` se
+     montaban unos sobre otros. Ahora se permite el salto de línea, se fija un
+     ancho mínimo y se alinean abajo, conservando el tamaño de letra. */
+  const thComp='class="num eds-col-comp" style="border-left:2px solid var(--c-line)"';
   const hdr=meses.map(mk=>`<th class="num" style="white-space:nowrap;font-size:11px">${ANAL_MESES_ABREV[+mk.slice(5)]} ${mk.slice(2,4)}</th>`).join('')
-    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:2px solid var(--c-line)">Var. vs mes ant.</th>`
-    +`<th class="num" style="white-space:nowrap;font-size:11px;border-left:1px solid var(--c-line)">Días mes actual</th>`;
+    +`<th ${thComp} title="Variación del mes en curso frente al mes anterior">Var. vs<br>mes ant.</th>`
+    +`<th ${thComp} title="Variación del mes en curso frente al promedio de los 12 meses anteriores completos">Var. vs<br>prom. 12M</th>`
+    +`<th class="num eds-col-comp" style="border-left:1px solid var(--c-line)" title="Días del mes en curso con venta registrada">Días<br>mes actual</th>`;
   const filas=matriz.map(({dow,nombre,fila})=>`
     <tr><td style="font-weight:600;white-space:nowrap">${nombre}</td>
       ${fila.map(v=>`<td class="num" style="${ventasHeatStyle(v,min,max)};font-size:12px">${v===null?'':formatear(v)}</td>`).join('')}
       ${edsVarCell(valorDe(dow,mkAct), valorDe(dow,mkAnt))}
+      ${edsVarCell(valorDe(dow,mkAct), edsPromedio12M(mk=>valorDe(dow,mk), mkAct))}
       ${diasCell(diasMesActual(dow))}
     </tr>`).join('');
   // Fila extra opcional (p. ej. "Promedio del mes"): fuera de la escala del
@@ -4100,6 +4185,8 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExt
       ${meses.map(mk=>{const v=filaExtra.valor(mk);
         return `<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;font-weight:700;font-size:12px">${v===null||v===undefined?'':formatear(v)}</td>`;}).join('')}
       ${(()=>{const ec=edsVarCell(filaExtra.valor(mkAct), filaExtra.valor(mkAnt));
+        return ec.replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
+      ${(()=>{const ec=edsVarCell(filaExtra.valor(mkAct), edsPromedio12M(mk=>filaExtra.valor(mk), mkAct));
         return ec.replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
       ${(()=>{const totalDias=EDS_DIAS.reduce((s,[dow])=>s+diasMesActual(dow),0);
         return diasCell(totalDias).replace('<td class="num" style="','<td class="num" style="background:#eef2ff;border-top:2px solid #c7d2fe;');})()}
@@ -4312,7 +4399,10 @@ const FLUJO_INGRESOS = [
 // rango dado. ÚNICA fuente de la Ganancia Neta mensual: la usan tanto la
 // tabla del flujo como el gráfico de evolución, garantizando que siempre
 // coincidan (misma fórmula: ganancia = ingresos del mes − egresos del mes).
-function flujoResumenMensual(desde, hasta){
+function flujoResumenMensual(desdeSel, hastaSel){
+  /* Agrupación MENSUAL: el rango se expande a meses calendario completos,
+     de modo que un mes nunca se calcule con una fracción de sus días. */
+  const {desde,hasta}=anRangoNormalizado(desdeSel, hastaSel, 'mes');
   const ingresosMes=new Map();
   ventasEnRango(desde, hasta).forEach(f=>{
     const mk=f.fecha.slice(0,7);
@@ -12676,7 +12766,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-09.7';
+const APP_VERSION = '2026-09-10.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
