@@ -662,7 +662,8 @@ const K = {
   salonProductos:'inv_salon_prod', salonInventario:'inv_salon_stock', seedSalon:'inv_salon_seedDone',
   // Módulo Inventario Menaje
   menajeArticulos:'inv_menaje_art', menajeInventario:'inv_menaje_stock', seedMenaje:'inv_menaje_seedDone',
-  cocinaProductos:'inv_cocina_prod', cocinaInventario:'inv_cocina_stock', seedCocina:'inv_cocina_seedDone'
+  cocinaProductos:'inv_cocina_prod', cocinaInventario:'inv_cocina_stock', seedCocina:'inv_cocina_seedDone',
+  cocinaMovimientos:'inv_cocina_movs'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -899,7 +900,7 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[], cocinaMovimientos:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   migrarCondiciones();   // idempotente: cada empleado tiene al menos una condición
@@ -928,6 +929,7 @@ function reloadState(){
   if(!S.menajeArticulos.length && !localStorage.getItem(K.seedMenaje)) seedMenajeArticulos(true);
   S.cocinaProductos=cocinaNormalizarCatalogo(load(K.cocinaProductos));
   S.cocinaInventario=load(K.cocinaInventario);
+  S.cocinaMovimientos=load(K.cocinaMovimientos);
   if(!S.cocinaProductos.length && !localStorage.getItem(K.seedCocina)) seedCocinaProductos(true);
   menajeSanearInventario(); // invariantes: sin huérfanos, sin duplicados, enteros
 }
@@ -3324,21 +3326,6 @@ function anMesMenos(mk, n){
   m-=n; while(m<=0){ m+=12; y--; } while(m>12){ m-=12; y++; }
   return y+'-'+String(m).padStart(2,'0');
 }
-// Clave de agrupación de UNA fecha, según el modo (fuente única: los tres
-// gráficos de Evolución de Ventas comparten esta función en vez de tener cada
-// uno su propia interpretación de semana/mes):
-//   'dia'    → la fecha tal cual
-//   'semana' → el lunes de su semana (lunes→domingo)
-//   'mes'    → el mes calendario YYYY-MM
-function anClavePeriodo(fecha, modo){
-  return modo==='mes' ? fecha.slice(0,7) : (modo==='semana' ? anLunesDe(fecha) : fecha);
-}
-// Etiqueta visible de un período a partir de su clave (mismo criterio que anClavePeriodo).
-function anLabelPeriodo(clave, modo){
-  return modo==='mes'    ? ANAL_MESES_ABREV[+clave.slice(5)]+' '+clave.slice(2,4)
-       : modo==='semana' ? fmtFechaCorta(clave)+'–'+fmtFechaCorta(anDomingoDe(clave))
-       : fmtFechaCorta(clave);
-}
 const fmtSoles = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{maximumFractionDigits:0});
 const fmtSolesDec = n => 'S/ '+Number(n||0).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
 // Heatmap rojo→amarillo→verde con escala automática por cuadro.
@@ -3382,40 +3369,31 @@ function evProyeccionMesActual(montoDe, hoyISO){
   return { valor:(acum/trabajados.length)*totalDias, transcurridos:trabajados.length, totalDias };
 }
 
-// Serie temporal: puntos {key,label,monto,cant} agrupados por día, semana o mes.
+// Serie temporal: puntos {key,label,monto,cant} agrupados por día o por mes.
 function evBuildSerie(){
-  /* El rango se expande según la agrupación (misma regla que "Ventas por
-     Canal de Venta"): por semana abarca de lunes a domingo y por mes, meses
-     calendario completos. Por día se respeta el rango exacto. */
-  const {desde,hasta}=anRangoNormalizado(evFilter.desde, evFilter.hasta, evFilter.agrup);
-  const datos=ventasEnRango(desde, hasta);
+  const datos=ventasEnRango(evFilter.desde, evFilter.hasta);
   const medio=evFilter.medio;
   const montoDe=f=> medio==='todos' ? f.total : (f[medio]||0);
   if(evFilter.agrup==='dia'){
     return datos.map(f=>({key:f.fecha, label:fmtFechaCorta(f.fecha), monto:montoDe(f), cant:f.n}));
   }
-  const acc=new Map();
+  const porMes=new Map();
   datos.forEach(f=>{
-    const k=anClavePeriodo(f.fecha, evFilter.agrup);
-    const p=acc.get(k)||{key:k, monto:0, cant:0};
-    p.monto+=montoDe(f); p.cant+=f.n; acc.set(k,p);
+    const k=f.fecha.slice(0,7);
+    const p=porMes.get(k)||{key:k, monto:0, cant:0};
+    p.monto+=montoDe(f); p.cant+=f.n; porMes.set(k,p);
   });
-  const serie=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1)
-    .map(p=>({...p, label:anLabelPeriodo(p.key, evFilter.agrup)}));
-  // Serie de PROYECCIÓN: solo aplica a la agrupación MENSUAL (mes en curso);
-  // los meses cerrados llevan el valor real exacto. En Día/Semana no hay
-  // proyección de cierre de mes.
-  if(evFilter.agrup==='mes'){
-    const mkHoy=fechaHoy().slice(0,7);
-    const proy=evProyeccionMesActual(montoDe);
-    serie.forEach(p=>{
-      p.esProy = !!(proy && p.key===mkHoy);
-      p.proy   = p.esProy ? proy.valor : p.monto;
-      if(p.esProy) p.proyInfo = proy;
-    });
-  } else {
-    serie.forEach(p=>{ p.esProy=false; p.proy=p.monto; });
-  }
+  const serie=[...porMes.values()].sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
+  // Serie de PROYECCIÓN: meses cerrados = valor real exacto; solo el mes en
+  // curso lleva el valor proyectado. Se recalcula en cada render/actualización.
+  const mkHoy=fechaHoy().slice(0,7);
+  const proy=evProyeccionMesActual(montoDe);
+  serie.forEach(p=>{
+    p.esProy = !!(proy && p.key===mkHoy);
+    p.proy   = p.esProy ? proy.valor : p.monto;
+    if(p.esProy) p.proyInfo = proy;
+  });
   return serie;
 }
 
@@ -3586,17 +3564,22 @@ function vdBuildSerie(){
      se corte por la fecha elegida. Por día se respeta el rango exacto. */
   const {desde,hasta}=anRangoNormalizado(vdFilter.desde, vdFilter.hasta, agrup);
   const acc=new Map();
+  // Clave del período: mes → YYYY-MM · semana → lunes de esa semana · día → fecha
+  const clave=f=> agrup==='mes' ? f.slice(0,7) : (agrup==='semana' ? anLunesDe(f) : f);
   const punto=k=>{ let p=acc.get(k); if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); } return p; };
   vdFacts.forEach(x=>{
     if(x.f<desde || x.f>hasta) return;                 // rango de fechas (común)
     const val = metrica==='numero' ? 1 : (x.v||0);     // 1 fila = 1 venta
-    const p=punto(anClavePeriodo(x.f, agrup));
+    const p=punto(clave(x.f));
     p.total += val;                                    // Total: sin filtro de medio
     if(medio!=='todos' && x.m!==medio) return;         // Canales: sí filtran por medio
     if(x.c) p.porCanal[x.c]=(p.porCanal[x.c]||0)+val;
   });
   const puntos=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1).map(p=>({
-    ...p, label: anLabelPeriodo(p.key, agrup)
+    ...p,
+    label: agrup==='mes'    ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)
+         : agrup==='semana' ? fmtFechaCorta(p.key)+'–'+fmtFechaCorta(anDomingoDe(p.key))
+         : fmtFechaCorta(p.key)
   }));
   return {puntos, canales: canal==='todos' ? VD_CANALES : [canal]};
 }
@@ -3817,25 +3800,22 @@ let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUltNMeses(2));
 // Mensual: primero SUMA los brutos del mes y recién ahí se calcula el %
 // (SUM(medio)/SUM(total)); nunca se promedian porcentajes diarios.
 function evbBuildSerie(){
-  /* Misma expansión de rango que los otros dos gráficos del módulo: por
-     semana, lunes a domingo; por mes, meses calendario completos. */
-  const {desde,hasta}=anRangoNormalizado(evbFilter.desde, evbFilter.hasta, evbFilter.agrup);
-  const enRango=ventasEnRango(desde, hasta).filter(f=>f.bruto);
+  const enRango=ventasEnRango(evbFilter.desde, evbFilter.hasta).filter(f=>f.bruto);
   if(evbFilter.agrup==='dia'){
     return enRango.filter(f=>(f.bruto.total||0)>0).map(f=>({
       key:f.fecha, label:fmtFechaCorta(f.fecha), brutos:f.bruto, total:f.bruto.total
     }));
   }
-  const acc=new Map();
+  const porMes=new Map();
   enRango.forEach(f=>{
-    const k=anClavePeriodo(f.fecha, evbFilter.agrup);
-    let p=acc.get(k);
-    if(!p){ p={key:k, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; acc.set(k,p); }
-    BRUTO_MEDIOS.forEach(([k2])=>{ p.brutos[k2]+=f.bruto[k2]||0; });
+    const mk=f.fecha.slice(0,7);
+    let p=porMes.get(mk);
+    if(!p){ p={key:mk, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; porMes.set(mk,p); }
+    BRUTO_MEDIOS.forEach(([k])=>{ p.brutos[k]+=f.bruto[k]||0; });
     p.total+=f.bruto.total||0;
   });
-  return [...acc.values()].filter(p=>p.total>0).sort((a,b)=>a.key<b.key?-1:1)
-    .map(p=>({...p, label:anLabelPeriodo(p.key, evbFilter.agrup)}));
+  return [...porMes.values()].filter(p=>p.total>0).sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
 }
 
 const evbPct=(p,medio)=> p.total>0 ? (p.brutos[medio]||0)/p.total*100 : null;
@@ -3919,7 +3899,6 @@ RENDERERS.evolucionVentas = function(){
         <div class="field"><label>Hasta</label><input type="date" id="evHasta" value="${evFilter.hasta}"></div>
         <div class="field"><label>Agrupar por</label>
           <select id="evAgrup"><option value="dia" ${evFilter.agrup==='dia'?'selected':''}>Día</option>
-            <option value="semana" ${evFilter.agrup==='semana'?'selected':''}>Semana</option>
             <option value="mes" ${evFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
         <div class="field"><label>Medio de pago</label>
           <select id="evMedio"><option value="todos" ${evFilter.medio==='todos'?'selected':''}>Todos</option>
@@ -3948,7 +3927,6 @@ RENDERERS.evolucionVentas = function(){
         <div class="field"><label>Hasta</label><input type="date" id="evbHasta" value="${evbFilter.hasta}"></div>
         <div class="field"><label>Agrupar por</label>
           <select id="evbAgrup"><option value="dia" ${evbFilter.agrup==='dia'?'selected':''}>Día</option>
-            <option value="semana" ${evbFilter.agrup==='semana'?'selected':''}>Semana</option>
             <option value="mes" ${evbFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
         <div class="field"><label>Tipo de ingreso</label>
           <select id="evbTipo"><option value="todos" ${evbFilter.tipo==='todos'?'selected':''}>Todos</option>
@@ -8294,6 +8272,78 @@ function cocinaUpsert(productoId, fecha, cantidad){
   S.cocinaInventario.push({ id:uid(), productoId, fecha, cantidad });
   return 'nuevo';
 }
+/* ── MOVIMIENTOS DE COCINA (fuente SEPARADA del inventario físico) ────────
+   El inventario físico (S.cocinaInventario) es un CONTEO que fija la
+   existencia base; los movimientos (S.cocinaMovimientos) son ingresos y
+   salidas que la modifican. Nunca se fusionan en un mismo registro: el
+   consolidado los combina al calcular.                                    */
+const COCINA_MOV_TIPOS = [['ingreso','Ingreso'], ['salida','Salida']];
+function cocinaMovTipoValido(t){ return t==='ingreso' || t==='salida'; }
+// Movimiento neto de un producto en un día: ingresos − salidas.
+function cocinaMovNeto(productoId, fecha){
+  let neto = 0;
+  S.cocinaMovimientos.forEach(m=>{
+    if(m.productoId!==productoId || m.fecha!==fecha) return;
+    const c = Number(m.cantidad)||0;
+    neto += (m.tipo==='salida') ? -c : c;      // todos los del día se acumulan
+  });
+  return neto;
+}
+function cocinaMovsDe(productoId, fecha){
+  return S.cocinaMovimientos.filter(m=>m.productoId===productoId && m.fecha===fecha);
+}
+
+/* ── EXISTENCIA CALCULADA ──────────────────────────────────────────────────
+   Para cada producto se recorre el tiempo desde la PRIMERA toma física:
+     · un inventario físico REINICIA la base ese día (los movimientos previos
+       dejan de influir);
+     · el día de una toma se le suman los movimientos de ESE mismo día;
+     · los días siguientes arrastran la existencia y le aplican su neto;
+     · antes de la primera toma no hay existencia (null → celda vacía), así
+       que los movimientos anteriores no construyen stock.
+   Devuelve un Map fecha → existencia (o null) que cubre TODO el rango
+   pedido, arrancando desde la última toma anterior al rango: por eso una
+   consulta parcial calcula bien aunque su base esté fuera de la vista.   */
+function cocinaExistencias(productoId, fechas){
+  const res = new Map();
+  if(!fechas || !fechas.length) return res;
+  const ini = fechas[0], fin = fechas[fechas.length-1];
+
+  // Fechas relevantes: las del rango más todo lo anterior con registros, para
+  // localizar la última toma física que establece la base.
+  const conRegistro = new Set();
+  S.cocinaInventario.forEach(r=>{ if(r.productoId===productoId && r.fecha<=fin) conRegistro.add(r.fecha); });
+  S.cocinaMovimientos.forEach(m=>{ if(m.productoId===productoId && m.fecha<=fin) conRegistro.add(m.fecha); });
+
+  // La toma física más reciente en o antes del inicio del rango marca el
+  // punto de partida; si no hay ninguna, se arranca sin existencia.
+  const tomas = [...conRegistro].filter(f=>{
+    const r = getInvCocina(productoId, f);
+    return r && numOrNull(r.cantidad)!==null;
+  }).sort();
+  const baseInicial = tomas.filter(f=>f<ini).pop() || null;
+
+  // Se recorre día a día desde la base (o desde el inicio del rango).
+  const arranque = baseInicial || ini;
+  const recorrido = rangoFechas(arranque, fin);
+  let existencia = null;                      // null = sin base física todavía
+  recorrido.forEach(f=>{
+    const reg = getInvCocina(productoId, f);
+    const fisico = reg ? numOrNull(reg.cantidad) : null;
+    if(fisico !== null){
+      existencia = fisico;                    // la toma REINICIA la base
+    }
+    if(existencia !== null){
+      // Los movimientos del día se aplican sobre la base vigente, incluido el
+      // día de la propia toma física.
+      existencia += cocinaMovNeto(productoId, f);
+    }
+    // Antes de la primera toma, los movimientos no generan existencia.
+    if(f >= ini) res.set(f, existencia);
+  });
+  return res;
+}
+
 /* Valida una cantidad de inventario de cocina: entero, no negativo.
    Devuelve {ok, valor, error}. Un campo vacío es válido y significa
    "sin registro" (valor null). */
@@ -8379,6 +8429,7 @@ function syncMenajeArticulos()  { _syncSheet('inventario','MenajeArticulos', 'Me
 function syncMenajeInventario() { _syncSheet('inventario','MenajeInventario','MenajeInventario',S.menajeInventario.length); }
 function syncCocinaProductos()  { _syncSheet('inventario','Cocina',   'Cocina',    S.cocinaProductos.length); }
 function syncCocinaInventario() { _syncSheet('inventario','InvCocina','InvCocina', S.cocinaInventario.length); }
+function syncCocinaMovimientos(){ _syncSheet('inventario','MovCocina','MovCocina', S.cocinaMovimientos.length); }
 
 // ── Estado de edición ─────────────────────────────────────────────
 let editMenajeArtId = null;
@@ -8457,6 +8508,20 @@ RENDERERS.cocinaAdmin = function(){
   const btnC=document.getElementById('cocCancel');
   if(btnC) btnC.onclick=()=>{ editCocinaProdId=null; RENDERERS.cocinaAdmin(); };
 };
+/* Elimina UN movimiento por su id: los demás del mismo día y producto se
+   conservan. El tombstone evita que reaparezca al fusionar con el remoto. */
+window.cocinaMovEliminar = function(id){
+  const m=S.cocinaMovimientos.find(x=>x.id===id); if(!m) return;
+  const p=S.cocinaProductos.find(x=>x.id===m.productoId);
+  if(!confirm('¿Eliminar este movimiento?\n\n'+(p?cocinaEtiqueta(p):'(producto eliminado)')+
+    ' · '+(m.tipo==='salida'?'Salida':'Ingreso')+' '+m.cantidad+' · '+fmtFecha(m.fecha))) return;
+  S.cocinaMovimientos=S.cocinaMovimientos.filter(x=>x.id!==id);
+  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('MovCocina', m);
+  save(K.cocinaMovimientos,S.cocinaMovimientos); syncCocinaMovimientos();
+  toast('Movimiento eliminado','success');
+  RENDERERS.invDiarioCocina();
+};
+
 window.cocinaEdit = function(id){ editCocinaProdId=id; RENDERERS.cocinaAdmin(); window.scrollTo({top:0,behavior:'smooth'}); };
 window.cocinaMover = function(id, delta){
   const lista=cocinaOrdenados(); const i=lista.findIndex(p=>p.id===id);
@@ -8498,9 +8563,41 @@ RENDERERS.invDiarioCocina = function(){
         data-prod="${p.id}" value="${v===null?'':v}" placeholder="" style="min-width:90px"></td>
     </tr>`;
   }).join('');
+  // Filas dinámicas del formulario de movimientos (estado en memoria).
+  const optsProd = lista.map(p=>`<option value="${p.id}">${p.nombre}${p.unidad?' ('+p.unidad+')':''}</option>`).join('');
+  const movsDelDia = S.cocinaMovimientos.filter(m=>m.fecha===cocinaFecha)
+    .sort((a,b)=>String(a.id).localeCompare(String(b.id)));
+  const nombreProd = id => { const p=S.cocinaProductos.find(x=>x.id===id); return p?cocinaEtiqueta(p):'(producto eliminado)'; };
+
   el.innerHTML=`
     <div class="page-head"><div><h1>🍳 Inv. Cocina</h1>
-      <p>Registro diario del inventario de cocina. Deja el campo vacío si no hay inventario registrado ese día; un <b>0</b> ingresado se guarda como cero.</p></div></div>
+      <p>Registro diario del inventario de cocina. El <b>inventario físico</b> es el conteo que fija la existencia; los <b>movimientos</b> la modifican con ingresos y salidas.</p></div></div>
+
+    <div class="card">
+      <h2>Registrar movimiento</h2>
+      <p class="hint" style="margin-top:0">Ingresos y salidas del día. Se guardan aparte del conteo físico y el <b>Consolidado Cocina</b> los combina: un inventario físico fija la base y los movimientos posteriores la suman o restan.</p>
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Fecha</label><input type="date" id="cocMovFecha" value="${cocinaFecha}"></div>
+        <button class="btn btn-ghost btn-sm" id="cocMovAdd">+ Agregar movimiento</button>
+      </div>
+      ${lista.length? `<div class="table-wrap"><table>
+        <thead><tr><th>Producto</th><th class="num" style="width:120px">Cantidad</th><th style="width:150px">Movimiento</th><th style="width:60px"></th></tr></thead>
+        <tbody id="cocMovBody"></tbody>
+      </table></div>
+      <div class="actions" style="margin-top:10px"><button class="btn btn-primary" id="cocMovSave">💾 Guardar movimientos</button></div>`
+      : `<p class="empty">No hay productos en el catálogo.</p>`}
+      ${movsDelDia.length? `<h3 style="font-size:13px;margin:16px 0 6px">Movimientos registrados el ${fmtFecha(cocinaFecha)} (${movsDelDia.length})</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Producto</th><th class="num">Cantidad</th><th>Movimiento</th><th>Acciones</th></tr></thead>
+          <tbody>${movsDelDia.map(m=>`<tr>
+            <td>${nombreProd(m.productoId)}</td>
+            <td class="num">${m.cantidad}</td>
+            <td><span class="badge ${m.tipo==='salida'?'b-late':'b-free'}">${m.tipo==='salida'?'Salida':'Ingreso'}</span></td>
+            <td><button class="btn-icon del" onclick="cocinaMovEliminar('${m.id}')">🗑️ Eliminar</button></td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : ''}
+    </div>
+
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Fecha</label><input type="date" id="cocFecha" value="${cocinaFecha}"></div>
@@ -8512,6 +8609,51 @@ RENDERERS.invDiarioCocina = function(){
       </table></div>` : `<p class="empty">No hay productos en el catálogo. Créalos en <b>Administración y configuración → Cocina</b>.</p>`}
       <p class="hint">Las cantidades son <b>números enteros</b> no negativos: la unidad (por ejemplo <i>bolsa 1kg</i>) describe la presentación, y aquí se registra cuántas hay.</p>
     </div>`;
+
+  // ── Formulario de movimientos: filas dinámicas ──
+  const movBody=document.getElementById('cocMovBody');
+  const filaMov=()=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td><select class="cocMovProd" style="min-width:220px">${optsProd}</select></td>
+      <td class="num"><input type="number" min="0" step="1" class="cocMovCant" placeholder="" style="min-width:90px"></td>
+      <td><select class="cocMovTipo">${COCINA_MOV_TIPOS.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select></td>
+      <td><button class="btn-icon del" title="Quitar fila">✕</button></td>`;
+    tr.querySelector('button').onclick=()=>{
+      tr.remove();
+      if(movBody && !movBody.children.length) movBody.appendChild(filaMov());   // siempre una fila
+    };
+    return tr;
+  };
+  if(movBody){
+    movBody.appendChild(filaMov());
+    const btnAdd=document.getElementById('cocMovAdd');
+    if(btnAdd) btnAdd.onclick=()=>movBody.appendChild(filaMov());
+    const btnSave=document.getElementById('cocMovSave');
+    if(btnSave) btnSave.onclick=()=>{
+      const filas=[...movBody.children];
+      const nuevos=[];
+      // Validación COMPLETA antes de guardar: un error aborta toda la operación.
+      for(const tr of filas){
+        const prod=tr.querySelector('.cocMovProd').value;
+        const raw =tr.querySelector('.cocMovCant').value;
+        const tipo=tr.querySelector('.cocMovTipo').value;
+        if(String(raw).trim()==='') continue;          // fila vacía: se ignora
+        const v=cocinaValidarCantidad(raw);
+        if(!v.ok){ toast(v.error,'error'); tr.querySelector('.cocMovCant').focus(); return; }
+        if(v.valor===null) continue;
+        if(!prod){ toast('Selecciona un producto en cada movimiento.','error'); return; }
+        if(!cocinaMovTipoValido(tipo)){ toast('Tipo de movimiento inválido.','error'); return; }
+        nuevos.push({ id:uid(), productoId:prod, fecha:cocinaFecha, cantidad:v.valor, tipo });
+      }
+      if(!nuevos.length){ toast('No hay movimientos que guardar.','info'); return; }
+      S.cocinaMovimientos.push(...nuevos);              // cada uno con su id único
+      save(K.cocinaMovimientos,S.cocinaMovimientos); syncCocinaMovimientos();
+      toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      RENDERERS.invDiarioCocina();
+    };
+  }
+  const mf=document.getElementById('cocMovFecha');
+  if(mf) mf.onchange=(e)=>{ cocinaFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioCocina(); };
 
   document.getElementById('cocFecha').onchange=(e)=>{ cocinaFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioCocina(); };
   document.getElementById('cocGuardar').onclick=()=>{
@@ -8552,7 +8694,8 @@ RENDERERS.consolidadoCocina = function(){
   const delCatalogo = cocinaOrdenados();
   const idsCatalogo = new Set(delCatalogo.map(p=>p.id));
   const huerfanos = [];
-  S.cocinaInventario.forEach(r=>{
+  // Productos fuera del catálogo con histórico en el rango (conteos o movimientos).
+  [...S.cocinaInventario, ...S.cocinaMovimientos].forEach(r=>{
     if(idsCatalogo.has(r.productoId)) return;
     if(huerfanos.some(h=>h.id===r.productoId)) return;
     if(!fechas.includes(r.fecha)) return;
@@ -8565,17 +8708,28 @@ RENDERERS.consolidadoCocina = function(){
       <div style="font-weight:400;font-size:10px;color:var(--c-muted)">${DIAS[diaSemana(f)].slice(0,3)}</div>
     </th>`).join('');
   const filas = productos.map(p=>{
+    /* Existencia CALCULADA: parte de la última toma física (aunque sea
+       anterior al rango) y aplica los movimientos día a día. Vacío mientras
+       no exista una toma que fije la base. */
+    const exist = cocinaExistencias(p.id, fechas);
     const celdas = fechas.map(f=>{
-      const v = cocinaCantidad(p.id, f);
-      // Sin registro = celda vacía; un 0 registrado se muestra como 0.
-      return `<td class="num" style="border-left:2px solid #e9d5ff">${v===null?'':v}</td>`;
+      const v = exist.get(f);
+      const hayToma = !!getInvCocina(p.id, f);
+      const hayMov  = cocinaMovsDe(p.id, f).length>0;
+      // Se destaca el día en que se hizo un conteo físico (reinicia la base).
+      const estilo = hayToma ? 'border-left:2px solid #e9d5ff;font-weight:700;color:#4c1d95'
+                             : (hayMov ? 'border-left:2px solid #e9d5ff;color:#0f766e'
+                                       : 'border-left:2px solid #e9d5ff');
+      const tip = hayToma ? ' title="Inventario físico registrado este día"'
+                          : (hayMov ? ' title="Movimientos del día aplicados"' : '');
+      return `<td class="num" style="${estilo}"${tip}>${(v===null||v===undefined)?'':v}</td>`;
     }).join('');
     return `<tr><td class="mx-fix">${p.nombre}${p.unidad?` <span class="badge b-free">${p.unidad}</span>`:''}${p.eliminado?' <span class="badge b-late" style="font-size:9px">Histórico</span>':''}</td>${celdas}</tr>`;
   }).join('');
 
   el.innerHTML=`
     <div class="page-head"><div><h1>🍳 Consolidado Cocina</h1>
-      <p>Histórico diario del inventario de cocina: una fila por producto y una columna por fecha.</p></div></div>
+      <p>Existencia diaria por producto: parte del último <b>inventario físico</b> y le aplica los <b>movimientos</b> de cada día. Un nuevo conteo reinicia la existencia (en morado); los días con movimientos se muestran en verde.</p></div></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="date" id="cocCDesde" value="${desde}"></div>
@@ -11698,7 +11852,7 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina','MovCocina'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -12146,6 +12300,10 @@ function gsSerializeInventario(){
       cocinaOrdenados().map((p,i)=>({ id:p.id, nombre:p.nombre, unidad:p.unidad||'', orden:i }))),
     InvCocina: gsRowsToMatrix(['id','productoId','fecha','cantidad'],
       S.cocinaInventario.map(r=>({ id:r.id, productoId:r.productoId, fecha:r.fecha, cantidad:r.cantidad }))),
+    // Movimientos en su PROPIO tab: nunca se mezclan con el conteo físico.
+    MovCocina: gsRowsToMatrix(['id','productoId','fecha','cantidad','tipo'],
+      S.cocinaMovimientos.map(m=>({ id:m.id, productoId:m.productoId, fecha:m.fecha,
+        cantidad:m.cantidad, tipo:m.tipo }))),
     MenajeArticulos: gsRowsToMatrix(['id','nombre'], S.menajeArticulos),
     MenajeInventario: gsRowsToMatrix(['id','articuloId','fecha','cantidad','rotas','rajadas'],
       S.menajeInventario.map(r=>({...r, rotas:menajeVal(r,'rotas'), rajadas:menajeVal(r,'rajadas')}))),
@@ -12268,6 +12426,9 @@ const GS_SHEET_KEYS = {
   SalonInventario:['productoId','fecha','unidad'],
   MenajeInventario:['articuloId','fecha'],
   Cocina:['id'],
+  // Cada movimiento es un registro propio: la clave es su id, porque un mismo
+  // producto puede tener varios movimientos el mismo día.
+  MovCocina:['id'],
   // Un registro por producto y día: volver a guardar actualiza, no duplica.
   InvCocina:['productoId','fecha'],
   EfectivoCaja:['fecha']
@@ -12685,8 +12846,15 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         // null si no hay dato: la ausencia de registro no es un 0.
         cantidad:numOrNull(r.cantidad)
       })).filter(r=>r.productoId && r.fecha);
+      if(puedeAplicar('MovCocina', S.cocinaMovimientos))
+      S.cocinaMovimientos = (byName['MovCocina']||[]).map(r=>({
+        id:String(r.id||uid()), productoId:String(r.productoId||''),
+        fecha:normFechaGS(r.fecha), cantidad:numOrNull(r.cantidad),
+        tipo: String(r.tipo||'').trim().toLowerCase()==='salida' ? 'salida' : 'ingreso'
+      })).filter(m=>m.productoId && m.fecha && m.cantidad!==null);
       save(K.cocinaProductos, S.cocinaProductos);
       save(K.cocinaInventario, S.cocinaInventario);
+      save(K.cocinaMovimientos, S.cocinaMovimientos);
       // Duplicados heredados de sincronizaciones anteriores: se consolidan en
       // memoria. No se reescribe la hoja aquí; el usuario decide cuándo con
       // "Guardar en Google Sheets" o limpiarMarcacionesDuplicadas().
@@ -12790,7 +12958,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    ════════════════════════════════════════════════════════════════════════ */
 const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
 // Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-10.1';
+const APP_VERSION = '2026-09-10.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
