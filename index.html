@@ -3320,6 +3320,23 @@ function anFinDeMes(iso){
   const ultimo=new Date(Date.UTC(y, m, 0)).getUTCDate();   // día 0 del mes siguiente
   return iso.slice(0,7)+'-'+String(ultimo).padStart(2,'0');
 }
+/* Clave del período al que pertenece una fecha, según la agrupación:
+     'mes'    → 'YYYY-MM'
+     'semana' → lunes de esa semana ('YYYY-MM-DD')
+     'dia'    → la propia fecha
+   Junto con anEtiquetaPeriodo son la fuente única de agrupación temporal de
+   Analítica: cualquier gráfico que agrupe por día/semana/mes las reutiliza. */
+function anClavePeriodo(iso, modo){
+  if(modo==='mes')    return iso.slice(0,7);
+  if(modo==='semana') return anLunesDe(iso);
+  return iso;
+}
+// Etiqueta legible de un período a partir de su clave ('Sep 26', '14/09–20/09', '14/09').
+function anEtiquetaPeriodo(key, modo){
+  if(modo==='mes')    return ANAL_MESES_ABREV[+key.slice(5)]+' '+key.slice(2,4);
+  if(modo==='semana') return fmtFechaCorta(key)+'–'+fmtFechaCorta(anDomingoDe(key));
+  return fmtFechaCorta(key);
+}
 // Clave YYYY-MM del mes N posiciones antes del indicado (N>0 = hacia atrás).
 function anMesMenos(mk, n){
   let [y,m]=mk.split('-').map(Number);
@@ -3369,24 +3386,30 @@ function evProyeccionMesActual(montoDe, hoyISO){
   return { valor:(acum/trabajados.length)*totalDias, transcurridos:trabajados.length, totalDias };
 }
 
-// Serie temporal: puntos {key,label,monto,cant} agrupados por día o por mes.
+// Serie temporal: puntos {key,label,monto,cant} agrupados por día, semana o mes.
+// El rango se expande antes de leer los datos (anRangoNormalizado): por semana
+// abarca de lunes a domingo y por mes, meses calendario completos, de modo que
+// la fecha elegida no corte un período a la mitad. Por día se respeta exacto.
 function evBuildSerie(){
-  const datos=ventasEnRango(evFilter.desde, evFilter.hasta);
+  const agrup=evFilter.agrup;
+  const {desde,hasta}=anRangoNormalizado(evFilter.desde, evFilter.hasta, agrup);
+  const datos=ventasEnRango(desde, hasta);
   const medio=evFilter.medio;
   const montoDe=f=> medio==='todos' ? f.total : (f[medio]||0);
-  if(evFilter.agrup==='dia'){
+  if(agrup==='dia'){
     return datos.map(f=>({key:f.fecha, label:fmtFechaCorta(f.fecha), monto:montoDe(f), cant:f.n}));
   }
-  const porMes=new Map();
+  const acc=new Map();
   datos.forEach(f=>{
-    const k=f.fecha.slice(0,7);
-    const p=porMes.get(k)||{key:k, monto:0, cant:0};
-    p.monto+=montoDe(f); p.cant+=f.n; porMes.set(k,p);
+    const k=anClavePeriodo(f.fecha, agrup);
+    const p=acc.get(k)||{key:k, monto:0, cant:0};
+    p.monto+=montoDe(f); p.cant+=f.n; acc.set(k,p);
   });
-  const serie=[...porMes.values()].sort((a,b)=>a.key<b.key?-1:1)
-    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
-  // Serie de PROYECCIÓN: meses cerrados = valor real exacto; solo el mes en
-  // curso lleva el valor proyectado. Se recalcula en cada render/actualización.
+  const serie=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:anEtiquetaPeriodo(p.key, agrup)}));
+  // Serie de PROYECCIÓN: solo aplica a la agrupación MENSUAL (meses cerrados =
+  // valor real exacto; solo el mes en curso lleva el valor proyectado).
+  if(agrup!=='mes') return serie;
   const mkHoy=fechaHoy().slice(0,7);
   const proy=evProyeccionMesActual(montoDe);
   serie.forEach(p=>{
@@ -3565,7 +3588,7 @@ function vdBuildSerie(){
   const {desde,hasta}=anRangoNormalizado(vdFilter.desde, vdFilter.hasta, agrup);
   const acc=new Map();
   // Clave del período: mes → YYYY-MM · semana → lunes de esa semana · día → fecha
-  const clave=f=> agrup==='mes' ? f.slice(0,7) : (agrup==='semana' ? anLunesDe(f) : f);
+  const clave=f=> anClavePeriodo(f, agrup);
   const punto=k=>{ let p=acc.get(k); if(!p){ p={key:k, total:0, porCanal:{}}; acc.set(k,p); } return p; };
   vdFacts.forEach(x=>{
     if(x.f<desde || x.f>hasta) return;                 // rango de fechas (común)
@@ -3577,9 +3600,7 @@ function vdBuildSerie(){
   });
   const puntos=[...acc.values()].sort((a,b)=>a.key<b.key?-1:1).map(p=>({
     ...p,
-    label: agrup==='mes'    ? ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)
-         : agrup==='semana' ? fmtFechaCorta(p.key)+'–'+fmtFechaCorta(anDomingoDe(p.key))
-         : fmtFechaCorta(p.key)
+    label: anEtiquetaPeriodo(p.key, agrup)
   }));
   return {puntos, canales: canal==='todos' ? VD_CANALES : [canal]};
 }
@@ -3800,22 +3821,24 @@ let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUltNMeses(2));
 // Mensual: primero SUMA los brutos del mes y recién ahí se calcula el %
 // (SUM(medio)/SUM(total)); nunca se promedian porcentajes diarios.
 function evbBuildSerie(){
-  const enRango=ventasEnRango(evbFilter.desde, evbFilter.hasta).filter(f=>f.bruto);
-  if(evbFilter.agrup==='dia'){
+  const agrup=evbFilter.agrup;
+  const {desde,hasta}=anRangoNormalizado(evbFilter.desde, evbFilter.hasta, agrup);
+  const enRango=ventasEnRango(desde, hasta).filter(f=>f.bruto);
+  if(agrup==='dia'){
     return enRango.filter(f=>(f.bruto.total||0)>0).map(f=>({
       key:f.fecha, label:fmtFechaCorta(f.fecha), brutos:f.bruto, total:f.bruto.total
     }));
   }
-  const porMes=new Map();
+  const acc=new Map();
   enRango.forEach(f=>{
-    const mk=f.fecha.slice(0,7);
-    let p=porMes.get(mk);
-    if(!p){ p={key:mk, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; porMes.set(mk,p); }
-    BRUTO_MEDIOS.forEach(([k])=>{ p.brutos[k]+=f.bruto[k]||0; });
+    const k=anClavePeriodo(f.fecha, agrup);
+    let p=acc.get(k);
+    if(!p){ p={key:k, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; acc.set(k,p); }
+    BRUTO_MEDIOS.forEach(([kk])=>{ p.brutos[kk]+=f.bruto[kk]||0; });
     p.total+=f.bruto.total||0;
   });
-  return [...porMes.values()].filter(p=>p.total>0).sort((a,b)=>a.key<b.key?-1:1)
-    .map(p=>({...p, label:ANAL_MESES_ABREV[+p.key.slice(5)]+' '+p.key.slice(2,4)}));
+  return [...acc.values()].filter(p=>p.total>0).sort((a,b)=>a.key<b.key?-1:1)
+    .map(p=>({...p, label:anEtiquetaPeriodo(p.key, agrup)}));
 }
 
 const evbPct=(p,medio)=> p.total>0 ? (p.brutos[medio]||0)/p.total*100 : null;
@@ -3899,6 +3922,7 @@ RENDERERS.evolucionVentas = function(){
         <div class="field"><label>Hasta</label><input type="date" id="evHasta" value="${evFilter.hasta}"></div>
         <div class="field"><label>Agrupar por</label>
           <select id="evAgrup"><option value="dia" ${evFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="semana" ${evFilter.agrup==='semana'?'selected':''}>Semana</option>
             <option value="mes" ${evFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
         <div class="field"><label>Medio de pago</label>
           <select id="evMedio"><option value="todos" ${evFilter.medio==='todos'?'selected':''}>Todos</option>
@@ -3927,6 +3951,7 @@ RENDERERS.evolucionVentas = function(){
         <div class="field"><label>Hasta</label><input type="date" id="evbHasta" value="${evbFilter.hasta}"></div>
         <div class="field"><label>Agrupar por</label>
           <select id="evbAgrup"><option value="dia" ${evbFilter.agrup==='dia'?'selected':''}>Día</option>
+            <option value="semana" ${evbFilter.agrup==='semana'?'selected':''}>Semana</option>
             <option value="mes" ${evbFilter.agrup==='mes'?'selected':''}>Mes</option></select></div>
         <div class="field"><label>Tipo de ingreso</label>
           <select id="evbTipo"><option value="todos" ${evbFilter.tipo==='todos'?'selected':''}>Todos</option>
