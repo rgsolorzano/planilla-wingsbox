@@ -12981,9 +12981,12 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
    3) Versión: se compara la versión del archivo servido con la cargada,
       para no seguir usando código antiguo desde la caché del navegador.
    ════════════════════════════════════════════════════════════════════════ */
-const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion' };
-// Versión de la app embebida en el propio archivo.
-const APP_VERSION = '2026-09-10.2';
+const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'ses_recargaVersion' };
+// Versión de la app embebida en el propio archivo. Señal EXPLÍCITA de
+// despliegue: conviene incrementarla en cada publicación, pero la detección ya
+// no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
+// documento servido cambia sola aunque esta constante se quede atrás).
+const APP_VERSION = '2026-09-23.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -13049,7 +13052,7 @@ function sesBloquearYRecargar(titulo, mensaje, motivo){
   }, 2500);
 }
 // Capa a pantalla completa: impide seguir interactuando mientras se recarga.
-function sesMostrarBloqueo(titulo, mensaje){
+function sesMostrarBloqueo(titulo, mensaje, pie){
   if(document.getElementById('sesBloqueo')) return;
   const d = document.createElement('div');
   d.id = 'sesBloqueo';
@@ -13059,7 +13062,7 @@ function sesMostrarBloqueo(titulo, mensaje){
       <div style="font-size:34px;line-height:1;margin-bottom:12px">🔒</div>
       <h2 style="margin:0 0 10px;font-size:19px;color:#1f1638">${titulo}</h2>
       <p style="margin:0 0 16px;font-size:14px;color:#6b6385;line-height:1.5">${mensaje}</p>
-      <div style="font-size:12px;color:#8b83a8">Actualizando…</div>
+      <div style="font-size:12px;color:#8b83a8">${pie||'Actualizando…'}</div>
     </div>`;
   document.body.appendChild(d);
 }
@@ -13069,36 +13072,127 @@ function sesManejarExpiracion(motivo){
     'La página se actualizará para que puedas iniciar sesión nuevamente. Los cambios que no hayas guardado no se conservarán.',
     motivo);
 }
-// Punto ÚNICO de reacción ante versión desactualizada.
+/* Punto ÚNICO de reacción ante versión desactualizada.
+   ANTI-BUCLE: si ya se recargó por versión hace muy poco, no se vuelve a
+   recargar. Un host que devolviera una firma distinta en cada petición
+   dejaría la pestaña recargándose sin fin; en ese caso se informa una sola
+   vez y la decisión queda en manos del usuario. */
+const SES_ANTIBUCLE_MS = 90000;
 function sesManejarVersionAntigua(motivo){
+  let ultima = 0;
+  try{ ultima = Number(sessionStorage.getItem(SES_KEYS.recarga)||0); }catch(e){}
+  if(ultima && Date.now()-ultima < SES_ANTIBUCLE_MS){
+    if(sesBloqueada) return;
+    sesBloqueada = true;
+    console.warn('[Versión] Recarga omitida para evitar un bucle ('+motivo+').');
+    sesMostrarBloqueo('Hay una nueva versión disponible',
+      'No se pudo confirmar la actualización automática. Actualiza la página manualmente (Ctrl+F5 o Cmd+Shift+R).',
+      'Actualización manual requerida');
+    return;
+  }
+  try{ sessionStorage.setItem(SES_KEYS.recarga, String(Date.now())); }catch(e){}
   sesBloquearYRecargar('Hay una nueva versión disponible',
     'La página se actualizará para cargar la versión más reciente de la aplicación.',
     motivo);
 }
 
-// ── Versión de la aplicación ──────────────────────────────────────────────
-// Descarga el propio documento sin caché y compara la versión declarada.
-async function sesHayNuevaVersion(){
+/* ── Versión de la aplicación ──────────────────────────────────────────────
+   Detectar un despliegue exige un identificador que cambie SIEMPRE que se
+   publica. APP_VERSION es manual y puede quedarse sin actualizar (fue
+   exactamente la causa de que una pestaña abierta no detectara la versión
+   nueva: V1 y V2 declaraban la misma cadena). Por eso se combina con la
+   FIRMA del documento servido, que cambia sola en cada despliegue:
+     1) ETag o Last-Modified de la respuesta (lo habitual en hosting estático);
+     2) si el host no los expone, un hash del cuerpo del documento.
+   Base: se captura al arrancar con un GET sin caché. Ese mismo GET detecta
+   además el caso inverso — que la pestaña se haya cargado desde la caché del
+   navegador cuando el servidor ya servía otra versión.
+   Comprobaciones posteriores: HEAD (muy barato); solo se recurre al GET si
+   el host no devuelve validadores.                                          */
+let sesVersionBase   = null;    // {version, etag, lastMod, hash}
+let sesVersionEnCurso = false;
+let sesUltimaVersionChk = 0;    // 0 = la primera comprobación puede ser inmediata
+const VERSION_INTERVALO_MS = 2*60*1000;
+
+function sesUrlDocumento(){ return window.location.pathname + '?v=' + Date.now(); }
+// Hash rápido (FNV-1a) del documento: respaldo cuando no hay ETag/Last-Modified.
+function sesHashTexto(txt){
+  let h = 0x811c9dc5;
+  for(let i=0;i<txt.length;i++){ h ^= txt.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h>>>0).toString(16);
+}
+// Lee del servidor la firma del documento desplegado (null si no hay red).
+async function sesLeerFirmaServidor(completo){
+  if(!completo){
+    try{
+      const r = await fetch(sesUrlDocumento(), {method:'HEAD', cache:'no-store'});
+      if(r.ok){
+        const etag=r.headers.get('ETag'), lastMod=r.headers.get('Last-Modified');
+        if(etag || lastMod) return {version:null, etag, lastMod, hash:null};
+      }
+    }catch(e){}                                  // host sin HEAD: se cae al GET
+  }
   try{
-    const r = await fetch(window.location.pathname + '?v=' + Date.now(), { cache:'no-store' });
-    if(!r.ok) return false;
+    const r = await fetch(sesUrlDocumento(), {cache:'no-store'});
+    if(!r.ok) return null;
     const txt = await r.text();
     const m = txt.match(/const APP_VERSION = '([^']+)'/);
-    return !!(m && m[1] && m[1] !== APP_VERSION);
-  }catch(e){ return false; }   // sin red: no se fuerza recarga
+    return {version: m?m[1]:null, etag:r.headers.get('ETag'),
+            lastMod:r.headers.get('Last-Modified'), hash:sesHashTexto(txt)};
+  }catch(e){ return null; }                      // sin red: nunca se fuerza recarga
+}
+/* Compara la firma recién leída con la base. Devuelve true SOLO ante una
+   señal inequívoca de cambio; ante cualquier duda, false (sin falsos
+   positivos y sin recargas en cadena). */
+function sesFirmaCambiada(act){
+  if(!act || !sesVersionBase) return false;
+  if(act.version && act.version !== APP_VERSION) return true;
+  if(sesVersionBase.etag    && act.etag)    return act.etag    !== sesVersionBase.etag;
+  if(sesVersionBase.lastMod && act.lastMod) return act.lastMod !== sesVersionBase.lastMod;
+  if(sesVersionBase.hash    && act.hash)    return act.hash    !== sesVersionBase.hash;
+  return false;
+}
+/* Punto ÚNICO de comprobación de versión. Lo invocan el temporizador, la
+   reactivación de la pestaña, la reanudación tras suspensión, la interacción
+   del usuario y el inicio de sesión. forzar=true salta el antirrebote.
+   La versión NO depende de la sesión: se comprueba también sin login. */
+async function sesComprobarVersion(motivo, forzar){
+  if(sesBloqueada || sesVersionEnCurso) return;
+  if(!forzar && Date.now()-sesUltimaVersionChk < VERSION_INTERVALO_MS) return;
+  sesUltimaVersionChk = Date.now();     // antes del await: evita peticiones en ráfaga
+  sesVersionEnCurso = true;
+  try{
+    const primera = !sesVersionBase;
+    const act = await sesLeerFirmaServidor(primera);
+    if(!act) return;                    // sin red o error: no se actúa
+    if(primera){
+      sesVersionBase = act;             // queda fijada la referencia de esta pestaña
+      // La pestaña pudo cargarse desde caché con el servidor ya en otra versión.
+      if(act.version && act.version !== APP_VERSION){
+        sesManejarVersionAntigua('la pestaña se cargó desde caché');
+      }
+      return;
+    }
+    if(sesFirmaCambiada(act)) sesManejarVersionAntigua(motivo||'nueva versión desplegada');
+  } finally { sesVersionEnCurso = false; }
 }
 
 
 // ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
+/* PRIORIDAD SESIÓN → VERSIÓN. Si ambas condiciones se dan a la vez manda la
+   sesión: se bloquea y se recarga, y esa misma recarga ya trae la última
+   versión. Existe así UNA sola ruta de recuperación, y sesBloqueada garantiza
+   que nunca se disparen dos refrescos simultáneos. */
 let sesUltimaValidacion = 0;
 async function sesValidarAlReactivar(){
   if(sesBloqueada) return;
   if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
   sesUltimaValidacion = Date.now();
-  if(!gsState.accessToken) return;
   // Caso equipo suspendido: al volver, lo primero es validar la sesión.
-  if(!gsTokenVigente()){ sesManejarExpiracion('reactivación tras inactividad'); return; }
-  if(await sesHayNuevaVersion()) sesManejarVersionAntigua('reactivación');
+  if(gsState.accessToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación tras inactividad'); return; }
+  // La versión es del CÓDIGO, no de la sesión: se comprueba siempre, incluso
+  // en la pantalla de login, donde antes se salía antes de llegar aquí.
+  sesComprobarVersion('reactivación de la pestaña', true);
 }
 /* ══ INTERCEPTOR CENTRAL DE INTERACCIONES ═════════════════════════════════
    Un único listener en fase de CAPTURA sobre document. Al capturar, se ejecuta
@@ -13121,27 +13215,11 @@ function sesInterceptarInteraccion(ev){
   }
   // Comprobación de versión: en segundo plano y con antirrebote, para no
   // penalizar cada click con una petición de red.
-  sesVerificarVersionConAntirrebote();
+  sesComprobarVersion('interacción del usuario');
 }
 ['click','change','input','keydown','submit'].forEach(tipo=>{
   document.addEventListener(tipo, sesInterceptarInteraccion, true);   // true = captura
 });
-
-/* Comprobación de versión disparada por la actividad del usuario, como máximo
-   una vez cada VERSION_INTERVALO_MS. Consulta el servidor (no una variable
-   local), por lo que detecta despliegues nuevos de forma fiable. */
-const VERSION_INTERVALO_MS = 5*60*1000;
-let sesUltimaVersionChk = Date.now();
-let sesVersionEnCurso = false;
-function sesVerificarVersionConAntirrebote(){
-  if(sesVersionEnCurso || sesBloqueada) return;
-  if(Date.now() - sesUltimaVersionChk < VERSION_INTERVALO_MS) return;
-  sesUltimaVersionChk = Date.now();
-  sesVersionEnCurso = true;
-  sesHayNuevaVersion()
-    .then(hay=>{ if(hay) sesManejarVersionAntigua('nueva versión desplegada'); })
-    .finally(()=>{ sesVersionEnCurso = false; });
-}
 
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) sesValidarAlReactivar(); });
 window.addEventListener('focus', sesValidarAlReactivar);
@@ -13168,13 +13246,20 @@ if(!window.__sesTickTimer){
     }
   }, 30000);
 }
-// Chequeo periódico ligero (sin recargar): un único timer.
+/* Chequeo periódico: UN solo temporizador para sesión y versión. Cubre el
+   escenario «pestaña abierta y visible que nadie toca», que antes no se
+   comprobaba nunca porque este timer solo miraba el token. La comprobación de
+   versión trae su propio antirrebote (VERSION_INTERVALO_MS), así que este
+   tick de 60 s no genera una petición por minuto. */
 if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
     if(sesBloqueada) return;
-    if(gsState.accessToken && !gsTokenVigente()) sesManejarExpiracion('vencimiento en uso');
+    if(gsState.accessToken && !gsTokenVigente()){ sesManejarExpiracion('vencimiento en uso'); return; }
+    sesComprobarVersion('comprobación periódica');
   }, 60000);
 }
+// Captura inmediata de la firma de referencia al arrancar la pestaña.
+sesComprobarVersion('arranque', true);
 // Coherencia entre pestañas: si una cierra sesión, las demás lo reflejan.
 window.addEventListener('storage', (e)=>{
   if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){
@@ -13575,7 +13660,7 @@ function authGrant(viaLogin){
   if(viaLogin){
     gsState.sesionInicio = gsState.sesionInicio || Date.now();
     gsState.sesionFin    = gsState.sesionInicio + SESION_MAX_MS;
-    sesHayNuevaVersion().then(hay=>{ if(hay) sesManejarVersionAntigua('inicio de sesión'); });
+    sesComprobarVersion('inicio de sesión', true);
   }
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
