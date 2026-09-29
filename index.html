@@ -1265,16 +1265,45 @@ function calcHorasProgramadas(empleadoId, fecha){
 // OVERNIGHT_MAX_HOUR:00 AM pueden pertenecer a la jornada iniciada el día anterior.
 const OVERNIGHT_MAX_HOUR = 2; // default 02:00 AM
 
-// Descuento por tardanza (en HORAS):
-//  > 30 min tarde  => 1 hora
-//  cada bloque adicional de 60 min después de los primeros 30 => +1 hora
-//  (>30=>1, >90=>2, >150=>3, ...)
-function calcHorasTardanza(entradaReal, entradaProg){
+/* ── TARDANZAS: función CENTRAL y única ───────────────────────────────────
+   Vigencia: la escala nueva rige desde el 16/09/2026. Antes de esa fecha se
+   conserva intacta la escala histórica, de modo que recalcular una quincena
+   antigua produce exactamente los mismos importes que antes.
+   La comparación es de cadenas 'YYYY-MM-DD' (la fecha del día que se está
+   calculando, ya en hora local America/Lima): no interviene ningún objeto
+   Date, así que no hay desplazamiento por UTC en el límite de vigencia.
+
+   ESCALA NUEVA (desde 16/09/2026), sobre los minutos de retraso:
+     1–15    → 0 horas   · NO cuenta para el acumulado
+     16–30   → 0.5 horas · sí cuenta
+     31–60   → 1 hora    · sí cuenta
+     61+     → techo(min/60) horas · sí cuenta   (61–120→2, 121–180→3, …)
+   ESCALA HISTÓRICA (hasta 15/09/2026), sin contador de acumulación:
+     ≤30 → 0 · >30 → 1 + floor((min-30)/60)                                */
+const TARDANZA_NUEVA_DESDE = '2026-09-16';
+const TARDANZA_ACUM_LIMITE = 4;      // el descuento adicional nace en la 5.ª
+
+// Minutos de retraso reales (nunca negativos; llegar antes no es tardanza).
+function minutosTardanza(entradaReal, entradaProg){
   const real=hmToMin(entradaReal), prog=hmToMin(entradaProg);
   if(real==null||prog==null) return 0;
-  const tarde = real - prog;
-  if(tarde <= 30) return 0;
-  return 1 + Math.floor((tarde - 30) / 60);
+  return Math.max(0, real - prog);
+}
+// Regla aplicable a una tardanza: {minutos, horas, cuenta, nueva}
+function reglaTardanza(minutos, fecha){
+  const min = Math.max(0, Number(minutos)||0);
+  if(String(fecha||'') < TARDANZA_NUEVA_DESDE){
+    const horas = min <= 30 ? 0 : 1 + Math.floor((min - 30) / 60);
+    return { minutos:min, horas, cuenta:false, nueva:false };
+  }
+  if(min <= 15) return { minutos:min, horas:0,   cuenta:false, nueva:true };
+  if(min <= 30) return { minutos:min, horas:0.5, cuenta:true,  nueva:true };
+  if(min <= 60) return { minutos:min, horas:1,   cuenta:true,  nueva:true };
+  return { minutos:min, horas:Math.ceil(min / 60), cuenta:true, nueva:true };
+}
+// Horas de descuento por tardanza (envoltorio compatible con el uso anterior).
+function calcHorasTardanza(entradaReal, entradaProg, fecha){
+  return reglaTardanza(minutosTardanza(entradaReal, entradaProg), fecha).horas;
 }
 
 // Descuento por salida anticipada (en HORAS):
@@ -1584,7 +1613,7 @@ function calcDia(empOriginal, fecha){
     return { fecha, sinCondicion:true,
       entradaReal: mar?mar.entradaReal:null, salidaReal: mar?mar.salidaReal:null,
       horasEf:0, horasProg:0, horasExtra:0, feriado:false, pagoFeriado:0,
-      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, minTardanza:0, cuentaTardanza:false, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual:0, pagoManual:0,
       pagoExtraHoras:0, totalDia:0, libre:false, tipoLibre:null, esPendiente:false,
       /* Estas listas deben existir SIEMPRE: construirLiquidacion() las recorre
@@ -1626,7 +1655,7 @@ function calcDiaCondicion(emp, fecha){
     return {
       fecha, entradaReal, salidaReal, feriado, pagoFeriado,
       horasEf, horasProg:0, horasExtra:0,
-      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, hSal:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:false, minTardanza:0, cuentaTardanza:false, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras,
       descManualList, pagoExtraList, faltaMarc:false, esFalta:false,
       salidaAsumida:false, esPayday:false, libre, tipoLibre,
@@ -1665,7 +1694,7 @@ function calcDiaCondicion(emp, fecha){
     return {
       fecha, entradaReal:null, salidaReal:null, feriado, pagoFeriado,
       horasEf:0, horasProg, horasExtra:0,
-      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:exo.activa, hSal:0,
+      hTard:0, hTardOriginal:0, horasTardExoneradas:0, exoActiva:exo.activa, minTardanza:0, cuentaTardanza:false, hSal:0,
       horasDescAuto:0, descAuto:0, descFalta:0, descManual, pagoManual, pagoExtraHoras:0,
       descManualList, pagoExtraList, faltaMarc:false, esFalta:false,
       salidaAsumida:false, esPayday:false, libre, tipoLibre, debeTrabajar,
@@ -1707,9 +1736,13 @@ function calcDiaCondicion(emp, fecha){
   const horasEf = esFalta ? 0 : calcHorasEfectivas(entradaReal, salidaReal);
 
   // En días libres/vacaciones NO se aplica descuento por tardanza ni por falta.
-  let hTardOriginal=0, hSal=0;
+  let hTardOriginal=0, hSal=0, minTardanza=0, tardanzaCuenta=false;
   if(!libre && debeTrabajar && !esFalta){
-    if(entradaReal) hTardOriginal = calcHorasTardanza(entradaReal, hor.entrada);
+    if(entradaReal){
+      // Regla central, resuelta con la FECHA del día (define qué escala rige).
+      const rt = reglaTardanza(minutosTardanza(entradaReal, hor.entrada), fecha);
+      minTardanza = rt.minutos; hTardOriginal = rt.horas; tardanzaCuenta = rt.cuenta;
+    }
     if(salidaReal)  hSal  = calcHorasSalidaAnt(salidaReal, hor.salida);
     // ── Corrección de cruce de medianoche ───────────────────────────────────
     // Si el empleado trabajó ≥ horas programadas no puede haber salida anticipada:
@@ -1726,6 +1759,10 @@ function calcDiaCondicion(emp, fecha){
   const exo = getExoneracionTardanza(emp.id, fecha);
   const horasTardExoneradas = exo.activa ? Math.min(numProp(exo.horas), hTardOriginal) : 0;
   const hTard = calcularTardanzaNeta(hTardOriginal, horasTardExoneradas); // tardanza NETA
+  /* Cuenta para el acumulado de la quincena solo si la escala vigente así lo
+     dice Y la tardanza no quedó totalmente exonerada: exonerar es perdonar la
+     tardanza, no solo su importe. */
+  const cuentaTardanza = tardanzaCuenta && hTard > 0;
   // Descuento por falta (ausencia) = horas programadas x sueldo/hora
   const descFalta = esFalta ? horasProg * (emp.sueldoHora||0) : 0;
   const horasDescAuto = hTard + hSal;
@@ -1752,7 +1789,7 @@ function calcDiaCondicion(emp, fecha){
 
   return {
     fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra, feriado, pagoFeriado,
-    hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
+    hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, minTardanza, cuentaTardanza, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
     descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia,
     esPendiente:false // día pasado evaluado normalmente
   };
@@ -1781,12 +1818,52 @@ function segmentosQuincena(emp, year, month, q){
      resultados, sin mezclar sueldos, AFP, ajustes ni horarios entre tramos.
    Los tramos sin condición aplicable se excluyen del cálculo (sus días
    quedan marcados como sinCondicion y se reportan aparte). */
+/* ── PENALIZACIÓN POR ACUMULACIÓN DE TARDANZAS ────────────────────────────
+   Desde el 16/09/2026: al superar las 4 tardanzas válidas de la quincena
+   (es decir, a partir de la 5.ª) se agrega UN solo descuento adicional:
+       (Sueldo total - Ajuste por planilla) / 30
+   donde Sueldo total = sueldoQuincenal × 2 + AFP, la misma definición que ya
+   usa el módulo de Empleados.
+   Se aplica en el ÚNICO punto de entrada del cálculo quincenal, no dentro de
+   calcQuincenaBase: con varias condiciones en la misma quincena, esa función
+   se ejecuta una vez por tramo y el contador debía ser de la QUINCENA entera,
+   no de cada tramo. Los importes se toman de la condición vigente en la fecha
+   de la 5.ª tardanza, resuelta con condicionEnFecha() (la regla ya existente).
+   No aplica a empleados libres ni a tramos pagados por horas, coherente con
+   que en esos casos no se aplican descuentos automáticos por asistencia.   */
+function aplicarAcumulacionTardanzas(emp, r){
+  if(!r || r.esLibre || r.pagoPorHoras) return r;
+  const conTardanza = (r.dias||[])
+    .filter(d=>d && d.cuentaTardanza && d.fecha >= TARDANZA_NUEVA_DESDE)
+    .sort((a,b)=> a.fecha<b.fecha ? -1 : 1);
+  r.tardanzasQuincena = conTardanza.length;
+  if(conTardanza.length <= TARDANZA_ACUM_LIMITE) return r;   // 4 o menos: nada
+  const fechaGatillo = conTardanza[TARDANZA_ACUM_LIMITE].fecha;   // la 5.ª
+  const c = condicionEnFecha(emp, fechaGatillo) || r.condicion || emp;
+  const sueldoTotal = (Number(c.sueldoQuincenal)||0)*2 + (Number(c.afpComision)||0);
+  const monto = Math.max(0, (sueldoTotal - (Number(c.ajustePlanilla)||0)) / 30);
+  if(!(monto > 0)) return r;
+  r.descAcumTardanzas  = monto;
+  r.fechaAcumTardanzas = fechaGatillo;
+  // Renglón PROPIO: nunca se mezcla con los descuentos individuales del día.
+  r.discounts = (r.discounts||[]).concat([{
+    fecha: fechaGatillo, tipo:'acumTardanzas',
+    descripcion: `Acumulación de tardanzas (${conTardanza.length} tardanzas · 5.ª el ${fmtFecha(fechaGatillo)})`,
+    monto, meta:{ tardanzas:conTardanza.length }
+  }]);
+  r.totalDescuentos = (Number(r.totalDescuentos)||0) + monto;
+  r.totalPagar      = (Number(r.totalPagar)||0) - monto;
+  // El agregado de descuentos automáticos también lo refleja, para que las
+  // columnas del Consolidado sigan explicando íntegramente el Total a Pagar.
+  if(r.tot) r.tot.descAuto = (Number(r.tot.descAuto)||0) + monto;
+  return r;
+}
 function calcQuincenaEmpleado(emp, year, month, q){
   const segs = segmentosQuincena(emp, year, month, q).filter(s=>s.condicionId);
-  if(segs.length > 1){
-    return calcQuincenaMultiCondicion(emp, year, month, q, segs);
-  }
-  return calcQuincenaBase(emp, year, month, q);
+  const r = segs.length > 1
+    ? calcQuincenaMultiCondicion(emp, year, month, q, segs)
+    : calcQuincenaBase(emp, year, month, q);
+  return aplicarAcumulacionTardanzas(emp, r);
 }
 /* Suma los resultados de cada tramo conservando una única identidad de
    empleado. El sueldo base de cada condición se prorratea por los días de
@@ -1943,7 +2020,9 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
       if((d.descAuto||0)>0){
         const motivos=[];
         if(d.esFalta) motivos.push(`Falta - ausencia (${d.horasProg}h)`);
-        if(d.hTard>0) motivos.push(`Tardanza ${d.hTard}h`);
+        if(d.hTard>0) motivos.push(d.fecha >= TARDANZA_NUEVA_DESDE
+          ? `Tardanza ${d.minTardanza||0} min`      // escala vigente: se informa el retraso real
+          : `Tardanza ${d.hTard}h`);                // histórico: se conserva el texto anterior
         if(d.hSal>0) motivos.push(`Salida anticipada ${d.hSal}h`);
         if(d.horasFaltaMarc>0) motivos.push(`Falta de marcación ${d.horasFaltaMarc}h`);
         discounts.push({fecha:d.fecha, tipo:'descAuto',
