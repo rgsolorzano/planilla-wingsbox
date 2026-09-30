@@ -4386,10 +4386,38 @@ const K_COMPRAS_META = 'compras_meta';
    leer la fuente. Sin esto, un caché con el formato anterior seguía usándose
    indefinidamente — por eso el desglose por Personal/Insumo mostraba
    "Sin detalle": los hechos guardados no traían aún el campo `detalle`. */
-const COMPRAS_FACTS_VERSION = 2;   // v2 = agrega el detalle (columna G)
+const COMPRAS_FACTS_VERSION = 3;   // v3 = unifica variantes de mayúsculas/acentos en F y G
 // Índices 0-based según especificación: B=1 fecha, F=5 tipo, I=8 monto, K=10 filtro
 // G=6 detalle: lo usa Evolución de gastos; Flujo de Caja lo ignora.
 const COMPRAS_COL = { fecha:1, tipo:5, detalle:6, monto:8, filtro:10 };
+
+/* ── UNIFICACIÓN DE VARIANTES (causa raíz de los meses en cero) ────────────
+   Las columnas F (tipo) y G (detalle) se escriben a mano en el spreadsheet,
+   así que el MISMO concepto aparece con distinta grafía según quién lo tecleó:
+   "Sueldo apoyo" en julio y agosto de 2025, "Sueldo Apoyo" desde septiembre.
+   Al guardarse el texto literal como clave, cada grafía formaba un tipo
+   distinto: el desplegable ofrecía uno solo y los meses escritos con la otra
+   grafía quedaban en S/ 0.00 pese a existir en la fuente.
+   La clave canónica ignora mayúsculas, acentos y espacios repetidos; la
+   ETIQUETA que se muestra es la grafía más frecuente de la fuente, de modo que
+   la apariencia no cambia y los importes dejan de partirse.                */
+function gastoClaveCanonica(s){
+  return String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/\s+/g,' ').trim().toUpperCase();
+}
+/* Elige, para cada clave canónica, la grafía a mostrar: la más repetida y,
+   en caso de empate, la primera alfabéticamente (resultado determinista). */
+function gastoEtiquetasCanonicas(conteo){
+  const out = new Map();
+  conteo.forEach((variantes, clave)=>{
+    let mejor=null, mejorN=-1;
+    variantes.forEach((n, texto)=>{
+      if(n>mejorN || (n===mejorN && String(texto)<String(mejor))){ mejor=texto; mejorN=n; }
+    });
+    out.set(clave, mejor);
+  });
+  return out;
+}
 
 let comprasFacts = [];  // [{fecha:'YYYY-MM-DD', tipo, monto}] agregado por (día, tipo)
 let comprasMeta  = null;
@@ -4417,44 +4445,67 @@ function comprasLoadFromStorage(){
 }
 comprasLoadFromStorage();
 
-// Sincroniza egresos desde COMPRAS: filtra K="WB" y pre-agrega por (día, tipo).
+/* Sincroniza egresos desde COMPRAS: filtra K="WB" y pre-agrega por
+   (día, tipo, detalle). Es una RECONSTRUCCIÓN COMPLETA, no un append: se lee
+   todo el histórico de la pestaña, se arma un mapa nuevo y se REEMPLAZA
+   comprasFacts y su caché. Por eso ejecutarla dos veces seguidas deja
+   exactamente el mismo resultado (idempotente). */
 async function comprasSync(){
   if(!isAuthorized()){ toast('Inicia sesión para sincronizar las compras.','error'); return null; }
   const t0=Date.now();
   try{
     gsUpdateSyncStatus('Sincronizando egresos (COMPRAS)…','info');
-    const r = await analiticaFetchRaw(COMPRAS_SHEET_RAW+'!A1:K50000'); // fuente RAW (solo lectura)
+    // Rango ABIERTO 'A:K': antes era A1:K50000, un tope fijo que habría
+    // recortado el histórico en silencio al crecer la pestaña.
+    const r = await analiticaFetchRaw(COMPRAS_SHEET_RAW+'!A:K'); // fuente RAW (solo lectura)
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas/compras.');
     if(r.status===404) throw new Error('No se encontró la pestaña COMPRAS en el Spreadsheet.');
     if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña COMPRAS.');
     const j=await r.json();
     const filas=j.values||[];
     console.log('[Flujo] COMPRAS: '+filas.length+' filas leídas. Fila 1 (posible encabezado):', JSON.stringify((filas[0]||[]).slice(0,11)));
-    const porClave=new Map(); // 'fecha|tipo' → monto acumulado
-    let wb=0, descartadas=0;
     const num=v=>{const n=analNumOrNull(v);return n===null?0:n;};
+
+    /* PASADA 1 — se leen las filas WB con fecha válida y se cuenta cada
+       grafía de F y de G bajo su clave canónica. Solo así puede elegirse la
+       etiqueta antes de agregar los importes. */
+    const validas=[];
+    const cTipo=new Map(), cDet=new Map();
+    const contar=(mapa, clave, texto)=>{
+      if(!mapa.has(clave)) mapa.set(clave, new Map());
+      const v=mapa.get(clave); v.set(texto, (v.get(texto)||0)+1);
+    };
+    let wb=0, descartadas=0;
     filas.forEach(row=>{
       if(!row||!row.length) return;
-      if(String(row[COMPRAS_COL.filtro]??'').trim().toUpperCase()!=='WB') return;
-      const fecha=normFechaGS(row[COMPRAS_COL.fecha]);
+      if(String(row[COMPRAS_COL.filtro]??'').trim().toUpperCase()!=='WB') return;  // K = WB
+      const fecha=normFechaGS(row[COMPRAS_COL.fecha]);                              // B
       if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ descartadas++; return; }
       wb++;
-      // Tipo de gasto DINÁMICO desde la columna F (sin catálogo fijo).
-      const tipo=String(row[COMPRAS_COL.tipo]??'').trim() || 'Sin clasificar';
-      /* Se agrega también por DETALLE (col. G) para que Evolución de gastos
-         pueda desglosar dentro de un tipo. La granularidad es mayor, pero las
-         sumas por (día, tipo) son idénticas, así que Flujo de Caja —que suma
-         sobre estos mismos hechos— no se ve afectado. */
-      const detalle=String(row[COMPRAS_COL.detalle]??'').trim() || 'Sin detalle';
-      const k=fecha+'\u0001'+tipo+'\u0001'+detalle;
-      porClave.set(k,(porClave.get(k)||0)+num(row[COMPRAS_COL.monto]));
+      const tipoTxt=String(row[COMPRAS_COL.tipo]??'').trim() || 'Sin clasificar';   // F
+      const detTxt =String(row[COMPRAS_COL.detalle]??'').trim() || 'Sin detalle';   // G
+      const kT=gastoClaveCanonica(tipoTxt), kD=gastoClaveCanonica(detTxt);
+      contar(cTipo, kT, tipoTxt); contar(cDet, kD, detTxt);
+      validas.push({fecha, kT, kD, monto:num(row[COMPRAS_COL.monto])});             // I
+    });
+    const etTipo=gastoEtiquetasCanonicas(cTipo), etDet=gastoEtiquetasCanonicas(cDet);
+    const fusionT=[...cTipo.values()].reduce((a,v)=>a+(v.size-1),0);
+    const fusionD=[...cDet.values()].reduce((a,v)=>a+(v.size-1),0);
+
+    /* PASADA 2 — agregación por (día, tipo, detalle) ya con la etiqueta
+       unificada, de modo que las distintas grafías suman en la misma fila. */
+    const porClave=new Map();
+    validas.forEach(v=>{
+      const k=v.fecha+'\u0001'+etTipo.get(v.kT)+'\u0001'+etDet.get(v.kD);
+      porClave.set(k,(porClave.get(k)||0)+v.monto);
     });
     comprasFacts=[...porClave.entries()].map(([k,monto])=>{
       const [fecha,tipo,detalle]=k.split('\u0001');
       return {fecha, tipo, detalle, monto};
     }).sort((a,b)=>a.fecha<b.fecha?-1:1);
     comprasMeta={ version:COMPRAS_FACTS_VERSION, lastSync:new Date().toISOString(), filasWB:wb,
-      registros:comprasFacts.length, tipos:new Set(comprasFacts.map(f=>f.tipo)).size,
+      registros:comprasFacts.length, tipos:etTipo.size, detalles:etDet.size,
+      sinFecha:descartadas, variantesTipo:fusionT, variantesDetalle:fusionD,
       duracion:((Date.now()-t0)/1000).toFixed(1) };
     try{
       localStorage.setItem(K_COMPRAS_DATA, JSON.stringify(comprasFacts));
@@ -4466,7 +4517,9 @@ async function comprasSync(){
       console.error('[Analítica] Error al escribir '+COMPRAS_SHEET_FACTS+' en el Spreadsheet de ANALÍTICA:', e.message);
       toast('⚠️ Datos actualizados, pero no se pudo guardar '+COMPRAS_SHEET_FACTS+' en el Spreadsheet de Analítica: '+e.message,'error');
     });
-    console.log('[Flujo] Sync COMPRAS OK: '+wb+' filas WB → '+comprasFacts.length+' registros (día,tipo), '+comprasMeta.tipos+' tipos. Sin fecha: '+descartadas);
+    console.log('[Flujo] Sync COMPRAS OK: '+wb+' filas WB → '+comprasFacts.length+' registros (día,tipo,detalle), '+
+      etTipo.size+' tipos, '+etDet.size+' detalles. Sin fecha: '+descartadas+
+      '. Variantes de grafía unificadas: '+fusionT+' en Tipo (F), '+fusionD+' en Detalle (G).');
     return comprasMeta;
   }catch(e){
     console.error('[Flujo] Sync COMPRAS error:', e);
@@ -4751,7 +4804,8 @@ RENDERERS.evolucionGastos = function(){
   el.innerHTML=`
     <div class="page-head"><div><h1>📉 Evolución de gastos</h1>
       <p>Gasto mensual por tipo y detalle, a partir de las compras registradas.
-      ${comprasMeta?`<br>Última sincronización: <b>${fmtFecha(String(comprasMeta.lastSync).slice(0,10))}</b> · ${comprasMeta.filasWB} compras · ${comprasMeta.tipos} tipos`:''}</p></div></div>
+      ${comprasMeta?`<br>Última sincronización: <b>${fmtFecha(String(comprasMeta.lastSync).slice(0,10))}</b> · ${comprasMeta.filasWB} compras · ${comprasMeta.tipos} tipos`:''}</p></div>
+      <button class="btn btn-primary" id="gasSync">🔄 Actualizar gastos</button></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="month" id="gasDesde" value="${gastosFilter.desde}"></div>
@@ -4781,6 +4835,22 @@ RENDERERS.evolucionGastos = function(){
                </table></div>`))}
     </div>`;
 
+  /* ACTUALIZAR GASTOS: relectura COMPLETA de COMPRAS y reconstrucción del
+     dataset analítico. comprasSync() reemplaza comprasFacts entero (no
+     acumula), así que pulsarlo varias veces deja el mismo resultado.
+     El tipo seleccionado se conserva solo si sigue existiendo tras la
+     recarga; si desapareció, se vuelve a "Todos" en lugar de mostrar vacío. */
+  document.getElementById('gasSync').onclick=async function(){
+    this.disabled=true; this.textContent='Actualizando…';
+    const meta = await comprasSync();
+    if(meta){
+      if(gastosFilter.tipo && !comprasFacts.some(f=>f.tipo===gastosFilter.tipo)) gastosFilter.tipo='';
+      const fus = (meta.variantesTipo||0)+(meta.variantesDetalle||0);
+      toast(`Gastos actualizados correctamente. ${meta.filasWB.toLocaleString('es-PE')} registros procesados. `+
+            `${meta.tipos} tipos encontrados.`+(fus?` ${fus} variante(s) de grafía unificadas.`:''),'success');
+    }
+    RENDERERS.evolucionGastos();   // repinta con los datos nuevos (y el botón restaurado)
+  };
   // Actualización AUTOMÁTICA: cualquier filtro repinta al instante, sin botón.
   const aplicar=()=>{
     const d=document.getElementById('gasDesde').value, h=document.getElementById('gasHasta').value;
