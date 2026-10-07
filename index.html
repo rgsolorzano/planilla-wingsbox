@@ -611,6 +611,7 @@
     <section class="page" id="page-estadisticasDiaSemana"></section>
     <section class="page" id="page-flujoCaja"></section>
     <section class="page" id="page-evolucionGastos"></section>
+    <section class="page" id="page-cotejos"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
     <section class="page" id="page-menajeAdmin"></section>
@@ -663,7 +664,7 @@ const K = {
   // Módulo Inventario Menaje
   menajeArticulos:'inv_menaje_art', menajeInventario:'inv_menaje_stock', seedMenaje:'inv_menaje_seedDone',
   cocinaProductos:'inv_cocina_prod', cocinaInventario:'inv_cocina_stock', seedCocina:'inv_cocina_seedDone',
-  cocinaMovimientos:'inv_cocina_movs'
+  cocinaMovimientos:'inv_cocina_movs', bebidasMovs:'pl_bebidasMovs'
 };
 const DIAS = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
 const TIPOS_DESC = ['Adelanto','Comida','Falta','Rotura','Error de cobro','No marcación','Otros'];
@@ -900,7 +901,7 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[], cocinaMovimientos:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[], cocinaMovimientos:[], bebidasMovs:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   migrarCondiciones();   // idempotente: cada empleado tiene al menos una condición
@@ -930,6 +931,7 @@ function reloadState(){
   S.cocinaProductos=cocinaNormalizarCatalogo(load(K.cocinaProductos));
   S.cocinaInventario=load(K.cocinaInventario);
   S.cocinaMovimientos=load(K.cocinaMovimientos);
+  S.bebidasMovs=load(K.bebidasMovs);
   if(!S.cocinaProductos.length && !localStorage.getItem(K.seedCocina)) seedCocinaProductos(true);
   menajeSanearInventario(); // invariantes: sin huérfanos, sin duplicados, enteros
 }
@@ -4866,6 +4868,212 @@ RENDERERS.evolucionGastos = function(){
     RENDERERS.evolucionGastos();
   };
 };
+
+
+/* ════════════════════════════════════════════════════════════════════════
+   ANALÍTICA → COTEJOS
+   Compara, por bebida y período, las VENTAS reales contra el CONSUMO que se
+   deduce del inventario físico y sus movimientos. Las tres fuentes se leen
+   por separado y solo se combinan al calcular:
+     · Ventas  → VENTAS_PRODUCTO_DETALLE (Z fecha, AJ producto, AQ cantidad)
+     · Stock   → S.stockBebidas  (conteo físico diario)
+     · Movs.   → S.bebidasMovs   (entradas / salidas manuales)
+   La agrupación reutiliza los helpers comunes de Analítica
+   (anRangoNormalizado / anClavePeriodo / anEtiquetaPeriodo), los mismos que
+   usan Evolución de Ventas y Ventas por Canal.
+   ════════════════════════════════════════════════════════════════════════ */
+// Columna AQ = cantidad vendida. Z y AJ ya están definidas arriba (VPD_COL_*).
+const VPD_COL_CANTIDAD = colLetraAIndice('AQ');   // 42
+// ventasBeb[fecha]['NOMBRE NORMALIZADO'] = unidades vendidas (suma de AQ).
+let cotVentas = {};
+let cotEstado = { cargando:false, rango:null, error:null, ultima:null, filas:0, unidades:0 };
+
+/* Carga las ventas de bebidas del rango. Suma AQ; NO cuenta filas, porque
+   una fila puede vender varias unidades. La coincidencia del producto es
+   EXACTA contra los 21 nombres (tras recortar espacios y normalizar
+   mayúsculas/acentos): "CORONA" jamás casa con "CORONA 310 ML". */
+async function cotCargarVentas(desde, hasta, opts={}){
+  if(!isAuthorized()) return false;
+  const clave = desde+'|'+hasta;
+  if(!opts.forzar && cotEstado.rango===clave && !cotEstado.error) return true;
+  cotEstado.cargando = true; cotEstado.error = null;
+  try{
+    const r = await gsApiFetch(
+      'https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
+      '/values/'+encodeURIComponent(VPD_RANGO)+'?valueRenderOption=UNFORMATTED_VALUE');
+    if(r.status===403) throw new Error('Sin permiso para leer '+VPD_SHEET+'.');
+    if(r.status===404) throw new Error('No se encontró la pestaña '+VPD_SHEET+'.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+VPD_SHEET+'.');
+    const filas = (await r.json()).values || [];
+    if(!filas.length) throw new Error(VPD_SHEET+' no devolvió datos (0 filas).');
+    const iF=VPD_COL_FECHA, iP=VPD_COL_PRODUCTO, iQ=VPD_COL_CANTIDAD;
+    const setBeb = new Set(COTEJO_BEBIDAS.map(b=>vpdNormalizar(b.venta)));
+    const acc={}; let filasOk=0, unidades=0, sinFecha=0, fuera=0, noListado=0;
+    for(let k=1;k<filas.length;k++){
+      const row=filas[k]; if(!row||!row.length) continue;
+      // normFechaGS: resuelve texto, serial de Sheets y fecha con hora sin
+      // desplazar el día (no pasa por la zona horaria del navegador ni UTC).
+      const fecha=normFechaGS(row[iF]);
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ sinFecha++; continue; }
+      if(fecha<desde || fecha>hasta){ fuera++; continue; }
+      const prod=vpdNormalizar(row[iP]);
+      if(!setBeb.has(prod)){ noListado++; continue; }      // coincidencia EXACTA
+      const q=analNumOrNull(row[iQ]);
+      const cant=(q===null?0:q);
+      (acc[fecha]=acc[fecha]||{});
+      acc[fecha][prod]=(acc[fecha][prod]||0)+cant;         // SUMA de AQ
+      filasOk++; unidades+=cant;
+    }
+    cotVentas=acc;
+    cotEstado={ cargando:false, rango:clave, error:null, ultima:new Date(), filas:filasOk, unidades };
+    console.log('[Cotejos] '+filasOk+' fila(s) de venta → '+unidades+' unidad(es) entre '+desde+' y '+hasta+
+      ' (descartadas → sin fecha: '+sinFecha+', fuera de rango: '+fuera+', producto no listado: '+noListado+').');
+    return true;
+  }catch(e){
+    console.error('[Cotejos] Error:', e);
+    cotEstado={ cargando:false, rango:null, error:e.message, ultima:cotEstado.ultima, filas:0, unidades:0 };
+    return false;
+  }
+}
+// Unidades vendidas de una bebida en un día (0 si no hubo ventas ese día).
+function cotVentasDia(nombreVenta, fecha){
+  const d=cotVentas[fecha]; if(!d) return 0;
+  return d[vpdNormalizar(nombreVenta)] || 0;
+}
+
+/* Rango por defecto: los dos meses anteriores terminando AYER (hoy nunca
+   entra, porque su jornada aún no ha cerrado). Si hoy es 07/10/2026 →
+   07/08/2026 → 06/10/2026. Se calcula con aritmética de calendario sobre la
+   fecha de Lima, sin objetos Date locales. */
+function cotRangoPorDefecto(){
+  const hasta = fechaMasDias(fechaEnLima(), -1);            // ayer
+  const hoy = fechaEnLima();
+  let [a,m,d] = hoy.split('-').map(Number);
+  m -= 2; while(m<=0){ m+=12; a--; }
+  const ult = ultimoDia(a,m);                               // 31/08 → 31, etc.
+  const desde = a+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,ult)).padStart(2,'0');
+  return { desde, hasta, agrup:'dia' };
+}
+let cotFilter = cotRangoPorDefecto();
+
+// Días (YYYY-MM-DD) entre dos fechas inclusive, en orden.
+function cotDiasDe(desde, hasta){
+  const out=[]; let f=desde; let guard=0;
+  while(f<=hasta && guard++<2000){ out.push(f); f=fechaMasDias(f,1); }
+  return out;
+}
+/* Períodos del rango según la agrupación. El rango VISUAL que escribió el
+   usuario se conserva intacto; aquí se deriva el rango de CÁLCULO: 'dia'
+   respeta las fechas exactas, 'semana' se expande a lunes-domingo y 'mes' a
+   meses calendario completos. Devuelve [{key,label,fechas}]. */
+function cotPeriodos(desde, hasta, agrup){
+  if(!desde || !hasta || desde>hasta) return [];
+  const R = anRangoNormalizado(desde, hasta, agrup);         // rango de CÁLCULO
+  const mapa = new Map();
+  cotDiasDe(R.desde, R.hasta).forEach(f=>{
+    const k = anClavePeriodo(f, agrup);
+    if(!mapa.has(k)) mapa.set(k, { key:k, label:anEtiquetaPeriodo(k, agrup), fechas:[] });
+    mapa.get(k).fechas.push(f);
+  });
+  return [...mapa.values()].sort((a,b)=> a.key<b.key?-1:1);
+}
+/* Fila de cotejo de una bebida en un período:
+     ventas  = Σ unidades vendidas (AQ) de los días del período
+     consumo = Σ consumos diarios válidos (función central), null si ninguno
+     dif     = consumo − ventas (null si el consumo no es calculable)      */
+function cotCalcular(beb, periodo){
+  const ventas = periodo.fechas.reduce((a,f)=>a+cotVentasDia(beb.venta,f), 0);
+  const consumo = beb.bebidaId ? consumoPeriodoBebida(beb.bebidaId, periodo.fechas) : null;
+  return { ventas, consumo, dif: consumo===null ? null : consumo-ventas };
+}
+
+let cotAutoCargaIntentada = false;
+RENDERERS.cotejos = function(){
+  const el=document.getElementById('page-cotejos');
+  if(!el) return;
+  const { desde, hasta, agrup } = cotFilter;
+  const R = anRangoNormalizado(desde, hasta, agrup);
+  // Las ventas se piden sobre el rango de CÁLCULO, no sobre el visual.
+  if(isAuthorized() && !cotEstado.cargando && cotEstado.rango!==(R.desde+'|'+R.hasta)){
+    if(!cotAutoCargaIntentada || cotFilter._recargar){
+      cotAutoCargaIntentada = true; cotFilter._recargar = false;
+      cotCargarVentas(R.desde, R.hasta).then(()=>{ if(currentPage==='cotejos') RENDERERS.cotejos(); });
+    }
+  }
+  const periodos = cotPeriodos(desde, hasta, agrup);
+  const bebs = cotobebidasOrden();
+  const n = v => (v===null||v===undefined) ? '<span style="opacity:.35">—</span>' : String(v);
+  const sgn = v => v===null||v===undefined ? '<span style="opacity:.35">—</span>'
+    : `<span style="color:${v>0?'var(--green)':(v<0?'var(--red)':'inherit')};font-weight:${v===0?400:600}">${v>0?'+':''}${v}</span>`;
+
+  const thPer = periodos.map(p=>`<th colspan="3" class="num" style="background:#f8f5ff;font-size:10px;font-weight:600;white-space:nowrap;border-left:2px solid #c4b5fd">${p.label}</th>`).join('');
+  const thSub = periodos.map(()=>`<th class="num" style="font-size:9px;font-weight:600;border-left:2px solid #c4b5fd">VENTAS</th>`+
+    `<th class="num" style="font-size:9px;font-weight:600">CONSUMO<br>INVENTARIO</th>`+
+    `<th class="num" style="font-size:9px;font-weight:600">DIFERENCIA</th>`).join('');
+  const cuerpo = bebs.map(b=>{
+    const celdas = periodos.map(p=>{
+      const r = cotCalcular(b, p);
+      return `<td class="num" style="border-left:2px solid #e9d5ff">${r.ventas}</td>`+
+             `<td class="num">${n(r.consumo)}</td>`+
+             `<td class="num">${sgn(r.dif)}</td>`;
+    }).join('');
+    const aviso = b.bebidaId ? '' : ' <span class="badge b-late" title="No existe en el catálogo de Bebidas">sin catálogo</span>';
+    return `<tr><td class="mx-fix">${b.venta}${aviso}</td>${celdas}</tr>`;
+  }).join('');
+
+  const metaStr = cotEstado.error ? `<br><span style="color:var(--red)">Error al leer ventas: ${cotEstado.error}</span>`
+    : (cotEstado.ultima ? `<br>Ventas leídas: <b>${cotEstado.unidades.toLocaleString('es-PE')}</b> unidad(es) en ${cotEstado.filas.toLocaleString('es-PE')} fila(s)` : '');
+  const rangoCalc = (R.desde!==desde || R.hasta!==hasta)
+    ? `<span class="hint" style="margin-left:8px">Rango de cálculo: <b>${fmtFecha(R.desde)} → ${fmtFecha(R.hasta)}</b></span>` : '';
+
+  el.innerHTML=`
+    <div class="page-head"><div><h1>🔎 Cotejos</h1>
+      <p>Ventas reales frente al consumo deducido del inventario físico y sus movimientos.
+      Fuentes: <code>${VPD_SHEET}</code> (Z·AJ·AQ), Stock Diario Bebidas y Registrar movimiento.${metaStr}</p></div>
+      <button class="btn btn-primary" id="cotSync">🔄 Actualizar ventas</button></div>
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Desde</label><input type="date" id="cotDesde" value="${desde}"></div>
+        <div class="field"><label>Hasta</label><input type="date" id="cotHasta" value="${hasta}"></div>
+        <div class="field"><label>Agrupar por</label>
+          <select id="cotAgrup">
+            <option value="dia"    ${agrup==='dia'?'selected':''}>Día</option>
+            <option value="semana" ${agrup==='semana'?'selected':''}>Semana</option>
+            <option value="mes"    ${agrup==='mes'?'selected':''}>Mes</option>
+          </select></div>
+        <button class="btn btn-ghost btn-sm" id="cotClear" style="align-self:flex-end">🗑 Limpiar</button>
+      </div>
+      <p class="hint" style="margin-top:0">La semana siempre va de <b>lunes a domingo</b> y el mes es el <b>mes calendario completo</b>: el rango que elijas decide qué períodos entran, pero cada período se calcula entero. <b>Diferencia = Consumo − Ventas</b>. Un guion (—) significa que falta el conteo físico para calcular el consumo; nunca es un cero.${rangoCalc}</p>
+      ${!periodos.length ? `<p class="empty">Selecciona un rango de fechas válido.</p>`
+        : `<div class="mx-outer"><table class="mx-table">
+             <thead>
+               <tr><th class="mx-fix" rowspan="2">Bebida</th>${thPer}</tr>
+               <tr>${thSub}</tr>
+             </thead>
+             <tbody>${cuerpo}</tbody>
+           </table></div>`}
+    </div>`;
+
+  const aplicar=()=>{
+    const d=document.getElementById('cotDesde').value, h=document.getElementById('cotHasta').value;
+    if(d&&h&&d>h){ toast('Rango inválido: "Desde" no puede ser posterior a "Hasta".','error'); return; }
+    cotFilter={ desde:d, hasta:h, agrup:document.getElementById('cotAgrup').value };
+    RENDERERS.cotejos();
+  };
+  document.getElementById('cotDesde').onchange=aplicar;
+  document.getElementById('cotHasta').onchange=aplicar;
+  document.getElementById('cotAgrup').onchange=aplicar;
+  document.getElementById('cotClear').onclick=()=>{ cotFilter=cotRangoPorDefecto(); RENDERERS.cotejos(); };
+  document.getElementById('cotSync').onclick=async function(){
+    this.disabled=true; this.textContent='Actualizando…';
+    const ok=await cotCargarVentas(R.desde, R.hasta, {forzar:true});
+    if(ok) toast(`Ventas actualizadas: ${cotEstado.unidades.toLocaleString('es-PE')} unidad(es) en ${cotEstado.filas.toLocaleString('es-PE')} fila(s).`,'success');
+    else toast('No se pudieron actualizar las ventas: '+(cotEstado.error||'error desconocido'),'error');
+    RENDERERS.cotejos();
+  };
+};
+// Las 21 bebidas, en su orden fijo. Nunca se oculta una por tener 0.
+function cotobebidasOrden(){ return cotejoBebidasResueltas(); }
 
 RENDERERS.flujoCaja = function(){
   const el=document.getElementById('page-flujoCaja');
@@ -11377,6 +11585,125 @@ function upsertStockBebida(bebidaId, fecha, stock){
   if(r) r.stock = stock;
   else S.stockBebidas.push({ id:uid(), bebidaId, fecha, stock });
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   MOVIMIENTOS DE BEBIDAS  (fuente SEPARADA del inventario físico)
+   ------------------------------------------------------------------------
+   · S.stockBebidas  → CONTEO físico del día (fuente 1, ya existente).
+   · S.bebidasMovs   → ingresos y salidas manuales (fuente 2, nueva).
+   Nunca se fusionan en un mismo registro: Cotejos los combina al calcular,
+   igual que ya hacen Inv. Cocina y su consolidado.
+   Persistencia: tab propio MovBebidas del Spreadsheet de INVENTARIO.
+   MovBebidas: { id, bebidaId, fecha, cantidad, tipoMovimiento }
+   ════════════════════════════════════════════════════════════════════════ */
+const BEB_MOV_TIPOS = ['Entrada','Salida'];
+function bebMovTipoNorm(t){
+  return String(t??'').trim().toLowerCase().startsWith('s') ? 'Salida' : 'Entrada';
+}
+/* Movimiento NETO de una bebida en un día: entradas − salidas.
+   Acumula TODOS los movimientos del día; nunca toma solo el primero
+   ni el último. Sin movimientos devuelve 0 (neutro en la fórmula). */
+function bebMovNeto(bebidaId, fecha){
+  let neto = 0;
+  S.bebidasMovs.forEach(m=>{
+    if(m.bebidaId!==bebidaId || m.fecha!==fecha) return;
+    const c = Number(m.cantidad)||0;
+    neto += (bebMovTipoNorm(m.tipoMovimiento)==='Salida') ? -c : c;
+  });
+  return neto;
+}
+function bebMovsDe(fecha){
+  return S.bebidasMovs.filter(m=>m.fecha===fecha)
+    .sort((a,b)=>String(a.id).localeCompare(String(b.id)));
+}
+function syncMovBebidas(){ _syncSheet('inventario','MovBebidas','MovBebidas', S.bebidasMovs.length); }
+window.bebMovEliminar = function(id){
+  const m=S.bebidasMovs.find(x=>x.id===id); if(!m) return;
+  if(!confirm('¿Eliminar este movimiento?')) return;
+  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('MovBebidas', m);
+  S.bebidasMovs = S.bebidasMovs.filter(x=>x.id!==id);
+  save(K.bebidasMovs,S.bebidasMovs); syncMovBebidas();
+  toast('Movimiento eliminado','success');
+  RENDERERS.stockDiarioBebidas();
+};
+
+/* ── CONSUMO DIARIO: FUNCIÓN CENTRAL Y ÚNICA ──────────────────────────────
+       Consumo(D) = Stock(D) + Entradas(D) − Salidas(D) − Stock(D+1)
+   Devuelve null (celda VACÍA) cuando falta Stock(D) o Stock(D+1): sin esos
+   dos extremos la resta no significa nada y la ausencia de conteo NO es un
+   cero. Los movimientos ausentes sí valen 0, porque "no hubo movimiento"
+   es un dato completo. Cualquier módulo que necesite consumo de bebidas
+   debe llamar a esta función, nunca reimplementar la fórmula.            */
+function consumoDiarioBebida(bebidaId, fecha){
+  const s0 = getStockBebida(bebidaId, fecha);
+  const s1 = getStockBebida(bebidaId, fechaMasDias(fecha, 1));
+  if(!s0 || !s1) return null;                       // base insuficiente
+  const a = Number(s0.stock), b = Number(s1.stock);
+  if(!isFinite(a) || !isFinite(b)) return null;
+  return a + bebMovNeto(bebidaId, fecha) - b;
+}
+/* Roll-up de consumo: SUMA de los consumos diarios de los días del período.
+   Nunca se recalcula comparando el primer y el último stock del período,
+   porque entre medias puede haber movimientos y reconteos.
+   null si ningún día del período fue calculable. */
+function consumoPeriodoBebida(bebidaId, fechas){
+  let suma = 0, validos = 0;
+  fechas.forEach(f=>{
+    const c = consumoDiarioBebida(bebidaId, f);
+    if(c===null) return;
+    suma += c; validos++;
+  });
+  return validos ? suma : null;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   CATÁLOGO DE COTEJO — 21 bebidas, orden fijo
+   ------------------------------------------------------------------------
+   Dos sistemas de nombres distintos conviven y aquí se unen explícitamente:
+     · `venta` → nombre tal cual aparece en la columna AJ de
+                 VENTAS_PRODUCTO_DETALLE (coincidencia EXACTA).
+     · `cat`   → nombre en el catálogo de inventario (S.bebidasCat), del que
+                 se obtiene el bebidaId real.
+   Para 17 bebidas ambos coinciden; las 4 restantes difieren solo en la
+   grafía del formato y se declaran aquí, en un único sitio visible, en
+   lugar de adivinarlas con coincidencias parciales.
+   El enlace final SIEMPRE es por bebidaId, nunca por nombre.            */
+const COTEJO_BEBIDAS = [
+  { venta:'CORONA' },
+  { venta:'CUSQUEÑA DORADA 310 ML' },
+  { venta:'CUSQUEÑA NEGRA 310 ML' },
+  { venta:'CUSQUEÑA TRIGO 310 ML' },
+  { venta:'PILSEN 305 ML' },
+  { venta:'AGUA SAN LUIS CON GAS' },
+  { venta:'AGUA SAN LUIS SIN GAS' },
+  { venta:'COCA COLA (1 L)' },
+  { venta:'COCA COLA (1.5 L)' },
+  { venta:'COCA COLA (297ML)' },
+  { venta:'COCA COLA (500ML)',      cat:'COCA COLA 500ML' },
+  { venta:'COCA COLA JUMBO (625ML)' },
+  { venta:'COCA COLA ZERO (500ML)' },
+  { venta:'FANTA ROJA (500ML)',     cat:'FANTA ROJA' },
+  { venta:'FANTA NARANJA (500ML)',  cat:'FANTA NARANJA' },
+  { venta:'INCA KOLA (1 L)' },
+  { venta:'INCA KOLA (1.5 L)' },
+  { venta:'INCA KOLA (297ML)' },
+  { venta:'INCA KOLA (500ML)',      cat:'INCA KOLA 500ML' },
+  { venta:'INCA KOLA GORDITA (625ML)' },
+  { venta:'INCA KOLA ZERO (500ML)' }
+];
+/* Resuelve cada entrada a su bebidaId del catálogo. Se hace en cada render
+   porque el catálogo puede sincronizarse y cambiar de IDs. Si una bebida no
+   existe en el catálogo, la fila se muestra igual (ventas sí se pueden
+   calcular) y el consumo queda vacío: nunca se oculta una bebida. */
+function cotejoBebidasResueltas(){
+  const porNombre = new Map(S.bebidasCat.map(b=>[String(b.nombre).trim().toUpperCase(), b]));
+  return COTEJO_BEBIDAS.map(e=>{
+    const nomCat = (e.cat || e.venta).trim().toUpperCase();
+    const b = porNombre.get(nomCat) || null;
+    return { venta:e.venta, nombreCat:(e.cat||e.venta), bebidaId: b ? b.id : null };
+  });
+}
+
 function nombreBebidaCat(id){ const b=S.bebidasCat.find(x=>x.id===id); return b?b.nombre:'(bebida eliminada)'; }
 function categoriaBebidaCat(id){ const b=S.bebidasCat.find(x=>x.id===id); return b?b.categoria:''; }
 
@@ -11501,8 +11828,40 @@ RENDERERS.stockDiarioBebidas = function(){
       <td class="num"><input type="number" class="stockBebInput" data-id="${b.id}" min="0" step="0.01" value="${r!=null?r.stock:''}" placeholder=""></td>
     </tr>`;
   }).join('');
+  // Opciones del desplegable: las 21 bebidas de cotejo que existan en el
+  // catálogo, en su orden fijo. El value es el bebidaId, nunca el nombre.
+  const bebsMov = cotejoBebidasResueltas().filter(x=>x.bebidaId);
+  const optsBeb = bebsMov.map(x=>`<option value="${x.bebidaId}">${x.venta}</option>`).join('');
+  const movsDia = bebMovsDe(stockBebidasFecha);
+
   el.innerHTML=`
     <div class="page-head"><div><h1>📋 Stock Diario de Bebidas</h1><p>Registra el stock de bebidas para la fecha seleccionada. Presiona "Guardar" para persistir y sincronizar.</p></div></div>
+
+    <div class="card">
+      <h2>Registrar movimiento</h2>
+      <p class="hint" style="margin-top:0">Entradas y salidas del día. Se guardan <b>aparte</b> del conteo físico: el módulo <b>Cotejos</b> los combina con el stock para calcular el consumo real.</p>
+      <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+        <div class="field"><label>Fecha</label><input type="date" id="bebMovFecha" value="${stockBebidasFecha}"></div>
+        <button class="btn btn-ghost btn-sm" id="bebMovAdd">+ Agregar movimiento</button>
+      </div>
+      ${bebsMov.length? `<div class="table-wrap"><table>
+        <thead><tr><th>Bebida</th><th class="num" style="width:120px">Cantidad</th><th style="width:150px">Tipo de movimiento</th><th style="width:60px"></th></tr></thead>
+        <tbody id="bebMovBody"></tbody>
+      </table></div>
+      <div class="actions" style="margin-top:10px"><button class="btn btn-primary" id="bebMovSave">💾 Guardar movimientos</button></div>`
+      : `<p class="empty">Ninguna de las bebidas de cotejo existe en el catálogo.</p>`}
+      ${movsDia.length? `<h3 style="font-size:13px;margin:16px 0 6px">Movimientos registrados el ${fmtFecha(stockBebidasFecha)} (${movsDia.length})</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Bebida</th><th class="num">Cantidad</th><th>Tipo</th><th>Acciones</th></tr></thead>
+          <tbody>${movsDia.map(m=>`<tr>
+            <td>${nombreBebidaCat(m.bebidaId)}</td>
+            <td class="num">${m.cantidad}</td>
+            <td><span class="badge ${bebMovTipoNorm(m.tipoMovimiento)==='Salida'?'b-late':'b-free'}">${bebMovTipoNorm(m.tipoMovimiento)}</span></td>
+            <td><button class="btn-icon del" onclick="bebMovEliminar('${m.id}')">🗑️ Eliminar</button></td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : ''}
+    </div>
+
     <div class="card">
       <div class="toolbar"><div class="field"><label>Fecha</label><input type="date" id="stockBebFecha" value="${stockBebidasFecha}"></div></div>
     </div>
@@ -11518,6 +11877,50 @@ RENDERERS.stockDiarioBebidas = function(){
       </div>
       <p class="hint">Los valores negativos no están permitidos. Si ya existe un registro para esta combinación de Fecha + Bebida, se actualiza sin duplicar.</p>
     </div>`;
+  // ── Formulario de movimientos: filas dinámicas ──
+  const bebMovBody=document.getElementById('bebMovBody');
+  const filaBebMov=()=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td><select class="bebMovBeb" style="min-width:240px">${optsBeb}</select></td>
+      <td class="num"><input type="number" min="0" step="1" class="bebMovCant" placeholder="" style="min-width:90px"></td>
+      <td><select class="bebMovTipo">${BEB_MOV_TIPOS.map(t=>`<option value="${t}">${t}</option>`).join('')}</select></td>
+      <td><button class="btn-icon del" title="Quitar fila">✕</button></td>`;
+    tr.querySelector('button').onclick=()=>{
+      tr.remove();
+      if(bebMovBody && !bebMovBody.children.length) bebMovBody.appendChild(filaBebMov()); // siempre una fila
+    };
+    return tr;
+  };
+  if(bebMovBody){
+    bebMovBody.appendChild(filaBebMov());
+    const add=document.getElementById('bebMovAdd');
+    if(add) add.onclick=()=>bebMovBody.appendChild(filaBebMov());
+    const sv=document.getElementById('bebMovSave');
+    if(sv) sv.onclick=()=>{
+      const nuevos=[];
+      // Validación COMPLETA antes de guardar: un error aborta toda la operación.
+      for(const tr of [...bebMovBody.children]){
+        const beb =tr.querySelector('.bebMovBeb').value;
+        const raw =tr.querySelector('.bebMovCant').value;
+        const tipo=tr.querySelector('.bebMovTipo').value;
+        if(String(raw).trim()==='') continue;            // fila vacía: se ignora
+        const v=cocinaValidarCantidad(raw);              // enteros ≥ 0, sin decimales
+        if(!v.ok){ toast(v.error,'error'); tr.querySelector('.bebMovCant').focus(); return; }
+        if(v.valor===null) continue;
+        if(!beb){ toast('Selecciona una bebida en cada movimiento.','error'); return; }
+        if(!BEB_MOV_TIPOS.includes(tipo)){ toast('Tipo de movimiento inválido.','error'); return; }
+        nuevos.push({ id:uid(), bebidaId:beb, fecha:stockBebidasFecha, cantidad:v.valor, tipoMovimiento:tipo });
+      }
+      if(!nuevos.length){ toast('No hay movimientos que guardar.','info'); return; }
+      S.bebidasMovs.push(...nuevos);                     // cada uno con su id único
+      save(K.bebidasMovs,S.bebidasMovs); syncMovBebidas();
+      toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      RENDERERS.stockDiarioBebidas();
+    };
+  }
+  const bmf=document.getElementById('bebMovFecha');
+  if(bmf) bmf.onchange=(e)=>{ stockBebidasFecha=e.target.value||fechaHoy(); RENDERERS.stockDiarioBebidas(); };
+
   document.getElementById('stockBebFecha').onchange=(e)=>{ stockBebidasFecha=e.target.value||fechaHoy(); RENDERERS.stockDiarioBebidas(); };
   document.getElementById('stockBebGuardar').onclick=stockBebidasGuardar;
   document.getElementById('stockBebExport').onclick=stockBebidasExportar;
@@ -11981,6 +12384,7 @@ const ACCOUNT_ROLES = {
       'propinasConsolidado','descuentos','pagos','libres','calculo',
       'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja',
       'evolucionGastos',   // Analítica de gastos: exclusiva de multiboxes.peru
+      'cotejos',           // Cotejo ventas vs inventario: exclusiva de multiboxes.peru
 
       // ── INVENTARIO ────────────────────────────────────────────────────────
       'produccion','insumos','inventarioConsolidado','alertaInsumos',
@@ -12026,7 +12430,7 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina','MovCocina'];
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina','MovCocina','MovBebidas'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -12467,6 +12871,11 @@ function gsSerializeInventario(){
         nroBotellasVacias: b.nroBotellasVacias!=null ? b.nroBotellasVacias : '',
         stockMinimo: b.stockMinimo!=null ? b.stockMinimo : '' }))),
     StockBebidas: gsRowsToMatrix(['id','bebidaId','fecha','stock'], S.stockBebidas),
+    // Movimientos de bebidas en tab PROPIO: nunca se mezclan con el conteo
+    // físico de StockBebidas. tipoMovimiento se guarda como Entrada | Salida.
+    MovBebidas: gsRowsToMatrix(['id','bebidaId','fecha','cantidad','tipoMovimiento'],
+      S.bebidasMovs.map(m=>({ id:m.id, bebidaId:m.bebidaId, fecha:m.fecha,
+        cantidad:m.cantidad, tipoMovimiento:bebMovTipoNorm(m.tipoMovimiento) }))),
     SalonProductos: gsRowsToMatrix(['id','nombre','unidades'], S.salonProductos.map(p=>({...p, unidades:p.unidades.join(',')}))),
     SalonInventario: gsRowsToMatrix(['id','productoId','fecha','unidad','cantidad'], S.salonInventario),
     // Cocina: catálogo y registros en tabs PROPIOS, sin mezclarse con otros.
@@ -12943,6 +13352,14 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         stockMinimo: (r.stockMinimo!==undefined&&r.stockMinimo!==null&&r.stockMinimo!=='') ? Number(r.stockMinimo) : null }));
       if(puedeAplicar('StockBebidas', S.stockBebidas))
       S.stockBebidas = (byName['StockBebidas']||[]).map(r=>({ id:String(r.id||uid()), bebidaId:String(r.bebidaId), fecha:normFechaGS(r.fecha), stock:Number(r.stock)||0 }));
+      /* Movimientos de bebidas: el id de la hoja es la clave de identidad, de
+         modo que recargar o volver a sincronizar NUNCA duplica una fila. */
+      if(puedeAplicar('MovBebidas', S.bebidasMovs))
+      S.bebidasMovs = (byName['MovBebidas']||[]).map(r=>({
+        id:String(r.id||uid()), bebidaId:String(r.bebidaId||''), fecha:normFechaGS(r.fecha),
+        cantidad:Number(r.cantidad)||0, tipoMovimiento:bebMovTipoNorm(r.tipoMovimiento||r.tipo)
+      })).filter(r=>r.bebidaId && /^\d{4}-\d{2}-\d{2}$/.test(r.fecha));
+      save(K.bebidasMovs, S.bebidasMovs);
       S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
         id:String(r.id||uid()), fecha:normFechaGS(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
         apBolsa:Number(r.apBolsa)||0,
@@ -13631,7 +14048,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja','evolucionGastos'] }
+    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja','evolucionGastos','cotejos'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -13659,7 +14076,8 @@ const NAV_MODULE_LABELS = {
   gananciaGrupo:['💰','Ganancia por Grupo'],
   evolucionVentas:['📉','Evolución de Ventas'],
   estadisticasDiaSemana:['🗓️','Estadísticas por Día'],
-  flujoCaja:['💵','Flujo de Caja'], evolucionGastos:['📉','Evolución de gastos']
+  flujoCaja:['💵','Flujo de Caja'], evolucionGastos:['📉','Evolución de gastos'],
+  cotejos:['🔎','Cotejos']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
