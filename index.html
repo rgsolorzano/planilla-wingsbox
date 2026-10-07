@@ -11659,15 +11659,17 @@ function consumoPeriodoBebida(bebidaId, fechas){
 /* ════════════════════════════════════════════════════════════════════════
    CATÁLOGO DE COTEJO — 21 bebidas, orden fijo
    ------------------------------------------------------------------------
-   Dos sistemas de nombres distintos conviven y aquí se unen explícitamente:
-     · `venta` → nombre tal cual aparece en la columna AJ de
-                 VENTAS_PRODUCTO_DETALLE (coincidencia EXACTA).
-     · `cat`   → nombre en el catálogo de inventario (S.bebidasCat), del que
-                 se obtiene el bebidaId real.
-   Para 17 bebidas ambos coinciden; las 4 restantes difieren solo en la
-   grafía del formato y se declaran aquí, en un único sitio visible, en
-   lugar de adivinarlas con coincidencias parciales.
-   El enlace final SIEMPRE es por bebidaId, nunca por nombre.            */
+     · `venta`     → nombre tal cual aparece en la columna AJ de
+                     VENTAS_PRODUCTO_DETALLE (coincidencia EXACTA).
+     · `catLegado` → nombre ANTIGUO que esa bebida tuvo en el catálogo de
+                     inventario, usado SOLO como respaldo.
+   El catálogo (Administración de Bebidas) ya usa los mismos nombres que las
+   ventas, así que la resolución normal es directa: `venta` → S.bebidasCat.
+   `catLegado` existe para un catálogo que todavía no se haya sincronizado
+   con esos cambios de nombre (otro dispositivo, una restauración antigua o
+   la carga inicial del seed): así la bebida se resuelve igualmente en lugar
+   de quedarse sin consumo. Nunca se usan coincidencias parciales, y el
+   enlace final SIEMPRE es por bebidaId, nunca por nombre.               */
 const COTEJO_BEBIDAS = [
   { venta:'CORONA' },
   { venta:'CUSQUEÑA DORADA 310 ML' },
@@ -11679,15 +11681,15 @@ const COTEJO_BEBIDAS = [
   { venta:'COCA COLA (1 L)' },
   { venta:'COCA COLA (1.5 L)' },
   { venta:'COCA COLA (297ML)' },
-  { venta:'COCA COLA (500ML)',      cat:'COCA COLA 500ML' },
+  { venta:'COCA COLA (500ML)',      catLegado:'COCA COLA 500ML' },
   { venta:'COCA COLA JUMBO (625ML)' },
   { venta:'COCA COLA ZERO (500ML)' },
-  { venta:'FANTA ROJA (500ML)',     cat:'FANTA ROJA' },
-  { venta:'FANTA NARANJA (500ML)',  cat:'FANTA NARANJA' },
+  { venta:'FANTA ROJA (500ML)',     catLegado:'FANTA ROJA' },
+  { venta:'FANTA NARANJA (500ML)',  catLegado:'FANTA NARANJA' },
   { venta:'INCA KOLA (1 L)' },
   { venta:'INCA KOLA (1.5 L)' },
   { venta:'INCA KOLA (297ML)' },
-  { venta:'INCA KOLA (500ML)',      cat:'INCA KOLA 500ML' },
+  { venta:'INCA KOLA (500ML)',      catLegado:'INCA KOLA 500ML' },
   { venta:'INCA KOLA GORDITA (625ML)' },
   { venta:'INCA KOLA ZERO (500ML)' }
 ];
@@ -11698,9 +11700,12 @@ const COTEJO_BEBIDAS = [
 function cotejoBebidasResueltas(){
   const porNombre = new Map(S.bebidasCat.map(b=>[String(b.nombre).trim().toUpperCase(), b]));
   return COTEJO_BEBIDAS.map(e=>{
-    const nomCat = (e.cat || e.venta).trim().toUpperCase();
-    const b = porNombre.get(nomCat) || null;
-    return { venta:e.venta, nombreCat:(e.cat||e.venta), bebidaId: b ? b.id : null };
+    // 1) El nombre de venta, que es como está hoy el catálogo. 2) Si no
+    //    aparece, el nombre antiguo, por si ese catálogo aún no se actualizó.
+    const b = porNombre.get(e.venta.trim().toUpperCase())
+           || (e.catLegado ? porNombre.get(e.catLegado.trim().toUpperCase()) : null)
+           || null;
+    return { venta:e.venta, nombreCat: b ? b.nombre : e.venta, bebidaId: b ? b.id : null };
   });
 }
 
@@ -11965,24 +11970,29 @@ function consBebidasRangoEfectivo(){
   if(fechas.length>CONS_BEB_MAX_DIAS) fechas=fechas.slice(-CONS_BEB_MAX_DIAS);
   return { desde, hasta, fechas };
 }
-RENDERERS.consolidadoStockBebidas = function(){
-  const el = document.getElementById('page-consolidadoStockBebidas');
+/* ── DATOS Y HTML DEL CONSOLIDADO ──────────────────────────────────────────
+   Extraídos del renderer SIN cambiar una sola regla de filtrado, orden ni
+   formato: son exactamente las mismas líneas. El motivo de separarlos es
+   poder repintar únicamente el bloque de resultados cuando el usuario
+   escribe en "Buscar bebida", en lugar de reconstruir la página entera
+   (que destruía el propio <input> en el que estaba escribiendo).         */
+function consBebidasDatos(){
   const { desde, hasta, fechas } = consBebidasRangoEfectivo();
   const categoriaFiltro = consBebidasFilter.categoria;
   const busqueda = (consBebidasFilter.busqueda||'').toLowerCase();
-  const bebidasBase = S.bebidasCat.filter(b=>
+  const base = S.bebidasCat.filter(b=>
     (!categoriaFiltro || b.categoria===categoriaFiltro) &&
     (!busqueda || b.nombre.toLowerCase().includes(busqueda))
   ).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
   // Filtro "solo alertas": bebidas cuyo stock < mínimo en alguna fecha del rango
-  const bebidasFiltradas = consBebidasSoloAlertas
-    ? bebidasBase.filter(b=>{
+  const bebidas = consBebidasSoloAlertas
+    ? base.filter(b=>{
         const minimo = b.stockMinimo!=null ? Number(b.stockMinimo) : null;
         if(minimo===null) return false; // sin mínimo configurado → no aplica
         return fechas.some(f=>{ const r=getStockBebida(b.id,f); return r!=null && Number(r.stock)<minimo; });
       })
-    : bebidasBase;
-  const hayDatos = bebidasFiltradas.some(b=>fechas.some(f=>getStockBebida(b.id,f)));
+    : base;
+  const hayDatos = bebidas.some(b=>fechas.some(f=>getStockBebida(b.id,f)));
 
   // Encabezados: 2 columnas por fecha (Inventario + Botellas vacías)
   const theadFechas = fechas.map(f=>`
@@ -11998,7 +12008,7 @@ RENDERERS.consolidadoStockBebidas = function(){
   ).join('');
 
   let catActual='';
-  const filas=bebidasFiltradas.map(b=>{
+  const filas=bebidas.map(b=>{
     const tieneVacias = b.nroBotellasVacias!=null;
     const nroVacias   = tieneVacias ? Number(b.nroBotellasVacias) : 0;
     const minimo      = b.stockMinimo!=null ? Number(b.stockMinimo) : null;
@@ -12017,6 +12027,28 @@ RENDERERS.consolidadoStockBebidas = function(){
       <td class="mx-fix">${b.nombre}${minimo!==null?`<span class="badge b-free" style="float:right;font-size:9px">mín ${minimo}</span>`:''}${tieneVacias?`<span title="Botellas retornables: ${nroVacias}" style="float:right;font-size:9px;color:#7c3aed;margin-right:4px">🍾${nroVacias}</span>`:''}
       </td>${celdas}</tr>`;
   }).join('');
+  return { desde, hasta, fechas, bebidas, hayDatos, theadFechas, theadSub, filas };
+}
+// HTML del bloque de resultados (título + tabla). Idéntico al que producía
+// el renderer; se aísla para poder repintarlo solo a él.
+function consBebTablaHTML(){
+  const d = consBebidasDatos();
+  return `<h2>Historial (${d.fechas.length} día${d.fechas.length===1?'':'s'}, ${d.bebidas.length} bebida${d.bebidas.length===1?'':'s'})</h2>`+
+    ((!d.hayDatos && d.bebidas.length) ? `<div class="empty">No hay registros de stock en el rango seleccionado.</div>` :
+     !d.bebidas.length ? `<div class="empty">No hay bebidas que coincidan con los filtros.</div>` : `
+    <div class="mx-outer"><table class="mx-table">
+      <thead>
+        <tr><th class="mx-fix" rowspan="2">Bebida</th>${d.theadFechas}</tr>
+        <tr>${d.theadSub}</tr>
+      </thead>
+      <tbody>${d.filas}</tbody>
+    </table></div>`);
+}
+
+RENDERERS.consolidadoStockBebidas = function(){
+  const el = document.getElementById('page-consolidadoStockBebidas');
+  const { desde, hasta, fechas, bebidas: bebidasFiltradas } = consBebidasDatos();
+
 
   el.innerHTML=`
     <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario. <span style="color:#dc2626">Celdas rojas</span>: inventario menor al stock mínimo configurado. Columna <b style="color:#7c3aed">Vacías</b>: botellas retornables esperadas menos inventario.</p></div></div>
@@ -12035,26 +12067,44 @@ RENDERERS.consolidadoStockBebidas = function(){
           <span style="font-size:13px;font-weight:500">Mostrar solo alertas</span>
         </label>
       </div>
-      <h2>Historial (${fechas.length} día${fechas.length===1?'':'s'}, ${bebidasFiltradas.length} bebida${bebidasFiltradas.length===1?'':'s'})</h2>
-      ${(!hayDatos&&bebidasFiltradas.length) ? `<div class="empty">No hay registros de stock en el rango seleccionado.</div>` :
-        !bebidasFiltradas.length ? `<div class="empty">No hay bebidas que coincidan con los filtros.</div>` : `
-      <div class="mx-outer"><table class="mx-table">
-        <thead>
-          <tr><th class="mx-fix" rowspan="2">Bebida</th>${theadFechas}</tr>
-          <tr>${theadSub}</tr>
-        </thead>
-        <tbody>${filas}</tbody>
-      </table></div>`}
+      <!-- Solo este bloque se repinta al escribir en "Buscar bebida": así la
+           barra de filtros (y su <input>) nunca se reconstruye. -->
+      <div id="consBebResultado">${consBebTablaHTML()}</div>
       <div class="actions" style="margin-top:14px"><button class="btn btn-green" id="consBebExport">⬇ Exportar Excel</button></div>
     </div>`;
 
   const applyF=()=>{
     const d=document.getElementById('consBebDesde').value, h=document.getElementById('consBebHasta').value;
     if(d&&h&&d>h){ toast('Rango de fechas inválido: "Desde" no puede ser mayor que "Hasta".','error'); return; }
-    consBebidasFilter={ desde:d, hasta:h, categoria:document.getElementById('consBebCat').value, busqueda:document.getElementById('consBebBusqueda').value };
+    // La búsqueda se lee del input vivo: así un cambio de fecha o categoría
+    // conserva lo que el usuario ya había escrito.
+    const inpB=document.getElementById('consBebBusqueda');
+    consBebidasFilter={ desde:d, hasta:h, categoria:document.getElementById('consBebCat').value,
+      busqueda: inpB ? inpB.value : (consBebidasFilter.busqueda||'') };
     RENDERERS.consolidadoStockBebidas();
   };
-  ['consBebDesde','consBebHasta','consBebCat','consBebBusqueda'].forEach(id=>{ const e=document.getElementById(id); if(e) e.onchange=applyF; if(e&&e.tagName==='INPUT') e.oninput=applyF; });
+  /* Fecha y categoría sí repintan la página entera: son controles discretos,
+     el usuario no está tecleando y no hay nada que interrumpir. */
+  ['consBebDesde','consBebHasta','consBebCat'].forEach(id=>{ const e=document.getElementById(id); if(e) e.onchange=applyF; });
+
+  /* ── BUSCAR BEBIDA ────────────────────────────────────────────────────────
+     CAUSA RAÍZ del corte tras la primera letra: este input tenía
+     oninput = applyF, y applyF llamaba al renderer completo, que hace
+     `el.innerHTML = …`. Eso DESTRUYE el nodo <input> que tenía el foco y lo
+     sustituye por uno nuevo; el foco se va al <body> y la siguiente tecla ya
+     no llega al campo. No era el value ni los listeners: era el propio
+     elemento siendo reemplazado en cada pulsación.
+     Solución: el filtrado sigue siendo en tiempo real, carácter por carácter,
+     pero solo se repinta el bloque de RESULTADOS. La barra de filtros —y con
+     ella este <input>— no se toca nunca, así que conserva foco, valor,
+     selección y posición del cursor sin necesidad de restaurarlos. */
+  const inpBusca = document.getElementById('consBebBusqueda');
+  if(inpBusca) inpBusca.oninput = ()=>{
+    consBebidasFilter.busqueda = inpBusca.value;      // mismo filtro de siempre
+    const cont = document.getElementById('consBebResultado');
+    if(cont) cont.innerHTML = consBebTablaHTML();     // solo la tabla
+    else RENDERERS.consolidadoStockBebidas();         // respaldo defensivo
+  };
   document.getElementById('consBebSoloAlertas').onchange=()=>{ consBebidasSoloAlertas=document.getElementById('consBebSoloAlertas').checked; RENDERERS.consolidadoStockBebidas(); };
   document.getElementById('consBebClear').onclick=()=>{
     const hoy=new Date(), hace2=new Date(hoy.getTime()-2*86400000), fmt=d=>d.toISOString().slice(0,10);
@@ -12063,7 +12113,10 @@ RENDERERS.consolidadoStockBebidas = function(){
   };
   document.getElementById('consBebExport').onclick=()=>{
     const datos=[];
-    bebidasFiltradas.forEach(b=>{ fechas.forEach(f=>{ const r=getStockBebida(b.id,f); datos.push({ fecha:f, categoria:b.categoria, bebida:b.nombre, stock:r!=null?r.stock:'' }); }); });
+    // Se recalcula al pulsar: si la búsqueda cambió sin repintar la página,
+    // el Excel refleja exactamente lo que se está viendo en la tabla.
+    const dx = consBebidasDatos();
+    dx.bebidas.forEach(b=>{ dx.fechas.forEach(f=>{ const r=getStockBebida(b.id,f); datos.push({ fecha:f, categoria:b.categoria, bebida:b.nombre, stock:r!=null?r.stock:'' }); }); });
     exportarExcelSimple('StockBebidas',datos,`consolidado_bebidas_${desde}_a_${hasta}_${excelTimestamp()}.xlsx`);
     toast('Excel de consolidado de bebidas descargado','success');
   };
