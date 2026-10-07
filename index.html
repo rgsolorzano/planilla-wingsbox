@@ -4998,11 +4998,16 @@ function cotPeriodos(desde, hasta, agrup){
 /* Fila de cotejo de una bebida en un período:
      ventas  = Σ unidades vendidas (AQ) de los días del período
      consumo = Σ consumos diarios válidos (función central), null si ninguno
-     dif     = consumo − ventas (null si el consumo no es calculable)      */
+     dif     = VENTAS − CONSUMO (null si el consumo no es calculable)
+   Signo: positivo = se vendió más de lo que el inventario dice que salió;
+   negativo = salió más inventario del que se vendió.
+   Este es el ÚNICO punto del módulo donde se calcula la diferencia: la
+   tabla solo pinta `dif`, así que las tres agrupaciones (día, semana y mes)
+   la heredan sin ninguna fórmula paralela.                                */
 function cotCalcular(beb, periodo){
   const ventas = periodo.fechas.reduce((a,f)=>a+cotVentasDia(beb.venta,f), 0);
   const consumo = beb.bebidaId ? consumoPeriodoBebida(beb.bebidaId, periodo.fechas) : null;
-  return { ventas, consumo, dif: consumo===null ? null : consumo-ventas };
+  return { ventas, consumo, dif: consumo===null ? null : ventas-consumo };
 }
 
 let cotAutoCargaIntentada = false;
