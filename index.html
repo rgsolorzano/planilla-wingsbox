@@ -1213,7 +1213,25 @@ function goto(page){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.getElementById('page-'+page).classList.add('active');
   document.getElementById('nav').classList.remove('open');
-  if(RENDERERS[page]) RENDERERS[page]();
+  /* Red de seguridad del enrutador. No sustituye a corregir el fallo: la
+     excepción se sigue propagando a la consola con su stack completo. Lo que
+     evita es el síntoma más dañino —la pantalla en blanco—, que esconde el
+     error y deja al usuario sin saber qué pasó ni cómo volver. */
+  if(RENDERERS[page]){
+    try{
+      RENDERERS[page]();
+    }catch(err){
+      console.error('[Render] Falló el módulo "'+page+'":', err);
+      const cont = document.getElementById('page-'+page);
+      if(cont) cont.innerHTML =
+        '<div class="card" style="border-color:#f6c4ce;background:#fdeef1">'+
+        '<b>⚠️ No se pudo mostrar este módulo</b>'+
+        '<p style="font-size:13px;color:var(--c-muted);margin:8px 0 12px">'+
+        String((err&&err.message)||err)+
+        '<br>El detalle completo está en la consola del navegador (F12).</p>'+
+        '<button class="btn btn-primary btn-sm" onclick="goto(\''+page+'\')">Reintentar</button></div>';
+    }
+  }
 }
 document.getElementById('navToggle').addEventListener('click', ()=> document.getElementById('nav').classList.toggle('open'));
 
@@ -11980,10 +11998,15 @@ function consBebidasDatos(){
   const { desde, hasta, fechas } = consBebidasRangoEfectivo();
   const categoriaFiltro = consBebidasFilter.categoria;
   const busqueda = (consBebidasFilter.busqueda||'').toLowerCase();
-  const base = S.bebidasCat.filter(b=>
-    (!categoriaFiltro || b.categoria===categoriaFiltro) &&
-    (!busqueda || b.nombre.toLowerCase().includes(busqueda))
-  ).sort((a,b_)=>a.categoria.localeCompare(b_.categoria)||a.nombre.localeCompare(b_.nombre));
+  /* `nombre` y `categoria` pueden faltar en un registro importado o a medio
+     migrar. Se normalizan a cadena para que una bebida incompleta aparezca al
+     final de la lista en lugar de reventar el filtro y vaciar la pantalla:
+     un solo registro corrupto no debe tumbar el módulo entero. */
+  const txt = v => String(v ?? '');
+  const base = S.bebidasCat.filter(b=> b && (
+    (!categoriaFiltro || txt(b.categoria)===categoriaFiltro) &&
+    (!busqueda || txt(b.nombre).toLowerCase().includes(busqueda))
+  )).sort((a,b_)=> txt(a.categoria).localeCompare(txt(b_.categoria)) || txt(a.nombre).localeCompare(txt(b_.nombre)));
   // Filtro "solo alertas": bebidas cuyo stock < mínimo en alguna fecha del rango
   const bebidas = consBebidasSoloAlertas
     ? base.filter(b=>{
@@ -12027,7 +12050,7 @@ function consBebidasDatos(){
       <td class="mx-fix">${b.nombre}${minimo!==null?`<span class="badge b-free" style="float:right;font-size:9px">mín ${minimo}</span>`:''}${tieneVacias?`<span title="Botellas retornables: ${nroVacias}" style="float:right;font-size:9px;color:#7c3aed;margin-right:4px">🍾${nroVacias}</span>`:''}
       </td>${celdas}</tr>`;
   }).join('');
-  return { desde, hasta, fechas, bebidas, hayDatos, theadFechas, theadSub, filas };
+  return { desde, hasta, fechas, categoriaFiltro, busqueda, bebidas, hayDatos, theadFechas, theadSub, filas };
 }
 // HTML del bloque de resultados (título + tabla). Idéntico al que producía
 // el renderer; se aísla para poder repintarlo solo a él.
@@ -12047,8 +12070,10 @@ function consBebTablaHTML(){
 
 RENDERERS.consolidadoStockBebidas = function(){
   const el = document.getElementById('page-consolidadoStockBebidas');
-  const { desde, hasta, fechas, bebidas: bebidasFiltradas } = consBebidasDatos();
-
+  /* Todo lo que la plantilla necesita sale de consBebidasDatos(): al extraer
+     el cálculo a esa función, los `const` locales que antes alimentaban el
+     <select> de Categoría dejaron de existir aquí. Deben destructurarse. */
+  const { desde, hasta, fechas, categoriaFiltro, bebidas: bebidasFiltradas } = consBebidasDatos();
 
   el.innerHTML=`
     <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario. <span style="color:#dc2626">Celdas rojas</span>: inventario menor al stock mínimo configurado. Columna <b style="color:#7c3aed">Vacías</b>: botellas retornables esperadas menos inventario.</p></div></div>
