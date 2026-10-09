@@ -13780,42 +13780,67 @@ function sesManejarExpiracion(motivo){
    recargar. Un host que devolviera una firma distinta en cada petición
    dejaría la pestaña recargándose sin fin; en ese caso se informa una sola
    vez y la decisión queda en manos del usuario. */
+/* ══ CONTROL DE VERSIÓN ═══════════════════════════════════════════════════
+   Estados que el mecanismo distingue, cada uno con su tratamiento:
+     A. No hay versión nueva            → no se hace nada.
+     B. No se pudo comprobar            → NO es evidencia de nada: se reintenta
+                                          más tarde, sin avisos.
+     C. Versión nueva CONFIRMADA        → bloquear, informar y recargar.
+     D. La actualización ya se completó → se reconoce y no se vuelve a avisar.
+
+   Señales, por orden de autoridad:
+     1) APP_VERSION declarada en el documento servido. Solo cambia cuando se
+        publica: es la única prueba CONCLUYENTE de un despliegue.
+     2) Firma del documento (ETag / Last-Modified / hash del cuerpo). Cambia
+        sola en cada despliegue, pero también puede cambiar por motivos
+        ajenos a un despliegue (compresión, CDN, cabeceras por petición), así
+        que NUNCA basta por sí sola: exige corroboración.                   */
 const SES_ANTIBUCLE_MS = 90000;
+const VERSION_INTERVALO_MS   = 2*60*1000;  // entre comprobaciones de rutina
+const VERSION_MIN_ENTRE_CHK  = 20000;      // suelo incluso para las forzadas
+const VERSION_CONFIRMACIONES = 2;          // lecturas seguidas que debe repetir
+                                           // una firma nueva para darse por buena
+
+let sesVersionBase    = null;   // {version, etag, lastMod, hash} capturada al arrancar
+let sesVersionEnCurso = false;
+let sesUltimaVersionChk = 0;
+let sesFirmaSospechosa  = null; // firma distinta aún sin corroborar
+let sesFirmaRepeticiones = 0;   // veces seguidas que se ha leído esa misma firma
+
+/* Estado de una actualización en curso, persistido en sessionStorage para
+   sobrevivir a la recarga. {desde, cuando, confirmada}
+   `desde` = APP_VERSION que estaba corriendo cuando se decidió recargar: es
+   lo que permite comprobar DESPUÉS si la recarga surtió efecto de verdad, en
+   lugar de fiarse de una bandera. */
+function sesLeerActualizacion(){
+  try{ return JSON.parse(sessionStorage.getItem(SES_KEYS.recarga)||'null'); }catch(e){ return null; }
+}
+function sesGuardarActualizacion(o){
+  try{ o ? sessionStorage.setItem(SES_KEYS.recarga, JSON.stringify(o))
+         : sessionStorage.removeItem(SES_KEYS.recarga); }catch(e){}
+}
+
+/* Punto ÚNICO de reacción ante una versión nueva CONFIRMADA.
+   Solo debe llamarse con evidencia concluyente; nunca ante una sospecha. */
 function sesManejarVersionAntigua(motivo){
-  let ultima = 0;
-  try{ ultima = Number(sessionStorage.getItem(SES_KEYS.recarga)||0); }catch(e){}
-  if(ultima && Date.now()-ultima < SES_ANTIBUCLE_MS){
-    if(sesBloqueada) return;
+  if(sesBloqueada) return;                       // un solo modal, siempre
+  const prev = sesLeerActualizacion();
+  /* ¿Ya se recargó por ESTA misma versión hace muy poco y seguimos en ella?
+     Entonces la recarga no surtió efecto (caché agresiva, proxy, etc.) y sí
+     corresponde pedir el refresco manual. Es la ÚNICA vía a ese mensaje. */
+  if(prev && prev.desde === APP_VERSION && Date.now()-prev.cuando < SES_ANTIBUCLE_MS){
     sesBloqueada = true;
-    console.warn('[Versión] Recarga omitida para evitar un bucle ('+motivo+').');
+    console.warn('[Versión] La recarga no cargó la versión nueva ('+motivo+'). Se pide refresco manual.');
     sesMostrarBloqueo('Hay una nueva versión disponible',
       'No se pudo confirmar la actualización automática. Actualiza la página manualmente (Ctrl+F5 o Cmd+Shift+R).',
       'Actualización manual requerida');
     return;
   }
-  try{ sessionStorage.setItem(SES_KEYS.recarga, String(Date.now())); }catch(e){}
+  sesGuardarActualizacion({ desde: APP_VERSION, cuando: Date.now() });
   sesBloquearYRecargar('Hay una nueva versión disponible',
     'La página se actualizará para cargar la versión más reciente de la aplicación.',
     motivo);
 }
-
-/* ── Versión de la aplicación ──────────────────────────────────────────────
-   Detectar un despliegue exige un identificador que cambie SIEMPRE que se
-   publica. APP_VERSION es manual y puede quedarse sin actualizar (fue
-   exactamente la causa de que una pestaña abierta no detectara la versión
-   nueva: V1 y V2 declaraban la misma cadena). Por eso se combina con la
-   FIRMA del documento servido, que cambia sola en cada despliegue:
-     1) ETag o Last-Modified de la respuesta (lo habitual en hosting estático);
-     2) si el host no los expone, un hash del cuerpo del documento.
-   Base: se captura al arrancar con un GET sin caché. Ese mismo GET detecta
-   además el caso inverso — que la pestaña se haya cargado desde la caché del
-   navegador cuando el servidor ya servía otra versión.
-   Comprobaciones posteriores: HEAD (muy barato); solo se recurre al GET si
-   el host no devuelve validadores.                                          */
-let sesVersionBase   = null;    // {version, etag, lastMod, hash}
-let sesVersionEnCurso = false;
-let sesUltimaVersionChk = 0;    // 0 = la primera comprobación puede ser inmediata
-const VERSION_INTERVALO_MS = 2*60*1000;
 
 function sesUrlDocumento(){ return window.location.pathname + '?v=' + Date.now(); }
 // Hash rápido (FNV-1a) del documento: respaldo cuando no hay ETag/Last-Modified.
@@ -13824,62 +13849,115 @@ function sesHashTexto(txt){
   for(let i=0;i<txt.length;i++){ h ^= txt.charCodeAt(i); h = Math.imul(h, 0x01000193); }
   return (h>>>0).toString(16);
 }
-// Lee del servidor la firma del documento desplegado (null si no hay red).
-async function sesLeerFirmaServidor(completo){
-  if(!completo){
-    try{
-      const r = await fetch(sesUrlDocumento(), {method:'HEAD', cache:'no-store'});
-      if(r.ok){
-        const etag=r.headers.get('ETag'), lastMod=r.headers.get('Last-Modified');
-        if(etag || lastMod) return {version:null, etag, lastMod, hash:null};
-      }
-    }catch(e){}                                  // host sin HEAD: se cae al GET
-  }
+/* Lee la firma del documento desplegado. SIEMPRE con GET, nunca con HEAD.
+   Motivo (causa raíz del falso positivo): la base se capturaba con GET y las
+   comprobaciones posteriores con HEAD, y un mismo servidor devuelve a menudo
+   validadores distintos para cada método —el ETag suele depender de la
+   codificación negociada, que en HEAD no se aplica—. Se comparaban entonces
+   dos firmas que nunca iban a coincidir, y cada comprobación "detectaba" un
+   despliegue inexistente. Además, solo el GET trae el cuerpo, que es donde
+   está APP_VERSION, la única señal concluyente.
+   Devuelve null si no se pudo leer: eso es "no se sabe", nunca "cambió". */
+async function sesLeerFirmaServidor(){
   try{
     const r = await fetch(sesUrlDocumento(), {cache:'no-store'});
     if(!r.ok) return null;
     const txt = await r.text();
+    if(!txt || txt.length < 200) return null;     // respuesta vacía o truncada
     const m = txt.match(/const APP_VERSION = '([^']+)'/);
-    return {version: m?m[1]:null, etag:r.headers.get('ETag'),
+    if(!m) return null;                           // no es el documento esperado
+    return {version:m[1], etag:r.headers.get('ETag'),
             lastMod:r.headers.get('Last-Modified'), hash:sesHashTexto(txt)};
-  }catch(e){ return null; }                      // sin red: nunca se fuerza recarga
+  }catch(e){ return null; }                       // sin red: no se fuerza nada
 }
-/* Compara la firma recién leída con la base. Devuelve true SOLO ante una
-   señal inequívoca de cambio; ante cualquier duda, false (sin falsos
-   positivos y sin recargas en cadena). */
-function sesFirmaCambiada(act){
-  if(!act || !sesVersionBase) return false;
-  if(act.version && act.version !== APP_VERSION) return true;
-  if(sesVersionBase.etag    && act.etag)    return act.etag    !== sesVersionBase.etag;
-  if(sesVersionBase.lastMod && act.lastMod) return act.lastMod !== sesVersionBase.lastMod;
-  if(sesVersionBase.hash    && act.hash)    return act.hash    !== sesVersionBase.hash;
-  return false;
+// Firma comparable (sin la versión): identifica el documento servido.
+function sesFirmaClave(f){
+  return f ? [f.etag||'', f.lastMod||'', f.hash||''].join('|') : '';
 }
-/* Punto ÚNICO de comprobación de versión. Lo invocan el temporizador, la
+
+/* Comprobación de versión. Punto ÚNICO: lo invocan el temporizador, la
    reactivación de la pestaña, la reanudación tras suspensión, la interacción
-   del usuario y el inicio de sesión. forzar=true salta el antirrebote.
-   La versión NO depende de la sesión: se comprueba también sin login. */
+   del usuario y el inicio de sesión.
+   `forzar` salta el antirrebote largo, pero NUNCA el suelo de
+   VERSION_MIN_ENTRE_CHK: así, alternar de pestaña diez veces seguidas no
+   dispara diez peticiones ni diez avisos.
+   La versión no depende de la sesión: se comprueba también sin login. */
 async function sesComprobarVersion(motivo, forzar){
   if(sesBloqueada || sesVersionEnCurso) return;
-  if(!forzar && Date.now()-sesUltimaVersionChk < VERSION_INTERVALO_MS) return;
-  sesUltimaVersionChk = Date.now();     // antes del await: evita peticiones en ráfaga
+  const desde = Date.now() - sesUltimaVersionChk;
+  if(desde < VERSION_MIN_ENTRE_CHK) return;
+  if(!forzar && desde < VERSION_INTERVALO_MS) return;
+  sesUltimaVersionChk = Date.now();   // antes del await: evita ráfagas
   sesVersionEnCurso = true;
   try{
-    const primera = !sesVersionBase;
-    const act = await sesLeerFirmaServidor(primera);
-    if(!act) return;                    // sin red o error: no se actúa
-    if(primera){
-      sesVersionBase = act;             // queda fijada la referencia de esta pestaña
-      // La pestaña pudo cargarse desde caché con el servidor ya en otra versión.
-      if(act.version && act.version !== APP_VERSION){
+    const act = await sesLeerFirmaServidor();
+    if(!act){                         // CASO B: no se pudo comprobar
+      console.warn('[Versión] No se pudo comprobar la versión ('+motivo+'). Se reintentará; no se asume nada.');
+      return;
+    }
+    const pend = sesLeerActualizacion();
+
+    if(!sesVersionBase){
+      /* Primera lectura de esta pestaña: fija la referencia y resuelve el
+         estado de cualquier actualización que viniera pendiente. */
+      sesVersionBase = act;
+      if(pend){
+        if(pend.desde !== APP_VERSION){
+          // CASO D: la recarga sí trajo una versión distinta. Completada.
+          console.log('[Versión] Actualización completada: '+pend.desde+' → '+APP_VERSION+'.');
+          sesGuardarActualizacion(null);
+        }else if(act.version === APP_VERSION){
+          /* Se recargó, seguimos en la misma versión y el servidor dice que
+             esa ES la versión vigente: la detección anterior fue un falso
+             positivo. Se descarta el pendiente en lugar de insistir. */
+          console.warn('[Versión] La recarga anterior fue un falso positivo: el servidor sigue sirviendo '+APP_VERSION+'. Se descarta el aviso.');
+          sesGuardarActualizacion(null);
+        }
+        // Si pend.desde === APP_VERSION y el servidor declara OTRA versión,
+        // el pendiente sigue vivo y lo resuelve la comprobación de abajo.
+      }
+      if(act.version !== APP_VERSION){
+        // La pestaña corre código antiguo (cargado desde caché): CASO C.
         sesManejarVersionAntigua('la pestaña se cargó desde caché');
       }
       return;
     }
-    if(sesFirmaCambiada(act)) sesManejarVersionAntigua(motivo||'nueva versión desplegada');
+
+    // ── Señal 1 (CONCLUYENTE): la versión declarada cambió ──
+    if(act.version !== APP_VERSION){
+      sesFirmaSospechosa = null; sesFirmaRepeticiones = 0;
+      sesManejarVersionAntigua(motivo||'nueva versión desplegada ('+act.version+')');
+      return;
+    }
+
+    /* ── Señal 2 (INDICIO): misma versión declarada, pero la firma difiere ──
+       Puede ser un despliegue cuyo APP_VERSION no se incrementó, o ruido del
+       servidor. Se exige que la MISMA firma nueva se repita en lecturas
+       consecutivas antes de actuar. Una lectura aislada no avisa jamás. */
+    const claveBase = sesFirmaClave(sesVersionBase), claveAct = sesFirmaClave(act);
+    if(claveBase && claveAct && claveBase !== claveAct){
+      if(sesFirmaSospechosa === claveAct){
+        sesFirmaRepeticiones++;
+      }else{
+        sesFirmaSospechosa = claveAct; sesFirmaRepeticiones = 1;
+      }
+      if(sesFirmaRepeticiones >= VERSION_CONFIRMACIONES){
+        console.warn('[Versión] Firma del documento distinta y estable en '+
+          sesFirmaRepeticiones+' lecturas, con APP_VERSION sin cambiar ('+APP_VERSION+
+          '). Se trata como despliegue sin incrementar la versión.');
+        sesFirmaSospechosa = null; sesFirmaRepeticiones = 0;
+        sesManejarVersionAntigua(motivo||'firma del documento modificada');
+      }else{
+        console.log('[Versión] Firma distinta sin confirmar ('+sesFirmaRepeticiones+
+          '/'+VERSION_CONFIRMACIONES+'). No se avisa todavía.');
+      }
+      return;
+    }
+    // CASO A: todo coincide. Se limpia cualquier sospecha previa.
+    if(sesFirmaRepeticiones){ sesFirmaSospechosa = null; sesFirmaRepeticiones = 0; }
+    if(pend && pend.desde === APP_VERSION && act.version === APP_VERSION) sesGuardarActualizacion(null);
   } finally { sesVersionEnCurso = false; }
 }
-
 
 // ── Reactivación tras suspensión / cambio de pestaña ──────────────────────
 /* PRIORIDAD SESIÓN → VERSIÓN. Si ambas condiciones se dan a la vez manda la
