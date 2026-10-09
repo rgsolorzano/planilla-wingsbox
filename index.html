@@ -10106,7 +10106,7 @@ RENDERERS.insumos = function(){
     <div class="card">
       <h2>Lista de insumos (${S.insumos.length})</h2>
       <p class="hint" style="margin-top:0">
-        <b>Alerta por consumo</b>: se activa cuando el consumo acumulado de los últimos 3 días es menor al valor configurado en <b>Consumo</b>.
+        <b>Alerta por consumo</b>: se activa cuando las <b>porciones consumidas</b> de los 3 días calendario anteriores (hoy no se incluye) suman menos que el valor configurado en <b>Consumo (porciones)</b>. Ese umbral se expresa en PORCIONES, no en la unidad del insumo: no se convierte a ml ni a gr. Las porciones son las mismas que muestra <b>Consolidado de Inventario</b>.
         <b>Alerta por mínimo</b>: se activa cuando el último inventario registrado es menor al valor configurado en <b>Mínimo</b>.
         Ambas alertas son independientes y pueden activarse simultáneamente para un mismo insumo.
         <b>Inventario</b>: define qué campos de stock son editables en <b>Inv. Producción → Registrar stock</b>: <b>Stock inicial</b>, <b>Stock cierre</b> o <b>Ambos</b>. No condiciona el registro de producción: cualquier insumo puede registrar producción.
@@ -10119,7 +10119,7 @@ RENDERERS.insumos = function(){
         <thead><tr><th style="width:74px">Orden</th><th>Insumo</th><th>Unidad</th>
           <th class="ins-col" title="Define qué campos de stock son editables">Inventario</th>
           <th class="ins-col" title="Define en qué secciones de Inv. Producción aparece el insumo">Tipo de<br>registro</th>
-          <th class="num ins-col" title="Consumo mínimo esperado en los últimos 3 días">Consumo</th>
+          <th class="num ins-col" title="Umbral en PORCIONES: mínimo esperado en los 3 días calendario anteriores (hoy excluido)">Consumo<br>(porciones)</th>
           <th class="num ins-col" title="Stock mínimo permitido">Mínimo</th>
           <th class="num ins-col-chk" title="Evalúa el consumo acumulado de 3 días contra el valor de Consumo">Alerta por<br>consumo</th>
           <th class="num ins-col-chk" title="Evalúa el último inventario registrado contra el valor de Mínimo">Alerta por<br>mínimo</th>
@@ -10546,6 +10546,10 @@ function fechasConDatosInsumo(insumoId){
    por lo que las 3 mediciones no son necesariamente días consecutivos.
    Si hay menos de 3, se usan las disponibles; si no hay ninguna → null y no
    se evalúa la alerta (falta de información, no consumo cero).            */
+/* NOTA: desde el cambio a porciones, la alerta de Consumo bajo ya NO usa
+   esta función (ver porcionesUltimos3Dias). Se conserva porque calcula el
+   consumo por diferencias de inventario, útil para diagnóstico desde la
+   consola, y porque eliminarla no aporta nada y sí arriesga romper algo. */
 function consumoUltimos3DiasV2(insumoId){
   const fechas = fechasConDatosInsumo(insumoId);   // de la más reciente hacia atrás
   let suma=0, mediciones=0, ultima=null;
@@ -10577,15 +10581,53 @@ function incrementoAnormalV2(insumoId, fecha){
   return null;
 }
 
+/* ── PORCIONES DE LOS 3 DÍAS CALENDARIO ANTERIORES ────────────────────────
+   Fuente ÚNICA: las mismas porciones que pinta Consolidado de Inventario
+   (vpdPorciones, vía porcionesDe/porcionesTabla). No hay cálculo paralelo:
+   este helper solo elige las fechas y suma.
+   Período: D-3, D-2 y D-1, donde D es HOY en America/Lima. El día actual
+   se EXCLUYE siempre, aunque ya tenga ventas registradas. Las fechas se
+   derivan de fechaEnLima() con aritmética de calendario, nunca de un Date
+   local, así que no hay desplazamiento por UTC ni fechas fijas en el código.
+   Devuelve null —y entonces NO se evalúa la alerta— cuando la información
+   no está disponible: el insumo no tiene seguimiento de porciones, o las
+   porciones del período aún no se han cargado o fallaron al cargarse. Un
+   día sin ventas sí cuenta como 0, igual que en el Consolidado.          */
+function alertaPorcionesRango3d(){
+  const hoy = fechaEnLima();
+  return { desde: fechaMasDias(hoy,-3), hasta: fechaMasDias(hoy,-1), hoy };
+}
+// ¿Están cargadas en memoria las porciones que cubren esos 3 días?
+function alertaPorcionesDisponibles(){
+  if(vpdEstado.error || !vpdEstado.rango) return false;
+  const [d,h] = String(vpdEstado.rango).split('|');
+  const R = alertaPorcionesRango3d();
+  return !!(d && h && d <= R.desde && h >= R.hasta);
+}
+function porcionesUltimos3Dias(insumo){
+  if(!insumo || !VPD_SET.has(vpdNormalizar(insumo.nombre))) return null;  // sin seguimiento
+  if(!alertaPorcionesDisponibles()) return null;                          // dato no disponible
+  const R = alertaPorcionesRango3d();
+  const dias = rangoFechas(R.desde, R.hasta);
+  // porcionesTabla aplica el MISMO criterio del Consolidado: un día sin
+  // registro de ventas vale 0 y entra en la suma.
+  const total = dias.reduce((a,f)=>a+porcionesTabla(insumo.nombre, f), 0);
+  return { total, dias:dias.length, desde:R.desde, hasta:R.hasta };
+}
+
 function evaluarAlertasInsumo(insumo){
   const out = { consumo:null, minimo:null, anomalia:null };
 
-  // 6.1 CONSUMO BAJO: acumulado de los últimos 3 días con dato computable.
+  /* 6.1 CONSUMO BAJO: PORCIONES consumidas de los 3 días calendario
+     anteriores (hoy excluido) frente al umbral configurado en Insumos, que
+     ahora se interpreta directamente como un número de PORCIONES: no se
+     convierte a ml, gr ni ninguna unidad física. */
   if(insumoAlertaConsumo(insumo)){
-    const c = consumoUltimos3DiasV2(insumo.id);
+    const c = porcionesUltimos3Dias(insumo);
     if(c){
       const umbral = insumoUmbralConsumo(insumo);
-      out.consumo = { activa: c.consumo < umbral, valor: c.consumo, umbral, fecha: c.ultimaFecha };
+      out.consumo = { activa: c.total < umbral, valor: c.total, umbral,
+                      fecha: c.hasta, desde: c.desde, porciones:true };
     }
   }
   // 6.2 STOCK MÍNIMO: se activa si el stock cierre O el stock inicial del día
@@ -11277,6 +11319,18 @@ function alasCuadreBind(){
 RENDERERS.alertaInsumos = function(){
   const el = document.getElementById('page-alertaInsumos');
   if(!el) return;
+  /* La alerta de consumo necesita las PORCIONES de los 3 días anteriores.
+     Se reutiliza el mismo cargador del Consolidado (vpdCargarPorciones) en
+     lugar de añadir una sincronización propia; si el rango ya cargado las
+     cubre, no se vuelve a pedir nada. Al terminar se repinta para que las
+     alertas se recalculen con los datos recién llegados. */
+  if(!alertaPorcionesDisponibles() && !vpdEstado.cargando && isAuthorized()){
+    const R = alertaPorcionesRango3d();
+    vpdEstado.cargando = true;
+    vpdCargarPorciones(R.desde, R.hasta).then(()=>{
+      if(currentPage==='alertaInsumos') RENDERERS.alertaInsumos();
+    });
+  }
   if(!S.insumos.length){
     el.innerHTML = `<div class="page-head"><div><h1>🔔 Alerta de Insumos</h1></div></div>
       <div class="card"><div class="empty">No hay insumos registrados. Agrégalos en el módulo <b>Insumos</b>.</div></div>`;
@@ -11310,11 +11364,11 @@ RENDERERS.alertaInsumos = function(){
 
   const filasHTML = filas.map(r=>{
     const badges = [];
-    if(r.consumoAlerta)  badges.push(`<span class="badge b-miss" title="Consumo 3d: ${r.ev.consumo.valor.toFixed(1)} ${r.ins.unidad} (umbral: ${r.ev.consumo.umbral})">📉 Consumo bajo</span>`);
+    if(r.consumoAlerta)  badges.push(`<span class="badge b-miss" title="Porciones ${fmtFecha(r.ev.consumo.desde)}–${fmtFecha(r.ev.consumo.fecha)}: ${r.ev.consumo.valor} (umbral: ${r.ev.consumo.umbral} porciones)">📉 Consumo bajo</span>`);
     if(r.minimoAlerta)   badges.push(`<span class="badge b-miss" style="background:#fef3c7;color:#92400e" title="Inventario: ${r.ev.minimo.valor} ${r.ins.unidad} (mínimo: ${r.ev.minimo.umbral})">📦 Stock mínimo</span>`);
     if(r.anomaliaAlerta) badges.push(`<span class="badge b-miss" style="background:#fee2e2;color:#991b1b" title="Cierre subió >2% sin producción el ${fmtFecha(r.ev.anomalia.fecha)}">⚠ Cierre anómalo</span>`);
     const valores = [];
-    if(r.consumoAlerta)  valores.push(`Consumo 3d: <b style="color:#991b1b">${r.ev.consumo.valor.toFixed(1)}</b> / ${r.ev.consumo.umbral} ${r.ins.unidad}`);
+    if(r.consumoAlerta)  valores.push(`Porciones 3d: <b style="color:#991b1b">${r.ev.consumo.valor}</b> / ${r.ev.consumo.umbral} porciones`);
     if(r.minimoAlerta)   valores.push(`Inventario: <b style="color:#991b1b">${r.ev.minimo.valor}</b> / ${r.ev.minimo.umbral} ${r.ins.unidad}`);
     if(r.anomaliaAlerta) valores.push(`Cierre: <b style="color:#991b1b">${r.ev.anomalia.valor}</b> ${r.ins.unidad} (incremento sin producción)`);
     const fechaRef = r.anomaliaAlerta ? r.ev.anomalia.fecha : r.minimoAlerta ? r.ev.minimo.fecha : (r.consumoAlerta ? r.ev.consumo.fecha : '');
