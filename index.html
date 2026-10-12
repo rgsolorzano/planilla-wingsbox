@@ -5722,11 +5722,28 @@ function agruparFilasMarcacion(filasRaw){
   const grupos = {};
   const noReconocidos = [];
   let leidas = 0;
-  filasRaw.forEach(({ts, nombre, tipo})=>{
-    if(ts==null || !nombre) return;
+  /* Toda fila descartada queda REGISTRADA con su motivo y su número de fila
+     en la hoja. Antes se descartaban en silencio, de modo que una marcación
+     que no llegaba a la app no dejaba rastro de por qué. */
+  const descartadas = [];
+  filasRaw.forEach(({ts, nombre, tipo}, i)=>{
+    const filaHoja = i + 2;                      // +1 por el encabezado, +1 base 1
+    if(ts==null || ts==='' || !nombre){
+      if(ts!=null && ts!=='' || nombre)          // fila totalmente vacía: no es un descarte
+        descartadas.push({fila:filaHoja, nombre:nombre||'(sin nombre)', motivo:'falta la marca temporal o el nombre'});
+      return;
+    }
     const emp = findEmpByName(nombre);
-    if(!emp){ if(!noReconocidos.includes(nombre)) noReconocidos.push(nombre); return; }
-    const p = parseExcelTS(ts); if(!p) return;
+    if(!emp){
+      if(!noReconocidos.includes(nombre)) noReconocidos.push(nombre);
+      descartadas.push({fila:filaHoja, nombre, motivo:'el nombre no coincide con ningún empleado'});
+      return;
+    }
+    const p = parseExcelTS(ts);
+    if(!p){
+      descartadas.push({fila:filaHoja, nombre, motivo:'marca temporal ilegible: '+JSON.stringify(ts)});
+      return;
+    }
     leidas++;
     const t = (tipo||'').toString().trim().toLowerCase();
     const esSalida = t.startsWith('sal');
@@ -5750,7 +5767,13 @@ function agruparFilasMarcacion(filasRaw){
     if(esSalida) grupos[key].salidas.push(p.hm);
     else grupos[key].entradas.push(p.hm); // por defecto Entrada
   });
-  return { grupos, noReconocidos, leidas };
+  if(descartadas.length){
+    console.warn('[Marcaciones] '+descartadas.length+' fila(s) de la fuente NO se importaron:');
+    descartadas.forEach(d=>console.warn('   · fila '+d.fila+' ('+d.nombre+'): '+d.motivo));
+  }
+  console.log('[Marcaciones] '+filasRaw.length+' fila(s) recibidas → '+leidas+' marcación(es) válidas, '+
+    descartadas.length+' descartada(s), '+Object.keys(grupos).length+' grupo(s) (empleado+fecha).');
+  return { grupos, noReconocidos, leidas, descartadas };
 }
 
 // Aplica los grupos {empleadoId,fecha,entradas,salidas} sobre S.mar respetando
@@ -5984,26 +6007,103 @@ function addMarManual(){
 }
 
 // Convierte un serial de Excel (o Date/string) a {fecha:'YYYY-MM-DD', hm:'HH:MM'}
+/* ── MARCA TEMPORAL → {fecha, hm} ─────────────────────────────────────────
+   El serial de una hoja de cálculo NO lleva zona horaria: es un número de
+   días desde 1899-12-30 más una fracción de día. Por eso se descompone con
+   aritmética pura y NUNCA a través de un Date en hora local o UTC.
+   CAUSA RAÍZ corregida: la rama de respaldo hacía
+       new Date(Math.round((v - 25569) * 86400 * 1000))
+   —que sitúa el instante en UTC— y luego leía getHours()/getDate(), que son
+   LOCALES. En America/Lima (UTC-5) eso restaba 5 horas a toda marcación y,
+   para cualquier scan anterior a las 05:00, retrocedía también el DÍA: una
+   salida real de las 00:09 del 11/10 se archivaba como las 19:09 del 10/10.
+   Esa rama se usaba siempre que SheetJS no estuviera cargado (CDN lento,
+   bloqueado o caído), sin aviso alguno.
+   Ahora el resultado es idéntico en cualquier zona horaria y no depende de
+   que una librería externa haya terminado de cargar.                      */
 function parseExcelTS(v){
-  let dt;
-  if(typeof v === 'number'){
-    // epoch de Excel: 1899-12-30. Usamos parser de SheetJS si está disponible.
-    if(window.XLSX && XLSX.SSF && XLSX.SSF.parse_date_code){
-      const o = XLSX.SSF.parse_date_code(v);
-      dt = new Date(o.y, o.m-1, o.d, o.H, o.M, Math.floor(o.S||0));
-    }else{
-      dt = new Date(Math.round((v - 25569) * 86400 * 1000));
+  if(v===null || v===undefined || v==='') return null;
+
+  // 1) Serial numérico (lo que devuelve la API con SERIAL_NUMBER).
+  const num = (typeof v === 'number') ? v
+            : (typeof v === 'string' && /^\d+(\.\d+)?$/.test(v.trim()) ? Number(v) : null);
+  if(num !== null && isFinite(num) && num > 0){
+    const dias = Math.floor(num);
+    // Fecha: días enteros desde 1899-12-30, en UTC puro (sin hora local).
+    const d = new Date(Date.UTC(1899, 11, 30) + dias*86400000);
+    /* Hora: se redondea al SEGUNDO (para absorber el error binario del
+       serial, que puede dejar las 12:00 como 11:59:59.9) y después se TRUNCA
+       a minutos, que es lo que hacían SheetJS y getHours()/getMinutes().
+       Redondear los minutos sería incorrecto: convertiría una salida real de
+       las 23:59:40 en las 00:00 del día siguiente, y una entrada de las
+       11:00:53 en las 11:01. */
+    let seg = Math.round((num - dias) * 86400);
+    if(seg >= 86400){ seg -= 86400; d.setUTCDate(d.getUTCDate() + 1); }
+    const min = Math.floor(seg / 60);
+    const fecha = d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
+    const hm = String(Math.floor(min/60)).padStart(2,'0')+':'+String(min%60).padStart(2,'0');
+    return {fecha, hm};
+  }
+
+  // 2) Date real (importación desde Excel con celdas de fecha).
+  if(v instanceof Date){
+    if(isNaN(v)) return null;
+    return { fecha: v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0'),
+             hm: String(v.getHours()).padStart(2,'0')+':'+String(v.getMinutes()).padStart(2,'0') };
+  }
+
+  // 3) TEXTO. Se interpreta explícitamente, sin delegar en new Date(): el
+  //    parser del navegador lee "11/10/2026" como 10 de NOVIEMBRE (formato
+  //    de EE. UU.), de modo que una marcación en dd/mm/aaaa acababa en otro
+  //    mes. Aquí dd/mm/aaaa es lo primero que se intenta, y solo se trata
+  //    como m/d/aaaa cuando el primer número no puede ser un día.
+  const txt = String(v).trim();
+  if(!txt) return null;
+  const mIso = txt.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ](\d{1,2}):(\d{2}))?/);
+  if(mIso){
+    return { fecha: mIso[1]+'-'+mIso[2].padStart(2,'0')+'-'+mIso[3].padStart(2,'0'),
+             hm: (mIso[4]||'00').padStart(2,'0')+':'+(mIso[5]||'00') };
+  }
+  const mDmy = txt.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})(?:[T ,]+(\d{1,2}):(\d{2}))?/);
+  if(mDmy){
+    let dd = Number(mDmy[1]), mm = Number(mDmy[2]);
+    if(dd > 31 || mm > 12){
+      if(mm > 12 && dd <= 12){ const t = dd; dd = mm; mm = t; }   // venía como m/d/aaaa
+      else return null;
     }
-  }else if(v instanceof Date){ dt = v; }
-  else { dt = new Date(v); }
-  if(isNaN(dt)) return null;
-  const fecha = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
-  const hm = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
-  return {fecha, hm};
+    if(dd < 1 || mm < 1) return null;
+    return { fecha: mDmy[3]+'-'+String(mm).padStart(2,'0')+'-'+String(dd).padStart(2,'0'),
+             hm: (mDmy[4]||'00').padStart(2,'0')+':'+(mDmy[5]||'00') };
+  }
+  return null;                                   // formato no reconocido
+}
+
+/* ── BÚSQUEDA DEL EMPLEADO POR NOMBRE ─────────────────────────────────────
+   Los nombres llegan de un Google Form, donde el texto trae con frecuencia
+   espacios dobles, espacios duros (U+00A0), caracteres invisibles o tildes
+   escritas de otra manera. La comparación anterior solo recortaba extremos y
+   pasaba a minúsculas, así que cualquiera de esas diferencias dejaba la fila
+   sin empleado y la marcación se descartaba en silencio.
+   Ahora se intenta primero la coincidencia EXACTA normalizada (la de antes,
+   que siempre gana) y solo después una relajada que ignora acentos y
+   espacios repetidos. Nunca se asigna a un empleado "parecido": la
+   comparación sigue siendo de nombre completo.                            */
+function empNombreNorm(x){
+  return String(x??'')
+    .replace(/[\u200B-\u200D\uFEFF]/g,'')        // caracteres invisibles
+    .replace(/[\u00A0\u2007\u202F]/g,' ')        // espacios duros → espacio normal
+    .replace(/\s+/g,' ').trim().toLowerCase();
+}
+function empNombreNormSinTildes(x){
+  return empNombreNorm(x).normalize('NFD').replace(/[\u0300-\u036f]/g,'');
 }
 function findEmpByName(name){
-  const n=(name||'').trim().toLowerCase();
-  return S.emp.find(e=>e.nombre.trim().toLowerCase()===n);
+  const n = empNombreNorm(name);
+  if(!n) return null;
+  const exacto = S.emp.find(e=>empNombreNorm(e.nombre)===n);
+  if(exacto) return exacto;
+  const sinTildes = empNombreNormSinTildes(name);
+  return S.emp.find(e=>empNombreNormSinTildes(e.nombre)===sinTildes) || null;
 }
 
 function importarExcel(){
@@ -6092,7 +6192,8 @@ async function sincronizarMarcacionesDesdeSheet(){
     const tipoCol = idxTipo!==-1 ? idxTipo : 2;
 
     const filasRaw = filas.slice(1).map(row=>({ ts:row[tsCol], nombre:row[nombreCol], tipo:row[tipoCol] }));
-    const { grupos, noReconocidos, leidas } = agruparFilasMarcacion(filasRaw);
+    const { grupos, noReconocidos, leidas, descartadas } = agruparFilasMarcacion(filasRaw);
+    console.log('[Marcaciones] Hoja "'+sheetName+'": '+filas.length+' fila(s) devueltas por la API (incluido el encabezado). Última fila con datos: '+filas.length+'.');
     if(!leidas) throw new Error('SIN_REGISTROS');
 
     const { nuevas, actualizadas, manualesProtegidas, manualesConservadas, manualesBorradas } =
@@ -6114,6 +6215,16 @@ async function sincronizarMarcacionesDesdeSheet(){
       if(reemplazar && conservarManuales) msg += `<br>Las marcaciones manuales fueron conservadas (${manualesConservadas}${manualesProtegidas?`, ${manualesProtegidas} no se sobreescribieron`:''}).`;
       if(reemplazar && !conservarManuales) msg += `<br>Todas las marcaciones anteriores fueron reemplazadas${manualesBorradas?` (incluidas ${manualesBorradas} manuales)`:''}.`;
       if(noReconocidos.length) msg += `<div style="margin-top:10px"><b>⚠ Nombres no reconocidos:</b> ${noReconocidos.join(', ')}.<br>Crea estos empleados (mismo nombre) y vuelve a sincronizar para incluirlos.</div>`;
+      /* Detalle PERSISTENTE de lo que no se importó, con el número de fila de
+         la hoja. Un toast desaparece; este bloque queda a la vista para poder
+         revisar fila por fila por qué una marcación no llegó. */
+      if(descartadas && descartadas.length){
+        msg += `<div style="margin-top:10px"><b>⚠ ${descartadas.length} fila(s) no importada(s):</b>
+          <ul style="margin:6px 0 0 18px;font-size:12px">`+
+          descartadas.slice(0,20).map(d=>`<li>Fila ${d.fila} — ${d.nombre}: ${d.motivo}</li>`).join('')+
+          (descartadas.length>20?`<li>… y ${descartadas.length-20} más (ver la consola del navegador).</li>`:'')+
+          `</ul></div>`;
+      }
       msg += `</div>`;
       msgEl.innerHTML = msg;
     }
