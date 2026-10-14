@@ -706,6 +706,33 @@ function fechaEnLima(d){
     year:'numeric', month:'2-digit', day:'2-digit' });
   return fmt.format(d || new Date());   // en-CA produce YYYY-MM-DD
 }
+/* ── PERÍODOS PREDETERMINADOS (fuente única) ──────────────────────────────
+   Los dos rangos que varios módulos comparten. Se calculan siempre desde la
+   fecha de HOY en America/Lima y con aritmética de calendario sobre cadenas
+   'YYYY-MM-DD', nunca a través de un Date local: así el día no se desplaza
+   por zona horaria y el rango avanza solo cada jornada.
+   Son valores INICIALES: en cuanto el usuario toca un filtro, su elección
+   manda y estas funciones no vuelven a intervenir.                        */
+
+/* Últimos 3 días calendario COMPLETOS, excluyendo hoy.
+   Con hoy = 14/10/2026 → 11/10/2026 … 13/10/2026 (ambos incluidos). */
+function rangoUlt3DiasCompletos(){
+  const hoy = fechaEnLima();
+  return { desde: fechaMasDias(hoy, -3), hasta: fechaMasDias(hoy, -1) };
+}
+/* Últimos 6 meses calendario contando el actual como el primero: desde el
+   día 1 del mes que está cinco meses atrás, hasta HOY.
+   Con hoy = 14/10/2026 → 01/05/2026 … 14/10/2026 (may, jun, jul, ago, sep, oct).
+   El retroceso se hace sobre el número de mes, de modo que el cambio de año
+   se resuelve solo: enero − 5 → agosto del año anterior. */
+function rangoUlt6MesesCalendario(){
+  const hoy = fechaEnLima();
+  let [a,m] = hoy.split('-').map(Number);
+  m -= 5; while(m <= 0){ m += 12; a--; }
+  return { desde: a+'-'+String(m).padStart(2,'0')+'-01', hasta: hoy,
+           añoDesde:a, mesDesde:m,
+           añoHasta:Number(hoy.slice(0,4)), mesHasta:Number(hoy.slice(5,7)) };
+}
 // Suma/resta días a una fecha ISO sin pasar por Date (evita corrimientos).
 function fechaMasDias(fechaISO, n){
   const [y,m,d] = fechaISO.split('-').map(Number);
@@ -2540,13 +2567,16 @@ const _añoNow = new Date().getFullYear();
 // ── Filtros por defecto basados en los datos disponibles ─────────────────
 // Usa los años REALES del OLAP en vez de hardcodear el año actual.
 // Esto evita que el filtro sea 2026 cuando los datos son de 2025.
+/* Rango inicial: los últimos 6 meses calendario incluido el actual, en vez
+   del histórico completo que había antes. Los selectores son de mes/año, así
+   que el helper devuelve también esos cuatro números ya resueltos (el cambio
+   de año lo absorbe él: enero − 5 → agosto del año anterior).
+   Los demás filtros —grupo, plato, cantidad, solo activos— no cambian. */
 function analDefaultFilter(){
-  const años=[...new Set(analiticaData.map(r=>r.año))].sort();
+  const r = rangoUlt6MesesCalendario();
   return {
-    añoDesde: años.length ? años[0]       : _añoNow,
-    mesDesde: 1,
-    añoHasta: años.length ? años.at(-1)   : _añoNow,
-    mesHasta: 12,
+    añoDesde: r.añoDesde, mesDesde: r.mesDesde,
+    añoHasta: r.añoHasta, mesHasta: r.mesHasta,
     grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual',
     soloActivos:false            // desmarcado por defecto: se muestran todos
   };
@@ -2561,7 +2591,7 @@ function gananciaDefaultFilter(){
   };
 }
 
-let analFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12, grupo:'', plato:'', cantOp:'', cantVal:'', cantAmbito:'mesActual' };
+let analFilter = analDefaultFilter();
 let gananciaFilter = { añoDesde:_añoNow, mesDesde:1, añoHasta:_añoNow, mesHasta:12 };
 let analSort   = { col:'grupo', dir:'asc' };
 
@@ -4202,7 +4232,10 @@ RENDERERS.evolucionVentas = function(){
    Tres cuadros (venta total, promedio de N° de ventas, ticket
    promedio) que comparten el mismo rango de fechas.
    ================================================================ */
-let edsFilter = ventasUlt12Meses();
+/* Últimos 6 meses calendario, con el actual como primero. La agrupación
+   mensual del módulo sigue expandiendo cada mes a mes calendario completo
+   (anRangoNormalizado); aquí solo cambia el rango inicial que se ve. */
+let edsFilter = (()=>{ const r = rangoUlt6MesesCalendario(); return { desde:r.desde, hasta:r.hasta }; })();
 // Memoización de la agregación mensual: se recalcula solo si cambia el rango
 // o tras una sincronización (invalidación en ventasSync()).
 let ventasMensualCache = { clave:null, datos:null };
@@ -4994,13 +5027,9 @@ function cotVentasDia(nombreVenta, fecha){
    07/08/2026 → 06/10/2026. Se calcula con aritmética de calendario sobre la
    fecha de Lima, sin objetos Date locales. */
 function cotRangoPorDefecto(){
-  const hasta = fechaMasDias(fechaEnLima(), -1);            // ayer
-  const hoy = fechaEnLima();
-  let [a,m,d] = hoy.split('-').map(Number);
-  m -= 2; while(m<=0){ m+=12; a--; }
-  const ult = ultimoDia(a,m);                               // 31/08 → 31, etc.
-  const desde = a+'-'+String(m).padStart(2,'0')+'-'+String(Math.min(d,ult)).padStart(2,'0');
-  return { desde, hasta, agrup:'dia' };
+  // Últimos 3 días calendario completos; hoy nunca entra (helper compartido).
+  const r = rangoUlt3DiasCompletos();
+  return { desde:r.desde, hasta:r.hasta, agrup:'dia' };
 }
 let cotFilter = cotRangoPorDefecto();
 
@@ -11627,8 +11656,11 @@ RENDERERS.alertaInsumos = function(){
 // Stock final   = Salida de la fecha final.
 // Ya no hay selector de Momento: la Entrada siempre es el inventario inicial
 // y la Salida siempre es el inventario final (nueva estructura del módulo).
-let cotejoLicFechaIni = (()=>{ const d=new Date(); d.setDate(d.getDate()-2); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
-let cotejoLicFechaFin = fechaHoy();
+/* Mismo período que ANALÍTICA → Cotejos: los últimos 3 días calendario
+   completos, hoy excluido. Antes eran "anteayer → hoy" construidos con un
+   Date local, que además podía desplazar el día. */
+let cotejoLicFechaIni = rangoUlt3DiasCompletos().desde;
+let cotejoLicFechaFin = rangoUlt3DiasCompletos().hasta;
 
 RENDERERS.cotejoLicores = function(){
   const el = document.getElementById('page-cotejoLicores');
@@ -14109,7 +14141,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-14.3';
+const APP_VERSION = '2026-10-14.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
