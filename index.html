@@ -1911,6 +1911,8 @@ function calcQuincenaMultiCondicion(emp, year, month, q, segs){
     dias: parciales.flatMap(r=>r.dias),
     tot, base: suma(r=>r.base), totalPagar: suma(r=>r.totalPagar),
     esLibre: parciales.every(r=>r.esLibre),
+    // Cada tramo aporta sus horas calculadas con SU propia condición.
+    totalHorasEfectivas: suma(r=>r.totalHorasEfectivas),
     bonoPuntualidad: suma(r=>r.bonoPuntualidad),
     // Cada tramo aporta su parte proporcional, con los valores de SU condición.
     sueldoPlanilla: suma(r=>r.sueldoPlanilla),
@@ -2033,8 +2035,18 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
     dias.forEach(d=>{
       if(d.pagoExtraHoras>0) payments.push({fecha:d.fecha, tipo:'horasExtra',
         descripcion:`Horas extra (${d.horasExtra}h)`, monto:d.pagoExtraHoras, meta:{horas:d.horasExtra}});
+      /* FERIADO. Para un empleado LIBRE el feriado es un concepto aparte que
+         se paga ADEMÁS de las horas, y esas mismas horas ya las declara la
+         fila 'horasTrabajadas' del mismo día. Si aquí se repitieran en
+         meta.horas, la boleta las mostraría dos veces y el día parecería
+         tener el doble de horas trabajadas de las reales.
+         Por eso en LIBRE las horas viajan en `horasRef` (solo informativas,
+         para explicar de dónde sale el importe) y NO en `horas`.
+         Para un empleado NO libre se conserva meta.horas exactamente como
+         estaba: su boleta no tiene una fila de horas con la que chocar. */
       if((d.pagoFeriado||0)>0) payments.push({fecha:d.fecha, tipo:'feriado',
-        descripcion:`Feriado trabajado (${d.horasEf}h)`, monto:d.pagoFeriado, meta:{horas:d.horasEf}});
+        descripcion:`Feriado trabajado (${d.horasEf}h)`, monto:d.pagoFeriado,
+        meta: esLibre ? {horasRef:d.horasEf} : {horas:d.horasEf}});
       d.pagoExtraList.forEach(p=> payments.push({fecha:d.fecha, tipo:'pagoManual',
         descripcion:`${p.tipo}${p.detalle?(' ('+p.detalle+')'):''}`, monto:Number(p.monto)||0}));
     });
@@ -2068,7 +2080,21 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
     dias.forEach(d=>{ d.pagoLibre = libreSinSueldoHora ? 0 : calcularPagoDiaEmpleadoLibre(d.horasEf, sh); });
     // El pago por feriado es acumulable también para empleados libres.
     const liq = construirLiquidacion({base:0, bonoPuntualidad:0, esLibre:true});
-    return { dias, tot, base:0, totalPagar:liq.totalPagar, esLibre:true, sueldoHora:sh, libreSinSueldoHora,
+    /* DOS totales distintos, porque cada módulo responde a una pregunta distinta:
+         · totalHorasEfectivas → SOLO horas × sueldo/hora de la condición de cada
+           día. Es lo que muestra Cálculo Quincenal: sin feriados, sin pagos
+           extra y sin descuentos.
+         · totalPagar          → el neto completo que se le abona al trabajador
+           (horas + feriados + extras − descuentos). Lo usan Boleta y
+           Consolidado, que sí representan el importe a pagar.
+       Antes Cálculo Quincenal mostraba totalPagar bajo el rótulo "Total a
+       pagar (por horas)", de ahí que el total no cuadrara con la suma de los
+       pagos diarios. Los conceptos no se eliminan de ningún sitio: siguen
+       contabilizados una sola vez en la liquidación. */
+    const totalHorasEfectivas = (liq.payments||[])
+      .filter(p=>p.tipo==='horasTrabajadas').reduce((a,p)=>a+(Number(p.monto)||0), 0);
+    return { dias, tot, base:0, totalPagar:liq.totalPagar, totalHorasEfectivas,
+             esLibre:true, sueldoHora:sh, libreSinSueldoHora,
              condicion: condRef0 || null,
              sueldoPlanilla: (Number(empQ.sueldoPlanilla)||0) * (diasTramo/totalDiasQ),
              afpComision: Number(empQ.afpComision)||0,
@@ -7258,8 +7284,17 @@ function renderCalculo(serie){
         <div class="summary">
           <div class="item"><div class="l">Sueldo por hora</div><div class="v">${money(sh)}</div></div>
           <div class="item"><div class="l">Horas trabajadas (periodo)</div><div class="v">${totalHoras} h</div></div>
-          <div class="item total"><div class="l">Total a pagar (por horas)</div><div class="v">${money(r.totalPagar)}</div></div>
+          <div class="item total"><div class="l">Total a pagar (por horas)</div><div class="v">${money(r.totalHorasEfectivas ?? r.totalPagar)}</div></div>
         </div>
+        ${(()=>{ /* Si el período trae feriados, extras o descuentos, se indica
+             dónde se contabilizan, para que el total de arriba no parezca
+             incompleto. No se suman aquí: este módulo es solo horas. */
+          const otros = (r.totalPagar||0) - (r.totalHorasEfectivas ?? r.totalPagar);
+          return Math.abs(otros) > 0.005
+            ? `<p class="hint" style="margin-top:8px">Este total corresponde <b>únicamente a las horas trabajadas</b>.
+               El período tiene además ${money(Math.abs(otros))} ${otros>=0?'a favor':'en contra'} por feriados, pagos extra o descuentos:
+               se reflejan en <b>Boleta por Empleado</b> y en <b>Consolidado</b>, donde el neto a pagar es ${money(r.totalPagar)}.</p>`
+            : ''; })()}
       </div>`;
       return; // siguiente empleado
     }
@@ -7444,6 +7479,10 @@ function renderConsolidado(serie){
     // Sueldo transferencia = Total a pagar - Sueldo planilla
     const sueldoTransfer = r.totalPagar - sueldoPlanilla;
     return {nombre:emp.nombre, esLibre:r.esLibre===true,
+      /* pagoHoras: lo que el libre gana por horas efectivas. Es el equivalente
+         a `base` de un empleado con sueldo quincenal, y hace auditable su
+         Total a Pagar con la misma fórmula de columnas. */
+      pagoHoras: Number(r.totalHorasEfectivas ?? 0),
       sueldoHora:Number(r.sueldoHora ?? emp.sueldoHora)||0, base:r.base, horasEf:r.tot.horasEf, horasProg:r.tot.horasProg,
       horasExtra:r.tot.horasExtra, pagoExtraHoras:r.tot.pagoExtraHoras, descAuto:r.tot.descAuto,
       descManual:r.tot.descManual, pagoManual:r.tot.pagoManual,
@@ -7459,7 +7498,9 @@ function renderConsolidado(serie){
     toast('No se pudo calcular a: '+erroresCons.join(', ')+'. Revisa sus condiciones.','warn');
   }
   const T=_consolidado.reduce((a,c)=>({
-    base:a.base+c.base, horasExtra:a.horasExtra+c.horasExtra, pagoExtraHoras:a.pagoExtraHoras+c.pagoExtraHoras,
+    // En la columna "Sueldo Base" el libre aporta su pago por horas: así la
+    // fila de TOTALES sigue explicando el Total general a pagar.
+    base:a.base+(c.esLibre?(c.pagoHoras||0):c.base), horasExtra:a.horasExtra+c.horasExtra, pagoExtraHoras:a.pagoExtraHoras+c.pagoExtraHoras,
     descAuto:a.descAuto+c.descAuto, descManual:a.descManual+c.descManual, pagoManual:a.pagoManual+c.pagoManual,
     pagoFeriado:a.pagoFeriado+c.pagoFeriado,
     bonoPuntualidad:a.bonoPuntualidad+c.bonoPuntualidad, total:a.total+c.total,
@@ -7470,8 +7511,12 @@ function renderConsolidado(serie){
   // a Pagar de cada empleado. Se registra cualquier descuadre en vez de
   // ocultarlo (misma política que la Boleta).
   _consolidado.forEach(c=>{
-    if(c.esLibre) return; // el libre no tiene sueldo base: su total sale de horas
-    const esperado=c.base+c.pagoExtraHoras+c.pagoManual+c.pagoFeriado+c.bonoPuntualidad-c.descAuto-c.descManual;
+    /* El LIBRE también se audita: su "base" es el pago por horas efectivas
+       en lugar del sueldo quincenal, y con esa sustitución la misma fórmula
+       debe explicar su Total a Pagar. Antes se saltaba la comprobación, de
+       modo que un descuadre en un empleado libre pasaba inadvertido. */
+    const baseC = c.esLibre ? (c.pagoHoras||0) : c.base;
+    const esperado=baseC+c.pagoExtraHoras+c.pagoManual+c.pagoFeriado+c.bonoPuntualidad-c.descAuto-c.descManual;
     if(Math.abs(esperado-c.total)>0.005){
       console.error('[Consolidado] DESCUADRE columnas vs Total a Pagar', {
         empleado:c.nombre, periodo:`${PER.month}/${PER.year} Q${PER.q}`,
@@ -7511,7 +7556,7 @@ function renderConsolidado(serie){
         </tr></thead>
         <tbody>${_consolidado.map(c=>`<tr>
           <td>${c.nombre}${c.esLibre?` <span class="badge b-late">Libre</span><br><small style="color:var(--c-muted)">${money(c.sueldoHora)}/h × ${c.horasEf}h</small>`:''}</td>
-          <td class="num">${money(c.base)}</td>
+          <td class="num" title="${c.esLibre?'Pago por horas efectivas (el libre no tiene sueldo quincenal)':'Sueldo quincenal base'}">${money(c.esLibre?(c.pagoHoras||0):c.base)}${c.esLibre?'<br><small style="color:var(--c-muted)">por horas</small>':''}</td>
           <td class="num">${c.horasEf}</td>
           <td class="num" style="color:${c.esLibre?'var(--c-muted)':'inherit'}">${c.esLibre?'—':c.horasProg}</td>
           <td class="num">${c.horasExtra||0}</td>
@@ -7585,11 +7630,22 @@ function renderBoleta(){
     const sh=r.sueldoHora;
     // Se presenta la MISMA liquidación (payments/discounts): un renglón por
     // concepto, de modo que ningún pago nuevo pueda quedar fuera del detalle.
+    /* Un renglón por CONCEPTO, no por fecha: una misma fecha puede traer
+       legítimamente la fila de horas trabajadas, la del feriado y algún pago
+       extra, y las tres son conceptos distintos que deben verse por separado.
+       Lo que NO puede repetirse es el mismo concepto.
+       Solo la fila de horas trabajadas declara horas y sueldo/hora; el
+       feriado y los pagos extra son importes, y mostrar ahí las horas otra
+       vez haría parecer que el día tuvo el doble de trabajo del real. */
+    const ETIQ_CONCEPTO = { horasTrabajadas:'', feriado:'Feriado', pagoManual:'Pago extra', horasExtra:'Horas extra' };
     const filasL=(r.payments||[]).map(c=>{
-      const esFer=c.tipo==='feriado';
-      const horas=(c.meta&&c.meta.horas)!=null?c.meta.horas:'—';
-      return `<tr><td>${c.fecha?fmtFecha(c.fecha)+' · '+DIAS[diaSemana(c.fecha)]:''} ${esFer?'<span class="badge b-late">Feriado</span>':''}</td>`+
-        `<td class="num">${horas}</td><td class="num">${money(sh)}</td>`+
+      const esHoras = c.tipo==='horasTrabajadas';
+      const horas = (c.meta && c.meta.horas!=null) ? c.meta.horas : '—';
+      const badge = c.tipo==='feriado'   ? '<span class="badge b-late">Feriado</span>'
+                  : c.tipo==='pagoManual'? '<span class="badge b-free">Pago extra</span>' : '';
+      const detalle = esHoras ? '' : `<br><small style="color:var(--c-muted)">${c.descripcion}</small>`;
+      return `<tr><td>${c.fecha?fmtFecha(c.fecha)+' · '+DIAS[diaSemana(c.fecha)]:''} ${badge}${detalle}</td>`+
+        `<td class="num">${horas}</td><td class="num">${esHoras?money(sh):'—'}</td>`+
         `<td class="num" style="color:var(--green)">${money(c.monto)}</td></tr>`;
     }).join('');
     const descL=(r.discounts||[]).map(c=>`<tr><td colspan="3">${c.fecha?fmtFecha(c.fecha)+' · ':''}${c.descripcion}</td><td class="num" style="color:var(--red)">- ${money(c.monto)}</td></tr>`).join('');
@@ -7607,7 +7663,10 @@ function renderBoleta(){
           <tfoot><tr><td>Totales</td><td class="num">${totalHoras} h</td><td class="num">—</td><td class="num">${money(r.totalPagar)}</td></tr></tfoot>
         </table></div>
         <div class="summary">
-          <div class="item total"><div class="l">Total a pagar (por horas)</div><div class="v">${money(r.totalPagar)}</div></div>
+          <div class="item"><div class="l">Pago por horas efectivas</div><div class="v">${money(r.totalHorasEfectivas ?? 0)}</div></div>
+          <div class="item"><div class="l">Feriados y pagos extra</div><div class="v">${money((r.totalPagos||0)-(r.totalHorasEfectivas||0))}</div></div>
+          <div class="item"><div class="l">Descuentos</div><div class="v" style="color:var(--red)">- ${money(r.totalDescuentos||0)}</div></div>
+          <div class="item total"><div class="l">Total a pagar</div><div class="v">${money(r.totalPagar)}</div></div>
         </div>
       </div>`;
     return;
@@ -13950,7 +14009,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-14.1';
+const APP_VERSION = '2026-10-14.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
