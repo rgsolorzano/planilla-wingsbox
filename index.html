@@ -5571,6 +5571,16 @@ window.empToggleActivo = function(id){
 };
 window.empDel = function(id){
   if(!confirm('¿Eliminar este empleado y todos sus datos asociados?')) return;
+  /* Se marcan el empleado Y todos sus registros dependientes: de lo
+     contrario la fusión con el remoto los devolvería uno a uno. */
+  if(typeof gsMarcarEliminado==='function'){
+    gsMarcarEliminado('Empleados', {id});
+    gsMarcarEliminados('Horarios',    S.hor.filter(h=>h.empleadoId===id));
+    gsMarcarEliminados('Marcaciones', S.mar.filter(m=>m.empleadoId===id));
+    gsMarcarEliminados('Descuentos',  S.desc.filter(d=>d.empleadoId===id));
+    gsMarcarEliminados('PagosExtra',  S.pago.filter(p=>p.empleadoId===id));
+    gsMarcarEliminados('DiasLibres',  S.libre.filter(l=>l.empleadoId===id));
+  }
   S.emp=S.emp.filter(e=>e.id!==id);
   S.hor=S.hor.filter(h=>h.empleadoId!==id);
   S.mar=S.mar.filter(m=>m.empleadoId!==id);
@@ -6001,6 +6011,8 @@ window.marSet = function(id, campo, val){
 window.marDel = function(id){
   const m=S.mar.find(x=>x.id===id);
   const esManual = m && marOrigen(m)==='manual';
+  /* Marca el borrado para que la fusión con el remoto no lo reintroduzca. */
+  if(m && typeof gsMarcarEliminado==='function') gsMarcarEliminado('Marcaciones', m);
   S.mar=S.mar.filter(x=>x.id!==id); save(K.mar,S.mar);
   toast(esManual?'Marcación manual eliminada correctamente':'Marcación eliminada','warn');
   RENDERERS.marcaciones();
@@ -6364,7 +6376,14 @@ RENDERERS.descuentos = function(){
   if(ed) document.getElementById('dCancel').onclick=()=>{ editDescId=null; RENDERERS.descuentos(); };
 };
 window.descEdit=function(id){ editDescId=id; RENDERERS.descuentos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.descDel=function(id){ if(editDescId===id) editDescId=null; S.desc=S.desc.filter(d=>d.id!==id); save(K.desc,S.desc); toast('Descuento eliminado','warn'); RENDERERS.descuentos(); syncDescuentos(); };
+window.descDel=function(id){
+  if(editDescId===id) editDescId=null;
+  const d = S.desc.find(x=>x.id===id);
+  /* Marca el borrado para que la fusión con el remoto no lo reintroduzca. */
+  if(d && typeof gsMarcarEliminado==='function') gsMarcarEliminado('Descuentos', d);
+  S.desc=S.desc.filter(x=>x.id!==id); save(K.desc,S.desc);
+  toast('Descuento eliminado','warn'); RENDERERS.descuentos(); syncDescuentos();
+};
 
 /* ================================================================
    MÓDULO 5: PAGOS EXTRA
@@ -6425,7 +6444,14 @@ RENDERERS.pagos = function(){
   if(ed) document.getElementById('pCancel').onclick=()=>{ editPagoId=null; RENDERERS.pagos(); };
 };
 window.pagoEdit=function(id){ editPagoId=id; RENDERERS.pagos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.pagoDel=function(id){ if(editPagoId===id) editPagoId=null; S.pago=S.pago.filter(p=>p.id!==id); save(K.pago,S.pago); toast('Pago extra eliminado','warn'); RENDERERS.pagos(); syncPagosDom(); };
+window.pagoDel=function(id){
+  if(editPagoId===id) editPagoId=null;
+  const p = S.pago.find(x=>x.id===id);
+  /* Marca el borrado para que la fusión con el remoto no lo reintroduzca. */
+  if(p && typeof gsMarcarEliminado==='function') gsMarcarEliminado('PagosExtra', p);
+  S.pago=S.pago.filter(x=>x.id!==id); save(K.pago,S.pago);
+  toast('Pago extra eliminado','warn'); RENDERERS.pagos(); syncPagosDom();
+};
 
 /* ================================================================
    MÓDULO 6: DÍAS LIBRES Y VACACIONES
@@ -6572,7 +6598,14 @@ RENDERERS.libres = function(){
   if(ed) document.getElementById('lCancel').onclick=()=>{ editLibreId=null; RENDERERS.libres(); };
 };
 window.libreEdit=function(id){ editLibreId=id; RENDERERS.libres(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.libreDel=function(id){ if(editLibreId===id) editLibreId=null; S.libre=S.libre.filter(l=>l.id!==id); save(K.libre,S.libre); toast('Registro eliminado','warn'); RENDERERS.libres(); syncLibresDom(); };
+window.libreDel=function(id){
+  if(editLibreId===id) editLibreId=null;
+  const l = S.libre.find(x=>x.id===id);
+  /* Marca el borrado para que la fusión con el remoto no lo reintroduzca. */
+  if(l && typeof gsMarcarEliminado==='function') gsMarcarEliminado('DiasLibres', l);
+  S.libre=S.libre.filter(x=>x.id!==id); save(K.libre,S.libre);
+  toast('Registro eliminado','warn'); RENDERERS.libres(); syncLibresDom();
+};
 
 /* ================================================================
    MÓDULO 6B: INGRESO DE PROPINAS (por mesero y por día)
@@ -6778,6 +6811,10 @@ window.propDel=function(itemId){
   const item=propinaItems().find(x=>x.itemId===itemId);
   if(!item) return;
   if(editPropItem && editPropItem.itemId===itemId) editPropItem=null;
+  /* Marca el borrado para que la fusión con el remoto no lo reintroduzca. */
+  /* La hoja Propinas exporta `id: it.itemId`, así que la marca debe usar ese
+     mismo valor; con `item` tal cual, la clave saldría vacía y no filtraría. */
+  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('Propinas', {id:item.itemId});
   propinaItemEliminar(item);
   save(K.prop,S.prop);
   toast('Propina eliminada','warn');
@@ -13471,14 +13508,75 @@ function gsClaveDe(sheetName, obj){
   const cols = GS_SHEET_KEYS[sheetName] || ['id'];
   return cols.map(c=>String(obj[c]??'').trim()).join('\u0001');
 }
-// Tombstones: registros eliminados deliberadamente por el usuario en esta
-// sesión. Sin ellos, la fusión "resucitaría" lo borrado al leerlo del remoto.
-const gsTombstones = new Map(); // sheetName -> Set(clave)
-function gsMarcarEliminado(sheetName, obj){
-  if(!gsTombstones.has(sheetName)) gsTombstones.set(sheetName, new Set());
-  gsTombstones.get(sheetName).add(gsClaveDe(sheetName, obj));
+/* ══ TOMBSTONES (registros eliminados a propósito) ════════════════════════
+   El guardado FUSIONA con el remoto: toda fila que exista en la hoja y no en
+   el estado local se "preserva" y se vuelve a escribir, para no pisar lo que
+   haya guardado otra sesión. Sin una marca de borrado explícita, esa misma
+   fusión RESUCITA lo que el usuario acaba de eliminar.
+
+   Dos correcciones sobre el mecanismo anterior:
+
+   1) PERSISTENCIA. Antes el Map vivía solo en memoria, de modo que recargar
+      la página —o cerrar el navegador antes de que el guardado llegara a
+      completarse— borraba las marcas y el registro volvía en la siguiente
+      sincronización. Ahora se guardan en localStorage.
+
+   2) CADUCIDAD Y LIMPIEZA. Una marca solo tiene que sobrevivir hasta que el
+      borrado quede escrito en la hoja. Al completarse con éxito el guardado
+      de una hoja, sus marcas se descartan: el remoto ya refleja la
+      eliminación. Las que queden huérfanas caducan solas a los 30 días, para
+      que una marca antigua no acabe suprimiendo un registro legítimo creado
+      más tarde desde otro dispositivo (las hojas cuya clave son campos de
+      negocio, como Marcaciones por empleado+fecha, podrían colisionar). */
+const GS_TOMBSTONES_KEY = 'gs_tombstones';
+const GS_TOMBSTONE_TTL_MS = 30*24*60*60*1000;   // 30 días
+const gsTombstones = new Map();                 // sheetName -> Map(clave -> timestamp)
+
+function gsTombstonesCargar(){
+  try{
+    const raw = JSON.parse(localStorage.getItem(GS_TOMBSTONES_KEY)||'{}');
+    const ahora = Date.now();
+    let vivas = 0, caducadas = 0;
+    Object.entries(raw).forEach(([hoja, claves])=>{
+      const m = new Map();
+      Object.entries(claves||{}).forEach(([k,t])=>{
+        if(ahora - Number(t||0) < GS_TOMBSTONE_TTL_MS){ m.set(k, Number(t)); vivas++; }
+        else caducadas++;
+      });
+      if(m.size) gsTombstones.set(hoja, m);
+    });
+    if(vivas||caducadas) console.log('[GS] Marcas de borrado restauradas: '+vivas+' vigente(s)'+(caducadas?', '+caducadas+' caducada(s)':'')+'.');
+  }catch(e){ console.warn('[GS] No se pudieron leer las marcas de borrado:', e); }
 }
-function gsMarcarEliminados(sheetName, objs){ (objs||[]).forEach(o=>gsMarcarEliminado(sheetName,o)); }
+function gsTombstonesGuardar(){
+  try{
+    const out = {};
+    gsTombstones.forEach((m, hoja)=>{ if(m.size){ out[hoja] = Object.fromEntries(m); } });
+    localStorage.setItem(GS_TOMBSTONES_KEY, JSON.stringify(out));
+  }catch(e){ console.warn('[GS] No se pudieron guardar las marcas de borrado:', e); }
+}
+function gsMarcarEliminado(sheetName, obj){
+  if(!gsTombstones.has(sheetName)) gsTombstones.set(sheetName, new Map());
+  gsTombstones.get(sheetName).set(gsClaveDe(sheetName, obj), Date.now());
+  gsTombstonesGuardar();
+}
+function gsMarcarEliminados(sheetName, objs){
+  if(!objs || !objs.length) return;
+  if(!gsTombstones.has(sheetName)) gsTombstones.set(sheetName, new Map());
+  const m = gsTombstones.get(sheetName), ahora = Date.now();
+  objs.forEach(o=> m.set(gsClaveDe(sheetName, o), ahora));
+  gsTombstonesGuardar();
+}
+/* Tras escribir una hoja con éxito, el remoto ya no contiene los registros
+   eliminados: sus marcas dejan de hacer falta y se descartan. */
+function gsTombstonesConfirmadas(sheetName){
+  if(!gsTombstones.has(sheetName)) return;
+  const n = gsTombstones.get(sheetName).size;
+  gsTombstones.delete(sheetName);
+  gsTombstonesGuardar();
+  if(n) console.log('[GS] "'+sheetName+'": '+n+' borrado(s) confirmado(s) en el Spreadsheet; marcas liberadas.');
+}
+gsTombstonesCargar();
 
 // Lee la hoja remota y devuelve la matriz fusionada con la local.
 // Lanza si la lectura remota falla (para abortar la escritura).
@@ -13499,7 +13597,7 @@ async function gsFusionarConRemoto(eid, sheetName, matrixLocal){
   // Claves presentes localmente y claves eliminadas a propósito
   const localesObj = gsMatrixToObjects(matrixLocal);
   const clavesLocales = new Set(localesObj.map(o=>gsClaveDe(sheetName,o)));
-  const borrados = gsTombstones.get(sheetName) || new Set();
+  const borrados = gsTombstones.get(sheetName) || new Map();   // clave -> timestamp
   // Remotos que no están localmente y no fueron eliminados → se conservan
   const aPreservar = remotos.filter(o=>{
     const k = gsClaveDe(sheetName, o);
@@ -13606,6 +13704,8 @@ async function gsSaveSheet(domain, sheetName, matrix){
       });
       if(!ur.ok) throw new Error('No se pudo escribir la hoja '+sheetName);
     }
+    // La hoja quedó escrita: los borrados ya están persistidos en el remoto.
+    gsTombstonesConfirmadas(sheetName);
     gsState.lastSync = new Date();
     console.log('[GS] Hoja "'+sheetName+'" guardada ('+((matrix&&matrix.length||1)-1)+' filas'+
       (preservados?', '+preservados+' preservadas del remoto':'')+')');
@@ -14009,7 +14109,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-14.2';
+const APP_VERSION = '2026-10-14.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
