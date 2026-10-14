@@ -1177,8 +1177,12 @@ let currentPage='empleados';
    antes de cualquier operación autenticada, de modo que la expiración se
    detecta al primer movimiento y no al fallar un guardado. */
 function sesGuardActividad(){
-  if(gsState.accessToken && !gsTokenVigente()){
-    sesManejarExpiracion('actividad del usuario');
+  if(!gsState.accessToken) return true;
+  /* Solo el fin de sesión decidido por la APP (tope o inactividad) expulsa
+     al usuario. Un token de Google caducado con la sesión viva no es motivo:
+     se renueva en segundo plano desde el interceptor de interacciones. */
+  if(sesionAppTerminada()){
+    sesManejarExpiracion('actividad del usuario · '+sesionAppTerminada());
     return false;
   }
   return true;
@@ -12707,6 +12711,21 @@ function gsRestoreSession(){
   const tok = localStorage.getItem(AUTH_KEYS.token);
   const exp = Number(localStorage.getItem(AUTH_KEYS.exp)||0);
   const email = localStorage.getItem(AUTH_KEYS.email);
+  /* El INICIO de sesión se restaura siempre, haya o no token utilizable:
+     sin esto, gsRequestToken() lo fijaría de nuevo en cada recarga y el tope
+     de SESION_MAX_MS se reiniciaría indefinidamente — bastaría con refrescar
+     la página para no agotar nunca la sesión. */
+  const ini = Number(localStorage.getItem(AUTH_KEYS.inicio)||0);
+  if(ini > 0){
+    gsState.sesionInicio = ini;
+    gsState.sesionFin    = ini + SESION_MAX_MS;
+    if(Date.now() >= gsState.sesionFin){
+      // El tope se agotó mientras la pestaña estaba cerrada: no se restaura nada.
+      console.warn('[Sesión] El tope de sesión se agotó mientras la app estaba cerrada. Se pedirá iniciar sesión.');
+      gsClearSession();
+      return false;
+    }
+  }
   if(tok && email && exp > Date.now()+60000){
     gsState.accessToken = tok; gsState.tokenExpiry = exp; gsState.email = email;
     return true;
@@ -12751,15 +12770,21 @@ function gsRequestToken(interactive=true){
          aplicación en SESION_MAX_MS (3 h) desde el inicio de sesión: mientras
          no se agote, el token de Google se renueva en silencio; cuando se
          agota, la sesión termina aunque el token siguiese vivo. */
-      const expGoogle = Date.now() + ((Number(resp.expires_in)||3600)*1000);
+      /* tokenExpiry es AHORA la caducidad real del token de Google, sin
+         recortarla al tope de sesión. Son dos relojes distintos y mezclarlos
+         era lo que hacía creer que la sesión moría con el token.
+         sesionFin sigue siendo el tope de la app. */
+      gsState.tokenExpiry = Date.now() + ((Number(resp.expires_in)||3600)*1000);
       if(!gsState.sesionInicio) gsState.sesionInicio = Date.now();
-      const limiteSesion = gsState.sesionInicio + SESION_MAX_MS;
-      gsState.tokenExpiry = Math.min(expGoogle, limiteSesion);
-      gsState.sesionFin   = limiteSesion;
+      gsState.sesionFin = gsState.sesionInicio + SESION_MAX_MS;
       try{ localStorage.setItem(AUTH_KEYS.inicio, String(gsState.sesionInicio)); }catch(e){}
       resolve(resp.access_token);
     };
-    try{ tc.requestAccessToken({ prompt: interactive ? 'consent' : '' }); }
+    /* prompt:'' tanto al renovar como al iniciar sesión. 'consent' forzaba
+       la pantalla de permisos en CADA inicio de sesión, incluso con el
+       consentimiento ya concedido; con '' Google la muestra solo la primera
+       vez o cuando los scopes cambian, que es justo cuando hace falta. */
+    try{ tc.requestAccessToken({ prompt: '' }); }
     catch(e){ reject(e); }
   });
 }
@@ -12796,33 +12821,134 @@ function gsSignOut(){
   gsState.accessToken = null;
   gsState.email = null;
   gsState.tokenExpiry = 0;
+  gsState.sesionInicio = 0; gsState.sesionFin = 0;
   gsClearSession();
+  /* Cierre DELIBERADO: se descarta el borrador. Conservarlo tendría sentido
+     tras una expiración inesperada, no cuando el usuario se va a propósito
+     —y en un equipo compartido dejaría datos de formulario a la vista. */
+  try{ sesDescartarBorrador(); }catch(e){}
   toast('Sesión de Google cerrada','warn');
   gsUpdateSyncStatus('Sin sesión.','info');
   gsRenderControls();
 }
 
-/* ── VIGENCIA DE SESIÓN ────────────────────────────────────────────────────
-   Antes bastaba con que existiera un accessToken en memoria, sin mirar su
-   expiración: por eso, tras horas de suspensión, la app parecía operativa con
-   un token ya vencido y el usuario solo lo descubría al fallar un guardado.
-   Ahora la caducidad forma parte de la comprobación, con 30 s de margen. */
-const SESION_MARGEN_MS = 30000;
-// Vigencia efectiva de la sesión fijada por la aplicación: 3 horas.
-const SESION_MAX_MS = 3*60*60*1000;
-function gsTokenVigente(){
-  if(!gsState.accessToken) return false;
-  // Límite duro de 3 h desde el inicio de sesión, independiente del token.
+/* ══ VIGENCIA DE SESIÓN ═══════════════════════════════════════════════════
+   Tres relojes DISTINTOS que antes se confundían en uno solo:
+
+     1) TOKEN de Google — dura 1 h y su duración la fija Google, no la app.
+        Que caduque NO significa que la sesión haya terminado: se renueva.
+     2) TOPE de sesión  — desde el inicio de sesión. Lo fija la app.
+     3) INACTIVIDAD     — tiempo sin ninguna interacción del usuario.
+
+   CAUSA RAÍZ del "vence a la hora": gsTokenVigente() devolvía false en
+   cuanto caducaba el TOKEN, y como el interceptor de interacciones la
+   consulta en cada clic, el primer clic pasada la hora bloqueaba la app y
+   forzaba un login. El tope de 3 h nunca llegaba a gobernar nada, y la
+   renovación silenciosa —que ya estaba escrita— jamás se invocaba, porque
+   el guardia previo de gsApiFetch lanzaba SESSION_EXPIRED antes de que
+   ninguna petición pudiera recibir un 401.
+
+   Ahora: el token se renueva por debajo mientras la SESIÓN siga viva, y la
+   sesión termina por decisión de la app (tope o inactividad), no por el
+   reloj de Google.                                                        */
+const SESION_MARGEN_MS   = 30000;          // margen al evaluar el token
+// Tope duro desde el inicio de sesión: cubre una jornada completa.
+const SESION_MAX_MS      = 12*60*60*1000;  // 12 h
+// Sin ninguna interacción durante este tiempo, la sesión se considera
+// abandonada aunque el tope no se haya agotado (portátil compartido o
+// extraviado). Se reinicia con cada interacción real del usuario.
+const SESION_INACTIVIDAD_MS = 4*60*60*1000; // 4 h
+// Umbral de renovación anticipada: con menos de esto de token restante, se
+// pide uno nuevo aprovechando la interacción en curso.
+const TOKEN_RENOVAR_ANTES_MS = 10*60*1000;  // 10 min
+
+/* Marca de la última interacción real del usuario. La actualiza el
+   interceptor central; NO la tocan los temporizadores ni los re-renders,
+   porque entonces la inactividad nunca se cumpliría. */
+let sesUltimaActividad = Date.now();
+function sesMarcarActividad(){ sesUltimaActividad = Date.now(); }
+
+// ¿Terminó la sesión por decisión de la APP? (tope o inactividad)
+// Es independiente del token: aquí no interviene el reloj de Google.
+function sesionAppTerminada(){
+  if(!gsState.accessToken) return null;
   const fin = Number(gsState.sesionFin||0);
-  if(fin > 0 && Date.now() >= fin) return false;
+  if(fin > 0 && Date.now() >= fin) return 'tope de sesión alcanzado';
+  if(Date.now() - sesUltimaActividad >= SESION_INACTIVIDAD_MS) return 'inactividad prolongada';
+  return null;
+}
+// ¿El TOKEN de Google sigue sirviendo para llamar a la API?
+function tokenGoogleVigente(){
+  if(!gsState.accessToken) return false;
   const exp = Number(gsState.tokenExpiry||0);
   return exp > 0 ? (exp - SESION_MARGEN_MS) > Date.now() : true;
 }
-function gsIsSignedIn(){ return gsTokenVigente(); }
-// Minutos restantes de sesión (informativo).
-function gsMinutosRestantes(){
+// ¿Conviene renovar ya, aprovechando que el usuario está interactuando?
+function tokenConvieneRenovar(){
+  if(!gsState.accessToken) return false;
   const exp = Number(gsState.tokenExpiry||0);
-  return exp ? Math.max(0, Math.round((exp-Date.now())/60000)) : null;
+  return exp > 0 && (exp - TOKEN_RENOVAR_ANTES_MS) <= Date.now();
+}
+/* Compatibilidad: el resto de la app sigue llamando a gsTokenVigente().
+   Ahora significa "se puede operar AHORA MISMO": sesión viva Y token útil.
+   Un token caducado con la sesión viva deja de ser motivo de expiración;
+   es la señal para renovar, y de eso se encarga sesAsegurarToken(). */
+function gsTokenVigente(){
+  if(!gsState.accessToken) return false;
+  if(sesionAppTerminada()) return false;
+  return tokenGoogleVigente();
+}
+function gsIsSignedIn(){ return gsTokenVigente(); }
+
+/* ── RENOVACIÓN SILENCIOSA ────────────────────────────────────────────────
+   Pide a Google un token nuevo con prompt:'' — sin pantalla de
+   consentimiento, porque ya fue concedido. Google lo devuelve mientras el
+   usuario conserve su sesión en Google y no haya revocado el acceso.
+
+   Se invoca desde el interceptor de interacciones, es decir, DENTRO del
+   gesto del usuario: la documentación de Google advierte que renovar
+   requiere un gesto, ya que GIS abre una ventana emergente y los
+   bloqueadores la impiden sin él.
+
+   Devuelve: 'ok' | 'no-hace-falta' | 'sesion-terminada' | 'fallo'
+   Nunca lanza, y una sola renovación en curso a la vez.                  */
+let sesRenovacionEnCurso = null;
+let sesRenovacionesFallidas = 0;
+const SES_RENOV_MAX_FALLOS = 3;
+
+async function sesAsegurarToken(motivo){
+  if(!gsState.accessToken) return 'fallo';
+  const finApp = sesionAppTerminada();
+  if(finApp) return 'sesion-terminada';
+  if(tokenGoogleVigente() && !tokenConvieneRenovar()) return 'no-hace-falta';
+  if(sesRenovacionEnCurso) return sesRenovacionEnCurso;   // sin renovaciones solapadas
+
+  sesRenovacionEnCurso = (async ()=>{
+    try{
+      await gsWaitForLib();
+      await gsRequestToken(false);          // prompt:'' → sin UI
+      gsPersistSession();
+      sesRenovacionesFallidas = 0;
+      console.log('[Sesión] Token renovado en silencio ('+(motivo||'rutina')+'). '+
+        'Vence a las '+new Date(gsState.tokenExpiry).toLocaleTimeString('es-PE')+
+        '; la sesión termina a las '+new Date(gsState.sesionFin).toLocaleTimeString('es-PE')+'.');
+      return 'ok';
+    }catch(e){
+      sesRenovacionesFallidas++;
+      console.warn('[Sesión] No se pudo renovar el token ('+(motivo||'rutina')+'), intento '+
+        sesRenovacionesFallidas+'/'+SES_RENOV_MAX_FALLOS+':', e && e.message || e);
+      return 'fallo';
+    }finally{ sesRenovacionEnCurso = null; }
+  })();
+  return sesRenovacionEnCurso;
+}
+// Minutos restantes de SESIÓN (informativo): lo que de verdad le queda al
+// usuario, no lo que le queda al token.
+function gsMinutosRestantes(){
+  const fin = Number(gsState.sesionFin||0);
+  if(!fin) return null;
+  const porInactividad = sesUltimaActividad + SESION_INACTIVIDAD_MS;
+  return Math.max(0, Math.round((Math.min(fin, porInactividad)-Date.now())/60000));
 }
 
 /* Obtiene el email de la cuenta conectada (informativo) */
@@ -12838,9 +12964,24 @@ async function gsFetchUserEmail(){
 /* ---------- Wrapper de fetch con manejo de token expirado (401) ---------- */
 async function gsApiFetch(url, options={}){
   if(!gsState.accessToken) throw new Error('NO_SESSION');
-  // Detección temprana: si el token ya caducó no se envía la petición; se
-  // conserva lo tecleado y se pide login antes de tocar el backend.
-  if(!gsTokenVigente()){ sesManejarExpiracion('operación con token vencido'); throw new Error('SESSION_EXPIRED'); }
+  /* Guardia previo. ANTES lanzaba SESSION_EXPIRED en cuanto caducaba el
+     token, lo que dejaba INALCANZABLE el bloque de renovación por 401 de más
+     abajo: esa era la ruta muerta que provocaba el login cada hora.
+     Ahora solo expulsa cuando la sesión terminó por decisión de la app; si
+     lo único caducado es el token, se renueva y se continúa. */
+  const finApp = sesionAppTerminada();
+  if(finApp){ sesManejarExpiracion('operación con la sesión terminada · '+finApp); throw new Error('SESSION_EXPIRED'); }
+  if(!tokenGoogleVigente()){
+    const r = await sesAsegurarToken('petición a la API');
+    if(r==='sesion-terminada'){ sesManejarExpiracion('operación con la sesión terminada'); throw new Error('SESSION_EXPIRED'); }
+    if(!tokenGoogleVigente()){
+      /* No se pudo renovar. Se deja que la petición salga igualmente: si el
+         token aún sirviera, Google responderá 200; si no, el 401 de abajo
+         lo resuelve. Nunca se bloquea la app por una renovación fallida sin
+         confirmación del servidor. */
+      console.warn('[Sesión] Renovación previa fallida; se intenta la petición con el token actual.');
+    }
+  }
   const opt = Object.assign({}, options);
   opt.headers = Object.assign({}, options.headers, { 'Authorization':'Bearer '+gsState.accessToken });
   let r = await fetch(url, opt);
@@ -12852,6 +12993,9 @@ async function gsApiFetch(url, options={}){
       opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
       r = await fetch(url, opt);
     }catch(e){
+      /* Google rechazó la renovación: la sesión ya no puede sostenerse
+         (revocada o cerrada en Google). Es la ÚNICA confirmación fiable. */
+      console.warn('[Sesión] Google rechazó la renovación tras un 401:', e && e.message || e);
       gsState.accessToken = null; gsClearSession();
       throw new Error('SESSION_EXPIRED');
     }
@@ -13329,11 +13473,17 @@ function gsMatrizValida(sheetName, matrix){
 const GS_BORRADO_MASIVO_MIN = 5;   // se ignora en hojas muy pequeñas
 
 async function gsSaveSheet(domain, sheetName, matrix){
-  // Guarda de sesión: con el token vencido no se intenta escribir ni se
-  // reporta éxito; se conserva lo ingresado y se solicita iniciar sesión.
-  if(gsState.accessToken && !gsTokenVigente()){
-    sesManejarExpiracion('guardado con token vencido');
-    return false;
+  /* Guarda de sesión antes de escribir. Solo el fin de sesión de la APP
+     impide guardar; un token caducado se renueva aquí mismo, porque un
+     guardado es justo el momento en que NO se debe expulsar al usuario.
+     Si la renovación falla, gsApiFetch resolverá con el 401 del servidor. */
+  if(gsState.accessToken){
+    const finApp = sesionAppTerminada();
+    if(finApp){
+      sesManejarExpiracion('guardado con la sesión terminada · '+finApp);
+      return false;
+    }
+    if(!tokenGoogleVigente()) await sesAsegurarToken('guardado');
   }
   if(!isAuthorized()) return false;
   try{
@@ -13800,7 +13950,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-09-23.1';
+const APP_VERSION = '2026-10-14.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -13834,7 +13984,109 @@ function sesFechaFormulario(){
 const SES_BORRADOR_VERSION = 2;
 
 function sesDescartarBorrador(){ localStorage.removeItem(SES_KEYS.borrador); }
-// Repuebla los campos del módulo si hay un borrador de ese mismo módulo.
+/* ══ BORRADOR DE FORMULARIO AL EXPIRAR LA SESIÓN ══════════════════════════
+   Qué es y qué NO es. Se guarda lo TECLEADO en los campos visibles; jamás
+   una operación pendiente de sincronizar. La distinción es la que importa:
+
+     · Guardar campos  → al volver, el usuario ve lo que escribía, lo revisa
+                         y pulsa guardar ÉL, ya con una sesión válida.
+     · Guardar la operación → repondría datos registrados sin sesión válida.
+                              Eso es lo que se prohíbe, y por eso no se hace.
+
+   Nada se sincroniza automáticamente desde aquí. El borrador no contiene
+   identificadores de registro ni intenciones: solo texto de formulario.
+   Caduca a las 12 h y se descarta al restaurarlo o al guardar.           */
+const SES_BORRADOR_MAX_MS = 12*60*60*1000;
+
+// Captura los campos visibles con valor del módulo activo.
+function sesCapturarBorrador(){
+  try{
+    const cont = document.getElementById('page') || document.body;
+    if(!cont) return false;
+    const campos = {};
+    let n = 0;
+    cont.querySelectorAll('input, select, textarea').forEach(el=>{
+      if(el.type==='file' || el.type==='password' || el.disabled) return;
+      const k = sesClaveCampo(el);
+      if(!k) return;
+      const v = (el.type==='checkbox' || el.type==='radio') ? (el.checked?'1':'') : String(el.value??'');
+      if(v==='' ) return;                       // campos vacíos: nada que conservar
+      campos[k] = v; n++;
+    });
+    if(!n) return false;
+    localStorage.setItem(SES_KEYS.borrador, JSON.stringify({
+      version: SES_BORRADOR_VERSION, modulo: currentPage, fecha: sesFechaFormulario(),
+      cuando: Date.now(), campos
+    }));
+    console.log('[Sesión] Borrador conservado: '+n+' campo(s) del módulo "'+currentPage+'".');
+    return true;
+  }catch(e){ console.warn('[Sesión] No se pudo conservar el borrador:', e); return false; }
+}
+
+// Lee el borrador si sigue siendo válido para el módulo y día actuales.
+function sesLeerBorrador(){
+  try{
+    const b = JSON.parse(localStorage.getItem(SES_KEYS.borrador)||'null');
+    if(!b || b.version !== SES_BORRADOR_VERSION) return null;
+    if(Date.now() - Number(b.cuando||0) > SES_BORRADOR_MAX_MS){ sesDescartarBorrador(); return null; }
+    if(b.modulo !== currentPage) return null;                       // otro módulo
+    const hoyForm = sesFechaFormulario();
+    if(b.fecha && hoyForm && b.fecha !== hoyForm) return null;      // otro día
+    return b;
+  }catch(e){ return null; }
+}
+
+/* Repuebla los campos y devuelve cuántos se restauraron. Solo escribe en
+   campos que estén VACÍOS: nunca pisa algo que el usuario ya haya tecleado. */
+function sesAplicarBorrador(b){
+  if(!b || !b.campos) return 0;
+  const cont = document.getElementById('page') || document.body;
+  if(!cont) return 0;
+  let n = 0;
+  cont.querySelectorAll('input, select, textarea').forEach(el=>{
+    if(el.type==='file' || el.type==='password' || el.disabled) return;
+    const k = sesClaveCampo(el);
+    if(!k || !(k in b.campos)) return;
+    if(el.type==='checkbox' || el.type==='radio'){
+      if(el.checked) return;
+      el.checked = b.campos[k]==='1';
+    }else{
+      if(String(el.value??'')!=='') return;     // ya tiene valor: no se pisa
+      el.value = b.campos[k];
+    }
+    n++;
+  });
+  return n;
+}
+
+/* Aviso no intrusivo tras volver a entrar: el usuario decide si restaura.
+   Nunca restaura solo, y nunca guarda nada por su cuenta. */
+function sesOfrecerBorrador(){
+  const b = sesLeerBorrador();
+  if(!b) return;
+  if(document.getElementById('sesBorradorAviso')) return;
+  const cont = document.getElementById('page') || document.body;
+  if(!cont) return;
+  const d = document.createElement('div');
+  d.id = 'sesBorradorAviso';
+  d.className = 'card';
+  d.style.cssText = 'background:#fffbeb;border-color:#fde68a;margin-bottom:14px';
+  d.innerHTML = `<b>📝 Tenías datos sin guardar en este módulo</b>
+    <p style="font-size:13px;color:var(--c-muted);margin:6px 0 10px">
+      Se conservó lo que estabas escribiendo cuando terminó la sesión anterior
+      (${new Date(b.cuando).toLocaleString('es-PE')}).
+      <b>No se guardó nada</b>: revisa los datos y guarda tú mismo si siguen siendo correctos.</p>
+    <button class="btn btn-primary btn-sm" id="sesBorrRestaurar">Restaurar lo que escribí</button>
+    <button class="btn btn-ghost btn-sm" id="sesBorrDescartar">Descartar</button>`;
+  cont.insertBefore(d, cont.firstChild);
+  d.querySelector('#sesBorrRestaurar').onclick = ()=>{
+    const n = sesAplicarBorrador(b);
+    sesDescartarBorrador();
+    d.remove();
+    toast(n ? n+' campo(s) restaurado(s). Revisa y guarda.' : 'No había campos que restaurar en esta vista.', n?'success':'warn');
+  };
+  d.querySelector('#sesBorrDescartar').onclick = ()=>{ sesDescartarBorrador(); d.remove(); };
+}
 
 // Aviso no intrusivo con opción de descartar.
 
@@ -13850,11 +14102,15 @@ let sesBloqueada = false;
 function sesBloquearYRecargar(titulo, mensaje, motivo){
   if(sesBloqueada) return;               // un solo bloqueo, sin bucles
   sesBloqueada = true;
+  /* Antes de desmontar nada se conserva lo TECLEADO (no la operación: ver
+     sesCapturarBorrador). Esto sustituye al removeItem que había aquí, que
+     descartaba el trabajo en curso justo en el peor momento. */
+  const hayBorrador = sesCapturarBorrador();
   gsState.accessToken = null;
   gsClearSession();
-  try{ localStorage.removeItem(SES_KEYS.borrador); }catch(e){}   // nada pendiente
-  console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…');
-  sesMostrarBloqueo(titulo, mensaje);
+  console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…'+(hayBorrador?' Se conservó lo tecleado.':''));
+  sesMostrarBloqueo(titulo, mensaje,
+    hayBorrador ? 'Lo que escribiste se recuperará al volver a entrar' : undefined);
   // Margen breve para que el usuario lea el aviso antes de recargar.
   setTimeout(()=>{
     try{
@@ -14080,8 +14336,15 @@ async function sesValidarAlReactivar(){
   if(sesBloqueada) return;
   if(Date.now() - sesUltimaValidacion < 5000) return;   // antirrebote
   sesUltimaValidacion = Date.now();
-  // Caso equipo suspendido: al volver, lo primero es validar la sesión.
-  if(gsState.accessToken && !gsTokenVigente()){ sesManejarExpiracion('reactivación tras inactividad'); return; }
+  /* Equipo suspendido. Al volver, un token caducado es lo ESPERADO y no
+     debe expulsar a nadie: solo termina la sesión si la app lo decide
+     (tope o inactividad). El token se renovará con la primera interacción,
+     que es el gesto que Google exige. */
+  if(gsState.accessToken){
+    const finApp = sesionAppTerminada();
+    if(finApp){ sesManejarExpiracion('reactivación · '+finApp); return; }
+    if(!tokenGoogleVigente()) console.log('[Sesión] Reactivación con el token caducado; se renovará con la primera interacción.');
+  }
   // La versión es del CÓDIGO, no de la sesión: se comprueba siempre, incluso
   // en la pantalla de login, donde antes se salía antes de llegar aquí.
   sesComprobarVersion('reactivación de la pestaña', true);
@@ -14099,11 +14362,36 @@ function sesInterceptarInteraccion(ev){
   if(sesBloqueada){ ev.stopPropagation(); ev.preventDefault(); return; }
   // Sin sesión iniciada aún (pantalla de login): no hay nada que validar.
   if(!gsState.accessToken) return;
-  if(!gsTokenVigente()){
+
+  /* ORDEN CRÍTICO: primero se EVALÚA la sesión con la marca de actividad
+     ANTERIOR y solo después se actualiza. Al revés —marcar y luego
+     evaluar— la inactividad no se cumpliría jamás, porque la propia
+     interacción que debía encontrarla caducada la estaría renovando. */
+  const finApp = sesionAppTerminada();
+  if(finApp){
     ev.stopPropagation();
     ev.preventDefault();
-    sesManejarExpiracion('interacción del usuario');
+    sesManejarExpiracion('interacción del usuario · '+finApp);
     return;
+  }
+
+  /* La sesión sigue viva: ahora sí, esta interacción prueba que el usuario
+     está presente. Es además el GESTO que Google exige para renovar sin que
+     el bloqueador de ventanas emergentes lo impida. */
+  sesMarcarActividad();
+
+  /* Token caducado o a punto: se renueva en segundo plano aprovechando este
+     gesto. La interacción NO se bloquea: la inmensa mayoría de clics no
+     tocan la red, y los que sí lo hacen pasan por gsApiFetch, que espera a
+     la renovación antes de enviar nada. */
+  if(tokenConvieneRenovar()){
+    sesAsegurarToken('interacción del usuario').then(r=>{
+      /* Solo si Google RECHAZA la renovación repetidamente se concluye que
+         la sesión ya no puede sostenerse (revocada, o cerrada en Google). */
+      if(r==='fallo' && !tokenGoogleVigente() && sesRenovacionesFallidas >= SES_RENOV_MAX_FALLOS){
+        sesManejarExpiracion('no se pudo renovar la sesión con Google');
+      }
+    });
   }
   // Comprobación de versión: en segundo plano y con antirrebote, para no
   // penalizar cada click con una petición de red.
@@ -14146,7 +14434,11 @@ if(!window.__sesTickTimer){
 if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
     if(sesBloqueada) return;
-    if(gsState.accessToken && !gsTokenVigente()){ sesManejarExpiracion('vencimiento en uso'); return; }
+    // Solo el fin de sesión de la APP expulsa; el token lo renueva el gesto.
+    if(gsState.accessToken){
+      const finApp = sesionAppTerminada();
+      if(finApp){ sesManejarExpiracion('vencimiento en uso · '+finApp); return; }
+    }
     sesComprobarVersion('comprobación periódica');
   }, 60000);
 }
@@ -14551,12 +14843,19 @@ function authGrant(viaLogin){
      última versión; si no, se bloquea y se recarga para no trabajar con
      código antiguo servido desde la caché. */
   if(viaLogin){
-    gsState.sesionInicio = gsState.sesionInicio || Date.now();
+    /* Un login EXPLÍCITO arranca una sesión nueva: el tope se cuenta desde
+       ahora y el reloj de inactividad se reinicia. */
+    gsState.sesionInicio = Date.now();
     gsState.sesionFin    = gsState.sesionInicio + SESION_MAX_MS;
+    try{ localStorage.setItem(AUTH_KEYS.inicio, String(gsState.sesionInicio)); }catch(e){}
+    sesMarcarActividad();
     sesComprobarVersion('inicio de sesión', true);
   }
   authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
   toast('Bienvenido, '+gsState.email,'success');
+  /* Si la sesión anterior terminó con un formulario a medias, se ofrece
+     recuperarlo. Se hace tras pintar el módulo, nunca antes. */
+  setTimeout(()=>{ try{ sesOfrecerBorrador(); }catch(e){} }, 600);
   gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
 
   const role = currentRole();
