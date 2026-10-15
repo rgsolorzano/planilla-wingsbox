@@ -750,23 +750,31 @@ function rangoUlt6MesesCalendario(){
            añoDesde:a, mesDesde:m,
            añoHasta:Number(hoy.slice(0,4)), mesHasta:Number(hoy.slice(5,7)) };
 }
-/* Ventana móvil de UN MES que termina AYER (hoy nunca participa), en hora de
+/* Ventana móvil de N MESES que termina AYER (hoy nunca participa), en hora de
    Lima. Ambos extremos son inclusivos.
-     hoy 2026-10-15 → { desde:'2026-09-14', hasta:'2026-10-14' }
-   El inicio es el MISMO día del mes anterior a `hasta`; si ese día no existe
-   en el mes anterior (31 → febrero) se recorta al último día de ese mes, que
-   es la única interpretación que no inventa una fecha inexistente.
+     n=1, hoy 2026-10-15 → { desde:'2026-09-14', hasta:'2026-10-14' }
+     n=2, hoy 2026-10-15 → { desde:'2026-08-14', hasta:'2026-10-14' }
+   El inicio es el MISMO día del mes situado N meses antes de `hasta`; si ese
+   día no existe en ese mes (31 → febrero) se recorta al último día del mes,
+   que es la única interpretación que no inventa una fecha inexistente.
    La ventana es FIJA: no depende del rango que el usuario tenga seleccionado
-   en ningún módulo. */
-function rangoUlt1MesHastaAyer(){
+   en ningún módulo. Es la ÚNICA implementación de esta ventana; cada módulo
+   solo elige cuántos meses necesita. */
+function rangoUltMesesHastaAyer(n){
+  const meses = Math.max(1, Math.trunc(Number(n) || 1));
   const hasta = fechaMasDias(fechaEnLima(), -1);
   let [a, m, d] = hasta.split('-').map(Number);
-  m -= 1; if(m === 0){ m = 12; a--; }
+  m -= meses; while(m <= 0){ m += 12; a--; }
   // Último día del mes (a,m): día 0 del mes siguiente en aritmética UTC.
   const ultimoDia = new Date(Date.UTC(a, m, 0)).getUTCDate();
   const dd = Math.min(d, ultimoDia);
-  return { desde: a+'-'+String(m).padStart(2,'0')+'-'+String(dd).padStart(2,'0'), hasta };
+  return { desde: a+'-'+String(m).padStart(2,'0')+'-'+String(dd).padStart(2,'0'), hasta, meses };
 }
+// Ventana de UN mes. La usa PROM. RENDIMIENTO (1 MES) del Consolidado.
+function rangoUlt1MesHastaAyer(){ return rangoUltMesesHastaAyer(1); }
+// Ventana de DOS meses. La usa "Consumo real de alas por día de la semana".
+//   hoy 2026-10-15 → { desde:'2026-08-14', hasta:'2026-10-14' }
+function rangoUlt2MesesHastaAyer(){ return rangoUltMesesHastaAyer(2); }
 // Suma/resta días a una fecha ISO sin pasar por Date (evita corrimientos).
 function fechaMasDias(fechaISO, n){
   const [y,m,d] = fechaISO.split('-').map(Number);
@@ -11690,8 +11698,11 @@ function alasCuadreHTML(){
    Si falta cualquiera de los dos extremos el día NO tiene dato (null) y no
    participa: la ausencia jamás se convierte en 0.
 
-   VENTANA: fija, un mes que termina AYER (rangoUlt1MesHastaAyer); hoy nunca
-   entra. No depende del rango del Cuadre de Alas ni de ningún filtro.
+   VENTANA: fija, DOS meses que terminan AYER (rangoUlt2MesesHastaAyer); hoy
+   nunca entra. No depende del rango del Cuadre de Alas ni de ningún filtro.
+   La ventana de PROM. RENDIMIENTO del Consolidado sigue siendo de un mes: son
+   indicadores distintos y cada uno elige su propio número de meses sobre la
+   misma implementación (rangoUltMesesHastaAyer).
 
    INCLUSIÓN: solo valores numéricos ESTRICTAMENTE POSITIVOS. Se descartan
    null, vacíos, 0 y negativos (un consumo ≤ 0 no es un consumo real sino un
@@ -11699,7 +11710,7 @@ function alasCuadreHTML(){
    Un día de la semana sin ninguna medición válida deja la celda VACÍA.
    ════════════════════════════════════════════════════════════════════════ */
 function alasConsumoPorDow(){
-  const R = rangoUlt1MesHastaAyer();
+  const R = rangoUlt2MesesHastaAyer();
   // Índice por día de la semana (0=Domingo … 6=Sábado), como DIAS[].
   const acc = {}; for(let i=0;i<7;i++) acc[i] = { suma:0, n:0, dias:0 };
   rangoFechas(R.desde, R.hasta).forEach(f=>{
@@ -11724,7 +11735,11 @@ function alasConsumoPorDow(){
 
 function alasConsumoPorDowHTML(){
   const D = alasConsumoPorDow();
-  const num = v => v===null ? '' : Number(v).toLocaleString('es-PE',{minimumFractionDigits:2, maximumFractionDigits:2});
+  /* El promedio se calcula con TODAS las mediciones válidas SIN redondear
+     (alasConsumoPorDow no toca los valores) y se redondea únicamente AQUÍ, al
+     presentarlo: entero más cercano, con el 0.5 hacia arriba (125.5 → 126).
+     Nunca se redondean las observaciones individuales antes de promediar. */
+  const num = v => v===null ? '' : Math.round(v).toLocaleString('es-PE');
   const conDato = D.filas.filter(r=>r.prom!==null);
   // Escala para el heatmap: solo con los promedios realmente calculados.
   const vals = conDato.map(r=>r.prom);
@@ -11741,17 +11756,19 @@ function alasConsumoPorDowHTML(){
       <h2>🍗 Consumo real de alas por día de la semana</h2>
       <p class="hint" style="margin-top:0">
         Promedio del <b>consumo real de alas según conteo</b> para cada día de la semana, en la ventana fija de
-        <b>un mes que termina ayer</b> (${fmtFecha(D.desde)} – ${fmtFecha(D.hasta)}); el día de hoy nunca participa.
+        <b>dos meses que terminan ayer</b> (${fmtFecha(D.desde)} – ${fmtFecha(D.hasta)}); el día de hoy nunca participa.
         Se calcula con la misma fórmula del Cuadre de Alas (<b>stock inicial − stock final</b> de ALAS PRECOCIDAS + ALAS EN SALMUERA)
         leída directamente de los registros persistidos de <b>Inventario de Insumos</b>, no de la tabla mostrada arriba.
         Solo se promedian los valores <b>estrictamente positivos</b>: los días sin registro, con 0 o con valor negativo se excluyen y
         <b>nunca</b> se cuentan como cero. Un día de la semana sin ninguna medición válida deja la celda <b>vacía</b>.
+        El promedio se calcula con todas las mediciones válidas y <b>se redondea al entero más cercano solo al mostrarlo</b>;
+        las mediciones individuales no se redondean.
         Esta tabla es informativa y no modifica ninguna alerta.
       </p>
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Día de la semana</th>
-          <th class="num" title="Promedio del consumo real de alas de ese día de la semana dentro de la ventana">Promedio de<br>consumo real</th>
+          <th class="num" title="Promedio del consumo real de alas de ese día de la semana dentro de la ventana de dos meses, redondeado al entero más cercano">Promedio de<br>consumo real</th>
           <th class="num" title="Días con medición válida sobre el total de ocurrencias de ese día en la ventana">Días con<br>dato</th>
         </tr></thead>
         <tbody>${cuerpo}</tbody>
@@ -14361,7 +14378,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-15.1';
+const APP_VERSION = '2026-10-15.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
