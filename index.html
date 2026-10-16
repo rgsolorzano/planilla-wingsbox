@@ -166,20 +166,45 @@
   /* Última columna fija a la DERECHA (espejo de .mx-fix). Se usa para
      indicadores de resumen que deben seguir visibles mientras se desplazan
      horizontalmente las columnas de días. */
+  .mx-table{ --mxr:92px }            /* ancho de cada columna fija derecha */
   .mx-fix-r{
-    position:sticky;right:0;z-index:2;
+    position:sticky;z-index:2;
     background:#f5f3ff;color:#4c1d95;font-weight:700;
-    min-width:84px;max-width:110px;
-    border-left:2px solid #4c1d95!important;
     box-shadow:-3px 0 6px rgba(0,0,0,.14);
     text-align:center
   }
+  /* El ancho se fuerza porque `.mx-table td.num` impone max-width:90px con
+     mayor especificidad: sin esto la columna mediría 90px mientras los
+     desplazamientos de abajo se calculan con --mxr, dejando una rendija
+     entre las columnas fijas. El ancho real debe ser EXACTAMENTE --mxr para
+     que el apilado encaje. */
+  .mx-table th.mx-fix-r,
+  .mx-table td.mx-fix-r{
+    width:var(--mxr)!important;
+    min-width:var(--mxr)!important;
+    max-width:var(--mxr)!important;
+    box-sizing:border-box
+  }
+  /* Varias columnas fijas apiladas desde el borde derecho. El desplazamiento
+     se calcula con --mxr, así que basta cambiar esa variable para ajustarlas
+     todas a la vez (p. ej. en pantallas estrechas). r1 es la más a la derecha.
+     Solo la primera del grupo (la más a la izquierda) lleva el borde grueso,
+     para que el bloque se lea como una sola unidad separada de los días. */
+  .mx-fix-r1{ right:0 }
+  .mx-fix-r2{ right:var(--mxr) }
+  .mx-fix-r3{ right:calc(var(--mxr) * 2) }
+  .mx-table th.mx-fix-r-ini,
+  .mx-table td.mx-fix-r-ini{ border-left:3px solid #4c1d95!important }
   .mx-table thead .mx-fix-r{
     z-index:6;background:#1e1b4b;color:#e9d5ff;
     font-size:10px;font-weight:700;white-space:normal;line-height:1.25;
     text-transform:uppercase;letter-spacing:.02em
   }
   .mx-table tbody tr:hover .mx-fix-r{ background:#ede9fe }
+  @media(max-width:768px){
+    .mx-table{ --mxr:66px }
+    .mx-table thead .mx-fix-r{ font-size:9px;letter-spacing:0 }
+  }
   /* ── HOVER DE FILA: SOLO FONDO, NUNCA COLOR DE TEXTO ────────────────────
      Regla única para todas las tablas matriciales. El hover no declara
      `color` en ninguna parte: el texto conserva exactamente el mismo tono que
@@ -9988,6 +10013,71 @@ function promRendimiento1Mes(ins){
   return { prom: n ? suma/n : null, n, desde:R.desde, hasta:R.hasta };
 }
 
+/* ── PROM. PORCIONES POR TIPO DE DÍA (DOM-JUE / VIE-SÁB) ─────────────────
+   MEDICIÓN DE PORCIONES, distinguiendo "cero real" de "sin medición".
+   -----------------------------------------------------------------------
+   La columna visible PORCIONES CONSUMIDAS usa porcionesTabla(), que convierte
+   la ausencia de registro en 0 para poder operar con ella; por eso en esa
+   tabla NO existen celdas vacías y un 0 puede ser cualquiera de los dos
+   casos. Además vpdPorciones nunca almacena un 0: el cargador cuenta filas
+   de venta (siempre ≥ 1) y representa "cero porciones" por AUSENCIA de la
+   clave. Para promediar hacen falta los dos conceptos separados, y la
+   distinción sí es recuperable a nivel de DÍA sobre la misma fuente:
+
+     · vpdPorciones[fecha] EXISTE  → ese día SÍ tiene datos de venta, luego
+       0 porciones de este insumo es una MEDICIÓN VÁLIDA de cero.
+     · vpdPorciones[fecha] NO existe → ese día no tiene ningún dato de venta,
+       luego no hay medición y el día se EXCLUYE (no se convierte en 0).
+
+   No se recalcula nada desde las ventas ni desde el inventario: se leen las
+   mismas porciones ya cargadas en vpdPorciones, con la misma normalización y
+   el mismo VPD_SET que usa el resto del módulo.
+   Devuelve null = sin medición; un número (que puede ser 0) = medición. */
+function porcionesMedicion(nombreInsumo, fecha){
+  const key = vpdNormalizar(nombreInsumo);
+  if(!VPD_SET.has(key)) return null;          // insumo fuera de la lista
+  const dia = vpdPorciones[fecha];
+  if(!dia) return null;                       // el día no fue medido
+  const n = dia[key];
+  if(n === undefined) return 0;               // día medido, 0 porciones: CERO REAL
+  const v = Number(n);
+  return Number.isFinite(v) ? v : null;       // no numérico → sin medición
+}
+// Grupos de días de la semana (índices de diaSemana(): 0=Domingo … 6=Sábado).
+const PROM_POR_DOM_JUE = [0,1,2,3,4];   // domingo a jueves
+const PROM_POR_VIE_SAB = [5,6];         // viernes y sábado
+/* Promedios de porciones por tipo de día, en la MISMA ventana móvil de un mes
+   que termina ayer que usa PROM. RENDIMIENTO (rangoUlt1MesHastaAyer), e
+   independiente del rango que el usuario tenga seleccionado.
+   Los ceros reales entran en la suma y en el denominador; los días sin
+   medición no entran en ninguno de los dos. Sin mediciones → prom:null
+   (celda VACÍA, nunca 0). El promedio se devuelve SIN redondear: el formato
+   de un decimal se aplica solo al presentarlo. */
+function promPorcionesPorTipoDia(ins){
+  const R = rangoUlt1MesHastaAyer();
+  const acc = { domJue:{suma:0,n:0}, vieSab:{suma:0,n:0} };
+  if(ins) rangoFechas(R.desde, R.hasta).forEach(f=>{
+    const v = porcionesMedicion(ins.nombre, f);
+    if(v === null) return;                     // sin medición: se excluye
+    const dow = diaSemana(f);
+    const g = PROM_POR_VIE_SAB.includes(dow) ? acc.vieSab
+            : (PROM_POR_DOM_JUE.includes(dow) ? acc.domJue : null);
+    if(!g) return;
+    g.suma += v; g.n++;                        // un 0 suma 0 y cuenta 1
+  });
+  return {
+    domJue: { prom: acc.domJue.n ? acc.domJue.suma/acc.domJue.n : null, n:acc.domJue.n },
+    vieSab: { prom: acc.vieSab.n ? acc.vieSab.suma/acc.vieSab.n : null, n:acc.vieSab.n },
+    desde:R.desde, hasta:R.hasta
+  };
+}
+// Formato de presentación: máximo UN decimal, sin mínimo (5 → "5", 5.24 →
+// "5.2", 12.75 → "12.8", 0 → "0"). Se aplica al promedio ya calculado.
+function fmtPromPorciones(v){
+  return (v === null || v === undefined || !Number.isFinite(v))
+    ? '' : Number(v).toLocaleString('es-PE', { maximumFractionDigits:1 });
+}
+
 /* ¿Este día está en alerta? Las condiciones son ACUMULATIVAS:
      1) rendimiento <= umbral mínimo del insumo
      2) rendimiento >= umbral máximo del insumo
@@ -11098,7 +11188,11 @@ RENDERERS.inventarioConsolidado = function(){
   /* Encabezado de la columna fija de la derecha. Lleva rowspan=2 igual que la
      columna de Insumo, porque no pertenece a ningún bloque de día. */
   const RP = rangoUlt1MesHastaAyer();
-  const theadProm = `<th class="num mx-fix-r" rowspan="2" title="Promedio de los rendimientos diarios válidos entre ${fmtFecha(RP.desde)} y ${fmtFecha(RP.hasta)} (ventana fija de un mes que termina ayer, independiente del rango seleccionado). Solo se promedian los días con ${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL}.">Prom.<br>rendimiento<br>(1 mes)</th>`;
+  const theadProm = `<th class="num mx-fix-r mx-fix-r3 mx-fix-r-ini" rowspan="2" title="Promedio de los rendimientos diarios válidos entre ${fmtFecha(RP.desde)} y ${fmtFecha(RP.hasta)} (ventana fija de un mes que termina ayer, independiente del rango seleccionado). Solo se promedian los días con ${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL}.">Prom.<br>rendimiento<br>(1 mes)</th>`
+    /* Promedios de PORCIONES por tipo de día. Comparten la ventana de un mes
+       con la columna anterior y se apilan a su derecha como bloque fijo. */
+    + `<th class="num mx-fix-r mx-fix-r2" rowspan="2" title="Promedio de las porciones consumidas los domingos, lunes, martes, miércoles y jueves entre ${fmtFecha(RP.desde)} y ${fmtFecha(RP.hasta)} (misma ventana de un mes que termina ayer, independiente del rango seleccionado). Los días medidos con 0 porciones cuentan; los días sin datos de venta se excluyen del promedio.">Prom.<br>porciones<br>(dom-jue)</th>`
+    + `<th class="num mx-fix-r mx-fix-r1" rowspan="2" title="Promedio de las porciones consumidas los viernes y sábados entre ${fmtFecha(RP.desde)} y ${fmtFecha(RP.hasta)} (misma ventana de un mes que termina ayer, independiente del rango seleccionado). Los días medidos con 0 porciones cuentan; los días sin datos de venta se excluyen del promedio.">Prom.<br>porciones<br>(vie-sáb)</th>`;
   const filasIndicadores = insumosIndicadores.map(ins=>{
     const celdas = fechas.map(f=>{
       const por  = porcionesTabla(ins.nombre, f);   // ventas; sin registro = 0
@@ -11121,8 +11215,19 @@ RENDERERS.inventarioConsolidado = function(){
     const prTitle = pr.prom===null
       ? `Sin mediciones válidas entre ${fmtFecha(pr.desde)} y ${fmtFecha(pr.hasta)} (se exige ${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL}).`
       : `Promedio de ${pr.n} día(s) con rendimiento válido entre ${fmtFecha(pr.desde)} y ${fmtFecha(pr.hasta)} (${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL}).`;
-    const celdaProm = `<td class="num mx-fix-r" title="${prTitle}">${prTxt}</td>`;
-    return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}${celdaProm}</tr>`;
+    const celdaProm = `<td class="num mx-fix-r mx-fix-r3 mx-fix-r-ini" title="${prTitle}">${prTxt}</td>`;
+    /* PROM. PORCIONES por tipo de día: misma ventana de un mes, mismos
+       criterios de vacío, formato de un decimal aplicado al promedio final. */
+    const pp = promPorcionesPorTipoDia(ins);
+    const ppCelda = (g, etiqueta, clase)=>{
+      const t = g.prom===null
+        ? `Sin mediciones de porciones en ${etiqueta} entre ${fmtFecha(pp.desde)} y ${fmtFecha(pp.hasta)}.`
+        : `Promedio de ${g.n} medición(es) de ${etiqueta} entre ${fmtFecha(pp.desde)} y ${fmtFecha(pp.hasta)} (los días medidos con 0 porciones cuentan; los días sin datos de venta no).`;
+      return `<td class="num mx-fix-r ${clase}" style="color:#7c3aed" title="${t}">${fmtPromPorciones(g.prom)}</td>`;
+    };
+    const celdasPorc = ppCelda(pp.domJue, 'domingo a jueves', 'mx-fix-r2')
+                     + ppCelda(pp.vieSab, 'viernes y sábado', 'mx-fix-r1');
+    return `<tr><td class="mx-fix">${ins.nombre} <span class="badge b-free">${ins.unidad}</span></td>${celdas}${celdaProm}${celdasPorc}</tr>`;
   }).join('');
 
   // Subtítulo del historial con contador actualizado
@@ -11182,9 +11287,13 @@ RENDERERS.inventarioConsolidado = function(){
         <b>Filtra alertas</b> (en la barra superior) es un filtro global: cuando está activo, ambas tablas muestran solo los insumos con algún día en alerta.
         Un día está en alerta si su rendimiento queda fuera del rango configurado (límites inclusivos) <b>o</b> si no hubo porciones consumidas y la cantidad consumida varió más de ±${CONSUMO_SIN_VENTA_TOL}, lo que delata una inconsistencia de inventario.
         Sin registro de ventas, las porciones se muestran como <b>0</b>.
-        La última columna, <b>Prom. rendimiento (1 mes)</b>, queda fija a la derecha y usa <b>siempre</b> su propia ventana de un mes que termina ayer
-        (${fmtFecha(RP.desde)} – ${fmtFecha(RP.hasta)}), al margen del rango seleccionado arriba. Solo promedia los días con ${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL};
+        Las <b>tres últimas columnas</b> quedan fijas a la derecha y usan <b>siempre</b> la misma ventana de un mes que termina ayer
+        (${fmtFecha(RP.desde)} – ${fmtFecha(RP.hasta)}), al margen del rango seleccionado arriba.
+        <b>Prom. rendimiento (1 mes)</b> solo promedia los días con ${PROM_REND_MIN_EXCL} &lt; rendimiento ≤ ${PROM_REND_MAX_INCL};
         si ningún día cumple la condición la celda queda <b>vacía</b> (nunca 0).
+        <b>Prom. porciones (dom-jue)</b> y <b>(vie-sáb)</b> promedian las porciones consumidas de cada grupo de días: un día medido con <b>0 porciones cuenta</b>
+        en la suma y en el divisor, mientras que un día <b>sin datos de venta se excluye</b> de ambos y nunca se convierte en 0; sin mediciones la celda queda
+        <b>vacía</b>. Se muestran con un máximo de un decimal, aplicado al promedio ya calculado.
       </p>
       ${insumosIndicadores.length===0
         ? `<div class="mx-outer"><table class="mx-table">
@@ -11192,7 +11301,7 @@ RENDERERS.inventarioConsolidado = function(){
                <tr><th class="mx-fix" rowspan="2">Insumo</th>${theadFechas2}${theadProm}</tr>
                <tr>${theadSub2}</tr>
              </thead>
-             <tbody><tr><td class="empty" colspan="${2+fechas.length*3}">${invConsSoloAlertas
+             <tbody><tr><td class="empty" colspan="${4+fechas.length*3}">${invConsSoloAlertas
                 ? 'Ningún insumo presenta rendimiento fuera de sus umbrales en el período seleccionado.'
                 : 'No hay indicadores disponibles para este insumo.'}</td></tr></tbody>
            </table></div>`
@@ -14378,7 +14487,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-15.2';
+const APP_VERSION = '2026-10-16.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
