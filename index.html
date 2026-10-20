@@ -76,6 +76,9 @@
   .field input,.field select,.field textarea{padding:9px 10px;border:1px solid var(--c-line);border-radius:8px;font-size:13px;font-family:inherit;background:#fff;color:var(--c-text)}
   .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(232,69,95,.18)}
   .field input.invalid,.field select.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
+  /* Misma marca de error para los inputs dentro de tablas (p. ej. las filas
+     dinámicas de Propinas), que no viven dentro de un .field */
+  table input.invalid,table select.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
   .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 
   /* ---------- Botones ---------- */
@@ -601,7 +604,9 @@
       <button data-page="empleados" class="active"><span class="ico">👥</span> Empleados</button>
       <button data-page="horarios"><span class="ico">🕒</span> Horarios</button>
       <button data-page="marcaciones"><span class="ico">📥</span> Carga de horas</button>
-      <button data-page="propinas"><span class="ico">💵</span> Propinas</button>
+      <!-- 'Propinas' ya no figura en este menú estático de planilla: el módulo
+           se trasladó a INVENTARIO → Registro Diario. Este bloque solo actúa
+           como respaldo (PLANILLA_NAV_HTML) si no se construye el accordion. -->
       <button data-page="propinasConsolidado"><span class="ico">🧮</span> Consolidado propinas</button>
       <button data-page="descuentos"><span class="ico">➖</span> Descuentos</button>
       <button data-page="pagos"><span class="ico">➕</span> Pagos extra</button>
@@ -691,6 +696,9 @@ const K = {
   desc:'pl_descuentos', pago:'pl_pagosExtra', libre:'pl_diasLibres',
   considerarHE:'pl_considerarHE', seed:'pl_seedDone',
   prop:'pl_propinas', tarjetaVal:'pl_tarjetaVal', exoTard:'pl_exoTardanza',
+  // Padrón mínimo de meseros (id + nombre) replicado al spreadsheet de
+  // INVENTARIO para que Propinas funcione sin acceso al de Planilla.
+  meseros:'pl_meserosPadron',
   // Módulo Producción / Insumos (inventario)
   insumos:'pl_insumos', produccion:'pl_produccion', seedInsumos:'pl_seedInsumosDone',
   // Producción como concepto INDEPENDIENTE del stock (ver migración v2).
@@ -995,13 +1003,14 @@ function retrasoMensualMinutos(emp, year, month){
 }
 
 /* Estado en memoria (se sincroniza con localStorage) */
-let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[], cocinaMovimientos:[], bebidasMovs:[] };
+let S = { emp:[], hor:[], mar:[], desc:[], pago:[], libre:[], prop:[], tarjetaVal:[], meseros:[], insumos:[], produccion:[], prodInsumos:[], licores:[], invLicores:[], bebidasCat:[], stockBebidas:[], efectivoCaja:[], salonProductos:[], salonInventario:[], menajeArticulos:[], menajeInventario:[], cocinaProductos:[], cocinaInventario:[], cocinaMovimientos:[], bebidasMovs:[] };
 function reloadState(){
   S.emp=load(K.emp); S.hor=load(K.hor); S.mar=load(K.mar);
   migrarCondiciones();   // idempotente: cada empleado tiene al menos una condición
   normalizarMarcacionesMedianoche(); // corrige scans de medianoche mal asignados
   S.desc=load(K.desc); S.pago=load(K.pago); S.libre=load(K.libre);
   S.prop=load(K.prop); S.tarjetaVal=load(K.tarjetaVal);
+  S.meseros=load(K.meseros);   // padrón de meseros (respaldo del dominio inventario)
   S.insumos=load(K.insumos).map(migrarCamposInsumo); // migra tipoAlerta/umbral si faltan
   S.produccion=load(K.produccion);
   // Producción: colección propia. Sin esta rehidratación, los registros
@@ -1114,15 +1123,94 @@ function calcularTotalBasePropinas(p){
 }
 // Aplana S.prop (formato nuevo y antiguo) en "items" atómicos, uno por propina individual.
 // Un registro antiguo con varios tipos > 0 genera varios items; uno nuevo genera exactamente 1.
-function propinaItems(){
+/* ════════════════════════════════════════════════════════════════════════
+   OV (ORDEN DE VENTA) — identificador obligatorio de cada propina nueva
+   ------------------------------------------------------------------------
+   Se guarda y se compara SIEMPRE como TEXTO: un OV como '00123' debe
+   conservar sus ceros iniciales, y cualquier paso por Number() los
+   destruiría ('00123' → 123). La hoja se escribe con
+   valueInputOption:'RAW', de modo que la cadena llega a Sheets tal cual.
+   Válido = una o más cifras 0-9 y nada más: se rechazan el vacío, letras,
+   espacios, signos, puntos, comas, guiones y cualquier otro carácter.
+   ════════════════════════════════════════════════════════════════════════ */
+function ovNormalizar(v){
+  return (v===null || v===undefined) ? '' : String(v).trim();
+}
+function ovEsValido(v){
+  return /^[0-9]+$/.test(ovNormalizar(v));
+}
+/* OV tal como debe quedar en el estado. '' significa "sin OV", que es el
+   caso legítimo de los registros históricos anteriores al campo: nunca se
+   inventa un valor ni se sustituye por un marcador. */
+function ovDesdeFila(v){
+  const s = ovNormalizar(v);
+  return ovEsValido(s) ? s : '';
+}
+
+/* ── PADRÓN DE MESEROS ───────────────────────────────────────────────────
+   El formulario de Propinas necesita id y nombre de cada mesero. Esa
+   información vive en S.emp, que solo se carga desde el spreadsheet de
+   PLANILLA; la cuenta de inventario no tiene acceso a él. Para que el
+   módulo funcione en ambas cuentas sin exponer sueldos ni datos
+   personales, la cuenta combinada replica un padrón mínimo (id + nombre)
+   en la hoja 'Meseros' del spreadsheet de INVENTARIO, y el módulo usa
+   S.emp cuando está disponible y el padrón como respaldo.
+   ----------------------------------------------------------------------- */
+// Lo que se publica en la hoja 'Meseros': solo meseros visibles, id y nombre.
+function meseroPadronExport(){
+  return S.emp.filter(e=>esMesero(e) && empEsVisible(e))
+              .map(e=>({ id:String(e.id), nombre:String(e.nombre||'').trim() }));
+}
+/* Fuente única del padrón para el módulo Propinas. Con S.emp disponible se
+   usa él (conserva activo/visible); si no, el padrón replicado. */
+function propMeseroPadron(){
+  const deEmp = S.emp.filter(e=>esMesero(e) && empEsVisible(e));
+  if(deEmp.length) return deEmp.map(e=>({ id:String(e.id), nombre:String(e.nombre||'').trim(), activo:empEsActivo(e) }));
+  return (S.meseros||[]).filter(m=>m && m.id).map(m=>({ id:String(m.id), nombre:String(m.nombre||'').trim(), activo:true }));
+}
+// Nombre de un mesero por id, con el mismo respaldo. '—' si no se resuelve.
+function propNombreMesero(id){
+  const e = S.emp.find(x=>x.id===id);
+  if(e) return e.nombre;
+  const m = (S.meseros||[]).find(x=>String(x.id)===String(id));
+  return m ? (m.nombre||'—') : '—';
+}
+
+/* ── Ventana por defecto de "Propinas registradas" ───────────────────────
+   Las DOS últimas semanas COMPLETAS (lunes a domingo), excluyendo la semana
+   en curso, en hora de Lima.
+     hoy martes 2026-10-20 → { desde:'2026-10-05', hasta:'2026-10-18' }
+   Solo limita la VISTA inicial: el usuario puede elegir cualquier otro
+   rango, y el consolidado nunca pasa por aquí. */
+function rangoUlt2SemanasCompletas(){
+  const lunesActual = anLunesDe(fechaEnLima());   // lunes de la semana en curso
+  const hasta = fechaMasDias(lunesActual, -1);    // domingo de la última semana completa
+  const desde = fechaMasDias(hasta, -13);         // lunes de la semana anterior a esa
+  return { desde, hasta };
+}
+
+/* `rango` (opcional) = {desde, hasta} en 'YYYY-MM-DD'. Filtra por fecha
+   ANTES de expandir los registros a items, de modo que la vista por defecto
+   de "Propinas registradas" no recorra ni construya todo el historial.
+   Sin argumento el comportamiento es EXACTAMENTE el anterior: historial
+   completo. El consolidado y las búsquedas por itemId siguen llamándola sin
+   rango, así que sus totales no cambian. */
+function propinaItems(rango){
   const out=[];
+  const d = rango && rango.desde ? rango.desde : null;
+  const h = rango && rango.hasta ? rango.hasta : null;
   S.prop.forEach(p=>{
+    if(d && !(String(p.fecha) >= d)) return;
+    if(h && !(String(p.fecha) <= h)) return;
     if(esPropinaNueva(p)){
-      out.push({ itemId:p.id, recordId:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:numProp(p.monto) });
+      out.push({ itemId:p.id, recordId:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:numProp(p.monto),
+        ov: ovNormalizar(p.ov) });
     }else{
       TIPOS_PROPINA.forEach(tipo=>{
         const monto=numProp(p[tipo]);
-        if(monto>0) out.push({ itemId:p.id+'::'+tipo, recordId:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo, monto });
+        // Formato antiguo: un registro se expande en varios items y NUNCA
+        // tuvo OV. Se deja vacío a propósito (no se inventa ningún valor).
+        if(monto>0) out.push({ itemId:p.id+'::'+tipo, recordId:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo, monto, ov:'' });
       });
     }
   });
@@ -1138,12 +1226,16 @@ function propinaItemActualizar(item, datos){
     const p=S.prop[idx];
     if(esPropinaNueva(p)){
       p.empleadoId=datos.empleadoId; p.fecha=datos.fecha; p.tipo=datos.tipo; p.monto=numProp(datos.monto);
+      // OV como TEXTO (conserva ceros iniciales). '' = sin OV, que es el
+      // estado legítimo de un registro histórico que nunca lo tuvo.
+      p.ov=ovNormalizar(datos.ov);
       return;
     }
     p[item.tipo]=0;
     if(TIPOS_PROPINA.every(t=>numProp(p[t])===0)) S.prop.splice(idx,1);
   }
-  S.prop.push({ id:uid(), empleadoId:datos.empleadoId, fecha:datos.fecha, tipo:datos.tipo, monto:numProp(datos.monto) });
+  S.prop.push({ id:uid(), empleadoId:datos.empleadoId, fecha:datos.fecha, tipo:datos.tipo, monto:numProp(datos.monto),
+    ov:ovNormalizar(datos.ov) });
 }
 // Elimina un item: si su registro es del formato nuevo, elimina el registro completo;
 // si es del formato antiguo, solo pone ese tipo en 0 (conserva los demás tipos del registro).
@@ -1159,7 +1251,9 @@ function propinaItemEliminar(item){
 // exportar a Excel / Google Sheets (una fila por propina independiente). Se reutiliza
 // propinaItems() para no duplicar la lógica de normalización de formatos.
 function propinaItemsExport(){
-  return propinaItems().map(it=>({ id:it.itemId, empleadoId:it.empleadoId, fecha:it.fecha, tipo:it.tipo, monto:it.monto }));
+  // `ov` siempre como texto; '' para los históricos sin OV (no se inventa).
+  return propinaItems().map(it=>({ id:it.itemId, empleadoId:it.empleadoId, fecha:it.fecha, tipo:it.tipo, monto:it.monto,
+    ov: ovNormalizar(it.ov) }));
 }
 // Reconstruye un registro de propina (formato nuevo) a partir de una fila importada
 // de Excel/Google Sheets. Soporta tanto el formato nuevo (columnas id/tipo/monto) como
@@ -1169,7 +1263,10 @@ function filaPropinaAEstado(r){
   if(r.tipo!==undefined && r.tipo!==null && String(r.tipo).trim()!==''){
     const tipo=String(r.tipo).trim().toLowerCase();
     return { id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
-      tipo: TIPOS_PROPINA.includes(tipo)?tipo:'efectivo', monto:numProp(r.monto) };
+      tipo: TIPOS_PROPINA.includes(tipo)?tipo:'efectivo', monto:numProp(r.monto),
+      // OV como texto. Si la hoja no trae la columna (histórico) queda '' y
+      // el registro sigue siendo consultable y consolidable sin OV.
+      ov: ovDesdeFila(r.ov) };
   }
   return { id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha),
     efectivo:numProp(r.efectivo), yape:numProp(r.yape), plin:numProp(r.plin), tarjeta:numProp(r.tarjeta), izipay:numProp(r.izipay) };
@@ -5736,8 +5833,27 @@ function empOptions(selected, includeInactive){
     .join('');
 }
 /* Helper: <option> solo de meseros visibles */
+/* Usada SOLO por el módulo Propinas. Toma el padrón de propMeseroPadron(),
+   que prefiere S.emp y cae al padrón replicado cuando la cuenta no tiene
+   acceso al spreadsheet de planilla; así el desplegable funciona en ambas
+   cuentas sin exponer más datos de empleado que id y nombre. */
 function meseroOptions(selected){
-  return S.emp.filter(e=>esMesero(e)&&empEsVisible(e)).map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}${!empEsActivo(e)?' (inactivo)':''}</option>`).join('');
+  return propMeseroPadron().map(e=>`<option value="${e.id}" ${e.id===selected?'selected':''}>${e.nombre}${e.activo===false?' (inactivo)':''}</option>`).join('');
+}
+/* Barra de filtros propia de Propinas: igual que filtroToolbar() pero el
+   desplegable de empleado se arma con el padrón de meseros en vez de S.emp,
+   que está vacío en la cuenta de inventario. No se modifica filtroToolbar()
+   porque la comparten otros módulos. */
+function propFiltroToolbar(f){
+  const R = rangoUlt2SemanasCompletas();
+  return `
+    <div class="toolbar" style="margin-bottom:12px;flex-wrap:wrap">
+      <div class="field"><label>Filtrar mesero</label><select id="prFEmp"><option value="">Todos</option>${propMeseroPadron().map(e=>`<option value="${e.id}" ${f.emp===e.id?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
+      <div class="field"><label>Desde</label><input type="date" id="prFDesde" value="${f.desde||''}"></div>
+      <div class="field"><label>Hasta</label><input type="date" id="prFHasta" value="${f.hasta||''}"></div>
+      <button class="btn btn-ghost btn-sm" id="prFClear" title="Vuelve a las dos últimas semanas completas (${fmtFecha(R.desde)} – ${fmtFecha(R.hasta)})">Últimas 2 semanas</button>
+      <button class="btn btn-ghost btn-sm" id="prFAll" title="Quita el filtro de fechas y muestra todo el historial (puede tardar si hay muchos registros)">Ver todo el historial</button>
+    </div>`;
 }
 function noEmpWarning(){
   return `<div class="card"><div class="empty">Primero registra empleados en el módulo <b>Empleados</b>.</div></div>`;
@@ -6732,9 +6848,19 @@ window.libreDel=function(id){
    normalización (ver propinaItems / propMonto más arriba).
    ================================================================ */
 let editPropItem=null;       // item en edición (formato unificado), null = modo "nueva propina"
-let propFilter={emp:'',desde:'',hasta:''};
+/* Vista inicial de "Propinas registradas": las dos últimas semanas
+   COMPLETAS (sin la semana en curso). Solo limita la VISTA; el usuario
+   puede cambiar el rango o pedir todo el historial, y el Consolidado de
+   Propinas nunca pasa por este filtro. */
+let propFilter=(()=>{ const R=rangoUlt2SemanasCompletas(); return {emp:'', desde:R.desde, hasta:R.hasta}; })();
 // Filas del formulario de "nueva propina" (no aplica en modo edición).
-let propDraftRows=[{tipo:'tarjeta', monto:''}];
+/* Tipo por defecto IZIPAY en la fila inicial, en cada fila agregada y al
+   reiniciar el formulario tras guardar. Cambia SOLO el valor preseleccionado:
+   TIPOS_PROPINA, las etiquetas y el cálculo de la base (0.98 en Tarjeta,
+   100% en Izipay, Yape, Efectivo y Plin) quedan intactos. */
+const PROP_TIPO_DEFECTO='izipay';
+const propFilaVacia=()=>({tipo:PROP_TIPO_DEFECTO, monto:'', ov:''});
+let propDraftRows=[propFilaVacia()];
 // Mesero/fecha seleccionados "en vivo" en el formulario de nueva propina (no aplica en
 // edición). Se usan para no perder la selección al agregar/quitar filas antes de guardar;
 // se reinician a null tras guardar (en ese punto manda lastPropina, que ya coincide).
@@ -6756,21 +6882,33 @@ function propCapturarFilas(){
   const tipos=document.querySelectorAll('.prRowTipo');
   const montos=document.querySelectorAll('.prRowMonto');
   if(!tipos.length) return;
-  propDraftRows = Array.from(tipos).map((sel,i)=>({ tipo:sel.value, monto:montos[i].value }));
+  // Incluye el OV para que un re-render (agregar fila, error de validación)
+  // no pierda lo que el usuario ya escribió.
+  const ovs = document.querySelectorAll('.prRowOv');
+  propDraftRows = Array.from(tipos).map((sel,i)=>({ tipo:sel.value, monto:montos[i].value,
+    ov: ovs[i] ? ovs[i].value : '' }));
 }
 
 RENDERERS.propinas = function(){
   const el=document.getElementById('page-propinas');
-  const meseros=S.emp.filter(esMesero);
+  const meseros=propMeseroPadron();
   if(!meseros.length){
     el.innerHTML=`<div class="page-head"><div><h1>💵 Propinas</h1></div></div>
-      <div class="card"><div class="empty">No hay empleados de tipo <b>Mesero</b>. Crea o asigna el tipo "Mesero" en el módulo <b>Empleados</b>.</div></div>`;
+      <div class="card"><div class="empty">No hay meseros disponibles.<br>
+        Si usas la cuenta de <b>planilla</b>, crea o asigna el tipo "Mesero" en el módulo <b>Empleados</b>.<br>
+        Si usas la cuenta de <b>inventario</b>, el padrón de meseros se replica desde planilla: pide que la cuenta de planilla
+        inicie sesión una vez para publicar la hoja <b>Meseros</b> del spreadsheet de inventario.</div></div>`;
     return;
   }
   const hoy=fechaHoy();
-  const allItems=propinaItems();
-  const list=aplicaFiltro([...allItems].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter);
   const ed=editPropItem;
+  /* Solo se expanden a items los registros del rango visible: con el filtro
+     por defecto (dos semanas) no se recorre ni se renderiza el historial
+     completo. Sin fechas en el filtro se pide todo, igual que antes. */
+  const rangoVista = (propFilter.desde || propFilter.hasta)
+    ? { desde:propFilter.desde, hasta:propFilter.hasta } : null;
+  const itemsRango = propinaItems(rangoVista);
+  const list=aplicaFiltro([...itemsRango].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter);
 
   const formularioHtml = ed ? `
     <div class="card">
@@ -6780,6 +6918,11 @@ RENDERERS.propinas = function(){
         <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${ed.fecha}"></div>
         <div class="field"><label>Tipo *</label><select id="prEditTipo">${TIPOS_PROPINA.map(t=>`<option value="${t}" ${ed.tipo===t?'selected':''}>${TIPO_PROPINA_LABEL[t]}</option>`).join('')}</select></div>
         <div class="field"><label>Monto *</label><input type="number" id="prEditMonto" min="0" step="0.01" placeholder="0.00" value="${ed.monto}"></div>
+        <div class="field"><label>OV (Orden de venta)${ovNormalizar(ed.ov)?' *':''}</label>
+          <input type="text" id="prEditOv" inputmode="numeric" autocomplete="off" placeholder="Solo dígitos" value="${ovNormalizar(ed.ov)}">
+          <small style="color:var(--c-muted)">${ovNormalizar(ed.ov)
+            ? 'Solo dígitos 0-9. Los ceros iniciales se conservan.'
+            : 'Registro histórico sin OV: puedes dejarlo vacío o asignarle uno (solo dígitos).'}</small></div>
       </div>
       <div class="actions">
         <button class="btn btn-primary" id="prSave">Actualizar</button>
@@ -6795,17 +6938,21 @@ RENDERERS.propinas = function(){
       <h3 style="margin-top:14px">Propinas a registrar</h3>
       <p class="hint" style="margin-top:0">El mesero y la fecha de arriba se aplican a todas las filas. Agrega tantas filas como necesites (no hay límite).</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Tipo</th><th class="num">Monto</th><th></th></tr></thead>
+        <thead><tr><th style="width:40px">#</th><th>Tipo</th><th class="num">Monto</th><th>OV (Orden de venta) *</th><th></th></tr></thead>
         <tbody>${propDraftRows.map((row,i)=>`
           <tr>
+            <td style="color:var(--c-muted);font-weight:600">${i+1}</td>
             <td><select class="prRowTipo">${TIPOS_PROPINA.map(t=>`<option value="${t}" ${row.tipo===t?'selected':''}>${TIPO_PROPINA_LABEL[t]}</option>`).join('')}</select></td>
             <td class="num"><input type="number" class="prRowMonto" min="0" step="0.01" placeholder="0.00" value="${row.monto??''}"></td>
+            <td><input type="text" class="prRowOv" inputmode="numeric" autocomplete="off" placeholder="Solo dígitos" value="${ovNormalizar(row.ov)}"></td>
             <td>${propDraftRows.length>1?`<button class="btn-icon del" onclick="propRowDel(${i})" title="Quitar fila">🗑️</button>`:''}</td>
           </tr>`).join('')}
         </tbody>
       </table></div>
       <div class="actions"><button class="btn btn-ghost btn-sm" id="prRowAdd">+ Agregar otra propina</button></div>
-      <p class="hint" style="margin-top:8px">Total base por propina = monto × 0.98 (Tarjeta) o el 100% del monto (Izipay, Yape, Efectivo, Plin).</p>
+      <p class="hint" style="margin-top:8px">Total base por propina = monto × 0.98 (Tarjeta) o el 100% del monto (Izipay, Yape, Efectivo, Plin).
+        <br><b>OV</b> es obligatorio en cada fila y solo admite dígitos del 0 al 9 (sin espacios, signos, puntos ni comas). Los ceros iniciales se conservan: <code>00123</code> se guarda tal cual.
+        Si alguna fila tiene el OV vacío o inválido no se guarda <b>ninguna</b> de la operación.</p>
       <div class="actions">
         <button class="btn btn-primary" id="prSave">Guardar propina${propDraftRows.length>1?'s':''}</button>
       </div>
@@ -6815,24 +6962,38 @@ RENDERERS.propinas = function(){
     <div class="page-head"><div><h1>💵 Propinas</h1><p>Registra una o varias propinas por mesero y por día. Solo se permiten meseros. Los montos vacíos se ignoran.</p></div></div>
     ${formularioHtml}
     <div class="card">
-      <h2>Propinas registradas (${list.length} de ${allItems.length})</h2>
-      ${filtroToolbar('pr', propFilter)}
+      <h2>Propinas registradas (${list.length})</h2>
+      <p class="hint" style="margin-top:0">${rangoVista
+        ? `Mostrando ${fmtFecha(propFilter.desde||list.length&&list[list.length-1].fecha||hoy)} – ${fmtFecha(propFilter.hasta||hoy)}.
+           Por defecto se cargan solo las <b>dos últimas semanas completas</b> (lunes a domingo, sin la semana en curso) para no recorrer todo el historial.
+           Cambia las fechas para consultar cualquier otro período, o pulsa <b>Ver todo el historial</b>.`
+        : `Mostrando <b>todo el historial</b> (${list.length} registros). Pulsa <b>Últimas 2 semanas</b> para volver a la vista rápida.`}
+        Nada de esto altera los registros guardados ni los totales del <b>Consolidado Propinas</b>, que sigue usando el historial completo.</p>
+      ${propFiltroToolbar(propFilter)}
       <div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th>Mesero</th><th>Tipo</th><th class="num">Monto</th><th class="num">Aporte a base</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Fecha</th><th>Mesero</th><th>Tipo</th><th class="num">Monto</th><th>OV</th><th class="num">Aporte a base</th><th>Acciones</th></tr></thead>
         <tbody>${list.length? list.map(it=>{
           const aporte=calcularTotalBasePropinas({[it.tipo]: it.monto});
-          return `<tr><td>${fmtFecha(it.fecha)}</td><td>${nombreEmp(it.empleadoId)}</td>
+          const ov=ovNormalizar(it.ov);
+          return `<tr><td>${fmtFecha(it.fecha)}</td><td>${propNombreMesero(it.empleadoId)}</td>
             <td><span class="badge ${TIPO_PROPINA_BADGE[it.tipo]||'b-extra'}">${TIPO_PROPINA_LABEL[it.tipo]||it.tipo}</span></td>
             <td class="num">${money(it.monto)}</td>
+            <td>${ov ? `<code>${ov}</code>` : `<span style="color:var(--c-muted)" title="Registro anterior al campo OV">—</span>`}</td>
             <td class="num"><b>${money(aporte)}</b></td>
             <td><button class="btn-icon" onclick="propEdit('${it.itemId}')">✏️</button> <button class="btn-icon del" onclick="propDel('${it.itemId}')">🗑️</button></td></tr>`;
-        }).join('') : `<tr><td colspan="6" class="empty">Sin propinas para el filtro aplicado.</td></tr>`}</tbody>
+        }).join('') : `<tr><td colspan="7" class="empty">Sin propinas para el filtro aplicado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
 
   const prApplyF=()=>{ propFilter={emp:document.getElementById('prFEmp').value, desde:document.getElementById('prFDesde').value, hasta:document.getElementById('prFHasta').value}; RENDERERS.propinas(); };
   ['prFEmp','prFDesde','prFHasta'].forEach(id=> document.getElementById(id).onchange=prApplyF);
-  document.getElementById('prFClear').onclick=()=>{ propFilter={emp:'',desde:'',hasta:''}; RENDERERS.propinas(); };
+  document.getElementById('prFClear').onclick=()=>{
+    const R=rangoUlt2SemanasCompletas();
+    propFilter={emp:'', desde:R.desde, hasta:R.hasta};   // vuelve a la vista por defecto
+    RENDERERS.propinas();
+  };
+  // Escape explícito del filtro por defecto: historial completo bajo demanda.
+  document.getElementById('prFAll').onclick=()=>{ propFilter={emp:propFilter.emp||'', desde:'', hasta:''}; RENDERERS.propinas(); };
 
   if(ed){
     document.getElementById('prSave').onclick=propActualizar;
@@ -6841,7 +7002,7 @@ RENDERERS.propinas = function(){
     document.getElementById('prSave').onclick=propGuardarNuevo;
     document.getElementById('prRowAdd').onclick=()=>{
       propCapturarFilas();
-      propDraftRows.push({tipo:'tarjeta', monto:''});
+      propDraftRows.push(propFilaVacia());
       RENDERERS.propinas();
       const tipos=document.querySelectorAll('.prRowTipo');
       if(tipos.length) tipos[tipos.length-1].focus();
@@ -6866,18 +7027,62 @@ function propGuardarNuevo(){
 
   const tipoSels=document.querySelectorAll('.prRowTipo');
   const montoInputs=document.querySelectorAll('.prRowMonto');
+  const ovInputs=document.querySelectorAll('.prRowOv');
+  /* Conserva lo escrito antes de cualquier salida temprana: si la validación
+     falla, el usuario recupera sus datos y corrige, sin volver a empezar. */
+  propCapturarFilas();
+
+  /* VALIDACIÓN DE TODAS LAS FILAS ANTES DE GUARDAR NADA.
+     Se recorren todas para marcar cada error a la vez (no solo el primero) y
+     se acumulan los números de fila para el mensaje. Si algo falla no se
+     escribe ninguna fila: la operación es todo-o-nada. */
   let ok=true; const filas=[];
+  const malMonto=[], malOv=[];
   montoInputs.forEach((inp,i)=>{
     const v=inp.value.trim();
-    const bad=v!=='' && (isNaN(Number(v))||Number(v)<0);
-    inp.classList.toggle('invalid', bad);
-    if(bad){ ok=false; }
-    else if(v!=='') filas.push({ tipo:tipoSels[i].value, monto:Number(v) });
+    const ovInp=ovInputs[i];
+    const ovVal=ovInp?ovInp.value:'';
+    const vacia = v==='' && ovNormalizar(ovVal)==='';
+    if(vacia){                         // fila totalmente vacía: se ignora
+      inp.classList.remove('invalid');
+      if(ovInp) ovInp.classList.remove('invalid');
+      return;
+    }
+    const montoBad = v==='' || isNaN(Number(v)) || Number(v)<0;
+    inp.classList.toggle('invalid', montoBad);
+    if(montoBad){ ok=false; malMonto.push(i+1); }
+    // OV obligatorio y exclusivamente dígitos 0-9 en CADA fila con datos.
+    const ovBad = !ovEsValido(ovVal);
+    if(ovInp) ovInp.classList.toggle('invalid', ovBad);
+    if(ovBad){ ok=false; malOv.push(i+1); }
+    if(!montoBad && !ovBad){
+      filas.push({ tipo:tipoSels[i].value, monto:Number(v), ov:ovNormalizar(ovVal) });
+    }
   });
-  if(!ok){ toast('Los montos deben ser numéricos y no negativos','error'); return; }
+  if(malOv.length){
+    toast('OV obligatorio y solo con dígitos 0-9 — corrige la fila '+(malOv.length>1?'s ':'')+malOv.join(', '),'error');
+    /* NO se repinta: el formulario conserva tal cual lo que el usuario
+       escribió y además queda marcado en rojo el campo exacto que falla.
+       Un re-render perdería ese marcado. */
+    const foco=ovInputs[malOv[0]-1]; if(foco) foco.focus();
+    return;
+  }
+  if(!ok){
+    toast('Los montos deben ser numéricos y no negativos — revisa la fila '+(malMonto.length>1?'s ':'')+malMonto.join(', '),'error');
+    const foco=montoInputs[malMonto[0]-1]; if(foco) foco.focus();
+    return;
+  }
   if(!filas.length){ toast('Ingresa al menos un monto de propina','error'); return; }
 
-  filas.forEach(f=> S.prop.push({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto }));
+  /* SEGUNDA BARRERA, en la capa de persistencia: no se confía en el
+     formulario ni en atributos HTML. Si algún OV no cumple aquí, no se
+     escribe nada en absoluto. */
+  const invalidos = filas.filter(f=>!ovEsValido(f.ov));
+  if(invalidos.length){
+    toast('No se guardó nada: hay '+invalidos.length+' propina(s) con OV inválido.','error');
+    return;
+  }
+  filas.forEach(f=> S.prop.push({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto, ov:f.ov }));
   save(K.prop,S.prop);
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
   syncPropinas();
@@ -6888,7 +7093,7 @@ function propGuardarNuevo(){
   // antes de presionar "Guardar" (sin pasar por "Agregar otra propina").
   propFormEmpleadoId = empleadoId;
   propFormFecha = fecha;
-  propDraftRows=[{tipo:'tarjeta', monto:''}];
+  propDraftRows=[propFilaVacia()];
   RENDERERS.propinas();
 }
 
@@ -6906,7 +7111,23 @@ function propActualizar(){
   montoInp.classList.toggle('invalid', bad);
   if(bad){ toast('Ingresa un monto válido','error'); return; }
 
-  propinaItemActualizar(editPropItem, { empleadoId, fecha, tipo, monto:Number(v) });
+  /* OV en la edición. Mismo formato (solo dígitos 0-9) y mismos ceros
+     iniciales. Única excepción, deliberada: un registro HISTÓRICO que nunca
+     tuvo OV puede seguir sin tenerlo, porque la validación de las operaciones
+     nuevas no se aplica retroactivamente y no se inventan valores. Si el
+     usuario escribe algo, debe cumplir el formato. */
+  const ovInp=document.getElementById('prEditOv');
+  const ovVal=ovInp?ovInp.value:'';
+  const teniaOv=ovNormalizar(editPropItem && editPropItem.ov)!=='';
+  const ovVacio=ovNormalizar(ovVal)==='';
+  const ovBad = ovVacio ? teniaOv : !ovEsValido(ovVal);
+  if(ovInp) ovInp.classList.toggle('invalid', ovBad);
+  if(ovBad){
+    toast(ovVacio ? 'El OV es obligatorio en este registro' : 'El OV solo admite dígitos del 0 al 9','error');
+    return;
+  }
+
+  propinaItemActualizar(editPropItem, { empleadoId, fecha, tipo, monto:Number(v), ov:ovNormalizar(ovVal) });
   save(K.prop,S.prop);
   toast('Propina actualizada','success');
   syncPropinas();
@@ -7022,6 +7243,70 @@ function calcularConsolidadoPropinas(lunes){
   return { lunes, domingo, dias, meseros, cocina, avisosCocina, baseSemana, pagadoMeseros, pagadoCocina, pagadoTotal, diferenciaTotal, tarjetaPorDia };
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   PUBLICAR PADRÓN DE MESEROS
+   ------------------------------------------------------------------------
+   El módulo Propinas vive en INVENTARIO, pero la lista de meseros (id y
+   nombre) solo existe en el spreadsheet de PLANILLA, al que la cuenta de
+   inventario no tiene acceso. Esta acción publica ese padrón mínimo en la
+   hoja 'Meseros' del spreadsheet de INVENTARIO.
+   Solo escribe id y nombre: ni sueldos, ni documentos, ni condiciones.
+   Es idempotente — reescribe la hoja con el padrón actual — y no toca
+   ninguna otra hoja ni el módulo de Empleados.
+   Vive aquí porque este módulo es exclusivo de la cuenta combinada, que es
+   la única que tiene a la vez S.emp y el spreadsheet de inventario.
+   ════════════════════════════════════════════════════════════════════════ */
+function propPadronCardHTML(){
+  const rol = (typeof currentRole==='function') ? currentRole() : null;
+  // Sin spreadsheet de inventario en el rol no hay destino posible.
+  if(!rol || !rol.inventarioGsheetId) return '';
+  const padron = meseroPadronExport();
+  return `
+    <div class="card">
+      <div class="toolbar" style="flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px">
+        <h2 style="margin:0">Padrón de meseros</h2>
+        <button class="btn btn-primary btn-sm" id="psPadron" ${padron.length?'':'disabled'}>📤 Publicar padrón de meseros</button>
+      </div>
+      <p class="hint" style="margin-top:0">
+        El módulo <b>Propinas</b> está en INVENTARIO y necesita la lista de meseros, que solo existe en el spreadsheet de Planilla.
+        Este botón copia <b>únicamente id y nombre</b> de los ${padron.length} mesero(s) visibles a la hoja <b>Meseros</b> del spreadsheet de Inventario,
+        para que la cuenta de inventario pueda registrar propinas. <b>No</b> se copian sueldos, documentos ni ninguna otra información de empleado.
+        Se puede pulsar las veces que haga falta: reescribe la hoja con el padrón actual y no modifica ninguna otra.
+        ${padron.length? '' : '<br><b>No hay meseros visibles que publicar.</b> Revisa el módulo Empleados.'}
+      </p>
+      <div id="psPadronOut" style="font-size:12px"></div>
+    </div>`;
+}
+function propPadronBind(){
+  const btn = document.getElementById('psPadron');
+  if(!btn) return;
+  btn.onclick = async ()=>{
+    const padron = meseroPadronExport();
+    if(!padron.length){ toast('No hay meseros visibles que publicar','error'); return; }
+    if(!confirm('Se publicarán '+padron.length+' mesero(s) (solo id y nombre) en la hoja "Meseros" del spreadsheet de Inventario.\n\nNo se copia ninguna otra información de empleado. ¿Continuar?')) return;
+    const out = document.getElementById('psPadronOut');
+    const txt = btn.textContent;
+    btn.disabled = true; btn.textContent = '⏳ Publicando…';
+    if(out) out.innerHTML = '';
+    try{
+      const ok = await gsSaveSheet('inventario', 'Meseros', gsRowsToMatrix(['id','nombre'], padron));
+      if(ok){
+        toast('Padrón publicado: '+padron.length+' mesero(s)','success');
+        if(out) out.innerHTML = `<div style="color:#15803d;font-weight:600">✔ Publicado el ${fmtFecha(fechaHoy())}: ${padron.length} mesero(s) → ${padron.map(m=>m.nombre).join(', ')}</div>`;
+      }else{
+        toast('No se pudo publicar el padrón. Revisa la sesión de Google y la consola.','error');
+        if(out) out.innerHTML = `<div style="color:#b91c1c;font-weight:600">✖ No se pudo publicar. La hoja de Inventario no se modificó.</div>`;
+      }
+    }catch(e){
+      console.error('[Meseros] Error al publicar el padrón:', e);
+      toast('Error al publicar el padrón: '+(e&&e.message?e.message:'ver consola'),'error');
+      if(out) out.innerHTML = `<div style="color:#b91c1c;font-weight:600">✖ Error: ${(e&&e.message)?e.message:'ver consola'}</div>`;
+    }finally{
+      btn.disabled = false; btn.textContent = txt;
+    }
+  };
+}
+
 RENDERERS.propinasConsolidado = function(){
   const el=document.getElementById('page-propinasConsolidado');
   el.innerHTML=`
@@ -7033,9 +7318,11 @@ RENDERERS.propinasConsolidado = function(){
       </div>
       <p class="hint" style="margin:0">La semana se calcula automáticamente de lunes a domingo según la fecha elegida.</p>
     </div>
+    ${propPadronCardHTML()}
     <div id="propConsOut"></div>`;
   document.getElementById('psGen').onclick=()=>{ propSemana=inicioSemana(document.getElementById('psFecha').value||fechaHoy()); renderPropinasConsolidado(); };
   document.getElementById('psFecha').onchange=(e)=>{ propSemana=inicioSemana(e.target.value||fechaHoy()); };
+  propPadronBind();
   renderPropinasConsolidado();
 };
 
@@ -13127,7 +13414,13 @@ const ACCOUNT_ROLES = {
     // la propietaria del archivo). Es el ÚNICO spreadsheet válido para todos
     // los módulos de Inventario: NUNCA se debe crear uno nuevo ni buscar por nombre.
     inventarioGsheetId: '1MksESd_BTXZpccGCH3X1lvgq08IGEqBSBcmRnZXrAzU',
-    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon','menajeAdmin','invDiarioMenaje','consolidadoMenaje','cocinaAdmin','invDiarioCocina','consolidadoCocina']
+    /* 'propinas' SÍ (el registro diario vive ahora en INVENTARIO y usa la
+       hoja Propinas de este mismo spreadsheet).
+       'propinasConsolidado' NO: sigue siendo exclusivo de multiboxes.peru.
+       Al no estar en esta lista, moduloPermitido() lo bloquea también por
+       ruta — goto() revalida en cada navegación, así que el acceso directo
+       redirige a la página por defecto; ocultarlo del menú no es el control. */
+    modules: ['produccion','insumos','inventarioConsolidado','alertaInsumos','syncInventario','licores','invDiarioLicores','cotejoLicores','bebidasAdmin','stockDiarioBebidas','consolidadoStockBebidas','efectivoCaja','consolidadoCaja','salonAdmin','invDiarioSalon','consolidadoSalon','menajeAdmin','invDiarioMenaje','consolidadoMenaje','cocinaAdmin','invDiarioCocina','consolidadoCocina','propinas']
   }
 };
 // ── OAuth scope ──────────────────────────────────────────────────────────────
@@ -13156,7 +13449,13 @@ const GS_SCOPE = 'openid email profile https://www.googleapis.com/auth/spreadshe
 const GS_FILE_NAME = 'WingsBox Planilla - Datos';
 const GS_FILE_NAME_INVENTARIO = 'WingsBox Inventario - Datos';
 // Hojas que debe tener el spreadsheet de inventario.
-const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina','MovCocina','MovBebidas'];
+/* 'Propinas' vive AQUÍ desde la migración al spreadsheet de INVENTARIO: los
+   datos ya fueron trasladados a mano, así que la hoja existe y
+   gsEnsureSheetsExist() no la recrea (es idempotente: solo crea las que
+   faltan). 'Meseros' es el padrón mínimo (id + nombre) que necesita el
+   formulario de Propinas en las cuentas sin acceso al spreadsheet de
+   Planilla; lo escribe la cuenta combinada y lo leen ambas. */
+const GS_SHEETS_INVENTARIO = ['Insumos','Produccion','ProduccionInsumos','Licores','InvLicores','BebidasCat','StockBebidas','EfectivoCaja','Meta','SalonProductos','SalonInventario','MenajeArticulos','MenajeInventario','Cocina','InvCocina','MovCocina','MovBebidas','Propinas','Meseros'];
 // Clave en localStorage para recordar el spreadsheet de inventario de esta cuenta/dispositivo.
 K.gsheetIdInv = 'pl_gsheetId_inv';
 // Clave en localStorage para recordar el spreadsheet de esta cuenta.
@@ -13481,7 +13780,13 @@ async function gsApiFetch(url, options={}){
 /* ================================================================
    SPREADSHEET: detectar, buscar por nombre o crear
    ================================================================ */
-const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','Propinas','ValidacionTarjeta','ConsiderarHoraExtra','ExoneracionTardanza','Meta'];
+/* 'Propinas' SALIÓ de este dominio: tras la migración la hoja de propinas
+   vive en el spreadsheet de INVENTARIO (ver GS_SHEETS_INVENTARIO). Al no
+   figurar aquí, el dominio planilla ya no la lee, no la escribe y no la
+   incluye en gsEnsureSheetsExist(), de modo que la pestaña 'Propinas' del
+   spreadsheet anterior queda intacta como respaldo histórico y la app no
+   vuelve a tocarla. */
+const GS_SHEETS = ['Empleados','Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres','ValidacionTarjeta','ConsiderarHoraExtra','ExoneracionTardanza','Meta'];
 
 // Config de cada dominio de datos (qué spreadsheet, qué hojas, qué clave de
 // localStorage). domain='planilla' es el comportamiento histórico (sin
@@ -13694,7 +13999,7 @@ function gsSerializeAll(){
       S.pago.map(p=>({ id:p.id, empleadoId:p.empleadoId, fecha:p.fecha, tipo:p.tipo, monto:p.monto, detalle:p.detalle||'' }))),
     DiasLibres: gsRowsToMatrix(['id','empleadoId','fecha','tipo','comentario'],
       S.libre.map(l=>({ id:l.id, empleadoId:l.empleadoId, fecha:l.fecha, tipo:l.tipo, comentario:l.comentario||'' }))),
-    Propinas: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto'], propinaItemsExport()),
+    // 'Propinas' ya no se serializa en el dominio planilla: migró a INVENTARIO.
     ValidacionTarjeta: gsRowsToMatrix(['fecha','niubiz','caja'],
       S.tarjetaVal.map(v=>({ fecha:v.fecha, niubiz:(v.niubiz===''||v.niubiz==null)?'':numProp(v.niubiz), caja:(v.caja===''||v.caja==null)?'':numProp(v.caja) }))),
     ConsiderarHoraExtra: gsRowsToMatrix(['empleadoId','fecha','considerar'], considerarHEToRows()),
@@ -13730,6 +14035,15 @@ function gsSerializeInventario(){
         migradoV2:r.migradoV2?1:'' }))),
     // Hoja propia de PRODUCCIÓN (fuente única del concepto).
     ProduccionInsumos: gsRowsToMatrix(['id','insumoId','fecha','cantidad'], S.prodInsumos),
+    /* PROPINAS (migradas desde el spreadsheet de planilla). Se añade 'ov'
+       como sexta columna, DESPUÉS de las cinco existentes, para no
+       desplazar ni sobrescribir los datos ya migrados: las filas
+       históricas simplemente traen la celda vacía. Se escribe con
+       valueInputOption:'RAW', así que un OV '00123' se conserva literal. */
+    Propinas: gsRowsToMatrix(['id','empleadoId','fecha','tipo','monto','ov'], propinaItemsExport()),
+    /* PADRÓN DE MESEROS: solo id y nombre, lo mínimo que necesita el
+       formulario de Propinas. No incluye sueldos ni datos personales. */
+    Meseros: gsRowsToMatrix(['id','nombre'], meseroPadronExport()),
     Licores: gsRowsToMatrix(['id','nombre','tamanoMl','ozPorBotella'], S.licores),
     InvLicores: gsRowsToMatrix(['id','bebidaId','fecha','entradaOzs','entradaBots','salidaOzs','salidaBots'], S.invLicores),
     BebidasCat: gsRowsToMatrix(['id','categoria','nombre','activo','nroBotellasVacias','stockMinimo'],
@@ -14120,14 +14434,26 @@ function syncInvLicores()  { _syncSheet('inventario','InvLicores', 'Inv.Licores'
 function syncBebidasCat()  { _syncSheet('inventario','BebidasCat', 'Bebidas',    S.bebidasCat.length); }
 function syncStockBebidas(){ _syncSheet('inventario','StockBebidas','StockBebidas',S.stockBebidas.length); }
 function syncEfectivoCaja(){ _syncSheet('inventario','EfectivoCaja','Caja',      S.efectivoCaja.length); }
+/* PROPINAS: tras la migración escribe en el spreadsheet de INVENTARIO.
+   Es el único punto de escritura del módulo, así que con este cambio
+   ningún alta, edición o borrado vuelve a tocar la hoja de planilla. */
+function syncPropinas()    { _syncSheet('inventario','Propinas',    'Propinas',   S.prop.length); }
+function syncMeseros()     { _syncSheet('inventario','Meseros',     'Meseros',    meseroPadronExport().length); }
 // ── PLANILLA ──
-function syncEmpleados()   { _syncSheet('planilla','Empleados',         'Empleados', S.emp.length); }
+function syncEmpleados()   {
+  _syncSheet('planilla','Empleados',         'Empleados', S.emp.length);
+  /* Replica el padrón mínimo de meseros al spreadsheet de INVENTARIO para
+     que la cuenta sin acceso a planilla pueda registrar propinas. Solo
+     cuando el rol declara un spreadsheet de inventario; si no, no se
+     intenta nada (gsEnsureSpreadsheet devolvería null). */
+  const rol = (typeof currentRole==='function') ? currentRole() : null;
+  if(rol && rol.inventarioGsheetId) syncMeseros();
+}
 function syncHorarios()    { _syncSheet('planilla','Horarios',          'Horarios',  S.hor.length); }
 function syncMarcaciones() { _syncSheet('planilla','Marcaciones',       'Marcaciones',S.mar.length); }
 function syncDescuentos()  { _syncSheet('planilla','Descuentos',        'Descuentos',S.desc.length); }
 function syncPagosDom()    { _syncSheet('planilla','PagosExtra',        'PagosExtra',S.pago.length); }
 function syncLibresDom()   { _syncSheet('planilla','DiasLibres',        'DiasLibres',S.libre.length); }
-function syncPropinas()    { _syncSheet('planilla','Propinas',          'Propinas',  S.prop.length); }
 function syncTarjetaValGS(){ _syncSheet('planilla','ValidacionTarjeta', 'TarjetaVal',S.tarjetaVal.length); }
 function syncConsHE()      { _syncSheet('planilla','ConsiderarHoraExtra','ConsHE',   Object.keys(CONSIDERAR_HE).length); }
 function syncExoTardGS()   { _syncSheet('planilla','ExoneracionTardanza','ExoTard',  Object.keys(EXO_TARD).length); }
@@ -14269,6 +14595,18 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       // Migra cualquier producción histórica que aún viva solo en el campo
       // legado (idempotente: nunca duplica lo ya migrado).
       migrarProduccionV2();
+      /* PROPINAS — nueva fuente tras la migración. Se lee con el mismo
+         filaPropinaAEstado() de siempre, que ya soporta el formato nuevo y el
+         antiguo, de modo que los registros históricos migrados se interpretan
+         igual que antes y sus valores no cambian. puedeAplicar() evita que
+         una lectura vacía borre lo que haya en memoria. */
+      if(puedeAplicar('Propinas', S.prop))
+        S.prop = (byName['Propinas']||[]).map(filaPropinaAEstado);
+      /* PADRÓN DE MESEROS (id + nombre). Lo escribe la cuenta combinada; aquí
+         solo se lee, y sirve de respaldo cuando S.emp no está disponible. */
+      if(puedeAplicar('Meseros', S.meseros))
+        S.meseros = (byName['Meseros']||[]).filter(r=>r && r.id)
+          .map(r=>({ id:String(r.id), nombre:String(r.nombre||'').trim() }));
       S.licores = (byName['Licores']||[]).map(r=>({ id:String(r.id||uid()), nombre:String(r.nombre||'').trim(), tamanoMl:Number(r.tamanoMl)||0, ozPorBotella:Number(r.ozPorBotella)||0 }));
       if(puedeAplicar('InvLicores', S.invLicores))
       S.invLicores = (byName['InvLicores']||[]).map(r=>{
@@ -14395,7 +14733,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         gsUpdateSyncStatus(aviso,'warn');
         toast('⚠️ '+aviso,'warn');
       }
-      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.prodInsumos,S.prodInsumos); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario);
+      save(K.insumos,S.insumos); save(K.produccion,S.produccion); save(K.prodInsumos,S.prodInsumos); save(K.licores,S.licores); save(K.invLicores,S.invLicores); save(K.bebidasCat,S.bebidasCat); save(K.stockBebidas,S.stockBebidas); save(K.efectivoCaja,S.efectivoCaja); save(K.salonInventario,S.salonInventario); save(K.menajeInventario,S.menajeInventario); save(K.prop,S.prop); save(K.meseros,S.meseros);
     }else{
       if(!byName['Empleados'] || !byName['Empleados'].length){
         if(!auto){ toast('El Spreadsheet no tiene datos de empleados.','error'); gsUpdateSyncStatus('Hoja Empleados sin datos. ID: '+id,'warn'); }
@@ -14438,12 +14776,15 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       S.desc = (byName['Descuentos']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.pago = (byName['PagosExtra']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Otros'), monto:Number(r.monto)||0, detalle:r.detalle?String(r.detalle):'' }));
       S.libre = (byName['DiasLibres']||[]).map(r=>({ id:String(r.id||uid()), empleadoId:String(r.empleadoId), fecha:String(r.fecha), tipo:String(r.tipo||'Día libre'), comentario:r.comentario?String(r.comentario):'' }));
-      S.prop = (byName['Propinas']||[]).map(filaPropinaAEstado);
+      /* 'Propinas' ya NO se lee aquí: migró al dominio inventario. Dejarlo
+         sería destructivo para la cuenta combinada, porque ambas ramas
+         corren en paralelo al iniciar sesión y esta, al no encontrar la
+         hoja, sobreescribiría S.prop con un array vacío. */
       S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
       loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
       loadExoTardFromRows(byName['ExoneracionTardanza']||[]);
 
-      save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.prop,S.prop); save(K.tarjetaVal,S.tarjetaVal);
+      save(K.emp,S.emp); save(K.hor,S.hor); save(K.mar,S.mar); save(K.desc,S.desc); save(K.pago,S.pago); save(K.libre,S.libre); save(K.tarjetaVal,S.tarjetaVal);
     }
 
     reloadState();
@@ -14487,7 +14828,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-16.1';
+const APP_VERSION = '2026-10-20.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -15185,7 +15526,8 @@ const NAV_GROUPS_INVENTARIO = [
   { id:'inv-admin',  ico:'📂', label:'Administración y Configuración',
     modules:['insumos','licores','bebidasAdmin','salonAdmin','menajeAdmin','cocinaAdmin','syncInventario'] },
   { id:'inv-diario', ico:'📝', label:'Registro Diario',
-    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje','invDiarioCocina'] },
+    // 'propinas' se trasladó aquí desde el grupo PROPINAS de planilla.
+    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje','invDiarioCocina','propinas'] },
   { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
     modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon','consolidadoMenaje','consolidadoCocina'] },
   { id:'inv-caja',   ico:'💰', label:'Caja',
@@ -15198,8 +15540,11 @@ const NAV_GROUPS_PLANILLA = [
     modules:['empleados','horarios','cuadrante','admin'] },
   { id:'pl-registro', ico:'📝', label:'Registro de Información',
     modules:['marcaciones','descuentos','pagos','libres'] },
+  /* 'propinas' salió de aquí: el registro diario ahora está en
+     INVENTARIO → Registro Diario. En planilla solo queda el consolidado,
+     que sigue siendo exclusivo de multiboxes.peru. */
   { id:'pl-propinas', ico:'💵', label:'Propinas',
-    modules:['propinas','propinasConsolidado'] },
+    modules:['propinasConsolidado'] },
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
