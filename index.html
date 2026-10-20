@@ -1043,11 +1043,18 @@ function reloadState(){
 // Wingsbox (inventario) los datos de planilla de Multiboxes no quedan
 // cargados en memoria (ni accesibles vía consola), y viceversa. Los datos
 // persistidos en localStorage de ambos dominios NUNCA se borran con esto.
+/* Limpia las colecciones que NO pertenecen al dominio de la cuenta conectada.
+   `prop` y `meseros` se movieron de 'planilla' a 'inventario' junto con la
+   migración del módulo Propinas: mientras siguieron listadas en 'planilla',
+   una cuenta de inventario ejecutaba limpiarEstadoDominio('planilla') al
+   final de CADA carga y vaciaba las propinas recién leídas, dejando el
+   historial en 0 aunque la lectura hubiera sido correcta. */
 function limpiarEstadoDominio(domain){
   if(domain==='planilla'){
-    S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.prop=[]; S.tarjetaVal=[];
+    S.emp=[]; S.hor=[]; S.mar=[]; S.desc=[]; S.pago=[]; S.libre=[]; S.tarjetaVal=[];
   }else if(domain==='inventario'){
     S.insumos=[]; S.produccion=[]; S.licores=[]; S.invLicores=[]; S.bebidasCat=[]; S.stockBebidas=[]; S.efectivoCaja=[]; S.salonProductos=[]; S.salonInventario=[];
+    S.prop=[]; S.meseros=[];
   }
 }
 
@@ -7017,7 +7024,7 @@ window.propRowDel=function(idx){
   RENDERERS.propinas();
 };
 
-function propGuardarNuevo(){
+async function propGuardarNuevo(){
   const empleadoId=document.getElementById('prEmp').value;
   const fechaInp=document.getElementById('prFecha');
   const fecha=fechaInp.value;
@@ -7082,10 +7089,42 @@ function propGuardarNuevo(){
     toast('No se guardó nada: hay '+invalidos.length+' propina(s) con OV inválido.','error');
     return;
   }
-  filas.forEach(f=> S.prop.push({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto, ov:f.ov }));
+  /* ESCRITURA CONFIRMADA. Antes se anunciaba el éxito y se sincronizaba en
+     segundo plano (fire-and-forget): si Google Sheets rechazaba la escritura,
+     el usuario veía "Propina registrada" y el dato no existía en la fuente.
+     Ahora se escribe, se ESPERA la confirmación y solo entonces se informa.
+     Si falla, se revierte el alta local para no dejar un registro fantasma
+     que luego se sincronizaría por su cuenta, y el formulario queda intacto
+     para reintentar. */
+  const nuevos = filas.map(f=>({ id:uid(), empleadoId, fecha, tipo:f.tipo, monto:f.monto, ov:f.ov }));
+  const previo = S.prop.slice();                 // copia para poder revertir
+  nuevos.forEach(r=> S.prop.push(r));
   save(K.prop,S.prop);
+
+  const btnGuardar = document.getElementById('prSave');
+  const etiqueta = btnGuardar ? btnGuardar.textContent : '';
+  if(btnGuardar){ btnGuardar.disabled = true; btnGuardar.textContent = 'Guardando…'; }
+  const res = await syncPropinasConfirmado();
+  if(btnGuardar){ btnGuardar.disabled = false; btnGuardar.textContent = etiqueta; }
+
+  if(!res.ok){
+    S.prop = previo;                             // revierte: nada quedó guardado
+    save(K.prop,S.prop);
+    toast('No se pudo guardar en Google Sheets: '+res.motivo+' No se registró nada; revisa la conexión y vuelve a intentarlo.','error');
+    return;                                      // el formulario conserva los datos
+  }
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
-  syncPropinas();
+
+  /* La fecha recién guardada puede caer FUERA de la ventana por defecto (dos
+     semanas completas, sin la semana en curso): una propina de hoy se
+     guardaba bien pero desaparecía de la tabla, dando la impresión de que no
+     se había registrado. Si queda fuera, se amplía el rango visible para que
+     el usuario vea lo que acaba de guardar. */
+  if((propFilter.desde && fecha < propFilter.desde) || (propFilter.hasta && fecha > propFilter.hasta)){
+    if(propFilter.desde && fecha < propFilter.desde) propFilter.desde = fecha;
+    if(propFilter.hasta && fecha > propFilter.hasta) propFilter.hasta = fecha;
+    toast('Se amplió el rango mostrado hasta '+fmtFecha(fecha)+' para incluir lo que acabas de registrar.','info');
+  }
 
   lastPropina = { empleadoId, fecha };
   // Mantiene el encabezado (mesero/fecha) sincronizado con lo recién guardado,
@@ -7097,7 +7136,7 @@ function propGuardarNuevo(){
   RENDERERS.propinas();
 }
 
-function propActualizar(){
+async function propActualizar(){
   const empleadoId=document.getElementById('prEmp').value;
   const fechaInp=document.getElementById('prFecha');
   const fecha=fechaInp.value;
@@ -7127,10 +7166,21 @@ function propActualizar(){
     return;
   }
 
+  const previo = JSON.parse(JSON.stringify(S.prop));   // para revertir si falla
   propinaItemActualizar(editPropItem, { empleadoId, fecha, tipo, monto:Number(v), ov:ovNormalizar(ovVal) });
   save(K.prop,S.prop);
+  const res = await syncPropinasConfirmado();
+  if(!res.ok){
+    S.prop = previo;                                   // nada quedó modificado
+    save(K.prop,S.prop);
+    toast('No se pudo guardar el cambio en Google Sheets: '+res.motivo+' No se modificó nada.','error');
+    return;                                            // sigue en modo edición
+  }
   toast('Propina actualizada','success');
-  syncPropinas();
+  if((propFilter.desde && fecha < propFilter.desde) || (propFilter.hasta && fecha > propFilter.hasta)){
+    if(propFilter.desde && fecha < propFilter.desde) propFilter.desde = fecha;
+    if(propFilter.hasta && fecha > propFilter.hasta) propFilter.hasta = fecha;
+  }
   editPropItem=null;
   lastPropina = { empleadoId, fecha };
   RENDERERS.propinas();
@@ -7143,7 +7193,7 @@ window.propEdit=function(itemId){
   RENDERERS.propinas();
   window.scrollTo({top:0,behavior:'smooth'});
 };
-window.propDel=function(itemId){
+window.propDel=async function(itemId){
   const item=propinaItems().find(x=>x.itemId===itemId);
   if(!item) return;
   if(editPropItem && editPropItem.itemId===itemId) editPropItem=null;
@@ -7151,10 +7201,19 @@ window.propDel=function(itemId){
   /* La hoja Propinas exporta `id: it.itemId`, así que la marca debe usar ese
      mismo valor; con `item` tal cual, la clave saldría vacía y no filtraría. */
   if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('Propinas', {id:item.itemId});
+  const previo = JSON.parse(JSON.stringify(S.prop));
   propinaItemEliminar(item);
   save(K.prop,S.prop);
+  const res = await syncPropinasConfirmado();
+  if(!res.ok){
+    S.prop = previo;                        // el registro NO se eliminó
+    save(K.prop,S.prop);
+    if(typeof gsTombstonesConfirmadas==='function') gsTombstonesConfirmadas('Propinas');
+    toast('No se pudo eliminar en Google Sheets: '+res.motivo+' El registro sigue ahí.','error');
+    RENDERERS.propinas();
+    return;
+  }
   toast('Propina eliminada','warn');
-  syncPropinas();
   RENDERERS.propinas();
 };
 
@@ -14425,6 +14484,21 @@ function _syncSheet(domain, sheet, label, count){
   console.log('['+label+'] Sincronizando hoja "'+sheet+'" ('+count+' registros)...');
   gsSaveSheet(domain, sheet, gsSerializeSheet(domain, sheet)).catch(e=>console.error('['+label+'] Error:', e));
 }
+/* Variante que SÍ informa del resultado, para los flujos que no pueden
+   anunciar un guardado exitoso sin confirmarlo (ver propGuardarNuevo).
+   Resuelve {ok, motivo} en vez de tragarse el error en consola. */
+async function _syncSheetConfirmado(domain, sheet, label){
+  if(!isAuthorized()) return { ok:false, motivo:'Sesión no autorizada.' };
+  try{
+    const ok = await gsSaveSheet(domain, sheet, gsSerializeSheet(domain, sheet));
+    return ok ? { ok:true } : { ok:false, motivo:'Google Sheets no confirmó la escritura.' };
+  }catch(e){
+    console.error('['+label+'] Error:', e);
+    return { ok:false, motivo:(e && e.message) ? e.message : 'Error de red o de la API.' };
+  }
+}
+// Guardado de propinas con confirmación real de escritura.
+function syncPropinasConfirmado(){ return _syncSheetConfirmado('inventario','Propinas','Propinas'); }
 // ── INVENTARIO ──
 function syncInsumos()     { _syncSheet('inventario','Insumos',    'Insumos',    S.insumos.length); }
 function syncProduccion()  { _syncSheet('inventario','Produccion', 'Stock de insumos', S.produccion.length); }
@@ -14482,7 +14556,36 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
 
     console.log('[Sync] Inicio carga domain='+domain+' id='+id+' user='+gsState.email);
 
-    const ranges = cfg.sheets.map(n=>'ranges='+encodeURIComponent(n+'!A:AZ')).join('&');
+    /* ── SOLO SE PIDEN RANGOS DE HOJAS QUE EXISTEN ────────────────────────
+       values:batchGet responde 400 ("Unable to parse range") si CUALQUIERA de
+       los rangos nombra una hoja inexistente, y ese 400 aborta la carga
+       ENTERA del dominio: ninguna colección se asigna. Es decir, declarar una
+       hoja nueva en cfg.sheets rompía la sincronización completa hasta que
+       alguien guardara algo (gsEnsureSheetsExist solo corre al ESCRIBIR).
+       Por eso se consulta antes la lista de hojas y se piden únicamente las
+       presentes. Una hoja ausente deja su entrada fuera de byName, y
+       puedeAplicar() conserva los datos locales de esa colección. */
+    let hojasPedidas = cfg.sheets;
+    try{
+      const rMeta = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'?fields=sheets.properties.title');
+      if(rMeta.ok){
+        const metaJson = await rMeta.json().catch(()=>null);
+        const existentes = new Set(((metaJson && metaJson.sheets) || []).map(sh=>sh && sh.properties && sh.properties.title));
+        const faltan = cfg.sheets.filter(n=>!existentes.has(n));
+        if(faltan.length){
+          console.warn('[Sync] Hojas declaradas que NO existen en el spreadsheet ('+domain+'): '+faltan.join(', ')+
+            '. Se omiten del batchGet para no invalidar la lectura; sus datos locales se conservan.');
+          hojasPedidas = cfg.sheets.filter(n=>existentes.has(n));
+        }
+      }else{
+        console.warn('[Sync] No se pudo listar las hojas (HTTP '+rMeta.status+'); se piden todas y el fallo se gestiona abajo.');
+      }
+    }catch(e){
+      console.warn('[Sync] Error al listar las hojas; se piden todas:', e);
+    }
+    if(!hojasPedidas.length) throw new Error('El spreadsheet no contiene ninguna de las hojas esperadas del dominio '+domain+'.');
+
+    const ranges = hojasPedidas.map(n=>'ranges='+encodeURIComponent(n+'!A:AZ')).join('&');
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
 
     if(!r.ok){
@@ -14494,6 +14597,12 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         gsUpdateSyncStatus(msg,'error');
         if(!auto) toast(msg,'error');
         return;
+      }
+      // 400 suele significar un rango inválido: se detalla para no depurar a ciegas.
+      if(r.status===400){
+        const errJson = await r.json().catch(()=>({}));
+        console.error('[Sync] Rango inválido al leer. Hojas pedidas: '+hojasPedidas.join(', '), errJson);
+        throw new Error('HTTP 400 al leer: algún rango no es válido (hojas pedidas: '+hojasPedidas.join(', ')+')');
       }
       throw new Error('HTTP '+r.status+' al leer hojas de Google Sheets');
     }
@@ -14805,7 +14914,16 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     goto(currentPage);
   }catch(err){
     console.error(err);
-    if(auto) gsUpdateSyncStatus('No se pudo sincronizar automáticamente al iniciar sesión.','error');
+    if(auto){
+      /* Antes esto solo escribía una línea de estado: una carga fallida al
+         iniciar sesión quedaba invisible y el usuario veía los módulos vacíos
+         sin ninguna señal de error. Ahora también avisa. */
+      const m = 'No se pudieron cargar los datos de '+(domain==='inventario'?'INVENTARIO':'PLANILLA')+
+                ' desde Google Sheets. Lo que ves puede estar incompleto o desactualizado.'+
+                (err && err.message ? ' ('+err.message+')' : '');
+      gsUpdateSyncStatus(m,'error');
+      if(typeof toast==='function') toast(m,'error');
+    }
     else gsHandleError(err, 'cargar');
   }
   gsRenderControls();
@@ -14828,7 +14946,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-20.2';
+const APP_VERSION = '2026-10-20.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
