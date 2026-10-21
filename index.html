@@ -1184,15 +1184,21 @@ function propNombreMesero(id){
 }
 
 /* ── Ventana por defecto de "Propinas registradas" ───────────────────────
-   Las DOS últimas semanas COMPLETAS (lunes a domingo), excluyendo la semana
-   en curso, en hora de Lima.
-     hoy martes 2026-10-20 → { desde:'2026-10-05', hasta:'2026-10-18' }
+   Las DOS últimas semanas COMPLETAS más la SEMANA EN CURSO (lunes a
+   domingo), en hora de Lima. Son 21 días exactos.
+     hoy miércoles 2026-10-21 → { desde:'2026-10-05', hasta:'2026-10-25' }
+       · 05/10–11/10  semana completa
+       · 12/10–18/10  semana completa
+       · 19/10–25/10  semana en curso (incluye lo registrado hasta hoy)
+   El extremo final es el DOMINGO de la semana en curso, no hoy, para que una
+   propina registrada hoy —o en lo que resta de semana— entre en el rango sin
+   tener que tocar el filtro.
    Solo limita la VISTA inicial: el usuario puede elegir cualquier otro
    rango, y el consolidado nunca pasa por aquí. */
-function rangoUlt2SemanasCompletas(){
+function rangoUlt3SemanasConActual(){
   const lunesActual = anLunesDe(fechaEnLima());   // lunes de la semana en curso
-  const hasta = fechaMasDias(lunesActual, -1);    // domingo de la última semana completa
-  const desde = fechaMasDias(hasta, -13);         // lunes de la semana anterior a esa
+  const desde = fechaMasDias(lunesActual, -14);   // lunes, dos semanas antes
+  const hasta = fechaMasDias(lunesActual, 6);     // domingo de la semana en curso
   return { desde, hasta };
 }
 
@@ -5852,13 +5858,13 @@ function meseroOptions(selected){
    que está vacío en la cuenta de inventario. No se modifica filtroToolbar()
    porque la comparten otros módulos. */
 function propFiltroToolbar(f){
-  const R = rangoUlt2SemanasCompletas();
+  const R = rangoUlt3SemanasConActual();
   return `
     <div class="toolbar" style="margin-bottom:12px;flex-wrap:wrap">
       <div class="field"><label>Filtrar mesero</label><select id="prFEmp"><option value="">Todos</option>${propMeseroPadron().map(e=>`<option value="${e.id}" ${f.emp===e.id?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
       <div class="field"><label>Desde</label><input type="date" id="prFDesde" value="${f.desde||''}"></div>
       <div class="field"><label>Hasta</label><input type="date" id="prFHasta" value="${f.hasta||''}"></div>
-      <button class="btn btn-ghost btn-sm" id="prFClear" title="Vuelve a las dos últimas semanas completas (${fmtFecha(R.desde)} – ${fmtFecha(R.hasta)})">Últimas 2 semanas</button>
+      <button class="btn btn-ghost btn-sm" id="prFClear" title="Vuelve al período por defecto: las dos últimas semanas completas más la semana en curso (${fmtFecha(R.desde)} – ${fmtFecha(R.hasta)})">Últimas 3 semanas</button>
       <button class="btn btn-ghost btn-sm" id="prFAll" title="Quita el filtro de fechas y muestra todo el historial (puede tardar si hay muchos registros)">Ver todo el historial</button>
     </div>`;
 }
@@ -6859,7 +6865,7 @@ let editPropItem=null;       // item en edición (formato unificado), null = mod
    COMPLETAS (sin la semana en curso). Solo limita la VISTA; el usuario
    puede cambiar el rango o pedir todo el historial, y el Consolidado de
    Propinas nunca pasa por este filtro. */
-let propFilter=(()=>{ const R=rangoUlt2SemanasCompletas(); return {emp:'', desde:R.desde, hasta:R.hasta}; })();
+let propFilter=(()=>{ const R=rangoUlt3SemanasConActual(); return {emp:'', desde:R.desde, hasta:R.hasta}; })();
 // Filas del formulario de "nueva propina" (no aplica en modo edición).
 /* Tipo por defecto IZIPAY en la fila inicial, en cada fila agregada y al
    reiniciar el formulario tras guardar. Cambia SOLO el valor preseleccionado:
@@ -6940,7 +6946,13 @@ RENDERERS.propinas = function(){
       <h2>Nueva propina</h2>
       <div class="form-grid">
         <div class="field"><label>Mesero *</label><select id="prEmp">${meseroOptions(propFormEmpleadoId!=null?propFormEmpleadoId:lastPropina.empleadoId)}</select></div>
-        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${propFormFecha!=null?propFormFecha:(lastPropina.fecha||fechaAyer())}"></div>
+        <!-- Por defecto HOY en hora de Lima (antes era el día anterior). Se
+             resuelve en cada render con fechaHoy(), así que al cambiar de día
+             el valor se actualiza solo; nunca queda fijado a una fecha
+             estática. lastPropina.fecha solo manda dentro de la misma
+             sesión, cuando el usuario ya eligió una fecha y guardó, para
+             poder encadenar varias propinas del mismo día. -->
+        <div class="field"><label>Fecha *</label><input type="date" id="prFecha" value="${propFormFecha!=null?propFormFecha:(lastPropina.fecha||fechaHoy())}"></div>
       </div>
       <h3 style="margin-top:14px">Propinas a registrar</h3>
       <p class="hint" style="margin-top:0">El mesero y la fecha de arriba se aplican a todas las filas. Agrega tantas filas como necesites (no hay límite).</p>
@@ -6972,9 +6984,9 @@ RENDERERS.propinas = function(){
       <h2>Propinas registradas (${list.length})</h2>
       <p class="hint" style="margin-top:0">${rangoVista
         ? `Mostrando ${fmtFecha(propFilter.desde||list.length&&list[list.length-1].fecha||hoy)} – ${fmtFecha(propFilter.hasta||hoy)}.
-           Por defecto se cargan solo las <b>dos últimas semanas completas</b> (lunes a domingo, sin la semana en curso) para no recorrer todo el historial.
+           Por defecto se cargan las <b>dos últimas semanas completas más la semana en curso</b> (lunes a domingo) para no recorrer todo el historial.
            Cambia las fechas para consultar cualquier otro período, o pulsa <b>Ver todo el historial</b>.`
-        : `Mostrando <b>todo el historial</b> (${list.length} registros). Pulsa <b>Últimas 2 semanas</b> para volver a la vista rápida.`}
+        : `Mostrando <b>todo el historial</b> (${list.length} registros). Pulsa <b>Últimas 3 semanas</b> para volver a la vista rápida.`}
         Nada de esto altera los registros guardados ni los totales del <b>Consolidado Propinas</b>, que sigue usando el historial completo.</p>
       ${propFiltroToolbar(propFilter)}
       <div class="table-wrap"><table>
@@ -6995,7 +7007,7 @@ RENDERERS.propinas = function(){
   const prApplyF=()=>{ propFilter={emp:document.getElementById('prFEmp').value, desde:document.getElementById('prFDesde').value, hasta:document.getElementById('prFHasta').value}; RENDERERS.propinas(); };
   ['prFEmp','prFDesde','prFHasta'].forEach(id=> document.getElementById(id).onchange=prApplyF);
   document.getElementById('prFClear').onclick=()=>{
-    const R=rangoUlt2SemanasCompletas();
+    const R=rangoUlt3SemanasConActual();
     propFilter={emp:'', desde:R.desde, hasta:R.hasta};   // vuelve a la vista por defecto
     RENDERERS.propinas();
   };
@@ -14946,7 +14958,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-20.3';
+const APP_VERSION = '2026-10-21.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
