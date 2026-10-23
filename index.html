@@ -7078,6 +7078,33 @@ RENDERERS.propinas = function(){
             <td class="num"><b>${money(aporte)}</b></td>
             <td><button class="btn-icon" onclick="propEdit('${it.itemId}')">✏️</button> <button class="btn-icon del" onclick="propDel('${it.itemId}')">🗑️</button></td></tr>`;
         }).join('') : `<tr><td colspan="7" class="empty">Sin propinas para el filtro aplicado.</td></tr>`}</tbody>
+        ${(()=>{
+          /* FILA DE TOTALES — suma de los registros VISIBLES (los que quedan
+             tras mesero + tipo + fechas), nunca del historial completo. Se
+             calcula sobre `list`, exactamente el mismo array que alimenta el
+             tbody, así que no puede contar de más ni de menos; y como una
+             suma no depende del orden, ordenar por cualquier columna la deja
+             igual. Va en <tfoot> para quedar siempre al final.
+             Cada importe se redondea al céntimo MOSTRADO antes de sumar, de
+             modo que el total coincida con la suma manual de la columna
+             (p. ej. 6.20 × 0.98 = 6.076 se ve como 6.08 y suma 6.08). No se
+             toca ninguna fórmula: el aporte sigue saliendo de
+             calcularTotalBasePropinas() fila a fila. */
+          const cent = v => Math.round((Number(v)||0)*100)/100;
+          let totMonto=0, totAporte=0;
+          list.forEach(it=>{
+            totMonto  += cent(it.monto);
+            totAporte += cent(calcularTotalBasePropinas({[it.tipo]: it.monto}));
+          });
+          const estilo='background:#ede9fe;border-top:2px solid #6d28d9;font-weight:800;color:#2e1065';
+          return `<tfoot><tr>
+            <td colspan="3" style="${estilo};text-align:left">TOTAL <span style="font-weight:600;font-size:11px;color:#6d28d9">(${list.length} registro${list.length===1?'':'s'} visible${list.length===1?'':'s'})</span></td>
+            <td class="num" style="${estilo}">${money(totMonto)}</td>
+            <td style="${estilo}"></td>
+            <td class="num" style="${estilo}">${money(totAporte)}</td>
+            <td style="${estilo}"></td>
+          </tr></tfoot>`;
+        })()}
       </table></div>
     </div>`;
 
@@ -15038,7 +15065,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-23.1';
+const APP_VERSION = '2026-10-23.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
