@@ -665,6 +665,7 @@
     <section class="page" id="page-flujoCaja"></section>
     <section class="page" id="page-evolucionGastos"></section>
     <section class="page" id="page-cotejos"></section>
+    <section class="page" id="page-remarketing"></section>
     <section class="page" id="page-salonAdmin"></section>
     <section class="page" id="page-invDiarioSalon"></section>
     <section class="page" id="page-menajeAdmin"></section>
@@ -4650,6 +4651,521 @@ RENDERERS.estadisticasDiaSemana = function(){
   ['edsDesde','edsHasta'].forEach(id=>{document.getElementById(id).onchange=apply;});
   document.getElementById('edsReset').onclick=()=>{ edsFilter=ventasUlt12Meses(); RENDERERS.estadisticasDiaSemana(); };
 };
+/* ════════════════════════════════════════════════════════════════════════
+   MÓDULO ANALÍTICA — REMARKETING
+   ------------------------------------------------------------------------
+   FUENTE DE VENTAS (solo lectura): pestaña CLIENTES del spreadsheet de
+   ANALÍTICA PROCESADA (ANALITICA_PROC_SS_ID). Nunca se escribe en ella.
+     A=NUMERO ORDEN  B=CLIENTE  C=TELEFONO  D=TOTAL  E=FECHA DE VENTA
+     F=CANAL DE VENTA 2
+   PERSISTENCIA DEL REMARKETING: pestaña propia REMARKETING en el MISMO
+   spreadsheet, escrita con analiticaWriteProcessedSheet(), que es la única
+   vía sancionada de la app para persistir tablas derivadas (crea la hoja si
+   falta y jamás toca las demás). Guarda el HISTORIAL de contactos, no un
+   booleano: una fila por contacto realizado.
+   ════════════════════════════════════════════════════════════════════════ */
+const RM_SHEET_CLIENTES = 'CLIENTES';
+const RM_SHEET_CONTACTOS = 'REMARKETING';
+const RM_COL = { orden:0, cliente:1, telefono:2, total:3, fecha:4, canal:5 };
+const RM_DIAS_OPCIONES = [5,10,15,20,25,30];
+const RM_PROM_OPCIONES = [100,125,150];
+
+/* Teléfono normalizado = IDENTIFICADOR del cliente. Se conservan solo los
+   dígitos; se descarta el prefijo país 51 cuando al quitarlo queda un número
+   peruano de 9 cifras, de modo que '+51 987 654 321' y '987654321' sean el
+   mismo cliente. Devuelve '' cuando no hay un número utilizable: esas filas
+   se excluyen por completo y NO se agrupan en un cliente ficticio. */
+function rmNormalizarTelefono(v){
+  const d = String(v==null?'':v).replace(/\D+/g,'');
+  if(!d) return '';
+  let n = d;
+  if(n.length>9 && n.startsWith('51') && n.length-2>=8) n = n.slice(2);
+  if(n.length<8) return '';            // demasiado corto para ser un teléfono
+  if(/^(\d)\1+$/.test(n)) return '';   // 000000000, 999999999… no identifican a nadie
+  return n;
+}
+// Nombre "más completo": el de más caracteres reales (sin espacios de más).
+// Empate → el primero visto, para que el resultado sea estable.
+function rmNombreMasCompleto(a, b){
+  const limpio = x => String(x==null?'':x).replace(/\s+/g,' ').trim();
+  const A=limpio(a), B=limpio(b);
+  if(!A) return B;
+  if(!B) return A;
+  return B.length > A.length ? B : A;
+}
+/* Días calendario entre dos fechas 'YYYY-MM-DD', en aritmética UTC pura para
+   que el resultado no dependa de la zona del navegador. La referencia es HOY
+   en hora de Lima (fechaEnLima()), nunca el día anterior. */
+function rmDiasDesde(fechaISO, hoyISO){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(fechaISO||''))) return null;
+  const hoy = hoyISO || fechaEnLima();
+  const a = Date.UTC(+fechaISO.slice(0,4), +fechaISO.slice(5,7)-1, +fechaISO.slice(8,10));
+  const b = Date.UTC(+hoy.slice(0,4), +hoy.slice(5,7)-1, +hoy.slice(8,10));
+  return Math.round((b-a)/86400000);
+}
+
+// ── Estado en memoria + caché local ──
+const K_RM_CLIENTES = 'rm_clientes';
+const K_RM_CLIENTES_META = 'rm_clientes_meta';
+const K_RM_CONTACTOS = 'rm_contactos';
+let rmClientes = [];     // agregados por teléfono
+let rmClientesMeta = null;
+let rmContactos = [];    // historial: [{id, telefono, fecha}]
+let rmCargando = false;
+let rmError = null;
+let rmAutoIntentado = false;
+let rmPendientes = {};   // telefono -> true|false (cambios sin guardar)
+let rmGuardando = false;
+
+function rmLoadFromStorage(){
+  try{
+    const c=localStorage.getItem(K_RM_CLIENTES), m=localStorage.getItem(K_RM_CLIENTES_META), h=localStorage.getItem(K_RM_CONTACTOS);
+    if(c) rmClientes=JSON.parse(c)||[];
+    if(m) rmClientesMeta=JSON.parse(m);
+    if(h) rmContactos=JSON.parse(h)||[];
+  }catch(e){ rmClientes=[]; rmClientesMeta=null; rmContactos=[]; }
+}
+rmLoadFromStorage();
+function rmSaveClientes(){
+  try{ localStorage.setItem(K_RM_CLIENTES, JSON.stringify(rmClientes));
+       localStorage.setItem(K_RM_CLIENTES_META, JSON.stringify(rmClientesMeta)); }
+  catch(e){ console.warn('[Remarketing] No se pudo cachear clientes:', e); }
+}
+function rmSaveContactos(){
+  try{ localStorage.setItem(K_RM_CONTACTOS, JSON.stringify(rmContactos)); }
+  catch(e){ console.warn('[Remarketing] No se pudo cachear contactos:', e); }
+}
+
+/* Agrega las filas crudas de CLIENTES en un cliente por teléfono.
+   `filas` es la matriz tal cual la devuelve Sheets (incluye encabezado). */
+function rmAgregarFilas(filas){
+  const porTel = new Map();
+  let leidas=0, sinTelefono=0, sinFecha=0;
+  (filas||[]).forEach((row, idx)=>{
+    if(!row || !row.length) return;
+    const tel = rmNormalizarTelefono(row[RM_COL.telefono]);
+    const fecha = normFechaGS(row[RM_COL.fecha]);
+    const esEncabezado = idx===0 && !/^\d{4}-\d{2}-\d{2}$/.test(fecha);
+    if(esEncabezado) return;
+    leidas++;
+    if(!tel){ sinTelefono++; return; }                       // fila excluida, no agrupada
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ sinFecha++; return; }
+    const monto = (()=>{ const n=Number(row[RM_COL.total]); return Number.isFinite(n)?n:0; })();
+    /* Desempate de "última compra" dentro del mismo día: si la celda de fecha
+       trae hora (serial con parte decimal) se usa esa fracción; si no, el
+       NÚMERO DE ORDEN. Nunca se inventa una hora que la fuente no tenga. */
+    const crudo = row[RM_COL.fecha];
+    const serial = Number(crudo);
+    const fraccion = (Number.isFinite(serial) && serial>0) ? (serial - Math.floor(serial)) : 0;
+    const ordenNum = (()=>{ const n=Number(String(row[RM_COL.orden]).replace(/\D+/g,'')); return Number.isFinite(n)?n:0; })();
+    const clave = fecha+'|'+String(fraccion).padStart(20,'0')+'|'+String(ordenNum).padStart(12,'0');
+
+    let c = porTel.get(tel);
+    if(!c){ c = { telefono:tel, nombre:'', visitas:0, montoTotal:0,
+                  ultimaFecha:'', ultimoMonto:0, _claveUlt:'' }; porTel.set(tel, c); }
+    c.nombre = rmNombreMasCompleto(c.nombre, row[RM_COL.cliente]);
+    c.visitas++;
+    c.montoTotal += monto;
+    if(clave > c._claveUlt){ c._claveUlt = clave; c.ultimaFecha = fecha; c.ultimoMonto = monto; }
+  });
+  const out = [...porTel.values()].map(c=>({
+    telefono:c.telefono,
+    nombre: c.nombre || '(sin nombre)',
+    visitas:c.visitas,
+    montoTotal: Math.round(c.montoTotal*100)/100,
+    promedio: c.visitas>0 ? (c.montoTotal/c.visitas) : 0,
+    ultimaFecha:c.ultimaFecha,
+    ultimoMonto:c.ultimoMonto
+  }));
+  return { clientes:out, leidas, sinTelefono, sinFecha };
+}
+
+// Lee CLIENTES del spreadsheet de ANALÍTICA PROCESADA (solo lectura).
+async function rmSyncClientes(){
+  if(!isAuthorized()){ toast('Inicia sesión para sincronizar los clientes.','error'); return false; }
+  rmCargando = true; rmError = null;
+  const t0 = Date.now();
+  try{
+    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
+      '/values/'+encodeURIComponent(RM_SHEET_CLIENTES+'!A1:F200000')+'?valueRenderOption=UNFORMATTED_VALUE');
+    if(r.status===403) throw new Error('Sin permiso para leer la pestaña '+RM_SHEET_CLIENTES+'.');
+    if(r.status===404) throw new Error('No se encontró la pestaña '+RM_SHEET_CLIENTES+'.');
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+RM_SHEET_CLIENTES+'.');
+    const filas = (await r.json()).values || [];
+    if(!filas.length) throw new Error(RM_SHEET_CLIENTES+' no devolvió datos (0 filas).');
+    const ag = rmAgregarFilas(filas);
+    rmClientes = ag.clientes;
+    rmClientesMeta = { lastSync:new Date().toISOString(), filas:ag.leidas, clientes:rmClientes.length,
+                       sinTelefono:ag.sinTelefono, sinFecha:ag.sinFecha,
+                       duracion:((Date.now()-t0)/1000).toFixed(1) };
+    rmSaveClientes();
+    console.log('[Remarketing] '+ag.leidas+' filas → '+rmClientes.length+' clientes. Descartadas: '+
+      ag.sinTelefono+' sin teléfono utilizable, '+ag.sinFecha+' sin fecha válida.');
+    rmCargando = false;
+    return true;
+  }catch(e){
+    console.error('[Remarketing] Error al leer '+RM_SHEET_CLIENTES+':', e);
+    rmError = e.message; rmCargando = false;
+    return false;
+  }
+}
+
+// Lee el historial de contactos de la pestaña REMARKETING. Si la pestaña aún
+// no existe, no es un error: simplemente no hay contactos todavía.
+async function rmSyncContactos(){
+  if(!isAuthorized()) return false;
+  try{
+    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
+      '/values/'+encodeURIComponent(RM_SHEET_CONTACTOS+'!A1:D100000')+'?valueRenderOption=UNFORMATTED_VALUE');
+    if(r.status===400 || r.status===404){
+      console.log('[Remarketing] La pestaña '+RM_SHEET_CONTACTOS+' aún no existe; se creará al guardar.');
+      return true;
+    }
+    if(!r.ok) throw new Error('HTTP '+r.status+' al leer '+RM_SHEET_CONTACTOS+'.');
+    const filas = (await r.json()).values || [];
+    const out = [];
+    filas.forEach((row, i)=>{
+      if(!row || !row.length) return;
+      if(i===0 && String(row[0]).toLowerCase()==='id') return;   // encabezado
+      const tel = rmNormalizarTelefono(row[1]);
+      const fecha = normFechaGS(row[2]);
+      if(!tel || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return;
+      out.push({ id:String(row[0]||uid()), telefono:tel, fecha });
+    });
+    rmContactos = out;
+    rmSaveContactos();
+    console.log('[Remarketing] '+out.length+' contacto(s) de remarketing cargados.');
+    return true;
+  }catch(e){
+    console.error('[Remarketing] Error al leer '+RM_SHEET_CONTACTOS+':', e);
+    rmError = e.message;
+    return false;
+  }
+}
+
+/* Último contacto registrado para un teléfono ('' si no hay ninguno). */
+function rmUltimoContacto(telefono){
+  let max='';
+  rmContactos.forEach(c=>{ if(c.telefono===telefono && c.fecha>max) max=c.fecha; });
+  return max;
+}
+/* ESTADO VIGENTE del remarketing.
+   Vigente = hay un contacto Y el cliente NO ha comprado en la fecha del
+   contacto ni después. Una compra el mismo día del contacto o posterior lo
+   invalida, sin borrar el historial: el contacto sigue en la hoja, solo deja
+   de considerarse vigente. */
+function rmVigente(cliente){
+  const ult = rmUltimoContacto(cliente.telefono);
+  if(!ult) return false;
+  return !(cliente.ultimaFecha && cliente.ultimaFecha >= ult);
+}
+// Estado que se muestra, teniendo en cuenta los cambios aún sin guardar.
+function rmEstadoVisible(cliente){
+  if(Object.prototype.hasOwnProperty.call(rmPendientes, cliente.telefono)) return !!rmPendientes[cliente.telefono];
+  return rmVigente(cliente);
+}
+
+
+/* ── SEGMENTACIÓN CENTRALIZADA ───────────────────────────────────────────
+   Una sola función decide el segmento de cada cliente, de modo que no puede
+   haber duplicados ni contradicciones entre cuadros.
+     VIP          visitas >= 5
+     GRUPAL       1 <= visitas <= 4  y  promedio  >  umbral
+     RECURRENTE   2 <= visitas <= 4  y  promedio  <  umbral
+     OCASIONAL    todo lo demás (segmento residual)
+   Las comparaciones monetarias son ESTRICTAS: un promedio exactamente igual
+   al umbral no es grupal ni recurrente, así que cae en ocasionales.
+   El umbral de monto es COMPARTIDO por grupales y recurrentes (un solo
+   selector), tal como exige la especificación.
+   La ANTIGÜEDAD no interviene aquí: cada cuadro aplica su propio umbral de
+   días sobre su segmento, con la condición estricta "más de X días". */
+const RM_SEGMENTOS = [
+  ['vip',        'Clientes VIP',         '👑', 'Visitas ≥ 5'],
+  ['grupal',     'Clientes grupales',    '👥', '1–4 visitas · promedio > umbral'],
+  ['recurrente', 'Clientes recurrentes', '🔁', '2–4 visitas · promedio < umbral'],
+  ['ocasional',  'Clientes ocasionales', '🧍', 'Todos los demás']
+];
+function rmSegmentoDe(cliente, promUmbral){
+  const v = cliente.visitas;
+  if(v >= 5) return 'vip';
+  if(v >= 1 && v <= 4){
+    if(cliente.promedio > promUmbral) return 'grupal';
+    if(v >= 2 && cliente.promedio < promUmbral) return 'recurrente';
+  }
+  return 'ocasional';
+}
+
+/* ── PARÁMETROS DE LA VISTA (persisten durante la sesión) ─────────────── */
+let rmParam = {
+  promUmbral: 125,                                  // compartido grupal/recurrente
+  dias:   { vip:15, grupal:15, recurrente:15, ocasional:15 },
+  estado: { vip:'todos', grupal:'todos', recurrente:'todos', ocasional:'todos' },
+  sort:   { vip:null, grupal:null, recurrente:null, ocasional:null }   // {col,dir}
+};
+window.rmSetDias = function(seg, v){ rmParam.dias[seg] = Number(v)||15; RENDERERS.remarketing(); };
+window.rmSetEstado = function(seg, v){ rmParam.estado[seg] = v; RENDERERS.remarketing(); };
+window.rmSetProm = function(v){ rmParam.promUmbral = Number(v)||125; RENDERERS.remarketing(); };
+const RM_COLS = [
+  ['nombre','Nombre','s'], ['telefono','Teléfono','tel'], ['montoTotal','Monto total','n'],
+  ['ultimoMonto','Último monto','n'], ['ultimaFecha','Última compra','f'],
+  ['dias','Días','n'], ['visitas','Visitas','n'], ['remk','Remarketing','b']
+];
+window.rmSetSort = function(seg, col){
+  const actual = rmParam.sort[seg];
+  rmParam.sort[seg] = (actual && actual.col===col) ? {col, dir: actual.dir===1?-1:1} : {col, dir:1};
+  RENDERERS.remarketing();
+};
+/* Ordena una COPIA de las filas ya filtradas. Estable: la posición original
+   desempata, así que los valores repetidos o vacíos conservan su orden. */
+function rmOrdenar(filas, seg){
+  const s = rmParam.sort[seg];
+  if(!s || !s.col) return filas;
+  const def = RM_COLS.find(c=>c[0]===s.col);
+  if(!def) return filas;
+  const tipo = def[2];
+  const val = f => {
+    if(s.col==='remk') return f.vigente ? 1 : 0;
+    if(s.col==='telefono'){ const n=Number(f.telefono); return Number.isFinite(n)?n:null; }
+    return f[s.col];
+  };
+  return filas.map((f,i)=>({f,i}))
+    .sort((a,b)=>{
+      const A=val(a.f), B=val(b.f);
+      const aV = A===null||A===undefined||A==='';
+      const bV = B===null||B===undefined||B==='';
+      if(aV && bV) return a.i-b.i;
+      if(aV) return 1;                       // vacíos siempre al final
+      if(bV) return -1;
+      let c;
+      if(tipo==='s') c = String(A).localeCompare(String(B),'es',{sensitivity:'base',numeric:true});
+      else if(tipo==='f') c = String(A).localeCompare(String(B));   // ISO → orden cronológico
+      else c = Number(A)-Number(B);
+      return c!==0 ? c*s.dir : a.i-b.i;
+    })
+    .map(x=>x.f);
+}
+
+/* Construye las filas de un segmento: aplica el umbral de días (estricto),
+   el filtro de estado y el ordenamiento. Devuelve también los descartados por
+   estado para poder informar. */
+function rmFilasSegmento(seg){
+  const hoy = fechaEnLima();
+  const umbralDias = rmParam.dias[seg];
+  const filas = [];
+  rmClientes.forEach(c=>{
+    if(rmSegmentoDe(c, rmParam.promUmbral) !== seg) return;
+    const dias = rmDiasDesde(c.ultimaFecha, hoy);
+    if(dias === null) return;
+    if(!(dias > umbralDias)) return;              // "más de X días", estricto
+    const vigente = rmEstadoVisible(c);
+    filas.push({ ...c, dias, vigente, contacto: rmUltimoContacto(c.telefono) });
+  });
+  const estado = rmParam.estado[seg];
+  const filtradas = filas.filter(f=>
+    estado==='todos' ? true : (estado==='con' ? f.vigente : !f.vigente));
+  return { total:filas.length, filas: rmOrdenar(filtradas, seg) };
+}
+
+/* ── GUARDADO EN BLOQUE ──────────────────────────────────────────────────
+   Marcar  → registra un contacto con la fecha de HOY.
+   Desmarcar → retira los contactos que hacían vigente el estado (corrección
+   de un marcado erróneo). No se tocan los contactos ya invalidados por una
+   compra posterior: esos son historial y se conservan.
+   Idempotente: no se añade un contacto si ya existe uno de ese teléfono con
+   la misma fecha, así que reintentar no duplica nada. */
+function rmAplicarPendientes(){
+  const hoy = fechaEnLima();
+  let altas=0, bajas=0;
+  Object.keys(rmPendientes).forEach(tel=>{
+    const quiere = !!rmPendientes[tel];
+    const cli = rmClientes.find(c=>c.telefono===tel);
+    const vigenteAhora = cli ? rmVigente(cli) : false;
+    if(quiere && !vigenteAhora){
+      const yaExiste = rmContactos.some(c=>c.telefono===tel && c.fecha===hoy);
+      if(!yaExiste){ rmContactos.push({ id:uid(), telefono:tel, fecha:hoy }); altas++; }
+    }else if(!quiere && vigenteAhora){
+      // Solo los contactos POSTERIORES a su última compra sostienen la vigencia.
+      const corte = cli ? cli.ultimaFecha : '';
+      const antes = rmContactos.length;
+      rmContactos = rmContactos.filter(c=> !(c.telefono===tel && (!corte || c.fecha > corte)) );
+      bajas += antes - rmContactos.length;
+    }
+  });
+  return { altas, bajas };
+}
+function rmMatrizContactos(){
+  return [['id','telefono','fecha'],
+    ...rmContactos.map(c=>[String(c.id), String(c.telefono), String(c.fecha)])];
+}
+window.rmToggle = function(tel, checked){
+  rmPendientes[tel] = !!checked;
+  // Si vuelve al estado ya persistido, deja de ser un cambio pendiente.
+  const cli = rmClientes.find(c=>c.telefono===tel);
+  if(cli && rmVigente(cli) === !!checked) delete rmPendientes[tel];
+  RENDERERS.remarketing();
+};
+window.rmDescartarPendientes = function(){
+  rmPendientes = {};
+  RENDERERS.remarketing();
+};
+window.rmGuardar = async function(){
+  const n = Object.keys(rmPendientes).length;
+  if(!n){ toast('No hay cambios pendientes que guardar.','info'); return; }
+  if(rmGuardando) return;
+  if(!isAuthorized()){ toast('Inicia sesión para guardar los cambios.','error'); return; }
+  /* Se trabaja sobre una copia: si la escritura falla, el historial en memoria
+     queda EXACTAMENTE como estaba y los cambios siguen pendientes, para que el
+     usuario pueda reintentar sin perder nada. */
+  const respaldo = rmContactos.map(c=>({...c}));
+  rmGuardando = true; RENDERERS.remarketing();
+  const { altas, bajas } = rmAplicarPendientes();
+  try{
+    await analiticaWriteProcessedSheet(RM_SHEET_CONTACTOS, rmMatrizContactos(), 'A1:D100000');
+    rmSaveContactos();
+    rmPendientes = {};
+    rmGuardando = false;
+    toast('✅ Remarketing guardado · '+altas+' contacto(s) registrado(s)'+(bajas?' · '+bajas+' retirado(s)':''),'success');
+  }catch(e){
+    rmContactos = respaldo;              // revierte: nada se dio por guardado
+    rmGuardando = false;
+    console.error('[Remarketing] Error al guardar:', e);
+    toast('No se pudo guardar el remarketing: '+(e&&e.message?e.message:'error desconocido')+'. Los cambios siguen pendientes.','error');
+  }
+  RENDERERS.remarketing();
+};
+
+
+RENDERERS.remarketing = function(){
+  const el = document.getElementById('page-remarketing');
+  if(!el) return;
+  /* Carga automática una sola vez por sesión: clientes + historial. No se
+     vuelve a leer el spreadsheet al cambiar un dropdown; los agregados ya
+     están en memoria y la segmentación se recalcula sobre ellos. */
+  if(!rmAutoIntentado && !rmCargando && isAuthorized() && !rmClientes.length){
+    rmAutoIntentado = true;
+    rmCargando = true;
+    Promise.all([rmSyncClientes(), rmSyncContactos()]).then(()=>{
+      rmCargando = false;
+      if(currentPage==='remarketing') RENDERERS.remarketing();
+    });
+  }
+
+  const hoy = fechaEnLima();
+  const pend = Object.keys(rmPendientes).length;
+  const meta = rmClientesMeta
+    ? `Última sincronización: ${fmtFecha(rmClientesMeta.lastSync.slice(0,10))} · ${rmClientesMeta.filas} filas de ${RM_SHEET_CLIENTES} · ${rmClientesMeta.clientes} clientes`
+      + (rmClientesMeta.sinTelefono? ` · ${rmClientesMeta.sinTelefono} fila(s) sin teléfono utilizable (excluidas)`:'')
+    : 'Sin sincronizar todavía.';
+
+  const sel = (id, valor, opciones, etiqueta, onchange) => `
+    <div class="field"><label>${etiqueta}</label>
+      <select id="${id}" onchange="${onchange}">
+        ${opciones.map(o=>`<option value="${o[0]}" ${String(o[0])===String(valor)?'selected':''}>${o[1]}</option>`).join('')}
+      </select></div>`;
+
+  const cuadro = ([seg, titulo, ico, regla])=>{
+    const { total, filas } = rmFilasSegmento(seg);
+    const s = rmParam.sort[seg];
+    const th = (col,label,cls)=>{
+      const act = s && s.col===col;
+      const icono = act ? (s.dir===1?'▲':'▼') : '⇅';
+      return `<th class="${cls?cls+' ':''}prs-th${act?' prs-act':''}" onclick="rmSetSort('${seg}','${col}')"`
+           + ` title="${act?`Ordenado por ${label} ${s.dir===1?'ascendente':'descendente'}. Clic para invertir.`:'Ordenar por '+label}">`
+           + `${label} <span class="prs-ico">${icono}</span></th>`;
+    };
+    const filtroDias = sel('rmD-'+seg, rmParam.dias[seg],
+      RM_DIAS_OPCIONES.map(d=>[d, 'Más de '+d+' días']), 'Días desde última compra', `rmSetDias('${seg}', this.value)`);
+    const filtroEstado = sel('rmE-'+seg, rmParam.estado[seg],
+      [['todos','Todos los clientes'],['con','Clientes con remarketing'],['sin','Clientes sin remarketing']],
+      'Estado de remarketing', `rmSetEstado('${seg}', this.value)`);
+    // El umbral monetario es ÚNICO y compartido: solo se dibuja en grupales,
+    // con una nota en recurrentes para que quede claro de dónde sale.
+    const filtroProm = seg==='grupal'
+      ? sel('rmP', rmParam.promUmbral, RM_PROM_OPCIONES.map(v=>[v,'S/ '+v]), 'Monto promedio mínimo (compartido)', `rmSetProm(this.value)`)
+      : '';
+
+    const cuerpo = filas.length ? filas.map(f=>{
+      const marcado = f.vigente ? 'checked' : '';
+      const pendiente = Object.prototype.hasOwnProperty.call(rmPendientes, f.telefono);
+      const hist = f.contacto
+        ? (f.vigente ? 'Contactado el '+fmtFecha(f.contacto)
+                     : 'Contacto del '+fmtFecha(f.contacto)+' invalidado por una compra del '+fmtFecha(f.ultimaFecha))
+        : 'Sin contactos registrados';
+      return `<tr${pendiente?' style="background:#fef9c3"':''}>
+        <td>${f.nombre}</td>
+        <td><code>${f.telefono}</code></td>
+        <td class="num">${money(f.montoTotal)}</td>
+        <td class="num">${money(f.ultimoMonto)}</td>
+        <td>${fmtFecha(f.ultimaFecha)}</td>
+        <td class="num">${f.dias}</td>
+        <td class="num">${f.visitas}</td>
+        <td style="text-align:center" title="${hist}">
+          <input type="checkbox" ${marcado} onchange="rmToggle('${f.telefono}', this.checked)" style="width:16px;height:16px;cursor:pointer">
+          ${pendiente?'<span style="font-size:10px;color:#a16207;font-weight:700"> sin guardar</span>':''}
+          ${(!f.vigente && f.contacto)?'<div style="font-size:10px;color:var(--c-muted)">contacto previo</div>':''}
+        </td></tr>`;
+    }).join('') : `<tr><td colspan="8" class="empty">${rmClientes.length
+        ? 'Ningún cliente cumple los criterios de este segmento con los parámetros seleccionados.'
+        : 'Sin datos de clientes. Pulsa <b>Actualizar clientes</b>.'}</td></tr>`;
+
+    return `
+      <div class="card" style="margin-bottom:16px">
+        <div class="toolbar" style="justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:10px 16px">
+          <h2 style="margin:0">${ico} ${titulo} <span style="font-size:12px;font-weight:600;color:var(--c-muted)">(${filas.length}${filas.length!==total?' de '+total:''})</span></h2>
+        </div>
+        <p class="hint" style="margin-top:0">${regla} · se listan solo los clientes con <b>más de ${rmParam.dias[seg]} días</b> desde su última compra.
+          ${seg==='recurrente'?`El umbral de monto promedio (<b>S/ ${rmParam.promUmbral}</b>) es el mismo que usa <b>Clientes grupales</b>.`:''}
+          ${seg==='ocasional'?'Segmento residual: recoge a quien no califica como VIP, grupal ni recurrente, incluidos los de promedio exactamente igual al umbral.':''}</p>
+        <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px">${filtroProm}${filtroDias}${filtroEstado}</div>
+        <div class="table-wrap"><table>
+          <thead><tr>${th('nombre','Nombre','')}${th('telefono','Teléfono','')}${th('montoTotal','Monto total','num')}${th('ultimoMonto','Último monto','num')}${th('ultimaFecha','Última compra','')}${th('dias','Días','num')}${th('visitas','Visitas','num')}${th('remk','Remarketing','')}</tr></thead>
+          <tbody>${cuerpo}</tbody>
+        </table></div>
+      </div>`;
+  };
+
+  const aviso = rmError
+    ? `<div class="card" style="background:#fee2e2;border-color:#fecaca"><b>⚠ No se pudieron cargar los datos:</b> ${rmError}</div>`
+    : '';
+  const cargando = rmCargando
+    ? `<div class="card"><div class="empty">⏳ Cargando clientes y contactos de remarketing…</div></div>` : '';
+
+  el.innerHTML = `
+    <div class="page-head">
+      <div><h1>📣 Remarketing</h1>
+        <p>Segmentación de clientes a partir de la pestaña <b>${RM_SHEET_CLIENTES}</b> (solo lectura), agrupados por teléfono.
+           ${meta}</p></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" id="rmSync" ${rmCargando?'disabled':''}>${rmCargando?'⏳ Actualizando…':'🔄 Actualizar clientes'}</button>
+        <button class="btn btn-primary" id="rmSave" ${(!pend||rmGuardando)?'disabled':''}>${rmGuardando?'⏳ Guardando…':'💾 Guardar cambios'+(pend?' ('+pend+')':'')}</button>
+      </div>
+    </div>
+    ${aviso}${cargando}
+    <div class="card">
+      <p class="hint" style="margin:0">
+        El cliente se identifica por su <b>teléfono normalizado</b>; todas las compras de un mismo número se agregan en un solo cliente y se usa su nombre más completo.
+        Las filas sin un teléfono utilizable se excluyen (no se agrupan en un cliente ficticio). Los días se cuentan contra <b>hoy</b> (${fmtFecha(hoy)}) en hora de Lima, con la condición estricta <b>más de X días</b>.
+        Marcar la casilla registra un contacto con la fecha de hoy, pero <b>no se guarda nada hasta pulsar «Guardar cambios»</b>.
+        Una compra en la <b>misma fecha del contacto o posterior</b> invalida el estado vigente y el cliente vuelve a aparecer como «sin remarketing»; el contacto anterior se conserva en el historial.
+        ${pend?`<br><b style="color:#a16207">Hay ${pend} cambio(s) sin guardar.</b> <button class="btn btn-ghost btn-sm" onclick="rmDescartarPendientes()">Descartar cambios</button>`:''}
+      </p>
+    </div>
+    ${RM_SEGMENTOS.map(cuadro).join('')}`;
+
+  const bs = document.getElementById('rmSync');
+  if(bs) bs.onclick = async ()=>{
+    rmCargando = true; rmError = null; RENDERERS.remarketing();
+    const ok1 = await rmSyncClientes();
+    const ok2 = await rmSyncContactos();
+    rmCargando = false;
+    RENDERERS.remarketing();
+    toast((ok1&&ok2) ? 'Clientes actualizados · '+rmClientes.length+' clientes'
+                     : 'No se pudieron actualizar los datos. '+(rmError||''), (ok1&&ok2)?'success':'error');
+  };
+  const bg = document.getElementById('rmSave');
+  if(bg) bg.onclick = ()=> rmGuardar();
+};
+
 /* ── FIN MÓDULO ANALÍTICA DE VENTAS ── */
 
 /* ================================================================
@@ -13576,6 +14092,7 @@ const ACCOUNT_ROLES = {
       'consolidado','boleta','admin','consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja',
       'evolucionGastos',   // Analítica de gastos: exclusiva de multiboxes.peru
       'cotejos',           // Cotejo ventas vs inventario: exclusiva de multiboxes.peru
+      'remarketing',       // Segmentación de clientes para campañas: exclusiva de multiboxes.peru
 
       // ── INVENTARIO ────────────────────────────────────────────────────────
       'produccion','insumos','inventarioConsolidado','alertaInsumos',
@@ -15065,7 +15582,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-23.2';
+const APP_VERSION = '2026-10-23.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -15785,7 +16302,7 @@ const NAV_GROUPS_PLANILLA = [
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
-    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja','evolucionGastos','cotejos'] }
+    modules:['consolidadoVentas','gananciaGrupo','evolucionVentas','estadisticasDiaSemana','flujoCaja','evolucionGastos','cotejos','remarketing'] }
 ];
 
 // ── Labels e íconos de todos los módulos (inventario + planilla) ──
@@ -15814,7 +16331,7 @@ const NAV_MODULE_LABELS = {
   evolucionVentas:['📉','Evolución de Ventas'],
   estadisticasDiaSemana:['🗓️','Estadísticas por Día'],
   flujoCaja:['💵','Flujo de Caja'], evolucionGastos:['📉','Evolución de gastos'],
-  cotejos:['🔎','Cotejos']
+  cotejos:['🔎','Cotejos'], remarketing:['📣','Remarketing']
 };
 
 // Estado accordion durante la sesión. Planilla y Inventario usan IDs con prefijo distinto
