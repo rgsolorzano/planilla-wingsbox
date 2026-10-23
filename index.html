@@ -79,6 +79,12 @@
   /* Misma marca de error para los inputs dentro de tablas (p. ej. las filas
      dinámicas de Propinas), que no viven dentro de un .field */
   table input.invalid,table select.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
+  /* Encabezados ordenables de "Propinas registradas" */
+  th.prs-th{cursor:pointer;user-select:none;white-space:nowrap}
+  th.prs-th:hover{background:#ede9fe}
+  th.prs-th .prs-ico{font-size:10px;opacity:.35;margin-left:2px}
+  th.prs-th.prs-act .prs-ico{opacity:1;color:#6d28d9}
+  th.prs-th.prs-act{color:#4c1d95}
   .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 
   /* ---------- Botones ---------- */
@@ -5862,6 +5868,9 @@ function propFiltroToolbar(f){
   return `
     <div class="toolbar" style="margin-bottom:12px;flex-wrap:wrap">
       <div class="field"><label>Filtrar mesero</label><select id="prFEmp"><option value="">Todos</option>${propMeseroPadron().map(e=>`<option value="${e.id}" ${f.emp===e.id?'selected':''}>${e.nombre}</option>`).join('')}</select></div>
+      <!-- Tipos tomados de TIPOS_PROPINA: la misma lista que usa el formulario
+           y el cálculo, para que no puedan desincronizarse. -->
+      <div class="field"><label>Tipo de propina</label><select id="prFTipo"><option value="">Todos</option>${TIPOS_PROPINA.map(t=>`<option value="${t}" ${f.tipo===t?'selected':''}>${TIPO_PROPINA_LABEL[t]}</option>`).join('')}</select></div>
       <div class="field"><label>Desde</label><input type="date" id="prFDesde" value="${f.desde||''}"></div>
       <div class="field"><label>Hasta</label><input type="date" id="prFHasta" value="${f.hasta||''}"></div>
       <button class="btn btn-ghost btn-sm" id="prFClear" title="Vuelve al período por defecto: las dos últimas semanas completas más la semana en curso (${fmtFecha(R.desde)} – ${fmtFecha(R.hasta)})">Últimas 3 semanas</button>
@@ -6865,7 +6874,57 @@ let editPropItem=null;       // item en edición (formato unificado), null = mod
    COMPLETAS (sin la semana en curso). Solo limita la VISTA; el usuario
    puede cambiar el rango o pedir todo el historial, y el Consolidado de
    Propinas nunca pasa por este filtro. */
-let propFilter=(()=>{ const R=rangoUlt3SemanasConActual(); return {emp:'', desde:R.desde, hasta:R.hasta}; })();
+let propFilter=(()=>{ const R=rangoUlt3SemanasConActual(); return {emp:'', tipo:'', desde:R.desde, hasta:R.hasta}; })();
+/* Ordenamiento de "Propinas registradas". UN solo criterio activo a la vez.
+   col: null | 'mesero' | 'tipo' | 'monto' | 'ov';  dir: 1 asc, -1 desc.
+   col=null conserva el orden histórico por fecha descendente. */
+let propSort={col:null, dir:1};
+const PROP_SORT_COLS={mesero:'Mesero', tipo:'Tipo', monto:'Monto', ov:'OV'};
+window.propSetSort=function(col){
+  if(!PROP_SORT_COLS[col]) return;
+  // Mismo encabezado → invierte el sentido; otro → reemplaza el criterio en asc.
+  if(propSort.col===col) propSort={col, dir: propSort.dir===1 ? -1 : 1};
+  else propSort={col, dir:1};
+  RENDERERS.propinas();
+};
+/* Ordena una copia de los items ya FILTRADOS. No toca S.prop ni los datos:
+   solo reordena la vista. Estable por construcción: cada elemento lleva su
+   posición original como desempate, así que los valores repetidos, vacíos o
+   iguales conservan entre sí el orden previo (fecha descendente). */
+function propOrdenar(items){
+  const { col, dir } = propSort;
+  if(!col || !PROP_SORT_COLS[col]) return items;
+  const texto = s => String(s==null?'':s);
+  /* OV: se compara como NÚMERO (no como texto), conservando intacto el
+     valor almacenado con sus ceros iniciales — '00123' se muestra tal cual
+     y se ordena como 123. Un OV ausente no es un 0: va siempre al final,
+     en cualquier sentido, para no desplazar a los que sí tienen valor. */
+  const clave = it => {
+    if(col==='mesero') return { t:'s', v: texto(propNombreMesero(it.empleadoId)) };
+    if(col==='tipo')   return { t:'s', v: texto(TIPO_PROPINA_LABEL[it.tipo]||it.tipo) };
+    if(col==='monto'){ const n=Number(it.monto); return { t:'n', v: Number.isFinite(n)?n:null }; }
+    const ov=ovNormalizar(it.ov);
+    const n=ov===''?null:Number(ov);
+    return { t:'n', v: Number.isFinite(n)?n:null };
+  };
+  return items
+    .map((it,i)=>({ it, i, k:clave(it) }))
+    .sort((a,b)=>{
+      const A=a.k, B=b.k;
+      // Vacíos/no numéricos siempre al final, independientemente del sentido.
+      const aVacio = A.v===null || A.v==='';
+      const bVacio = B.v===null || B.v==='';
+      if(aVacio && bVacio) return a.i-b.i;
+      if(aVacio) return 1;
+      if(bVacio) return -1;
+      let c;
+      if(A.t==='n') c = A.v - B.v;
+      else c = A.v.localeCompare(B.v, 'es', { sensitivity:'base', numeric:true });
+      if(c!==0) return c*dir;
+      return a.i-b.i;              // empate → orden previo (estabilidad)
+    })
+    .map(x=>x.it);
+}
 // Filas del formulario de "nueva propina" (no aplica en modo edición).
 /* Tipo por defecto IZIPAY en la fila inicial, en cada fila agregada y al
    reiniciar el formulario tras guardar. Cambia SOLO el valor preseleccionado:
@@ -6921,7 +6980,13 @@ RENDERERS.propinas = function(){
   const rangoVista = (propFilter.desde || propFilter.hasta)
     ? { desde:propFilter.desde, hasta:propFilter.hasta } : null;
   const itemsRango = propinaItems(rangoVista);
-  const list=aplicaFiltro([...itemsRango].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter);
+  /* aplicaFiltro() la comparten Descuentos y Pagos Extra, así que el filtro
+     por TIPO se aplica aparte en vez de modificarla: así ningún otro módulo
+     cambia de comportamiento. Es un filtro de coincidencia EXACTA. */
+  const listaFiltrada=aplicaFiltro([...itemsRango].sort((a,b)=>b.fecha.localeCompare(a.fecha)), propFilter)
+    .filter(it=> !propFilter.tipo || it.tipo===propFilter.tipo);
+  // El orden se aplica DESPUÉS de los filtros, sobre los registros ya visibles.
+  const list=propOrdenar(listaFiltrada);
 
   const formularioHtml = ed ? `
     <div class="card">
@@ -6977,6 +7042,18 @@ RENDERERS.propinas = function(){
       </div>
     </div>`;
 
+  /* Encabezado ordenable: indica el sentido activo (▲/▼) y ofrece ⇅ en las
+     ordenables inactivas, para que se vea cuáles responden al clic. */
+  const thOrd=(col,label,cls)=>{
+    const activo = propSort.col===col;
+    const icono = activo ? (propSort.dir===1?'▲':'▼') : '⇅';
+    const titulo = activo
+      ? `Ordenado por ${label} ${propSort.dir===1?'ascendente':'descendente'}. Clic para invertir.`
+      : `Ordenar por ${label}`;
+    return `<th class="${cls?cls+' ':''}prs-th${activo?' prs-act':''}" title="${titulo}" onclick="propSetSort('${col}')">`+
+           `${label} <span class="prs-ico">${icono}</span></th>`;
+  };
+
   el.innerHTML=`
     <div class="page-head"><div><h1>💵 Propinas</h1><p>Registra una o varias propinas por mesero y por día. Solo se permiten meseros. Los montos vacíos se ignoran.</p></div></div>
     ${formularioHtml}
@@ -6990,7 +7067,7 @@ RENDERERS.propinas = function(){
         Nada de esto altera los registros guardados ni los totales del <b>Consolidado Propinas</b>, que sigue usando el historial completo.</p>
       ${propFiltroToolbar(propFilter)}
       <div class="table-wrap"><table>
-        <thead><tr><th>Fecha</th><th>Mesero</th><th>Tipo</th><th class="num">Monto</th><th>OV</th><th class="num">Aporte a base</th><th>Acciones</th></tr></thead>
+        <thead><tr><th>Fecha</th>${thOrd('mesero','Mesero','')}${thOrd('tipo','Tipo','')}${thOrd('monto','Monto','num')}${thOrd('ov','OV','')}<th class="num">Aporte a base</th><th>Acciones</th></tr></thead>
         <tbody>${list.length? list.map(it=>{
           const aporte=calcularTotalBasePropinas({[it.tipo]: it.monto});
           const ov=ovNormalizar(it.ov);
@@ -7004,15 +7081,18 @@ RENDERERS.propinas = function(){
       </table></div>
     </div>`;
 
-  const prApplyF=()=>{ propFilter={emp:document.getElementById('prFEmp').value, desde:document.getElementById('prFDesde').value, hasta:document.getElementById('prFHasta').value}; RENDERERS.propinas(); };
-  ['prFEmp','prFDesde','prFHasta'].forEach(id=> document.getElementById(id).onchange=prApplyF);
+  const prApplyF=()=>{ propFilter={emp:document.getElementById('prFEmp').value,
+    tipo:document.getElementById('prFTipo').value,
+    desde:document.getElementById('prFDesde').value, hasta:document.getElementById('prFHasta').value}; RENDERERS.propinas(); };
+  ['prFEmp','prFTipo','prFDesde','prFHasta'].forEach(id=> document.getElementById(id).onchange=prApplyF);
   document.getElementById('prFClear').onclick=()=>{
     const R=rangoUlt3SemanasConActual();
-    propFilter={emp:'', desde:R.desde, hasta:R.hasta};   // vuelve a la vista por defecto
+    propFilter={emp:'', tipo:'', desde:R.desde, hasta:R.hasta};   // vuelve a la vista por defecto
     RENDERERS.propinas();
   };
   // Escape explícito del filtro por defecto: historial completo bajo demanda.
-  document.getElementById('prFAll').onclick=()=>{ propFilter={emp:propFilter.emp||'', desde:'', hasta:''}; RENDERERS.propinas(); };
+  // Solo quita las FECHAS: conserva los filtros de mesero y de tipo.
+  document.getElementById('prFAll').onclick=()=>{ propFilter={emp:propFilter.emp||'', tipo:propFilter.tipo||'', desde:'', hasta:''}; RENDERERS.propinas(); };
 
   if(ed){
     document.getElementById('prSave').onclick=propActualizar;
@@ -14958,7 +15038,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-21.1';
+const APP_VERSION = '2026-10-23.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
