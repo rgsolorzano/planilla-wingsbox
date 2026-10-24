@@ -79,6 +79,36 @@
   /* Misma marca de error para los inputs dentro de tablas (p. ej. las filas
      dinámicas de Propinas), que no viven dentro de un .field */
   table input.invalid,table select.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
+  /* ── Tabla del módulo Remarketing ────────────────────────────────────
+     Son 9 columnas, varias con encabezado largo. La regla global
+     th.prs-th lleva `white-space:nowrap`, que aquí hacía que los títulos se
+     desbordaran unos sobre otros ("ÚLTIMO MONTOÚLTIMA COMPRA"). Se anula
+     SOLO en esta tabla —la de Propinas conserva su nowrap— y se reparte el
+     ancho con min-width por tipo de columna, sin reducir la fuente. */
+  .rm-table{width:100%;table-layout:fixed}
+  .rm-table th,.rm-table td{overflow:hidden;text-overflow:ellipsis}
+  .rm-table th.prs-th{
+    white-space:normal;word-break:normal;overflow-wrap:anywhere;
+    line-height:1.25;vertical-align:bottom;padding:6px 8px
+  }
+  .rm-table .prs-ico{display:inline-block}      /* el icono no cae solo a otra línea */
+  /* Los anchos se declaran con la especificidad suficiente para ganar a
+     `.table-wrap table th.num{max-width:90px}`, que de lo contrario recorta
+     estas columnas a 90px y obliga al encabezado más largo a partirse en
+     tres líneas. */
+  .table-wrap table.rm-table th.rmc-nom{width:auto;min-width:150px;max-width:none;text-align:left}
+  .rm-table td:first-child{white-space:normal;word-break:break-word}
+  .table-wrap table.rm-table th.rmc-tel{width:104px;max-width:none}
+  .table-wrap table.rm-table th.rmc-mon{width:100px;max-width:none}
+  .table-wrap table.rm-table th.rmc-prom{width:116px;max-width:none}
+  .table-wrap table.rm-table th.rmc-fec{width:96px;max-width:none}
+  .table-wrap table.rm-table th.rmc-min{width:66px;max-width:none}
+  .table-wrap table.rm-table th.rmc-rmk{width:92px;max-width:none;text-align:center}
+  @media(max-width:900px){
+    /* En pantallas estrechas la tabla se desplaza dentro de .table-wrap en
+       lugar de comprimir las columnas hasta solaparlas. */
+    .rm-table{table-layout:auto;min-width:900px}
+  }
   /* Encabezados ordenables de "Propinas registradas" */
   th.prs-th{cursor:pointer;user-select:none;white-space:nowrap}
   th.prs-th:hover{background:#ede9fe}
@@ -4907,7 +4937,8 @@ window.rmSetEstado = function(seg, v){ rmParam.estado[seg] = v; RENDERERS.remark
 window.rmSetProm = function(v){ rmParam.promUmbral = Number(v)||125; RENDERERS.remarketing(); };
 const RM_COLS = [
   ['nombre','Nombre','s'], ['telefono','Teléfono','tel'], ['montoTotal','Monto total','n'],
-  ['ultimoMonto','Último monto','n'], ['ultimaFecha','Última compra','f'],
+  ['ultimoMonto','Último monto','n'], ['promedio','Promedio por visita','n'],
+  ['ultimaFecha','Última compra','f'],
   ['dias','Días','n'], ['visitas','Visitas','n'], ['remk','Remarketing','b']
 ];
 window.rmSetSort = function(seg, col){
@@ -4926,6 +4957,9 @@ function rmOrdenar(filas, seg){
   const val = f => {
     if(s.col==='remk') return f.vigente ? 1 : 0;
     if(s.col==='telefono'){ const n=Number(f.telefono); return Number.isFinite(n)?n:null; }
+    // Sin visitas válidas el promedio no existe (se muestra '—'): va al final,
+    // no se ordena como si fuera 0.
+    if(s.col==='promedio') return (f.visitas>0 && Number.isFinite(f.promedio)) ? f.promedio : null;
     return f[s.col];
   };
   return filas.map((f,i)=>({f,i}))
@@ -5066,11 +5100,18 @@ RENDERERS.remarketing = function(){
   const cuadro = ([seg, titulo, ico, regla])=>{
     const { total, filas } = rmFilasSegmento(seg);
     const s = rmParam.sort[seg];
+    /* `label` puede traer un <br> para repartir el encabezado en dos líneas;
+       `titulo` es el texto plano que va al tooltip. El icono de orden se
+       mantiene pegado a la última palabra (prs-ico es inline-block) para que
+       nunca quede huérfano en una tercera línea. */
     const th = (col,label,cls)=>{
       const act = s && s.col===col;
       const icono = act ? (s.dir===1?'▲':'▼') : '⇅';
+      // El espacio que precede al <br> se colapsa visualmente, pero mantiene
+      // legible el textContent ("Promedio por visita", no "Promediopor").
+      const titulo = label.replace(/<br>/g,'').replace(/\s+/g,' ').trim();
       return `<th class="${cls?cls+' ':''}prs-th${act?' prs-act':''}" onclick="rmSetSort('${seg}','${col}')"`
-           + ` title="${act?`Ordenado por ${label} ${s.dir===1?'ascendente':'descendente'}. Clic para invertir.`:'Ordenar por '+label}">`
+           + ` title="${act?`Ordenado por ${titulo} ${s.dir===1?'ascendente':'descendente'}. Clic para invertir.`:'Ordenar por '+titulo}">`
            + `${label} <span class="prs-ico">${icono}</span></th>`;
     };
     const filtroDias = sel('rmD-'+seg, rmParam.dias[seg],
@@ -5096,6 +5137,7 @@ RENDERERS.remarketing = function(){
         <td><code>${f.telefono}</code></td>
         <td class="num">${money(f.montoTotal)}</td>
         <td class="num">${money(f.ultimoMonto)}</td>
+        <td class="num">${(f.visitas>0 && Number.isFinite(f.promedio)) ? money(f.promedio) : '—'}</td>
         <td>${fmtFecha(f.ultimaFecha)}</td>
         <td class="num">${f.dias}</td>
         <td class="num">${f.visitas}</td>
@@ -5104,7 +5146,7 @@ RENDERERS.remarketing = function(){
           ${pendiente?'<span style="font-size:10px;color:#a16207;font-weight:700"> sin guardar</span>':''}
           ${(!f.vigente && f.contacto)?'<div style="font-size:10px;color:var(--c-muted)">contacto previo</div>':''}
         </td></tr>`;
-    }).join('') : `<tr><td colspan="8" class="empty">${rmClientes.length
+    }).join('') : `<tr><td colspan="9" class="empty">${rmClientes.length
         ? 'Ningún cliente cumple los criterios de este segmento con los parámetros seleccionados.'
         : 'Sin datos de clientes. Pulsa <b>Actualizar clientes</b>.'}</td></tr>`;
 
@@ -5117,8 +5159,8 @@ RENDERERS.remarketing = function(){
           ${seg==='recurrente'?`El umbral de monto promedio (<b>S/ ${rmParam.promUmbral}</b>) es el mismo que usa <b>Clientes grupales</b>.`:''}
           ${seg==='ocasional'?'Segmento residual: recoge a quien no califica como VIP, grupal ni recurrente, incluidos los de promedio exactamente igual al umbral.':''}</p>
         <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px">${filtroProm}${filtroDias}${filtroEstado}</div>
-        <div class="table-wrap"><table>
-          <thead><tr>${th('nombre','Nombre','')}${th('telefono','Teléfono','')}${th('montoTotal','Monto total','num')}${th('ultimoMonto','Último monto','num')}${th('ultimaFecha','Última compra','')}${th('dias','Días','num')}${th('visitas','Visitas','num')}${th('remk','Remarketing','')}</tr></thead>
+        <div class="table-wrap"><table class="rm-table">
+          <thead><tr>${th('nombre','Nombre','rmc-nom')}${th('telefono','Teléfono','rmc-tel')}${th('montoTotal','Monto <br>total','num rmc-mon')}${th('ultimoMonto','Último <br>monto','num rmc-mon')}${th('promedio','Promedio <br>por visita','num rmc-prom')}${th('ultimaFecha','Última <br>compra','rmc-fec')}${th('dias','Días','num rmc-min')}${th('visitas','Visitas','num rmc-min')}${th('remk','Remarketing','rmc-rmk')}</tr></thead>
           <tbody>${cuerpo}</tbody>
         </table></div>
       </div>`;
@@ -15582,7 +15624,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-23.3';
+const APP_VERSION = '2026-10-23.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
