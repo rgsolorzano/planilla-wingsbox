@@ -79,6 +79,18 @@
   /* Misma marca de error para los inputs dentro de tablas (p. ej. las filas
      dinámicas de Propinas), que no viven dentro de un .field */
   table input.invalid,table select.invalid{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
+  /* ── Tabla "Ventas por hora y día" ───────────────────────────────────
+     La primera columna (la hora) queda fija al desplazar en horizontal, para
+     que en pantallas pequeñas no se pierda la referencia de la fila. */
+  .vh-table{width:100%;border-collapse:separate;border-spacing:0}
+  .vh-table th,.vh-table td{white-space:nowrap}
+  .vh-table th:first-child,.vh-table td:first-child{
+    position:sticky;left:0;z-index:2;background:#1e1b4b;color:#e9d5ff;font-weight:700
+  }
+  .vh-table thead th{position:sticky;top:0;z-index:3}
+  .vh-table thead th:first-child{z-index:4}
+  .vh-table tfoot td:first-child{z-index:3}
+  @media(max-width:820px){ .vh-table{min-width:760px} }
   /* ── Tabla del módulo Remarketing ────────────────────────────────────
      Son 9 columnas, varias con encabezado largo. La regla global
      th.prs-th lleva `white-space:nowrap`, que aquí hacía que los títulos se
@@ -3852,7 +3864,10 @@ function evChartSVG(serie){
    resuelven íntegramente en memoria, sin nuevas consultas.
    ================================================================ */
 const VD_SHEET = 'VENTAS_DETALLE';
-const VD_COL   = { monto:19, fecha:31, medio:36, canal:43 };
+const VD_COL   = { monto:19, fecha:31, hora:32, medio:36, canal:43 };
+/* Versión del registro cacheado. Al subir, las cachés antiguas (sin hora ni
+   canal en crudo) se detectan como obsoletas y se vuelven a sincronizar. */
+const VD_FACTS_VERSION = 2;
 const K_VD_DATA = 'ventas_detalle_facts';
 const K_VD_META = 'ventas_detalle_meta';
 const VD_CANALES = ['PARA LLEVAR','SALÓN','PEDIDOS YA','RAPPI','RECOJO','DELIVERY'];
@@ -3871,6 +3886,31 @@ let vdAutoSyncIntentado=false;
     if(m) vdMeta=JSON.parse(m);
   }catch(e){ vdFacts=[]; vdMeta=null; }
 })();
+
+/* HORA de la venta (columna AG) truncada a la hora completa.
+   UNFORMATTED_VALUE puede devolverla como texto 'HH:MM:SS' o como número
+   serial (fracción de día, o fecha+hora con parte decimal). Se cubren ambos
+   casos sin construir un Date, que introduciría la zona del navegador:
+     '21:26:17'  → 21
+     0.8932...   → 21   (0.8932 × 24 = 21.43)
+   Devuelve null si no hay una hora interpretable, y esas filas no se cuentan. */
+function vdHoraDe(v){
+  if(v === null || v === undefined || v === '') return null;
+  if(typeof v === 'number' && isFinite(v)){
+    const frac = v - Math.floor(v);              // descarta la parte de fecha
+    const h = Math.floor(frac*24 + 1e-9);        // 1e-9 evita el 20.999… binario
+    return (h>=0 && h<=23) ? h : null;
+  }
+  const m = String(v).trim().match(/^(\d{1,2})\s*:\s*\d{1,2}/);
+  if(m){ const h=Number(m[1]); return (h>=0 && h<=23) ? h : null; }
+  // Algunas celdas llegan como número en texto ('0.8932')
+  const n = Number(String(v).trim().replace(',','.'));
+  if(isFinite(n) && n>=0){
+    const h = Math.floor((n-Math.floor(n))*24 + 1e-9);
+    return (h>=0 && h<=23) ? h : null;
+  }
+  return null;
+}
 
 // Normaliza el canal a uno de los válidos (tolera mayúsculas, acentos y espacios).
 function vdNormCanal(raw){
@@ -3913,7 +3953,11 @@ async function vdSync(){
         sinCanal++;
       }
       out.push({ f:fecha, c:canal,
-        m:String(row[VD_COL.medio]??'').trim()||'(Sin medio)', v:monto===null?0:monto });
+        m:String(row[VD_COL.medio]??'').trim()||'(Sin medio)', v:monto===null?0:monto,
+        // Campos añadidos para "Ventas por hora y día": hora truncada (AG) y
+        // canal TAL CUAL está en la fuente (AR), sin normalizar ni inventar.
+        h: vdHoraDe(row[VD_COL.hora]),
+        cr: canalRaw.trim() });
     });
     if(canalesNoClasificados.size){
       console.warn('[Canal] AUDITORÍA columna AR: '+sinCanal+' venta(s) con canal no clasificado ('+
@@ -3925,7 +3969,8 @@ async function vdSync(){
     }
     vdFacts=out;
     vdMeta={ lastSync:new Date().toISOString(), ventas:out.length, descartadas:invalidas,
-      medios:[...new Set(out.map(x=>x.m))].length, duracion:((Date.now()-t0)/1000).toFixed(1) };
+      medios:[...new Set(out.map(x=>x.m))].length, duracion:((Date.now()-t0)/1000).toFixed(1),
+      sinHora: out.filter(x=>x.h===null).length, version: VD_FACTS_VERSION };
     try{
       localStorage.setItem(K_VD_DATA, JSON.stringify(vdFacts));
       localStorage.setItem(K_VD_META, JSON.stringify(vdMeta));
@@ -4605,6 +4650,175 @@ function edsCuadroHTML(titulo, subt, meses, celdas, calcular, formatear, filaExt
     </div>`;
 }
 
+
+/* ════════════════════════════════════════════════════════════════════════
+   VENTAS POR HORA Y DÍA (sección de "Estadísticas por Día de la Semana")
+   ------------------------------------------------------------------------
+   Fuente: pestaña VENTAS_DETALLE del Spreadsheet de ANALÍTICA, ya descargada
+   y cacheada por vdSync() — no se abre una segunda consulta ni se lee una
+   celda por casilla: los hechos viven en memoria (vdFacts) y la matriz se
+   construye en UNA sola pasada.
+     Fecha AF  ·  Hora AG  ·  Monto T  ·  Canal AR
+   Una fila válida = un pedido. Las filas sin fecha u hora interpretables se
+   descartan (vdSync ya descarta las que no tienen fecha, incluidos los
+   encabezados y las líneas informativas del reporte).
+   ════════════════════════════════════════════════════════════════════════ */
+const VH_DIAS = [[1,'Lunes'],[2,'Martes'],[3,'Miércoles'],[4,'Jueves'],[5,'Viernes'],[6,'Sábado'],[0,'Domingo']];
+// Rango horario por defecto: 12 a 23, ambas inclusive.
+const VH_HORA_INI_DEF = 12, VH_HORA_FIN_DEF = 23;
+let vhFilter = (()=>{
+  const hoy = fechaEnLima();
+  return { desde: hoy.slice(0,7)+'-01',   // primer día del mes calendario actual
+           hasta: hoy,                    // hoy
+           hIni: VH_HORA_INI_DEF, hFin: VH_HORA_FIN_DEF,
+           canal: 'todos', metrica: 'pedidos' };
+})();
+
+/* Canales disponibles: valores DISTINTOS de la columna AR tal como están en
+   la fuente, sin duplicados y sin inventar categorías. Los vacíos no figuran
+   como opción, pero sus pedidos sí entran cuando se elige "Todos". */
+function vhCanalesDisponibles(){
+  const set = new Set();
+  vdFacts.forEach(x=>{ const c=String(x.cr||'').trim(); if(c) set.add(c); });
+  return [...set].sort((a,b)=>a.localeCompare(b,'es',{sensitivity:'base'}));
+}
+
+/* Matriz hora × día de la semana en UNA pasada sobre los hechos filtrados.
+   Devuelve { celdas, totalHora, totalDia, total, pedidos } donde celdas[h][dow].
+   `metrica`: 'pedidos' cuenta filas; 'monto' suma la columna T. */
+function vhAgregar(){
+  const f = vhFilter;
+  const celdas = {};   // h → {dow → valor}
+  const totalHora = {}, totalDia = {};
+  VH_DIAS.forEach(([dow])=>{ totalDia[dow]=0; });
+  for(let h=0; h<24; h++){ celdas[h]={}; totalHora[h]=0; VH_DIAS.forEach(([dow])=>{ celdas[h][dow]=0; }); }
+  let total=0, filas=0;
+  const hIni=Math.min(f.hIni,f.hFin), hFin=Math.max(f.hIni,f.hFin);
+  vdFacts.forEach(x=>{
+    if(x.h===null || x.h===undefined) return;                 // sin hora válida
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(String(x.f||''))) return;   // sin fecha válida
+    if(f.desde && x.f < f.desde) return;
+    if(f.hasta && x.f > f.hasta) return;
+    if(x.h < hIni || x.h > hFin) return;                       // rango inclusivo
+    /* Canal: "todos" incluye TAMBIÉN los registros con canal vacío; un canal
+       concreto exige coincidencia exacta con el valor original de AR. */
+    if(f.canal !== 'todos' && String(x.cr||'').trim() !== f.canal) return;
+    const dow = diaSemana(x.f);
+    const v = f.metrica==='monto' ? (Number(x.v)||0) : 1;      // no numérico → 0
+    celdas[x.h][dow] += v;
+    totalHora[x.h]   += v;
+    totalDia[dow]    += v;
+    total            += v;
+    filas++;
+  });
+  return { celdas, totalHora, totalDia, total, filas, hIni, hFin };
+}
+
+window.vhSet = function(campo, valor){
+  if(campo==='hIni' || campo==='hFin') vhFilter[campo] = Number(valor);
+  else vhFilter[campo] = valor;
+  RENDERERS.estadisticasDiaSemana();
+};
+window.vhReset = function(){
+  const hoy = fechaEnLima();
+  vhFilter = { desde: hoy.slice(0,7)+'-01', hasta: hoy,
+               hIni: VH_HORA_INI_DEF, hFin: VH_HORA_FIN_DEF, canal:'todos', metrica:'pedidos' };
+  RENDERERS.estadisticasDiaSemana();
+};
+
+function vhSeccionHTML(){
+  const f = vhFilter;
+  const fmt = v => f.metrica==='monto' ? money(v) : String(v);
+  const canales = vhCanalesDisponibles();
+  const opt = (v,l,sel)=>`<option value="${v}" ${String(sel)===String(v)?'selected':''}>${l}</option>`;
+  const horasOpts = sel => Array.from({length:24},(_,h)=>opt(h, String(h).padStart(2,'0')+':00', sel)).join('');
+  const meta = vdMeta
+    ? `${vdMeta.ventas.toLocaleString('es-PE')} pedidos en ${VD_SHEET}`
+      + (vdMeta.sinHora ? ` · ${vdMeta.sinHora} sin hora válida (excluidos)` : '')
+    : 'Sin sincronizar todavía.';
+
+  const filtros = `
+    <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
+      <div class="field"><label>Desde</label><input type="date" value="${f.desde}" onchange="vhSet('desde', this.value)"></div>
+      <div class="field"><label>Hasta</label><input type="date" value="${f.hasta}" onchange="vhSet('hasta', this.value)"></div>
+      <div class="field"><label>Hora inicio</label><select onchange="vhSet('hIni', this.value)">${horasOpts(f.hIni)}</select></div>
+      <div class="field"><label>Hora fin</label><select onchange="vhSet('hFin', this.value)">${horasOpts(f.hFin)}</select></div>
+      <div class="field"><label>Canal de venta</label>
+        <select onchange="vhSet('canal', this.value)">
+          ${opt('todos','Todos', f.canal)}${canales.map(c=>opt(c,c,f.canal)).join('')}
+        </select></div>
+      <div class="field"><label>Mostrar</label>
+        <select onchange="vhSet('metrica', this.value)">
+          ${opt('pedidos','Número de pedidos', f.metrica)}${opt('monto','Monto de ventas', f.metrica)}
+        </select></div>
+      <button class="btn btn-ghost btn-sm" onclick="vhReset()" style="align-self:flex-end">Restablecer</button>
+    </div>`;
+
+  // Validación: hora inicial posterior a la final → no se muestran resultados.
+  if(f.hIni > f.hFin){
+    return `<div class="card">
+      <h2>🕒 Ventas por hora y día</h2>
+      <p class="hint" style="margin-top:0">Fuente: <code>${VD_SHEET}</code> · ${meta}</p>
+      ${filtros}
+      <div class="empty" style="padding:24px;color:#b91c1c;font-weight:600">
+        La hora de inicio (${String(f.hIni).padStart(2,'0')}:00) es posterior a la hora de fin (${String(f.hFin).padStart(2,'0')}:00).
+        Ajusta el rango horario para ver resultados.
+      </div></div>`;
+  }
+
+  const ag = vhAgregar();
+  const horas = [];
+  for(let h=ag.hIni; h<=ag.hFin; h++) horas.push(h);
+  const valores = horas.flatMap(h=>VH_DIAS.map(([dow])=>ag.celdas[h][dow]));
+  const min = valores.length?Math.min(...valores):0, max = valores.length?Math.max(...valores):0;
+
+  const cuerpo = horas.map(h=>`
+    <tr>
+      <td style="font-weight:700;white-space:nowrap">${String(h).padStart(2,'0')}:00</td>
+      ${VH_DIAS.map(([dow])=>{
+        const v = ag.celdas[h][dow];
+        return `<td class="num" style="${v>0?ventasHeatStyle(v,min,max):'color:var(--c-muted)'}">${fmt(v)}</td>`;
+      }).join('')}
+      <td class="num" style="font-weight:800;background:#f5f3ff;border-left:2px solid #c4b5fd">${fmt(ag.totalHora[h])}</td>
+    </tr>`).join('');
+
+  const estiloTot = 'background:#ede9fe;border-top:2px solid #6d28d9;font-weight:800;color:#2e1065';
+  const pie = `<tfoot><tr>
+      <td style="${estiloTot}">Total</td>
+      ${VH_DIAS.map(([dow])=>`<td class="num" style="${estiloTot}">${fmt(ag.totalDia[dow])}</td>`).join('')}
+      <td class="num" style="${estiloTot};border-left:2px solid #6d28d9">${fmt(ag.total)}</td>
+    </tr></tfoot>`;
+
+  return `
+    <div class="card">
+      <h2>🕒 Ventas por hora y día</h2>
+      <p class="hint" style="margin-top:0">
+        Pedidos y monto por <b>hora del día</b> y <b>día de la semana</b>. Fuente: pestaña <code>${VD_SHEET}</code> · ${meta}.
+        La hora se trunca a la hora completa (una venta de las 21:26:17 cuenta en la fila <b>21</b>) y el rango horario es
+        <b>inclusivo</b> en ambos extremos. Con <b>Todos</b> los canales se incluyen también los pedidos sin canal registrado.
+        Las celdas sin registros muestran <b>${vhFilter.metrica==='monto'?money(0):'0'}</b>.
+      </p>
+      ${filtros}
+      ${ag.filas===0
+        ? `<div class="empty" style="padding:24px">Sin pedidos para los filtros seleccionados${vdFacts.length?'':' (no hay datos sincronizados: pulsa «Actualizar ventas»)'}.</div>`
+        : ''}
+      <div class="table-wrap"><table class="vh-table">
+        <thead><tr>
+          <th style="text-align:left">Hora</th>
+          ${VH_DIAS.map(([,n])=>`<th class="num">${n}</th>`).join('')}
+          <th class="num" style="border-left:2px solid #c4b5fd">Total</th>
+        </tr></thead>
+        <tbody>${cuerpo}</tbody>
+        ${pie}
+      </table></div>
+      <p class="hint" style="margin-bottom:0">
+        ${ag.filas.toLocaleString('es-PE')} pedido(s) dentro de los filtros · período ${fmtFecha(f.desde)} – ${fmtFecha(f.hasta)} ·
+        horas ${String(ag.hIni).padStart(2,'0')}:00–${String(ag.hFin).padStart(2,'0')}:59 ·
+        canal ${f.canal==='todos'?'<b>Todos</b>':'<b>'+f.canal+'</b>'}.
+      </p>
+    </div>`;
+}
+
 RENDERERS.estadisticasDiaSemana = function(){
   const el=document.getElementById('page-estadisticasDiaSemana');
   if(!el) return;
@@ -4612,6 +4826,15 @@ RENDERERS.estadisticasDiaSemana = function(){
   if((!ventasFacts.length || cacheDesactualizado) && !ventasAutoSyncIntentado && isAuthorized()){
     ventasAutoSyncIntentado=true;
     ventasSync().then(()=>{ if(currentPage==='estadisticasDiaSemana') RENDERERS.estadisticasDiaSemana(); });
+  }
+  /* "Ventas por hora y día" se alimenta de VENTAS_DETALLE (vdFacts), que es
+     una fuente distinta de la de los tres cuadros anteriores (CAJA). Se
+     sincroniza una sola vez por sesión y también cuando la caché viene de una
+     versión anterior, que no guardaba la hora ni el canal en crudo. */
+  const vdDesactualizado = vdFacts.length && (!vdMeta || vdMeta.version!==VD_FACTS_VERSION);
+  if((!vdFacts.length || vdDesactualizado) && !vdAutoSyncIntentado && isAuthorized()){
+    vdAutoSyncIntentado=true;
+    vdSync().then(()=>{ if(currentPage==='estadisticasDiaSemana') RENDERERS.estadisticasDiaSemana(); });
   }
   const metaStr=ventasMeta
     ? `Última sincronización: ${fmtFecha(ventasMeta.lastSync.slice(0,10))} · ${ventasMeta.filasWB} registros WB · ${ventasMeta.dias} días`
@@ -4666,10 +4889,13 @@ RENDERERS.estadisticasDiaSemana = function(){
       </div>
       <p class="hint">Los tres cuadros comparten este rango y se recalculan juntos. Heatmap: <span style="background:hsl(0,78%,78%);padding:0 6px;border-radius:3px">bajo</span> <span style="background:hsl(60,78%,78%);padding:0 6px;border-radius:3px">medio</span> <span style="background:hsl(120,78%,78%);padding:0 6px;border-radius:3px">alto</span> — escala automática según los valores de cada cuadro.</p>
     </div>
-    ${cuadros}`;
+    ${cuadros}
+    ${vhSeccionHTML()}`;
   document.getElementById('edsSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
+    // Las dos fuentes del módulo: CAJA (cuadros 1-3) y VENTAS_DETALLE (hora/día).
     await ventasSync();
+    await vdSync();
     RENDERERS.estadisticasDiaSemana();
   };
   const apply=()=>{
@@ -15758,7 +15984,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-26.1';
+const APP_VERSION = '2026-10-26.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
