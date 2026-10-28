@@ -15984,7 +15984,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-26.2';
+const APP_VERSION = '2026-10-28.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -16133,16 +16133,27 @@ function sesOfrecerBorrador(){
    Se eliminó el mecanismo de borradores que conservaba lo tecleado durante
    una sesión inválida: podía reponer datos que después no se guardarían. */
 let sesBloqueada = false;
-function sesBloquearYRecargar(titulo, mensaje, motivo){
+/* `opts.conservarSesion` = true → NO se tocan las credenciales.
+   SEPARACIÓN DE RESPONSABILIDADES: borrar la sesión es correcto cuando la
+   sesión es justamente lo que ha vencido, pero no cuando lo único que ha
+   cambiado es la versión publicada. Un despliegue no revoca las credenciales
+   de nadie; hacerlo dejaba al usuario en la pantalla de "Acceso restringido"
+   después de cada actualización, obligándole a iniciar sesión de nuevo. */
+function sesBloquearYRecargar(titulo, mensaje, motivo, opts){
   if(sesBloqueada) return;               // un solo bloqueo, sin bucles
   sesBloqueada = true;
   /* Antes de desmontar nada se conserva lo TECLEADO (no la operación: ver
      sesCapturarBorrador). Esto sustituye al removeItem que había aquí, que
      descartaba el trabajo en curso justo en el peor momento. */
   const hayBorrador = sesCapturarBorrador();
-  gsState.accessToken = null;
-  gsClearSession();
-  console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…'+(hayBorrador?' Se conservó lo tecleado.':''));
+  const conservar = !!(opts && opts.conservarSesion);
+  if(!conservar){
+    gsState.accessToken = null;
+    gsClearSession();
+  }
+  console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…'+
+    (conservar?' La sesión se conserva: solo cambia la versión.':' Se cierra la sesión.')+
+    (hayBorrador?' Se conservó lo tecleado.':''));
   sesMostrarBloqueo(titulo, mensaje,
     hayBorrador ? 'Lo que escribiste se recuperará al volver a entrar' : undefined);
   // Margen breve para que el usuario lea el aviso antes de recargar.
@@ -16239,8 +16250,8 @@ function sesManejarVersionAntigua(motivo){
   }
   sesGuardarActualizacion({ desde: APP_VERSION, cuando: Date.now() });
   sesBloquearYRecargar('Hay una nueva versión disponible',
-    'La página se actualizará para cargar la versión más reciente de la aplicación.',
-    motivo);
+    'La página se actualizará para cargar la versión más reciente. Tu sesión se mantiene.',
+    motivo, { conservarSesion:true });
 }
 
 function sesUrlDocumento(){ return window.location.pathname + '?v=' + Date.now(); }
@@ -16271,9 +16282,25 @@ async function sesLeerFirmaServidor(){
             lastMod:r.headers.get('Last-Modified'), hash:sesHashTexto(txt)};
   }catch(e){ return null; }                       // sin red: no se fuerza nada
 }
-// Firma comparable (sin la versión): identifica el documento servido.
+/* Firma comparable del documento servido.
+   CAUSA RAÍZ del aviso falso repetido: antes la clave concatenaba
+   ETag + Last-Modified + hash del cuerpo. El ETag varía por motivos ajenos a
+   un despliegue —negociación de compresión, nodos distintos de un CDN,
+   validadores débiles—, así que dos lecturas del MISMO documento, byte a
+   byte idéntico, producían claves distintas. Si ese ETag alternativo se
+   repetía en dos lecturas seguidas (p. ej. dos nodos de CDN), la señal 2 lo
+   daba por "despliegue confirmado" y recargaba la aplicación sin que se
+   hubiera publicado nada.
+   Como el documento SIEMPRE se descarga entero (de él se extrae APP_VERSION),
+   el hash del cuerpo es la huella autorizada y suficiente: si el cuerpo no
+   cambió, no hubo despliegue, dijeran lo que dijeran las cabeceras.
+   ETag y Last-Modified se conservan solo como dato de diagnóstico. */
 function sesFirmaClave(f){
-  return f ? [f.etag||'', f.lastMod||'', f.hash||''].join('|') : '';
+  if(!f) return '';
+  if(f.hash) return 'h:'+f.hash;              // cuerpo = única fuente de verdad
+  // Sin cuerpo utilizable no hay huella fiable: se devuelve '' y la señal 2
+  // queda inactiva (sesComprobarVersion exige ambas claves no vacías).
+  return '';
 }
 
 /* Comprobación de versión. Punto ÚNICO: lo invocan el temporizador, la
@@ -16336,6 +16363,14 @@ async function sesComprobarVersion(motivo, forzar){
        servidor. Se exige que la MISMA firma nueva se repita en lecturas
        consecutivas antes de actuar. Una lectura aislada no avisa jamás. */
     const claveBase = sesFirmaClave(sesVersionBase), claveAct = sesFirmaClave(act);
+    /* Traza para diagnosticar discrepancias futuras. Solo metadatos del
+       documento: ni tokens, ni correo, ni nada de la sesión. */
+    if(claveBase !== claveAct){
+      console.log('[Versión] Contraste de firmas — versión declarada: '+act.version+
+        ' · hash base '+(sesVersionBase.hash||'—')+' vs servido '+(act.hash||'—')+
+        ' · ETag base '+(sesVersionBase.etag||'—')+' vs servido '+(act.etag||'—')+
+        ' (el ETag es informativo: no dispara avisos por sí solo).');
+    }
     if(claveBase && claveAct && claveBase !== claveAct){
       if(sesFirmaSospechosa === claveAct){
         sesFirmaRepeticiones++;
@@ -16854,14 +16889,31 @@ async function authTrySilent(){
   if(!localStorage.getItem(AUTH_KEYS.email)) return; // sin sesión previa: mostrar login
   // 1) Restaurar un token aún válido sin contactar a Google (mantiene la sesión al refrescar).
   if(gsRestoreSession() && isAuthorized()){ authGrant(false); return; }
-  // 2) Renovación silenciosa si el token expiró.
+  /* 2) Renovación silenciosa si el token expiró o no había sesión guardada.
+        TRAZABILIDAD: antes el fallo se descartaba en un catch vacío, así que
+        cuando la puerta aparecía no quedaba ni rastro del motivo y los dos
+        casos posibles —no había credenciales que restaurar, o la renovación
+        silenciosa falló— resultaban indistinguibles. Ahora se registra el
+        motivo y se refleja en la propia pantalla, sin exponer el token ni
+        ningún dato sensible. */
+  const habiaCredenciales = !!localStorage.getItem(AUTH_KEYS.token);
   try{
     await gsWaitForLib();
     await gsRequestToken(false); // sin prompt
     await gsFetchUserEmail();
-    if(isAuthorized()) authGrant(false);
-    else authDeny(gsState.email);
-  }catch(e){ /* se requiere login manual */ }
+    if(isAuthorized()){ authGrant(false); return; }
+    authDeny(gsState.email);
+  }catch(e){
+    const motivo = (e && e.message) ? e.message : 'causa desconocida';
+    console.warn('[Sesión] No se pudo restaurar la sesión automáticamente ('+motivo+'). '+
+      (habiaCredenciales
+        ? 'Había credenciales guardadas pero el token ya no servía y la renovación silenciosa falló.'
+        : 'No había credenciales guardadas en este navegador.')+
+      ' Se pide iniciar sesión.');
+    authSetMsg(habiaCredenciales
+      ? 'Tu sesión anterior expiró y no se pudo renovar automáticamente. Vuelve a iniciar sesión.'
+      : 'No hay una sesión guardada en este navegador. Inicia sesión para continuar.', 'info');
+  }
 }
 
 // Concede acceso: muestra la app (con el menú filtrado por rol) y habilita
