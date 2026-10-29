@@ -13044,7 +13044,8 @@ const ALAS_INSUMOS = {
   salmuera:   'ALAS EN SALMUERA',
   idpos:      'ALAS CONSUMIDAS SEGUN IDPOS',
   entrantes:  'ALAS ENTRANTES',
-  kilos:      'KILOS ALAS PEDIDOS'
+  kilos:      'KILOS ALAS PEDIDOS',
+  merma:      'ALAS MERMA'
 };
 // Busca el insumo por nombre, tolerando mayúsculas/acentos/espacios.
 function alasInsumoPorNombre(nombre){
@@ -13097,13 +13098,18 @@ function alasCuadreFilas(desde, hasta){
     // Si falta el dato del día anterior no se asume 0: queda vacío.
     const stockFinPrev = alasStockFinal(fechaMenosUnDia(fecha));
     const contabilizadas = (stockIni!==null && stockFinPrev!==null) ? stockIni-stockFinPrev : null;
+    /* ALAS MERMA: se lee el STOCK CIERRE de ese insumo en la misma fecha,
+       con el mismo mecanismo que el resto del cuadro (alasValor → stockCierreDe).
+       No interviene en ningún cálculo: es un dato informativo. Sin registro
+       devuelve null y la celda queda VACÍA, nunca 0. */
+    const merma = alasValor(ALAS_INSUMOS.merma, fecha, 'cierre');
     // Diferencia entradas = Alas contabilizadas − Alas entrantes
     const difEntradas = (contabilizadas!==null && entrantes!==null) ? contabilizadas-entrantes : null;
     // Rendimiento = alas entrantes ÷ kg pedidos. Sin kg (o kg = 0) → vacío.
     const rendimiento = (entrantes!==null && kgPedidos!==null && kgPedidos>0)
       ? entrantes/kgPedidos : null;
     return { fecha, stockIni, stockFin, consumoReal, consumoIdpos, difConsumo,
-             kgPedidos, entrantes, contabilizadas, difEntradas, rendimiento };
+             kgPedidos, entrantes, contabilizadas, merma, difEntradas, rendimiento };
   });
 }
 // Rango por defecto del cuadre: últimos 7 días móviles hasta hoy.
@@ -13137,6 +13143,7 @@ function alasCuadreHTML(){
       <td class="num">${num(r.kgPedidos)}</td>
       <td class="num">${num(r.entrantes)}</td>
       <td class="num" style="font-weight:600">${num(r.contabilizadas)}</td>
+      <td class="num">${num(r.merma)}</td>
       ${dif(r.difEntradas)}
       <td class="num">${r.rendimiento===null?'':r.rendimiento.toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2})+' alas/kg'}</td>
     </tr>`).join('');
@@ -13149,7 +13156,8 @@ function alasCuadreHTML(){
         <b>Rendimiento alas</b> = alas entrantes ÷ kg pedidos.
         <b>Celdas vacías</b> = sin registro ese día (la ausencia de dato nunca se interpreta como 0).
         <b>Alas contabilizadas</b> = stock inicial del día − stock final del día anterior (el día previo al rango se consulta automáticamente y no se muestra como fila).
-        La franja vertical separa el <b>bloque de consumo</b> (stock, consumo real, IDPOS y su diferencia) del <b>bloque de entradas</b> (kg pedidos, entrantes, contabilizadas y su diferencia).
+        <b>Alas merma</b> = stock de cierre del insumo ALAS MERMA de ese día; es un dato informativo y no entra en ningún cálculo del cuadro.
+        La franja vertical separa el <b>bloque de consumo</b> (stock, consumo real, IDPOS y su diferencia) del <b>bloque de entradas</b> (kg pedidos, entrantes, contabilizadas, merma y su diferencia).
       </p>
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="alasDesde" value="${desde}"></div>
@@ -13168,10 +13176,11 @@ function alasCuadreHTML(){
           <th class="num alas-col">KG<br>pedidos</th>
           <th class="num alas-col">Alas<br>entrantes</th>
           <th class="num alas-col">Alas<br>contabilizadas</th>
+          <th class="num alas-col">Alas<br>merma</th>
           <th class="num alas-col">Diferencia<br>entradas</th>
           <th class="num alas-col">Rendimiento<br>alas</th>
         </tr></thead>
-        <tbody>${cuerpo||`<tr><td colspan="12" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
+        <tbody>${cuerpo||`<tr><td colspan="13" class="empty">Sin días en el rango seleccionado.</td></tr>`}</tbody>
       </table></div>
     </div>`;
 }
@@ -15984,7 +15993,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-28.2';
+const APP_VERSION = '2026-10-29.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
