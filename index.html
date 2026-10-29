@@ -516,6 +516,16 @@
      especificidad necesaria para no heredar el texto claro del footer. */
   .anal-tfoot.anal-subtotal, .anal-tfoot.anal-subtotal *{ background:#faf5ff; color:#4c1d95 }
   .anal-tfoot.anal-grand,    .anal-tfoot.anal-grand *   { background:#ede9fe; color:#1e1b4b }
+  /* Subtotal por grupo: mismo lenguaje morado del módulo, en un tono
+     intermedio entre la fila de producto (blanco) y el pie de Totales
+     (morado oscuro), para que se lea como cierre del bloque sin competir
+     con el total general. Se declara DESPUÉS de .anal-subtotal/.anal-grand
+     y con dos clases, de modo que esas columnas no le ganen el fondo. */
+  .anal-sub{background:#ddd3f7;color:#3b1570;font-weight:700;
+    border-top:1px solid #c4b5fd;border-bottom:2px solid #c4b5fd}
+  .anal-sub.anal-fix{background:#ddd3f7;color:#3b1570}
+  .anal-sub.anal-subtotal, .anal-sub.anal-subtotal *{ background:#d2c3f3; color:#3b1570 }
+  .anal-sub.anal-grand,    .anal-sub.anal-grand *   { background:#c6b4ef; color:#2e1065 }
   /* Fondo morado oscuro (--panel) con texto que heredaba el color oscuro de
      la tabla: los totales resultaban ilegibles. Se declara aquí el color del
      texto junto al fondo para que el contraste no dependa de la celda. */
@@ -3014,6 +3024,51 @@ function analRowYearTotal(row,año,colsByAño){
 function analRowGrandTotal(row,cols){
   return cols.reduce((s,c)=>{const v=row.vals[c.key];return(v!==null&&v!==undefined)?s+v:s;},0);
 }
+/* ── Subtotales por grupo ──────────────────────────────────────────
+   Agregan ÚNICAMENTE filas de producto del grupo (`analBuildRowMap`),
+   nunca otra fila de subtotal ni el pie de Totales, por lo que no hay
+   doble conteo posible. Reciben las filas ya filtradas y ordenadas que
+   el renderer está pintando, así que respetan automáticamente todos los
+   filtros activos y se recalculan en cada repintado.
+
+   Distinguen "sin dato" de "cero real": devuelven null cuando NINGUNA
+   fila del grupo tiene valor en ese mes (celda vacía) y el número cuando
+   al menos una lo tiene, incluido un 0 legítimo. Un dato faltante nunca
+   se convierte en cero. */
+function analSumMes(filas,key){
+  let s=0,hay=false;
+  filas.forEach(r=>{const v=r.vals[key];if(v!==null&&v!==undefined){s+=v;hay=true;}});
+  return hay?s:null;
+}
+function analSumAño(filas,año,colsByAño){
+  let s=0,hay=false;
+  (colsByAño[año]||[]).forEach(c=>{const v=analSumMes(filas,c.key);if(v!==null){s+=v;hay=true;}});
+  return hay?s:null;
+}
+function analSumGeneral(filas,cols){
+  let s=0,hay=false;
+  cols.forEach(c=>{const v=analSumMes(filas,c.key);if(v!==null){s+=v;hay=true;}});
+  return hay?s:null;
+}
+// Fila de cierre de un grupo. Replica la geometría de la fila de producto
+// (2 celdas fijas fusionadas + precio + margen en blanco) para que las
+// columnas numéricas queden alineadas con las de arriba.
+function analSubtotalFilaHTML(grupo,filas,cols,colsByAño,años){
+  const n=v=>(v===null?'':v);
+  let celdas='';
+  años.forEach(año=>{
+    (colsByAño[año]||[]).forEach(c=>{ celdas+=`<td class="num anal-sub">${n(analSumMes(filas,c.key))}</td>`; });
+    celdas+=`<td class="num anal-sub anal-subtotal">${n(analSumAño(filas,año,colsByAño))}</td>`;
+  });
+  celdas+=`<td class="num anal-sub anal-grand">${n(analSumGeneral(filas,cols))}</td>`;
+  const etq=grupo||'(sin grupo)';
+  return `<tr class="anal-row-sub" data-grupo="${etq}">`
+    + `<td class="anal-fix anal-sub" colspan="2" style="left:0;z-index:2">Subtotal ${etq}`
+    + ` <span style="font-weight:600;opacity:.7">(${filas.length})</span></td>`
+    + `<td class="anal-fix anal-sub num" style="left:245px"></td>`
+    + `<td class="anal-fix anal-sub num" style="left:315px"></td>`
+    + celdas + `</tr>`;
+}
 function analCellStyle(q){
   if(q===null||q===undefined) return '';
   if(q===0) return 'background:#fecaca;color:#991b1b;font-weight:700';
@@ -3152,12 +3207,22 @@ RENDERERS.consolidadoVentas = function(){
   });
 
   // ── Cuerpo ──
-  let prevGrupo=null, tbody='';
+  /* Las filas de un mismo grupo siempre son contiguas (analCompareRows ordena
+     por grupo antes que por cualquier otro criterio, y el toggle de GRUPO solo
+     invierte el orden de los bloques), así que el subtotal se cierra al
+     detectar el cambio de grupo y, el último, al terminar el recorrido. */
+  let prevGrupo=null, tbody='', bloque=[];
+  const cerrarBloque=()=>{
+    if(bloque.length) tbody+=analSubtotalFilaHTML(prevGrupo,bloque,cols,colsByAño,años);
+    bloque=[];
+  };
   rows.forEach(row=>{
     if(row.grupo!==prevGrupo){
+      cerrarBloque();
       tbody+=`<tr class="anal-row-grupo"><td colspan="${nCols}"><b>${row.grupo||'(sin grupo)'}</b></td></tr>`;
       prevGrupo=row.grupo;
     }
+    bloque.push(row);
     let cells='';
     años.forEach(año=>{
       (colsByAño[año]||[]).forEach(c=>{
@@ -3179,6 +3244,7 @@ RENDERERS.consolidadoVentas = function(){
       ${cells}
     </tr>`;
   });
+  cerrarBloque();   // subtotal del último grupo
 
   // ── Fila de totales ──
   let totRow=`<td class="anal-fix anal-tfoot" colspan="2" style="left:0;z-index:3">Totales (${rows.length})</td>`;
@@ -3249,6 +3315,7 @@ RENDERERS.consolidadoVentas = function(){
               <span style="background:#fecaca;padding:0 5px;border-radius:3px;font-size:11px">Rojo</span> ventas = 0 (producto existía) &nbsp;
               <span style="background:#fce7f3;padding:0 5px;border-radius:3px;font-size:11px">Rosa</span> 1–5 ventas &nbsp;
               Celda vacía = producto no existía ese mes. Nombre del plato: <span style="color:hsl(0,80%,30%)">rojo</span>=margen bajo → <span style="color:hsl(120,80%,30%)">verde</span>=margen alto.
+              <br><b>Subtotal [grupo]</b>: suma de los platos visibles de ese grupo con los filtros activos; queda vacío el mes en el que ningún plato del grupo tiene dato.
             </p>`}
     </div>`;
 
@@ -15993,7 +16060,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-29.1';
+const APP_VERSION = '2026-10-29.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
