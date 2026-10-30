@@ -3745,6 +3745,7 @@ function ventasEnRango(desde,hasta){
      'dia'    → exactamente las fechas seleccionadas
      'semana' → de LUNES a DOMINGO (la semana completa que contiene cada extremo)
      'mes'    → del día 1 al último día del mes de cada extremo
+     'año'    → del 1 de enero al 31 de diciembre del año de cada extremo
    Toda la aritmética se hace sobre la cadena 'YYYY-MM-DD' con Date.UTC, sin
    pasar por la hora local: un lunes sigue siendo lunes y el día 1 pertenece
    siempre a su mes, sin desplazamientos por zona horaria.              */
@@ -3752,6 +3753,7 @@ function anRangoNormalizado(desde, hasta, modo){
   if(!desde || !hasta) return { desde, hasta };
   if(modo==='semana') return { desde: anLunesDe(desde), hasta: anDomingoDe(hasta) };
   if(modo==='mes')    return { desde: desde.slice(0,7)+'-01', hasta: anFinDeMes(hasta) };
+  if(modo==='año')    return { desde: desde.slice(0,4)+'-01-01', hasta: hasta.slice(0,4)+'-12-31' };
   return { desde, hasta };                       // 'dia': sin cambios
 }
 // Día de la semana en UTC puro (0=domingo … 6=sábado), sin hora local.
@@ -3779,12 +3781,14 @@ function anFinDeMes(iso){
    Junto con anEtiquetaPeriodo son la fuente única de agrupación temporal de
    Analítica: cualquier gráfico que agrupe por día/semana/mes las reutiliza. */
 function anClavePeriodo(iso, modo){
+  if(modo==='año')    return iso.slice(0,4);
   if(modo==='mes')    return iso.slice(0,7);
   if(modo==='semana') return anLunesDe(iso);
   return iso;
 }
-// Etiqueta legible de un período a partir de su clave ('Sep 26', '14/09–20/09', '14/09').
+// Etiqueta legible de un período a partir de su clave ('2026', 'Sep 26', '14/09–20/09', '14/09').
 function anEtiquetaPeriodo(key, modo){
+  if(modo==='año')    return key;
   if(modo==='mes')    return ANAL_MESES_ABREV[+key.slice(5)]+' '+key.slice(2,4);
   if(modo==='semana') return fmtFechaCorta(key)+'–'+fmtFechaCorta(anDomingoDe(key));
   return fmtFechaCorta(key);
@@ -5681,7 +5685,44 @@ async function flujoSync(){
 }
 
 // ── Filtro y agregación ───────────────────────────────────────────
-let fcFilter = ventasUltNMeses(12);
+/* Rangos rápidos del módulo. Se calculan SIEMPRE a partir del día de hoy en
+   hora de Lima (fechaHoy), nunca con años fijos en el código, de modo que
+   «Año pasado» y «Hace 2 años» se desplazan solos al cambiar de año.
+   El rango que devuelven son años calendario completos salvo «Este año»,
+   cuyo extremo final es hoy (apartado 3.3): la normalización posterior a mes
+   o año completo la hace anRangoNormalizado, no estos rangos.            */
+const FLUJO_PRESETS = [
+  ['esteAno',  'Este año'],
+  ['anoPasado','Año pasado'],
+  ['hace2Anos','Hace 2 años'],
+  ['ult12',    'Últimos 12 meses']
+];
+function flujoPresetRango(id){
+  const hoy = fechaHoy();                         // 'YYYY-MM-DD' en America/Lima
+  const a = +hoy.slice(0,4);
+  if(id==='esteAno')   return { desde: a+'-01-01',     hasta: hoy };
+  if(id==='anoPasado') return { desde: (a-1)+'-01-01', hasta: (a-1)+'-12-31' };
+  if(id==='hace2Anos') return { desde: (a-2)+'-01-01', hasta: (a-2)+'-12-31' };
+  return ventasUltNMeses(12);                     // 'ult12' — rango móvil preexistente
+}
+/* Qué botón se muestra activo. Se DERIVA del rango vigente en lugar de
+   guardarse aparte, así que editar las fechas a mano apaga el resaltado y
+   volver a teclear exactamente el rango de un botón lo vuelve a encender,
+   sin posibilidad de que el estado quede desincronizado del filtro. */
+function flujoPresetActivo(f){
+  const hit = FLUJO_PRESETS.find(([id])=>{
+    const r = flujoPresetRango(id);
+    return r.desde===f.desde && r.hasta===f.hasta;
+  });
+  return hit ? hit[0] : null;
+}
+function flujoBotonesHTML(prefijo, activo){
+  return FLUJO_PRESETS.map(([id,lbl])=>
+    `<button class="btn ${activo===id?'btn-primary':'btn-ghost'} btn-sm" data-fcpreset="${id}"
+       style="align-self:flex-end" aria-pressed="${activo===id?'true':'false'}">${lbl}</button>`).join('');
+}
+
+let fcFilter = flujoPresetRango('esteAno');       // por defecto: «Este año»
 let flujoCache = {clave:null, datos:null};
 
 // Estructura EXTENSIBLE de conceptos de ingreso: para agregar un concepto
@@ -5715,13 +5756,20 @@ function flujoResumenMensual(desdeSel, hastaSel){
 function flujoDatos(){
   const clave=fcFilter.desde+'|'+fcFilter.hasta+'|'+(ventasMeta?ventasMeta.lastSync:'')+'|'+(comprasMeta?comprasMeta.lastSync:'');
   if(flujoCache.clave===clave) return flujoCache.datos;
-  const meses=ventasMesesDeRango(fcFilter.desde, fcFilter.hasta);
-  const {ingresosMes}=flujoResumenMensual(fcFilter.desde, fcFilter.hasta);
+  /* Los meses del cuadro se calculan SOBRE EL RANGO NORMALIZADO a meses
+     calendario completos, el mismo que ya usaba flujoResumenMensual para los
+     ingresos. Antes los egresos se filtraban con las fechas en crudo: con
+     «Desde 15/01» el mes de enero sumaba sus ingresos completos contra solo
+     los egresos del 15 en adelante, y la Ganancia Neta de ese mes salía
+     inflada. Ahora ambos lados del cálculo usan exactamente el mismo rango. */
+  const R=anRangoNormalizado(fcFilter.desde, fcFilter.hasta, 'mes');
+  const meses=ventasMesesDeRango(R.desde, R.hasta);
+  const {ingresosMes}=flujoResumenMensual(R.desde, R.hasta);
   // Egresos por (tipo, mes) — el pivote respeta el rango seleccionado
   const egresosTipoMes=new Map(); // tipo → Map(mes→monto)
   const egresosMes=new Map();     // mes → total egresos
   comprasFacts.forEach(f=>{
-    if(f.fecha<fcFilter.desde || f.fecha>fcFilter.hasta) return;
+    if(f.fecha<R.desde || f.fecha>R.hasta) return;
     const mk=f.fecha.slice(0,7);
     let m=egresosTipoMes.get(f.tipo);
     if(!m){ m=new Map(); egresosTipoMes.set(f.tipo,m); }
@@ -5743,6 +5791,15 @@ function flujoDatos(){
   const gananciaMes=new Map();
   meses.forEach(mk=>gananciaMes.set(mk, D.ingresoTotalMes(mk)-(egresosMes.get(mk)||0)));
   D.gananciaMes=gananciaMes;
+  /* Indicadores (CUADRO): se suman EXACTAMENTE las mismas celdas que pinta la
+     tabla —recorriendo D.meses y leyendo las mismas funciones— en lugar de
+     volver a filtrar comprasFacts/ventasFacts. Por construcción no pueden
+     discrepar del cuadro ni contar un registro dos veces, y quedan fuera los
+     meses ajenos al período. Los históricos (TOTAL) no se tocan. */
+  D.cuadroIngresos = meses.reduce((s,mk)=>s+D.ingresoTotalMes(mk), 0);
+  D.cuadroEgresos  = meses.reduce((s,mk)=>s+(egresosMes.get(mk)||0), 0);
+  D.cuadroGanancia = D.cuadroIngresos - D.cuadroEgresos;
+  D.rangoCuadro    = R;
   flujoCache={clave, datos:D};
   return D;
 }
@@ -5750,20 +5807,34 @@ function flujoDatos(){
 // ── Gráfico de evolución de Ganancia Neta ─────────────────────────
 // Filtro PROPIO e independiente del filtro de la tabla (fcFilter):
 // cambiar uno jamás modifica el otro. Default: año calendario actual.
-let fcgFilter = ventasUltNMeses(12);
+let fcgFilter = Object.assign({agrup:'mes'}, flujoPresetRango('esteAno'));
 
+/* Serie del gráfico. Parte SIEMPRE del resumen mensual (flujoResumenMensual),
+   la misma y única fuente que alimenta la tabla, y cuando la agrupación es
+   anual se limita a plegar esos meses por año. No hay un segundo camino de
+   cálculo, y cada mes se visita una sola vez, de modo que nada se suma dos
+   veces. El rango se expande antes a meses o a años calendario completos
+   según la agrupación activa (apartados 3.1 y 3.2). */
 function flujoGananciaSerie(){
-  const meses=ventasMesesDeRango(fcgFilter.desde, fcgFilter.hasta);
-  const {ingresosMes, egresosMes}=flujoResumenMensual(fcgFilter.desde, fcgFilter.hasta);
-  return meses.map(mk=>({
-    key:mk, label:ANAL_MESES_ABREV[+mk.slice(5)]+' '+mk.slice(2,4),
-    ing:ingresosMes.get(mk)||0, egr:egresosMes.get(mk)||0,
-    gan:(ingresosMes.get(mk)||0)-(egresosMes.get(mk)||0)
-  }));
+  const modo = (fcgFilter.agrup==='año') ? 'año' : 'mes';
+  const R = anRangoNormalizado(fcgFilter.desde, fcgFilter.hasta, modo);
+  const meses = ventasMesesDeRango(R.desde, R.hasta);
+  const {ingresosMes, egresosMes} = flujoResumenMensual(R.desde, R.hasta);
+  const serie=[], idx=new Map();
+  meses.forEach(mk=>{
+    const key = anClavePeriodo(mk+'-01', modo);
+    let p = idx.get(key);
+    if(!p){ p={key, label:anEtiquetaPeriodo(key, modo), ing:0, egr:0, gan:0}; idx.set(key,p); serie.push(p); }
+    p.ing += ingresosMes.get(mk)||0;
+    p.egr += egresosMes.get(mk)||0;
+  });
+  serie.forEach(p=>{ p.gan = p.ing - p.egr; });
+  return serie;
 }
 
 // SVG de líneas con soporte de valores negativos (línea de cero visible).
-function flujoGananciaSVG(serie){
+function flujoGananciaSVG(serie, modo){
+  const unidad = (modo==='año') ? 'Año' : 'Mes';
   const W=940,H=300,mL=84,mR=20,mT=16,mB=44;
   const iw=W-mL-mR, ih=H-mT-mB, n=serie.length;
   const X=i=> n>1 ? mL+i*iw/(n-1) : mL+iw/2;
@@ -5795,8 +5866,8 @@ function flujoGananciaSVG(serie){
   <div id="fcgTip" style="position:absolute;display:none;pointer-events:none;background:#1e1b4b;color:#fff;font-size:11px;padding:6px 10px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap;z-index:5"></div>
   </div>
   <div style="display:flex;gap:16px;padding:6px 4px;font-size:12px">
-    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#16a34a;vertical-align:middle;margin-right:5px"></span>Mes con ganancia</span>
-    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc2626;vertical-align:middle;margin-right:5px"></span>Mes con pérdida</span>
+    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#16a34a;vertical-align:middle;margin-right:5px"></span>${unidad} con ganancia</span>
+    <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc2626;vertical-align:middle;margin-right:5px"></span>${unidad} con pérdida</span>
   </div>`;
 }
 
@@ -6272,20 +6343,29 @@ RENDERERS.flujoCaja = function(){
       <p>Ingresos: CAJA col. AI (solo WB) · Egresos: COMPRAS col. I por tipo (col. F, solo WB). ${metaStr}</p></div>
       <button class="btn btn-primary" id="fcSync">🔄 Actualizar datos</button></div>
     <div class="card">
-      <div class="toolbar">
+      <div class="toolbar" id="fcTool" style="flex-wrap:wrap;gap:10px 8px">
         <div class="field"><label>Desde</label><input type="date" id="fcDesde" value="${fcFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="fcHasta" value="${fcFilter.hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="fcReset" style="align-self:flex-end">Últimos 12 meses</button>
+        ${flujoBotonesHTML('fc', flujoPresetActivo(fcFilter))}
       </div>
     </div>
     <div class="summary">
       <div class="item"><div class="l">Ingresos totales (histórico)</div><div class="v">${fmtSoles(D.histIngresos)}</div></div>
       <div class="item"><div class="l">Egresos totales (histórico)</div><div class="v">${fmtSoles(D.histEgresos)}</div></div>
       <div class="item" style="background:${D.histGanancia>=0?'#dcfce7':'#fee2e2'};border:2px solid ${D.histGanancia>=0?'#16a34a':'#dc2626'};border-radius:10px">
-        <div class="l" style="font-weight:700">Ganancia neta acumulada</div>
+        <div class="l" style="font-weight:700">Ganancia neta acumulada (TOTAL)</div>
         <div class="v" style="${gnColor(D.histGanancia)};font-weight:800">${fmtSoles(D.histGanancia)}</div></div>
     </div>
-    <p class="hint" style="margin:2px 4px 10px">Los tres indicadores superiores usan <b>todo el histórico</b> del Spreadsheet (no dependen del filtro de fechas); el filtro solo afecta la tabla.</p>
+    <div class="summary" style="margin-top:10px">
+      <div class="item" id="fcCuadroIng"><div class="l">Ingreso acumulado (CUADRO)</div><div class="v">${fmtSoles(D.cuadroIngresos)}</div></div>
+      <div class="item" id="fcCuadroEgr"><div class="l">Egreso acumulado (CUADRO)</div><div class="v">${fmtSoles(D.cuadroEgresos)}</div></div>
+      <div class="item" id="fcCuadroGan" style="background:${D.cuadroGanancia>=0?'#dcfce7':'#fee2e2'};border:2px solid ${D.cuadroGanancia>=0?'#16a34a':'#dc2626'};border-radius:10px">
+        <div class="l" style="font-weight:700">Ganancia neta acumulada (CUADRO)</div>
+        <div class="v" style="${gnColor(D.cuadroGanancia)};font-weight:800">${fmtSoles(D.cuadroGanancia)}</div></div>
+    </div>
+    <p class="hint" style="margin:2px 4px 10px">Los tres indicadores <b>(TOTAL)</b> usan todo el histórico del Spreadsheet y no dependen del filtro de fechas.
+      Los tres <b>(CUADRO)</b> suman exactamente los meses visibles en la tabla${D.meses.length?` (${anEtiquetaPeriodo(D.meses[0],'mes')} – ${anEtiquetaPeriodo(D.meses[D.meses.length-1],'mes')})`:''} y se recalculan al cambiar el rango.
+      El rango siempre se amplía a <b>meses calendario completos</b>: si eliges un día intermedio, el mes entra entero.</p>
     <div class="card" style="padding:0;overflow:hidden">
       ${hayDatos?`
       <div class="cotejo-outer">
@@ -6310,13 +6390,19 @@ RENDERERS.flujoCaja = function(){
     </div>
     <div class="card">
       <h2>📈 Evolución de Ganancia Neta</h2>
-      <p class="hint" style="margin-top:0">Misma Ganancia Neta mensual de la tabla (ingresos − egresos). Este rango es <b>independiente</b> del filtro de la tabla.</p>
-      <div class="toolbar">
+      <p class="hint" style="margin-top:0">Misma Ganancia Neta de la tabla (ingresos − egresos). Este rango y esta agrupación son <b>independientes</b> del filtro de la tabla.
+        Con agrupación <b>mensual</b> el rango se amplía a meses calendario completos; con <b>anual</b>, a años calendario completos.</p>
+      <div class="toolbar" id="fcgTool" style="flex-wrap:wrap;gap:10px 8px">
+        <div class="field"><label>Agrupación</label>
+          <select id="fcgAgrup">
+            <option value="mes" ${fcgFilter.agrup!=='año'?'selected':''}>Mensual</option>
+            <option value="año" ${fcgFilter.agrup==='año'?'selected':''}>Anual</option>
+          </select></div>
         <div class="field"><label>Desde</label><input type="date" id="fcgDesde" value="${fcgFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="fcgHasta" value="${fcgFilter.hasta}"></div>
-        <button class="btn btn-ghost btn-sm" id="fcgReset" style="align-self:flex-end">Últimos 12 meses</button>
+        ${flujoBotonesHTML('fcg', flujoPresetActivo(fcgFilter))}
       </div>
-      ${hayDatos? flujoGananciaSVG(flujoGananciaSerie()) : `<div class="empty">Sin datos para graficar.</div>`}
+      ${hayDatos? flujoGananciaSVG(flujoGananciaSerie(), fcgFilter.agrup) : `<div class="empty">Sin datos para graficar.</div>`}
     </div>`;
 
   ['fcgDesde','fcgHasta'].forEach(id=>{
@@ -6327,7 +6413,15 @@ RENDERERS.flujoCaja = function(){
       RENDERERS.flujoCaja(); // fcFilter (tabla) permanece intacto
     };
   });
-  document.getElementById('fcgReset').onclick=()=>{ fcgFilter=ventasUltNMeses(12); RENDERERS.flujoCaja(); };
+  document.getElementById('fcgAgrup').onchange=e=>{
+    fcgFilter.agrup = e.target.value==='año' ? 'año' : 'mes';
+    RENDERERS.flujoCaja();          // el rango y el filtro de la tabla no se tocan
+  };
+  /* Los botones rápidos solo reemplazan las fechas de SU propio filtro; la
+     agrupación elegida se conserva y el otro cuadro queda intacto. */
+  document.querySelectorAll('#fcgTool [data-fcpreset]').forEach(b=>{
+    b.onclick=()=>{ Object.assign(fcgFilter, flujoPresetRango(b.dataset.fcpreset)); RENDERERS.flujoCaja(); };
+  });
   // Tooltip inmediato: misma interacción que el gráfico principal de Evolución
   // de Ventas (div flotante + seguimiento del cursor al punto más cercano),
   // sin <title> nativo (que provoca el retardo del navegador).
@@ -6366,7 +6460,9 @@ RENDERERS.flujoCaja = function(){
     RENDERERS.flujoCaja(); // recalcula todos los meses y oculta los fuera de rango
   };
   ['fcDesde','fcHasta'].forEach(id=>{document.getElementById(id).onchange=apply;});
-  document.getElementById('fcReset').onclick=()=>{ fcFilter=ventasUltNMeses(12); RENDERERS.flujoCaja(); };
+  document.querySelectorAll('#fcTool [data-fcpreset]').forEach(b=>{
+    b.onclick=()=>{ fcFilter=flujoPresetRango(b.dataset.fcpreset); RENDERERS.flujoCaja(); };
+  });
 };
 /* ── FIN MÓDULO FLUJO DE CAJA ── */
 
@@ -16060,7 +16156,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-29.2';
+const APP_VERSION = '2026-10-30.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
