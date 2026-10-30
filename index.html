@@ -14206,7 +14206,19 @@ function consBebidasDatos(){
      final de la lista en lugar de reventar el filtro y vaciar la pantalla:
      un solo registro corrupto no debe tumbar el módulo entero. */
   const txt = v => String(v ?? '');
-  const base = S.bebidasCat.filter(b=> b && (
+  /* Solo bebidas ACTIVAS del catálogo. Se filtra AQUÍ, en el origen de los
+     datos del módulo, no al pintar: `base` alimenta el listado, las columnas
+     por fecha, las cabeceras de categoría, «Mostrar solo alertas», la
+     búsqueda y la exportación a Excel, de modo que una bebida inactiva queda
+     fuera de todos ellos a la vez y no solo oculta.
+     La condición es `activo!==false`, exactamente la misma que ya usa el
+     registro diario (RENDERERS.stockDiarioBebidas): un registro antiguo sin
+     el campo cuenta como activo, así que desactivar es siempre un acto
+     explícito y un catálogo heredado no desaparece por omisión.
+     Esto NO toca S.stockBebidas: los registros históricos de una bebida
+     desactivada siguen intactos en el Spreadsheet y vuelven a mostrarse en
+     cuanto se la marca activa de nuevo. */
+  const base = S.bebidasCat.filter(b=> b && b.activo!==false && (
     (!categoriaFiltro || txt(b.categoria)===categoriaFiltro) &&
     (!busqueda || txt(b.nombre).toLowerCase().includes(busqueda))
   )).sort((a,b_)=> txt(a.categoria).localeCompare(txt(b_.categoria)) || txt(a.nombre).localeCompare(txt(b_.nombre)));
@@ -14279,7 +14291,8 @@ RENDERERS.consolidadoStockBebidas = function(){
   const { desde, hasta, fechas, categoriaFiltro, bebidas: bebidasFiltradas } = consBebidasDatos();
 
   el.innerHTML=`
-    <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario. <span style="color:#dc2626">Celdas rojas</span>: inventario menor al stock mínimo configurado. Columna <b style="color:#7c3aed">Vacías</b>: botellas retornables esperadas menos inventario.</p></div></div>
+    <div class="page-head"><div><h1>📊 Consolidado de Stock de Bebidas</h1><p>Evolución histórica del stock diario. <span style="color:#dc2626">Celdas rojas</span>: inventario menor al stock mínimo configurado. Columna <b style="color:#7c3aed">Vacías</b>: botellas retornables esperadas menos inventario.
+      Se listan solo las bebidas marcadas como <b>ACTIVO</b> en <b>Administración → Bebidas</b>; al desactivar una, sus registros históricos se conservan y reaparecen si se la vuelve a activar.</p></div></div>
     <div class="card">
       <div class="form-grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
         <div class="field"><label>Desde</label><input type="date" id="consBebDesde" value="${desde}"></div>
@@ -16156,7 +16169,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-30.1';
+const APP_VERSION = '2026-10-30.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
