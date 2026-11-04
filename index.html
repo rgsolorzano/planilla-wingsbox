@@ -3606,27 +3606,173 @@ async function analiticaWriteProcessedSheet(nombreHoja, matrix, rangoLimpieza){
 }
 const K_VENTAS_DATA = 'ventas_facts';
 const K_VENTAS_META = 'ventas_meta';
-// Índices 0-based de las columnas según la especificación (A=0):
-// Estructura del tab CAJA vigente desde ago-2026 (se insertó una columna antes
-// de los medios de pago y se agregó Izipay): Efectivo=AB, Bancos=AC, Rappi=AD,
-// PedidosYa=AE, DIDI=AF+AG, Tarjetas=AH, Izipay=AI (nuevo), MercadoPago=AJ,
-// Ingreso total del día=AK. Índices 0-based (A=0).
-const VENTAS_FACTS_VERSION = 3; // versión del esquema de facts cacheados
+// Índices 0-based de las columnas (A=0). El layout vigente y el porqué de
+// cada posición están documentados en el bloque ESTRUCTURA DEL TAB CAJA.
+const VENTAS_FACTS_VERSION = 5; // v5 = CAJA reestructurada: Justo bruto (L) y neto (AM), comisión en W
+
+/* ╔═ ESTRUCTURA DEL TAB CAJA ═══════════════════════════════════════════════╗
+   Reestructuración de nov-2026 sobre el Spreadsheet RAW:
+     · se insertó la columna L con el nuevo tipo de ingreso «Justo»;
+     · se insertó una segunda columna en la posición W.
+   Desplazamiento NETO resultante para cualquier columna anterior (A=0):
+     · índice ≤ 10  (A..K) → sin cambio
+     · índice 11..20 (L..U) → +1
+     · índice ≥ 21  (V en adelante) → +2
+   La segunda inserción cae en la posición 22 del layout ya desplazado, así
+   que una columna antigua i llega a i+1 y recibe el +1 adicional cuando
+   i+1 ≥ 22, es decir i ≥ 21. Ninguna de las columnas que lee la aplicación
+   cae en el único tramo donde el enunciado admitiría otra lectura (los
+   antiguos índices 21 y 22), de modo que el mapa de abajo es inequívoco.
+
+   La pestaña COMPRAS del mismo Spreadsheet lee A:K (índice máximo 10), que
+   queda a la IZQUIERDA de ambas inserciones: no requiere cambio alguno.    ╚═╝ */
+
 // Columnas de INGRESO BRUTO de CAJA (análisis de composición — NO confundir
-// con las columnas de medios de pago AB..AJ usadas por los demás cálculos):
-// F=Efectivo, G=Yape, H=Plin, I=Izipay, J=Rappi, K=PedidosYa, N=Tarjeta,
-// O=MercadoPago, P=Ingreso total bruto. Índices 0-based.
-const VENTAS_COL_BRUTO = { efectivo:5, yape:6, plin:7, izipay:8, rappi:9, pedidosya:10, tarjeta:13, mercadopago:14, total:15 };
+// con las columnas de medios de pago del bloque NETO usadas por los demás
+// cálculos). Tras el desplazamiento:
+// F=Efectivo, G=Yape, H=Plin, I=Izipay, J=Rappi, K=PedidosYa, L=Justo (nueva),
+// O=Tarjeta (antes N), P=MercadoPago (antes O), Q=Ingreso total bruto (antes P).
+const VENTAS_COL_BRUTO = { efectivo:5, yape:6, plin:7, izipay:8, rappi:9, pedidosya:10, justo:11, tarjeta:14, mercadopago:15, total:16 };
 const BRUTO_MEDIOS = [
   ['efectivo','Efectivo','#f59e0b'], ['yape','Yape','#7c3aed'], ['plin','Plin','#06b6d4'],
   ['izipay','Izipay','#dc2626'], ['rappi','Rappi','#ea580c'], ['pedidosya','Pedidos Ya','#be185d'],
+  ['justo','Justo','#65a30d'],
   ['tarjeta','Tarjeta','#2563eb'], ['mercadopago','Mercado Pago','#059669']
 ];
-const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:27, bancos:28, rappi:29, pedidosya:30, didi1:31, didi2:32, tarjetas:33, izipay:34, mercadopago:35, ingresoDia:36 };
+/* Bloque NETO (medios de pago + ingreso del día). Antes AB..AK; con el
+   desplazamiento de +2 pasaría a AD..AM, pero Justo también tiene importe
+   NETO y ocupa AM, al final de los medios de pago, de modo que el ingreso
+   total del día queda en AN:
+   AD=Efectivo, AE=Bancos, AF=Rappi, AG=PedidosYa, AH+AI=DIDI, AJ=Tarjetas,
+   AK=Izipay, AL=MercadoPago, AM=Justo (nuevo), AN=Ingreso total del día.
+
+   La posición de Justo (AM) está confirmada; la de «Ingreso del día» (AN) se
+   deduce de ella, porque AM dejó de estar libre. La resolución por cabecera
+   comprueba ambas en cada sincronización y las reubica si la hoja difiere,
+   dejando constancia en los metadatos del módulo.
+
+   Nota: la columna W contiene la COMISIÓN que cobra Justo. Ningún cálculo
+   actual la usa, así que no se mapea: un importe de comisión no es ni un
+   ingreso bruto ni uno neto, y sumarlo a cualquiera de los dos falsearía las
+   cifras. Si en el futuro se quiere analizar, se añade aquí explícitamente. */
+const VENTAS_COL = { fecha:0, filtro:2, nVentas:3, efectivo:29, bancos:30, rappi:31, pedidosya:32, didi1:33, didi2:34, tarjetas:35, izipay:36, mercadopago:37, justo:38, ingresoDia:39 };
 const VENTAS_MEDIOS = [
   ['efectivo','Efectivo'], ['bancos','Bancos'], ['rappi','Rappi'], ['pedidosya','PedidosYa'],
-  ['didi','DIDI'], ['tarjetas','Tarjetas'], ['izipay','Izipay'], ['mercadopago','Mercado Pago']
+  ['didi','DIDI'], ['tarjetas','Tarjetas'], ['izipay','Izipay'], ['mercadopago','Mercado Pago'],
+  ['justo','Justo']
 ];
+
+/* ── RESOLUCIÓN POR CABECERA ───────────────────────────────────────────────
+   Los índices de arriba dejan de ser la última palabra: en cada sincronización
+   se busca la cabecera real de la hoja y, cuando una columna se reconoce por
+   su rótulo, se usa ESA posición. Así, una futura inserción de columnas se
+   corrige sola en vez de producir cifras silenciosamente equivocadas.
+
+   La búsqueda está ACOTADA a ±CAJA_TOLERANCIA columnas del índice configurado,
+   y eso es deliberado: los bloques BRUTO (F..Q) y NETO (AD..AM) repiten
+   rótulos — «Efectivo», «Izipay», «Tarjeta», «Mercado Pago» están en los dos —
+   y los separan más de doce columnas. Una búsqueda global elegiría la columna
+   del bloque equivocado; con una ventana estrecha un desplazamiento por
+   inserción se absorbe, pero jamás se salta de un bloque al otro.
+
+   Si un rótulo no aparece, o aparece más de una vez dentro de la ventana, NO
+   se adivina: se conserva el índice configurado y se anota el motivo, que
+   queda visible en los metadatos del módulo y en la consola.              */
+const CAJA_TOLERANCIA = 6;
+const CAJA_CABECERAS = {
+  bruto: { efectivo:['efectivo'], yape:['yape'], plin:['plin'], izipay:['izipay'],
+           rappi:['rappi'], pedidosya:['pedidos ya','pedidosya'], justo:['justo'],
+           tarjeta:['tarjeta'], mercadopago:['mercado pago','mercadopago'],
+           total:['bruto','total'] },
+  neto:  { efectivo:['efectivo'], bancos:['banco'], rappi:['rappi'],
+           pedidosya:['pedidos ya','pedidosya'], tarjetas:['tarjeta'],
+           izipay:['izipay'], mercadopago:['mercado pago','mercadopago'],
+           justo:['justo'], ingresoDia:['ingreso'] }
+};
+// Normaliza un rótulo: sin acentos, en minúsculas y con la puntuación
+// colapsada a espacios, para que 'Mercado Pago', 'MERCADO-PAGO' y
+// 'mercadopago' se comparen igual.
+function cajaNormHdr(v){
+  return String(v ?? '').normalize('NFD').replace(/[̀-ͯ]/g,'')
+    .toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+}
+/* Primera fila que parece una cabecera: su columna A no es una fecha legible
+   y tiene suficientes celdas con texto. Se miran solo las primeras filas,
+   porque una fila de datos con la fecha corrupta no debe confundirse con la
+   cabecera. Devuelve null si no se reconoce ninguna: entonces no se resuelve
+   nada y rigen los índices configurados. */
+function cajaFilaCabecera(filas){
+  for(let i=0; i<Math.min(filas.length, 12); i++){
+    const r = filas[i] || [];
+    if(/^\d{4}-\d{2}-\d{2}$/.test(normFechaGS(r[VENTAS_COL.fecha]))) continue;
+    const conTexto = r.filter(c=>cajaNormHdr(c).length>2).length;
+    if(conTexto >= 8) return { fila:i, celdas:r };
+  }
+  return null;
+}
+function cajaResolverColumnas(cabecera, base, claves){
+  const cols = Object.assign({}, base);
+  const movidas = [], confirmadas = [], sinResolver = [];
+  if(!cabecera) return { cols, movidas, confirmadas, sinResolver };
+  const hdr = (cabecera.celdas||[]).map(cajaNormHdr);
+  Object.keys(claves).forEach(campo=>{
+    const idx = base[campo];
+    if(idx === undefined) return;
+    const pats = claves[campo], hits = [];
+    for(let i=Math.max(0, idx-CAJA_TOLERANCIA); i<=idx+CAJA_TOLERANCIA; i++){
+      if(hdr[i] && pats.some(p=>hdr[i].includes(p))) hits.push(i);
+    }
+    if(hits.length !== 1){
+      sinResolver.push({ campo, idx, letra:colIndexToLetter(idx),
+        motivo: hits.length ? 'rótulo ambiguo ('+hits.length+' coincidencias)' : 'rótulo no encontrado' });
+      return;
+    }
+    cols[campo] = hits[0];
+    const reg = { campo, de:idx, a:hits[0], letra:colIndexToLetter(hits[0]), rotulo:hdr[hits[0]] };
+    (hits[0] === idx ? confirmadas : movidas).push(reg);
+  });
+  /* DIDI ocupa DOS columnas contiguas cuyos rótulos comparten la misma
+     palabra, así que la regla de «exactamente una coincidencia» nunca podría
+     resolverlas y quedarían ancladas a su índice mientras el resto del bloque
+     se reubica: justo el estado mixto que produce cifras incoherentes. Se
+     resuelven como PAREJA — si en la ventana aparecen exactamente dos
+     columnas DIDI, se asignan en orden; con cualquier otro número no se
+     adivina y rigen los índices configurados. */
+  if(base.didi1 !== undefined && base.didi2 !== undefined){
+    const hits = [];
+    for(let i=Math.max(0, base.didi1-CAJA_TOLERANCIA); i<=base.didi2+CAJA_TOLERANCIA; i++){
+      if(hdr[i] && hdr[i].includes('didi')) hits.push(i);
+    }
+    if(hits.length === 2){
+      [['didi1',hits[0]],['didi2',hits[1]]].forEach(([campo,a])=>{
+        const de = base[campo]; cols[campo] = a;
+        const reg = { campo, de, a, letra:colIndexToLetter(a), rotulo:hdr[a] };
+        (a === de ? confirmadas : movidas).push(reg);
+      });
+    } else {
+      sinResolver.push({ campo:'didi1+didi2', idx:base.didi1, letra:colIndexToLetter(base.didi1),
+        motivo: hits.length+' columna(s) DIDI en la ventana (se esperaban 2)' });
+    }
+  }
+  return { cols, movidas, confirmadas, sinResolver };
+}
+/* Resumen visible de la estructura con la que se leyó CAJA. Sirve para
+   comprobar sin abrir la consola qué columna alimentó cada cifra: si la hoja
+   vuelve a moverse, el aviso aparece aquí en lugar de pasar inadvertido. */
+function cajaEstructuraHTML(){
+  const c = ventasMeta && ventasMeta.cabecera;
+  const letra = k => colIndexToLetter(VENTAS_COL[k]!==undefined ? VENTAS_COL[k] : VENTAS_COL_BRUTO[k]);
+  const base = `<span title="Columnas de las que se leen las cifras">Columnas en uso: Justo bruto <b>${colIndexToLetter(VENTAS_COL_BRUTO.justo)}</b> · Justo neto <b>${letra('justo')}</b> · Ingreso del día <b>${letra('ingresoDia')}</b></span>`;
+  if(!ventasMeta) return '';
+  if(!c) return `<p class="hint" style="margin:2px 0 0;font-size:11px">${base} · <span style="color:#b45309">no se reconoció la fila de cabecera: no se pudo verificar contra los rótulos de la hoja.</span></p>`;
+  const av = [];
+  if(c.movidas && c.movidas.length)
+    av.push(`<span style="color:#b45309">⚠ ${c.movidas.length} columna(s) reubicada(s) por rótulo: ${c.movidas.map(m=>m.campo+' → '+m.letra).join(', ')}</span>`);
+  if(c.sinResolver && c.sinResolver.length)
+    av.push(`<span style="color:#b45309">⚠ sin verificar: ${c.sinResolver.map(s=>s.campo+' ('+s.letra+')').join(', ')}</span>`);
+  return `<p class="hint" style="margin:2px 0 0;font-size:11px">${base} · cabecera leída en la fila ${c.fila}`
+       + (av.length ? ' · '+av.join(' · ') : ' · <span style="color:#15803d">todas verificadas contra los rótulos de la hoja</span>') + `</p>`;
+}
 
 let ventasFacts = [];  // [{fecha:'YYYY-MM-DD', n, efectivo, bancos, rappi, pedidosya, didi, tarjetas, mercadopago, total}]
 let ventasMeta  = null;
@@ -3653,7 +3799,9 @@ async function ventasSync(){
   const t0=Date.now();
   try{
     gsUpdateSyncStatus('Sincronizando ventas (CAJA)…','info');
-    const r = await analiticaFetchRaw(VENTAS_SHEET_RAW+'!A1:AK50000'); // fuente RAW (solo lectura)
+    // Rango ampliado hasta AZ: el bloque NETO termina ahora en AM y se deja
+    // holgura para que otra inserción de columnas no quede fuera de la lectura.
+    const r = await analiticaFetchRaw(VENTAS_SHEET_RAW+'!A1:AZ50000'); // fuente RAW (solo lectura)
     if(r.status===403) throw new Error('Sin permiso para leer el Spreadsheet de ventas. Verifica la cuenta conectada.');
     if(r.status===404) throw new Error('No se encontró el Spreadsheet de ventas o la pestaña CAJA.');
     if(!r.ok) throw new Error('HTTP '+r.status+' al leer la pestaña CAJA.');
@@ -3662,39 +3810,73 @@ async function ventasSync(){
     // Verificación de estructura: se reporta (sin fallar) lo observado en la hoja.
     console.log('[Ventas] CAJA: '+filas.length+' filas leídas. Fila 1 (posible encabezado):', JSON.stringify((filas[0]||[]).slice(0,5)));
 
+    /* Las columnas efectivas salen de la cabecera real cuando se reconoce;
+       si no, rigen los índices configurados. A partir de aquí el bucle usa
+       COL y COLB, nunca las constantes, para que la corrección por rótulo
+       llegue a TODOS los campos. */
+    const cab  = cajaFilaCabecera(filas);
+    const resN = cajaResolverColumnas(cab, VENTAS_COL,       CAJA_CABECERAS.neto);
+    const resB = cajaResolverColumnas(cab, VENTAS_COL_BRUTO, CAJA_CABECERAS.bruto);
+    const COL = resN.cols, COLB = resB.cols;
+    const movidas = [...resN.movidas, ...resB.movidas];
+    const sinResolver = [...resN.sinResolver, ...resB.sinResolver];
+    if(cab){
+      console.log('[Ventas] Cabecera detectada en la fila '+(cab.fila+1)+'. '+
+        (resN.confirmadas.length+resB.confirmadas.length)+' columnas confirmadas por rótulo, '+
+        movidas.length+' reubicadas, '+sinResolver.length+' sin resolver (se usa el índice configurado).');
+      if(movidas.length) console.warn('[Ventas] Columnas reubicadas por rótulo:',
+        movidas.map(m=>m.campo+': '+colIndexToLetter(m.de)+'→'+m.letra).join(', '));
+      if(sinResolver.length) console.warn('[Ventas] Sin resolver por rótulo:',
+        sinResolver.map(s=>s.campo+' ('+s.letra+', '+s.motivo+')').join(', '));
+    } else {
+      console.warn('[Ventas] No se reconoció una fila de cabecera en CAJA: se usan los índices configurados sin verificar.');
+    }
+
     const porDia = new Map();
     let leidas=0, wb=0, descartadas=0;
     filas.forEach(row=>{
       if(!row || !row.length) return;
       leidas++;
       // Solo registros de la marca WB (Columna C), insensible a mayúsculas/espacios.
-      if(String(row[VENTAS_COL.filtro]??'').trim().toUpperCase()!=='WB') return;
-      const fecha = normFechaGS(row[VENTAS_COL.fecha]);
+      if(String(row[COL.filtro]??'').trim().toUpperCase()!=='WB') return;
+      const fecha = normFechaGS(row[COL.fecha]);
       if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ descartadas++; return; } // encabezados o fechas ilegibles
       wb++;
       const num = v => { const n=analNumOrNull(v); return n===null?0:n; };
       let f = porDia.get(fecha);
-      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, izipay:0, mercadopago:0, total:0, ing:0,
-        bruto:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0,total:0}}; porDia.set(fecha,f); }
-      f.n           += num(row[VENTAS_COL.nVentas]);
-      f.efectivo    += num(row[VENTAS_COL.efectivo]);
-      f.bancos      += num(row[VENTAS_COL.bancos]);
-      f.rappi       += num(row[VENTAS_COL.rappi]);
-      f.pedidosya   += num(row[VENTAS_COL.pedidosya]);
-      f.didi        += num(row[VENTAS_COL.didi1]) + num(row[VENTAS_COL.didi2]);
-      f.tarjetas    += num(row[VENTAS_COL.tarjetas]);
-      f.izipay      += num(row[VENTAS_COL.izipay]);
-      f.mercadopago += num(row[VENTAS_COL.mercadopago]);
-      f.ing         += num(row[VENTAS_COL.ingresoDia]); // Ingreso del día (col. AK) — usado por Flujo de Caja
-      // Ingresos BRUTOS (cols. F..P) — usados solo por el gráfico de composición
-      Object.keys(VENTAS_COL_BRUTO).forEach(k=>{ f.bruto[k]+=num(row[VENTAS_COL_BRUTO[k]]); });
+      if(!f){ f={fecha, n:0, efectivo:0, bancos:0, rappi:0, pedidosya:0, didi:0, tarjetas:0, izipay:0, mercadopago:0, justo:0, total:0, ing:0,
+        // El acumulador de brutos se deriva del propio mapa de columnas: al
+        // añadir un tipo de ingreso no hay una segunda lista que actualizar.
+        bruto:Object.keys(VENTAS_COL_BRUTO).reduce((o,k)=>(o[k]=0,o),{})}; porDia.set(fecha,f); }
+      f.n           += num(row[COL.nVentas]);
+      f.efectivo    += num(row[COL.efectivo]);
+      f.bancos      += num(row[COL.bancos]);
+      f.rappi       += num(row[COL.rappi]);
+      f.pedidosya   += num(row[COL.pedidosya]);
+      f.didi        += num(row[COL.didi1]) + num(row[COL.didi2]);
+      f.tarjetas    += num(row[COL.tarjetas]);
+      f.izipay      += num(row[COL.izipay]);
+      f.mercadopago += num(row[COL.mercadopago]);
+      f.justo       += num(row[COL.justo]);      // Justo NETO (col. AM) — no confundir con bruto.justo (col. L)
+      f.ing         += num(row[COL.ingresoDia]); // Ingreso del día (col. AN) — usado por Flujo de Caja
+      // Ingresos BRUTOS (cols. F..Q, con Justo en L) — solo para el gráfico de composición
+      Object.keys(COLB).forEach(k=>{ f.bruto[k]+=num(row[COLB[k]]); });
     });
-    porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.izipay+f.mercadopago; });
+    // Total neto: suma de TODOS los medios, Justo incluido — es lo que grafica
+    // «Todos» en Evolución de Ventas.
+    porDia.forEach(f=>{ f.total = f.efectivo+f.bancos+f.rappi+f.pedidosya+f.didi+f.tarjetas+f.izipay+f.mercadopago+f.justo; });
     ventasFacts = [...porDia.values()].sort((a,b)=>a.fecha<b.fecha?-1:1);
     ventasMeta = {
       lastSync:new Date().toISOString(), filas:leidas, filasWB:wb, dias:ventasFacts.length,
-      duracion:((Date.now()-t0)/1000).toFixed(1), version:VENTAS_FACTS_VERSION
+      duracion:((Date.now()-t0)/1000).toFixed(1), version:VENTAS_FACTS_VERSION,
+      // Trazabilidad de la estructura leída: permite comprobar desde la propia
+      // interfaz qué columna alimentó cada cifra, sin abrir la consola.
+      cabecera: cab ? { fila:cab.fila+1, movidas, sinResolver } : null
     };
+    if(movidas.length){
+      toast('⚠️ La estructura de CAJA cambió: '+movidas.length+' columna(s) reubicada(s) por rótulo ('+
+        movidas.map(m=>m.campo+'→'+m.letra).join(', ')+'). Revisa las cifras.','warn');
+    }
     ventasSaveToStorage();
     ventasMensualCache = { clave:null, datos:null }; // invalidar agregados memorizados
     // Tab auxiliar (best-effort): NUNCA toca CAJA ni el resto del Spreadsheet.
@@ -3718,11 +3900,13 @@ async function ventasSync(){
 // Escribe los facts diarios en la tabla procesada VENTAS_FACTS, SIEMPRE en el
 // spreadsheet de ANALÍTICA (nunca en el RAW).
 async function ventasWriteFactsSheet(){
+  // Justo (neto) y BrutoJusto se añaden al FINAL para no desplazar las
+  // columnas que ya tenía la tabla procesada.
   const matrix=[['Fecha','NumVentas','Efectivo','Bancos','Rappi','PedidosYa','DIDI','Tarjetas','Izipay','MercadoPago','Total','IngresoDia',
-      'BrutoEfectivo','BrutoYape','BrutoPlin','BrutoIzipay','BrutoRappi','BrutoPedidosYa','BrutoTarjeta','BrutoMercadoPago','BrutoTotal'],
+      'BrutoEfectivo','BrutoYape','BrutoPlin','BrutoIzipay','BrutoRappi','BrutoPedidosYa','BrutoTarjeta','BrutoMercadoPago','BrutoTotal','BrutoJusto','Justo'],
     ...ventasFacts.map(f=>{const b=f.bruto||{};return [f.fecha,f.n,f.efectivo,f.bancos,f.rappi,f.pedidosya,f.didi,f.tarjetas,f.izipay||0,f.mercadopago,f.total,f.ing||0,
-      b.efectivo||0,b.yape||0,b.plin||0,b.izipay||0,b.rappi||0,b.pedidosya||0,b.tarjeta||0,b.mercadopago||0,b.total||0];})];
-  return analiticaWriteProcessedSheet(VENTAS_SHEET_FACTS, matrix, 'A:V');
+      b.efectivo||0,b.yape||0,b.plin||0,b.izipay||0,b.rappi||0,b.pedidosya||0,b.tarjeta||0,b.mercadopago||0,b.total||0,b.justo||0,f.justo||0];})];
+  return analiticaWriteProcessedSheet(VENTAS_SHEET_FACTS, matrix, 'A:X');
 }
 
 // ── Helpers comunes ───────────────────────────────────────────────
@@ -4298,10 +4482,10 @@ function vdBindCard(){
   }
 }
 
-/* ── Composición de INGRESOS BRUTOS (análisis nuevo; cols. F..P de CAJA) ──
+/* ── Composición de INGRESOS BRUTOS (análisis nuevo; cols. F..Q de CAJA) ──
    Gráfico independiente dentro de Evolución de Ventas, con filtros PROPIOS:
    Desde/Hasta (default últimos 12 meses), Agrupar por (default Día) y Tipo de
-   ingreso (default Todos = 8 líneas). Los períodos con ingreso bruto total = 0
+   ingreso (default Todos = 9 líneas). Los períodos con ingreso bruto total = 0
    se tratan como AUSENCIA de información (no aparecen como 0%). */
 let evbFilter = Object.assign({agrup:'dia', tipo:'todos'}, ventasUltNMeses(2));
 
@@ -4322,7 +4506,9 @@ function evbBuildSerie(){
   enRango.forEach(f=>{
     const k=anClavePeriodo(f.fecha, agrup);
     let p=acc.get(k);
-    if(!p){ p={key:k, brutos:{efectivo:0,yape:0,plin:0,izipay:0,rappi:0,pedidosya:0,tarjeta:0,mercadopago:0}, total:0}; acc.set(k,p); }
+    // Acumulador derivado de BRUTO_MEDIOS: incorporar un tipo de ingreso allí
+    // basta; aquí ya no hay una segunda lista que quedara desactualizada.
+    if(!p){ p={key:k, brutos:BRUTO_MEDIOS.reduce((o,[kk])=>(o[kk]=0,o),{}), total:0}; acc.set(k,p); }
     BRUTO_MEDIOS.forEach(([kk])=>{ p.brutos[kk]+=f.bruto[kk]||0; });
     p.total+=f.bruto.total||0;
   });
@@ -4403,7 +4589,7 @@ RENDERERS.evolucionVentas = function(){
     : 'Sin sincronizar todavía.';
   el.innerHTML=`
     <div class="page-head"><div><h1>📉 Evolución de Ventas</h1>
-      <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p></div>
+      <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p>${cajaEstructuraHTML()}</div>
       <button class="btn btn-primary" id="evSync">🔄 Actualizar ventas</button></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap">
@@ -4434,7 +4620,7 @@ RENDERERS.evolucionVentas = function(){
     </div>
     <div class="card">
       <h2>🧮 Composición de ingresos brutos (%)</h2>
-      <p class="hint" style="margin-top:0">Participación de cada medio sobre el ingreso bruto total (cols. F..P de CAJA, solo registros WB). Filtros independientes del gráfico principal. Los períodos con ingreso bruto total en 0 no se grafican.</p>
+      <p class="hint" style="margin-top:0">Participación de cada medio sobre el ingreso bruto total (cols. F..Q de CAJA, solo registros WB). Filtros independientes del gráfico principal. Los períodos con ingreso bruto total en 0 no se grafican.</p>
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="evbDesde" value="${evbFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="evbHasta" value="${evbFilter.hasta}"></div>
@@ -5675,7 +5861,7 @@ async function comprasWriteFactsSheet(){
   return analiticaWriteProcessedSheet(COMPRAS_SHEET_FACTS, matrix, 'A:C');
 }
 
-// Sincroniza ambas fuentes del flujo (CAJA con col. AI + COMPRAS).
+// Sincroniza ambas fuentes del flujo (CAJA con col. AM + COMPRAS).
 async function flujoSync(){
   const a=await ventasSync();   // ingresos (y dashboards de ventas)
   const b=await comprasSync();  // egresos
@@ -5731,7 +5917,7 @@ const FLUJO_INGRESOS = [
   { id:'reales', label:'Ingresos reales', valorMes:(mes,D)=> D.ingresosMes.get(mes)||0 }
 ];
 
-// Resumen mensual de ingresos (CAJA col. AK) y egresos (COMPRAS) para un
+// Resumen mensual de ingresos (CAJA col. AM) y egresos (COMPRAS) para un
 // rango dado. ÚNICA fuente de la Ganancia Neta mensual: la usan tanto la
 // tabla del flujo como el gráfico de evolución, garantizando que siempre
 // coincidan (misma fórmula: ganancia = ingresos del mes − egresos del mes).
@@ -6340,7 +6526,7 @@ RENDERERS.flujoCaja = function(){
 
   el.innerHTML=`
     <div class="page-head"><div><h1>💵 Flujo de Caja</h1>
-      <p>Ingresos: CAJA col. AI (solo WB) · Egresos: COMPRAS col. I por tipo (col. F, solo WB). ${metaStr}</p></div>
+      <p>Ingresos: CAJA col. AM (solo WB) · Egresos: COMPRAS col. I por tipo (col. F, solo WB). ${metaStr}</p></div>
       <button class="btn btn-primary" id="fcSync">🔄 Actualizar datos</button></div>
     <div class="card">
       <div class="toolbar" id="fcTool" style="flex-wrap:wrap;gap:10px 8px">
@@ -16169,7 +16355,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-10-30.2';
+const APP_VERSION = '2026-11-04.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
