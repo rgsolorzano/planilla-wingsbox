@@ -1570,6 +1570,12 @@ const OVERNIGHT_MAX_HOUR = 2; // default 02:00 AM
 const TARDANZA_NUEVA_DESDE = '2026-09-16';
 const TARDANZA_ACUM_LIMITE = 4;      // el descuento adicional nace en la 5.ª
 
+/* COMPENSACIÓN de tardanza con prolongación de jornada: vigente desde esta fecha
+   (inicio de la quincena en que se introduce la regla). Antes de ella el cálculo
+   es EXACTAMENTE el anterior, para no alterar quincenas ya cerradas/pagadas.
+   Cambiar solo este valor mueve la vigencia de la regla. */
+const COMPENSA_TARDANZA_DESDE = '2026-11-01';
+
 // Minutos de retraso reales (nunca negativos; llegar antes no es tardanza).
 function minutosTardanza(entradaReal, entradaProg){
   const real=hmToMin(entradaReal), prog=hmToMin(entradaProg);
@@ -1617,6 +1623,24 @@ function calcHorasSalidaAnt(salidaReal, salidaProg){
 function calcHorasExtra(efectivas, programadas){
   const ex = efectivas - programadas;
   return ex > 0 ? round0(ex) : 0;
+}
+
+/* Minutos trabajados DESPUÉS de la hora de salida programada (nunca negativos).
+   Sirve para COMPENSAR la tardanza de entrada con la prolongación de la jornada:
+   si el trabajador ingresa tarde pero se queda trabajando pasado su fin de turno,
+   esos minutos recuperan el retraso. Se mide la jornada real completa
+   (entrada → salida, tolerando el cruce de medianoche con +24 h) y se ubica la
+   salida respecto al FIN PROGRAMADO contado desde la entrada programada, de modo
+   que funciona aunque el turno se desplace o termine de madrugada.
+   Fórmula:  (salida − entrada_real) + (entrada_real − entrada_prog) − duración_prog
+           =  span            +  desfase_entrada            −  duración_prog     */
+function minutosDespuesSalidaProg(entradaReal, salidaReal, hor){
+  if(!entradaReal || !salidaReal || !hor || !hor.entrada || !hor.salida) return 0;
+  const inReal = hmToMin(entradaReal), inProg = hmToMin(hor.entrada), outProg = hmToMin(hor.salida);
+  if(inReal==null || inProg==null || outProg==null) return 0;
+  let span = hmToMin(salidaReal) - inReal; if(span < 0) span += 1440; // jornada real (min)
+  let dur  = outProg - inProg;             if(dur  < 0) dur  += 1440; // duración programada (min)
+  return Math.max(0, span + (inReal - inProg) - dur);
 }
 
 /* ---------- Accesores auxiliares ---------- */
@@ -2023,11 +2047,27 @@ function calcDiaCondicion(emp, fecha){
   const horasEf = esFalta ? 0 : calcHorasEfectivas(entradaReal, salidaReal);
 
   // En días libres/vacaciones NO se aplica descuento por tardanza ni por falta.
-  let hTardOriginal=0, hSal=0, minTardanza=0, tardanzaCuenta=false;
+  let hTardOriginal=0, hSal=0, minTardanza=0, tardanzaCuenta=false, minTardBruta=0, minCompensados=0;
   if(!libre && debeTrabajar && !esFalta){
     if(entradaReal){
-      // Regla central, resuelta con la FECHA del día (define qué escala rige).
-      const rt = reglaTardanza(minutosTardanza(entradaReal, hor.entrada), fecha);
+      // Tardanza BRUTA de entrada (minutos de retraso respecto al horario).
+      minTardBruta = minutosTardanza(entradaReal, hor.entrada);
+      /* COMPENSACIÓN por prolongar la jornada: los minutos trabajados DESPUÉS de
+         la hora de salida programada recuperan el retraso de entrada, hasta el
+         total de la tardanza. Así, quien llega tarde pero se queda trabajando no
+         recibe descuento por el tiempo recuperado. El EXCEDENTE (más allá de la
+         tardanza) NO se toca aquí: lo capturan las horas extra, que se calculan
+         por horas efectivas vs programadas; como las horas efectivas ya incluyen
+         todo el tiempo trabajado, el sobretiempo resulta = (efectivas − prog) =
+         (minutos tras el fin − tardanza) cuando es positivo, de modo que un mismo
+         minuto nunca se cuenta dos veces (compensa O es extra, no ambas). */
+      minCompensados = (salidaReal && String(fecha) >= COMPENSA_TARDANZA_DESDE)
+        ? Math.min(minTardBruta, minutosDespuesSalidaProg(entradaReal, salidaReal, hor))
+        : 0;
+      const minTardNeta = Math.max(0, minTardBruta - minCompensados);
+      // Regla central, resuelta con la FECHA del día (define qué escala rige),
+      // aplicada sobre la tardanza NETA (ya descontada la compensación).
+      const rt = reglaTardanza(minTardNeta, fecha);
       minTardanza = rt.minutos; hTardOriginal = rt.horas; tardanzaCuenta = rt.cuenta;
     }
     if(salidaReal)  hSal  = calcHorasSalidaAnt(salidaReal, hor.salida);
@@ -2076,7 +2116,7 @@ function calcDiaCondicion(emp, fecha){
 
   return {
     fecha, entradaReal, salidaReal, horasEf, horasProg, horasExtra, feriado, pagoFeriado,
-    hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, minTardanza, cuentaTardanza, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
+    hTard, hTardOriginal, horasTardExoneradas, exoActiva:exo.activa, minTardanza, minTardBruta, minCompensados, cuentaTardanza, hSal, horasDescAuto, descAuto, descFalta, descManual, pagoManual, pagoExtraHoras,
     descManualList, pagoExtraList, faltaMarc, esFalta, salidaAsumida, esPayday, libre, tipoLibre, debeTrabajar, totalDia,
     esPendiente:false // día pasado evaluado normalmente
   };
@@ -9058,6 +9098,8 @@ function renderCalculo(serie){
       if(d.esFalta) detDescAuto.push(`Falta - ausencia (${d.horasProg}h prog.)`);
       if(d.hTard>0) detDescAuto.push(`Tardanza (${d.hTard}h${d.horasTardExoneradas>0?(' neta, exon. '+d.horasTardExoneradas+'h de '+d.hTardOriginal+'h'):''})`);
       else if(d.horasTardExoneradas>0) detDescAuto.push(`Tardanza exonerada (${d.horasTardExoneradas}h)`);
+      // Compensación de tardanza con sobretiempo: informativo, no es descuento.
+      if(d.minCompensados>0) detDescAuto.push(`<span style="color:var(--c-ok,#15803d)">Tardanza ${d.minTardBruta} min: ${d.minCompensados} min compensados con sobretiempo</span>`);
       if(d.hSal>0) detDescAuto.push(`Salida anticipada (${d.hSal}h)`);
       if(d.horasFaltaMarc>0) detDescAuto.push(`Falta marcación (${d.horasFaltaMarc}h)`);
       const detDesc=[...detDescAuto, ...d.descManualList.map(x=>`${x.tipo}: ${money(x.monto)}`)].join('<br>');
@@ -9068,6 +9110,7 @@ function renderCalculo(serie){
       else if(d.esFalta) estado='<span class="badge b-miss">⛔ Falta</span>';
       else if(d.faltaMarc) estado='<span class="badge b-miss">⚠ Falta marcación</span>';
       else if(d.hTard>0||d.hSal>0) estado='<span class="badge b-late">Tardanza/Salida</span>';
+      else if(d.minCompensados>0) estado='<span class="badge b-free">Tardanza compensada</span>';
       const heChecked = getConsiderarHoraExtra(emp.id, d.fecha);
       const hePending = Object.prototype.hasOwnProperty.call(calcPendingHE, heKey(emp.id, d.fecha));
       return `<tr class="${cls}">
@@ -16498,7 +16541,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-11.2';
+const APP_VERSION = '2026-11-11.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
