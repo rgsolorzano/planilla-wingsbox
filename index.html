@@ -11984,9 +11984,17 @@ RENDERERS.produccion = function(){
   // aparecen tanto en Stock día como en Stock noche, conservando su posición.
   // Registrar stock: solo insumos cuyo TIPO DE REGISTRO incluya stock,
   // filtrados además por la clasificación de inventario elegida.
+  // Registro de "Stock cierre": para las 22 salsas se ocultan las que NO
+  // tuvieron movimiento (ventas ni producción) en la fecha, y a las visibles se
+  // les muestra el peso esperado. Solo se oculta cuando las ventas del día ya se
+  // cargaron; mientras no, se muestran todas (no se trata "sin datos" como "sin
+  // ventas"). El resto de insumos no cambia.
+  const esNocheCierre = (prodInvFiltro === 'noche');
+  const ventasListas = porcionesListasPara(prodFecha);
   const insumosVista = insumosOrdenados()
     .filter(i=>insumoRegistraStock(i))
-    .filter(i=>insumoEnInventario(i, prodInvFiltro));
+    .filter(i=>insumoEnInventario(i, prodInvFiltro))
+    .filter(i=> !(esNocheCierre && ventasListas && esSalsaCierre(i) && !salsaTuvoMovimiento(i, prodFecha)));
   const filas = insumosVista.length ? insumosVista.map(ins=>{
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
@@ -11997,11 +12005,13 @@ RENDERERS.produccion = function(){
         const editaCie = (t==='noche' || t==='ambos');
         const vIni = stockInicialDe(ins.id, prodFecha);
         const vCie = stockCierreDe(ins.id, prodFecha);
-        const celda=(campo, val, editable)=>`<td class="num"><input type="number" min="0" step="0.01"
+        const celda=(campo, val, editable, extra='')=>`<td class="num"><input type="number" min="0" step="0.01"
           class="prodInput" data-insumo="${ins.id}" data-campo="${campo}"
           value="${val===null?'':val}" placeholder="${editable?'':'—'}"
-          ${editable?'':'disabled title="No editable: la clasificación Inventario de este insumo no incluye este campo" style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"'}></td>`;
-        return celda('stockInicial', vIni, editaIni) + celda('stockCierre', vCie, editaCie);
+          ${editable?'':'disabled title="No editable: la clasificación Inventario de este insumo no incluye este campo" style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"'}>${extra}</td>`;
+        // Peso esperado: solo junto al cierre, en la vista "Stock cierre" y para salsas.
+        const extraCie = (esNocheCierre && esSalsaCierre(ins)) ? pesoEsperadoHTML(ins, prodFecha) : '';
+        return celda('stockInicial', vIni, editaIni) + celda('stockCierre', vCie, editaCie, extraCie);
       })()}
     </tr>`;
   }).join('') : `<tr><td colspan="3" class="empty">No hay insumos en esta clasificación.</td></tr>`;
@@ -12011,6 +12021,9 @@ RENDERERS.produccion = function(){
     <div class="card">
       <h2>Registrar stock</h2>
       <p class="hint" style="margin-top:0">Stock inicial y stock de cierre del día. Los campos editables dependen de la clasificación <b>Inventario</b> de cada insumo; los no editables se muestran atenuados.</p>
+      ${esNocheCierre ? `<p class="hint" style="margin-top:0;border-left:3px solid #5b21b6;padding-left:8px">
+        <b>Stock de cierre de salsas:</b> solo se piden las salsas con <b>movimiento</b> hoy (ventas o producción). Las salsas sin movimiento no aparecen: al <b>Guardar</b>, su cierre se <b>conserva automáticamente</b> del día anterior. Junto a cada salsa se muestra el <b>peso esperado</b> (cierre anterior + producción − consumo estimado por ventas), como referencia.
+        ${ventasListas ? '' : '<br><span style="color:#b45309">⏳ Cargando las ventas del día… se oculta/estima al terminar.</span>'}</p>` : ''}
       <div class="toolbar">
         <div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div>
         <div class="field"><label>Inventario</label>
@@ -12033,6 +12046,20 @@ RENDERERS.produccion = function(){
   document.getElementById('btnGuardarProduccion').onclick = guardarProduccion;
   prodSeccionProduccionBind();
   document.getElementById('btnExportProduccion').onclick = exportarProduccionDiaExcel;
+  // En la vista "Stock cierre" se necesitan las porciones de la fecha y de la
+  // ventana de 1 mes (para el prom. rendimiento). Se usa el MISMO cargador del
+  // Consolidado (vpdCargarPorciones) y el mismo rango (invPorcionesRango), y se
+  // re-renderiza al terminar para ocultar/estimar con datos ya cargados.
+  if(prodInvFiltro==='noche' && isAuthorized()){
+    const RP = invPorcionesRango(prodFecha, prodFecha);
+    const clave = RP.desde+'|'+RP.hasta;
+    if(!vpdEstado.cargando && vpdEstado.rango !== clave){
+      vpdEstado.cargando = true;
+      vpdCargarPorciones(RP.desde, RP.hasta).then(()=>{
+        if(currentPage==='produccion') RENDERERS.produccion();
+      });
+    }
+  }
 };
 /* ── SECCIÓN "REGISTRAR PRODUCCIÓN" (filas dinámicas) ──────────────
    Permite cargar la producción de varios insumos para una misma fecha
@@ -12233,9 +12260,24 @@ async function guardarProduccion(){
     if(!cieVacio) r.stockCierre  = Number(vals.stockCierre);
     guardados++;
   });
-  if(!guardados){ toast('Ingresa al menos un valor de stock inicial o de cierre','error'); return; }
+  // Conservación automática del cierre de salsas sin movimiento. Solo en el
+  // registro de "Stock cierre" y solo si las ventas del día ya se cargaron (para
+  // no conservar por error una salsa que sí vendió). No pide entrada manual ni
+  // duplica registros.
+  let conservados = 0;
+  const ventasListas = porcionesListasPara(prodFecha);
+  if(prodInvFiltro === 'noche' && ventasListas) conservados = conservarSalsasSinMovimiento(prodFecha);
+
+  if(!guardados && !conservados){
+    if(prodInvFiltro === 'noche' && !ventasListas)
+      toast('Aún se están cargando las ventas del día. Espera unos segundos y vuelve a Guardar para conservar el cierre de las salsas sin movimiento.','warn');
+    else
+      toast('Ingresa al menos un valor de stock inicial o de cierre','error');
+    return;
+  }
   save(K.produccion, S.produccion);
-  toast(`Stock guardado (${guardados} insumo(s)).`,'success');
+  toast(`Stock guardado (${guardados} insumo(s))`
+        + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : '') + '.','success');
   RENDERERS.produccion();
   syncProduccion();
   // Refresca el módulo "Alerta de Insumos" si está abierto en otra pestaña/grupo
@@ -12596,6 +12638,107 @@ const CC_PRODUCTOS = ['ACEVICHADO CLÁSICO','ACEVICHADO PICANTE','AJILLO','ANTIC
   'SALVAJE','TERIYAKI DULCE'];
 const CC_SET = new Set(CC_PRODUCTOS.map(vpdNormalizar));
 function insumoAplicaCantConsumida(nombre){ return CC_SET.has(vpdNormalizar(nombre)); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   STOCK DE CIERRE DE SALSAS · optimización del registro (Inv. Producción)
+   ------------------------------------------------------------------------
+   En el selector "Stock cierre" solo se piden las salsas que tuvieron
+   MOVIMIENTO en la fecha (ventas o producción). Las salsas sin movimiento no
+   se piden: su stock de cierre se CONSERVA automáticamente desde el del día
+   anterior (nunca se inventa un valor). Junto al input de cada salsa visible
+   se muestra el PESO ESPERADO de cierre, calculado con los MISMOS datos y
+   funciones del tablero "Consumo y rendimiento" (no hay cálculo paralelo).
+   ════════════════════════════════════════════════════════════════════════ */
+// Las 18 salsas alcanzadas por la regla. La coincidencia es por nombre
+// normalizado (vpdNormalizar: mayúsculas, sin acentos), igual que el resto del
+// módulo de porciones. Esta lista es la única fuente de verdad de "qué es salsa"
+// para este registro; editarla aquí basta para sumar o quitar una.
+const SALSAS_CIERRE = ['ACEVICHADO CLÁSICO','ACEVICHADO PICANTE','AJILLO','ANTICUCHERA',
+  'BBQ CLÁSICA','BBQ PICANTE','BRASA','BÚFALO','CHARAPITA','CHIMICHURRI',
+  'HONEY MUSTARD','LEMON PEPPER','MANGO HABANERO','MARACUYÁ CLÁSICO','MARACUYÁ PICANTE',
+  'PIÑA HABANERA','SALVAJE','TERIYAKI DULCE'];
+const SALSAS_CIERRE_SET = new Set(SALSAS_CIERRE.map(vpdNormalizar));
+function esSalsaCierre(ins){ return !!ins && SALSAS_CIERRE_SET.has(vpdNormalizar(ins.nombre)); }
+
+/* ¿Hay porciones (ventas) cargadas que cubran esta fecha? Sin esto no se puede
+   saber si una salsa tuvo ventas: en ese caso NO se oculta ninguna salsa ni se
+   conserva stock (se evita tratar "sin datos" como "sin ventas"). */
+function porcionesListasPara(fecha){
+  if(!isAuthorized() || vpdEstado.cargando || vpdEstado.error || !vpdEstado.rango) return false;
+  const p = vpdEstado.rango.split('|');
+  return p[0] <= fecha && fecha <= p[1];
+}
+
+/* ¿La salsa tuvo movimiento en la fecha? Movimiento = porciones consumidas
+   (ventas) > 0  O  una producción registrada ese día. Reutiliza porcionesTabla
+   y produccionDe (las mismas fuentes del tablero), sin recalcular nada. */
+function salsaTuvoMovimiento(ins, fecha){
+  if(porcionesTabla(ins.nombre, fecha) > 0) return true;
+  return produccionDe(ins.id, fecha) !== null;
+}
+
+/* Peso esperado de cierre de una salsa en una fecha. Distingue el valor
+   calculable de los casos sin datos suficientes (nunca inventa un 0):
+     { estado:'ok', valor }        calculable
+     { estado:'sin-anterior' }     no hay stock de cierre del día anterior
+     { estado:'sin-rendimiento' }  hubo ventas pero el prom. rendimiento (1 mes) está vacío
+   Fórmula: cierre del día anterior + producción del día − consumo estimado,
+   con consumo estimado = porciones consumidas hoy × prom. rendimiento (1 mes).
+   Producción ausente aporta 0; porciones ausentes dan consumo 0. */
+function pesoEsperadoCierre(ins, fecha){
+  const prev = stockCierreDe(ins.id, fechaMasDias(fecha, -1));
+  if(prev === null) return { estado:'sin-anterior' };
+  const prod = produccionDe(ins.id, fecha);
+  const prodN = (prod === null) ? 0 : prod;
+  const porc = porcionesTabla(ins.nombre, fecha);
+  let consumo = 0;
+  if(porc > 0){
+    const pr = promRendimiento1Mes(ins).prom;
+    if(pr === null || !Number.isFinite(pr)) return { estado:'sin-rendimiento' };
+    consumo = porc * pr;
+  }
+  return { estado:'ok', valor: prev + prodN - consumo };
+}
+
+// Indicador visual del peso esperado, para mostrar junto al input de cierre.
+function pesoEsperadoHTML(ins, fecha){
+  const nd = 'margin-top:4px;font-size:11px;line-height:1.25;font-weight:500;font-style:italic;color:#9ca3af;white-space:normal';
+  if(!porcionesListasPara(fecha))
+    return `<div style="${nd}" title="Aún se están cargando las ventas del día desde Google Sheets.">Esperado: cargando ventas…</div>`;
+  const r = pesoEsperadoCierre(ins, fecha);
+  if(r.estado === 'sin-anterior')
+    return `<div style="${nd}" title="No hay stock de cierre registrado el día anterior; no se puede estimar.">Esperado: — (falta cierre anterior)</div>`;
+  if(r.estado === 'sin-rendimiento')
+    return `<div style="${nd}" title="Hubo ventas, pero el prom. rendimiento (1 mes) está vacío; no se puede estimar el consumo.">Esperado: — (sin rendimiento suficiente)</div>`;
+  const neg = r.valor < 0;
+  const col = neg ? '#b91c1c' : '#5b21b6';
+  const val = Number(r.valor).toLocaleString('es-PE', { maximumFractionDigits:1 });
+  return `<div style="margin-top:4px;font-size:11px;line-height:1.25;font-weight:600;color:${col};white-space:normal"
+    title="Peso esperado = cierre del día anterior + producción del día − (porciones consumidas × prom. rendimiento 1 mes).">Esperado: ${val} ${ins.unidad||''}</div>`;
+}
+
+/* CONSERVACIÓN AUTOMÁTICA del cierre de salsas sin movimiento en la fecha. Fija
+   el stock de cierre del día = stock de cierre del día anterior, SOLO si:
+     · el día anterior tiene un stock de cierre registrado, y
+     · la fecha aún no tiene stock de cierre (no se pisa nada existente).
+   Upsert por (insumo, fecha) sobre S.produccion: nunca duplica. No toca stock
+   inicial ni producción. Devuelve la cantidad de salsas conservadas. El llamador
+   debe asegurar que las ventas del día estén cargadas (porcionesListasPara). */
+function conservarSalsasSinMovimiento(fecha){
+  let n = 0;
+  insumosOrdenados().filter(esSalsaCierre).forEach(ins=>{
+    if(!insumoEnInventario(ins, 'noche')) return;      // sin concepto de cierre
+    if(salsaTuvoMovimiento(ins, fecha)) return;        // tuvo movimiento: se pide a mano
+    if(stockCierreDe(ins.id, fecha) !== null) return;  // ya tiene cierre: no se pisa
+    const prev = stockCierreDe(ins.id, fechaMasDias(fecha, -1));
+    if(prev === null) return;                          // sin anterior: no se inventa
+    let r = getStockReg(ins.id, fecha);
+    if(!r){ r = {id:uid(), insumoId:ins.id, fecha}; S.produccion.push(r); }
+    r.stockCierre = prev;
+    n++;
+  });
+  return n;
+}
 
 /* ── CONSUMO DIARIO: definición ÚNICA de la aplicación ────────────────────
    Disminución de stock entre dos mediciones CONTIGUAS del MISMO tipo, más la
@@ -16355,7 +16498,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-04.2';
+const APP_VERSION = '2026-11-11.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
