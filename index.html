@@ -1399,6 +1399,16 @@ function diffHoras(entrada, salida){
 function diaSemana(fecha){ const [y,m,d]=fecha.split('-').map(Number); return new Date(y,m-1,d).getDay(); }
 // Formato moneda
 const money = (n)=> 'S/ ' + (Number(n)||0).toLocaleString('es-PE',{minimumFractionDigits:2,maximumFractionDigits:2});
+/* Redondeo de DINERO a céntimos, con el medio céntimo siempre hacia arriba en
+   magnitud (4.555 → 4.56; -4.555 → -4.56). El epsilon corrige que un valor como
+   4.555 se guarde en binario como 4.5549999…, que sin corregir redondearía hacia
+   abajo de forma impredecible según el importe. Se usa en los descuentos diarios
+   para que no queden fracciones de céntimo arrastrándose hasta el total. */
+function redondearSoles(x){
+  const n = Number(x) || 0;
+  return Math.round((n + (n >= 0 ? 1e-9 : -1e-9)) * 100) / 100;
+}
+
 const round0 = (n)=> Math.round(Number(n)||0); // redondeo a horas completas
 function fmtFecha(f){ const [y,m,d]=f.split('-'); return `${d}/${m}/${y}`; }
 function fmtFechaCorta(f){ const [,m,d]=f.split('-'); return `${d}/${m}`; } // DD/MM para encabezados compactos
@@ -2093,7 +2103,12 @@ function calcDiaCondicion(emp, fecha){
   // Descuento por falta (ausencia) = horas programadas x sueldo/hora
   const descFalta = esFalta ? horasProg * (emp.sueldoHora||0) : 0;
   const horasDescAuto = hTard + hSal;
-  const descAuto = horasDescAuto * (emp.sueldoHora||0) + descFalta;
+  /* El descuento automático del día se REDONDEA A CÉNTIMOS. Sin esto queda con
+     fracciones de céntimo (media hora de tardanza con sueldo/hora S/ 9.11 da
+     S/ 4.555) que se arrastran hasta el total de la quincena. Se redondea aquí,
+     por día, para que cada importe mostrado sea el que de verdad se descuenta y
+     la suma de los días cuadre con el total. */
+  const descAuto = redondearSoles(horasDescAuto * (emp.sueldoHora||0) + descFalta);
 
   const horasExtra = calcHorasExtra(horasEf, horasProg);
   const pagoExtraHoras = horasExtra * (emp.sueldoHora||0);
@@ -16541,7 +16556,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-11.3';
+const APP_VERSION = '2026-11-12.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
