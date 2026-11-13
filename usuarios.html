@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wingsbox · Usuarios</title>
+<style>
+  :root{
+    --fondo:#faf9f7; --tarjeta:#fff; --texto:#1c1a17; --suave:#6b6660;
+    --borde:#e3dfd9; --acento:#b4472a; --ok:#2f6f4e; --mal:#9a3324; --tenue:#f3f0ec;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --fondo:#171614; --tarjeta:#201e1b; --texto:#f0ece6; --suave:#a39d95;
+      --borde:#332f2b; --acento:#e0714d; --ok:#6fbf8f; --mal:#e08a73; --tenue:#262320;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--fondo);color:var(--texto);padding:24px 16px;
+    font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .envoltura{max-width:900px;margin:0 auto}
+  header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;justify-content:space-between;
+    margin-bottom:6px}
+  h1{font-size:21px;margin:0}
+  .sub{color:var(--suave);font-size:14px;margin:0 0 22px}
+  a{color:var(--acento)}
+  .aviso{padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;
+    border:1px solid var(--borde);background:var(--tarjeta)}
+  .aviso.ok{color:var(--ok)} .aviso.mal{color:var(--mal)}
+  table{width:100%;border-collapse:collapse;background:var(--tarjeta);
+    border:1px solid var(--borde);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--borde);font-size:14px;
+    vertical-align:middle}
+  th{background:var(--tenue);font-weight:600;color:var(--suave);font-size:12.5px;
+    text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  .correo{color:var(--suave);font-size:13px}
+  select,button{font:inherit;font-size:14px;padding:6px 10px;border-radius:8px;
+    border:1px solid var(--borde);background:var(--fondo);color:var(--texto);cursor:pointer}
+  button:disabled,select:disabled{opacity:.45;cursor:not-allowed}
+  .marca{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12.5px;
+    border:1px solid var(--borde)}
+  .marca.si{color:var(--ok)} .marca.no{color:var(--suave)}
+  .yo{font-size:12px;color:var(--suave);margin-left:6px}
+  @media (max-width:620px){
+    thead{display:none}
+    tr{display:block;border-bottom:1px solid var(--borde);padding:8px 0}
+    td{display:flex;justify-content:space-between;gap:12px;border:none;padding:6px 14px}
+    td::before{content:attr(data-eti);color:var(--suave);font-size:12.5px}
+  }
+</style>
+</head>
+<body>
+<div class="envoltura">
+  <header>
+    <h1>Usuarios</h1>
+    <a href="login.html">← Volver</a>
+  </header>
+  <p class="sub">Quién entra al sistema y qué puede ver cada uno</p>
+  <div id="salida">Cargando…</div>
+</div>
+
+<script type="module">
+/* Públicas por diseño: lo que protege los datos son las políticas RLS. */
+const SUPABASE_URL = 'https://ylarfmswevnkzpqqkklg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_tO34kGlfOe9z2WE1t_bgYw_iKWmOGBq';
+
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const core = () => sb.schema('core');
+
+const salida = document.getElementById('salida');
+const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+let yo = null, roles = [];
+
+function avisar(texto, clase){
+  const d = document.createElement('div');
+  d.className = 'aviso ' + (clase || '');
+  d.textContent = texto;
+  salida.prepend(d);
+  setTimeout(()=>d.remove(), 4000);
+}
+
+async function cargar(){
+  const { data:{ session } } = await sb.auth.getSession();
+  if(!session){
+    salida.innerHTML = '<div class="aviso">No has iniciado sesión. <a href="login.html">Entrar</a></div>';
+    return;
+  }
+  yo = session.user.id;
+
+  const [{ data:usuarios, error:eU }, { data:rs, error:eR }] = await Promise.all([
+    core().from('usuarios')
+      .select('id, nombre, email, activo, usuario_rol(rol_id, roles(id, nombre))')
+      .order('nombre'),
+    core().from('roles').select('id, nombre').order('nombre'),
+  ]);
+
+  if(eU || eR){
+    /* Un gerente llega hasta aquí y no ve nada: RLS le deja consultar
+       core.usuarios pero no modificarlo. El mensaje distingue "no tienes
+       permiso" de "algo se rompió", que no es lo mismo para quien lo lee. */
+    salida.innerHTML = `<div class="aviso mal">No se pudo cargar la lista: ${esc((eU||eR).message)}</div>`;
+    return;
+  }
+  roles = rs || [];
+
+  if(!usuarios.length){
+    salida.innerHTML = '<div class="aviso">Todavía no hay usuarios. Aparecen aquí en cuanto inician sesión por primera vez.</div>';
+    return;
+  }
+
+  salida.innerHTML = `
+    <table>
+      <thead><tr><th>Persona</th><th>Estado</th><th>Perfil</th><th></th></tr></thead>
+      <tbody>${usuarios.map(fila).join('')}</tbody>
+    </table>
+    <p class="sub" style="margin-top:14px">
+      Quien inicia sesión por primera vez entra desactivado y sin perfil: no ve nada
+      hasta que se le asigne uno aquí.
+    </p>`;
+
+  salida.querySelectorAll('[data-activar]').forEach(b =>
+    b.onclick = () => cambiarActivo(b.dataset.activar, b.dataset.valor === '1'));
+  salida.querySelectorAll('[data-rol-de]').forEach(s =>
+    s.onchange = () => cambiarRol(s.dataset.rolDe, s.value));
+}
+
+function fila(u){
+  const rolActual = u.usuario_rol?.[0]?.roles?.id || '';
+  const soyYo = u.id === yo;
+  return `<tr>
+    <td data-eti="Persona">
+      <span>${esc(u.nombre)}${soyYo ? '<span class="yo">(tú)</span>' : ''}<br>
+      <span class="correo">${esc(u.email)}</span></span>
+    </td>
+    <td data-eti="Estado">
+      <span class="marca ${u.activo?'si':'no'}">${u.activo?'Activo':'Desactivado'}</span>
+    </td>
+    <td data-eti="Perfil">
+      <select data-rol-de="${esc(u.id)}" ${soyYo?'disabled':''}>
+        <option value="">— sin perfil —</option>
+        ${roles.map(r=>`<option value="${esc(r.id)}" ${r.id===rolActual?'selected':''}>${esc(r.nombre)}</option>`).join('')}
+      </select>
+    </td>
+    <td data-eti="">
+      <button data-activar="${esc(u.id)}" data-valor="${u.activo?'0':'1'}" ${soyYo?'disabled':''}>
+        ${u.activo?'Desactivar':'Activar'}
+      </button>
+    </td>
+  </tr>`;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Los controles de la propia fila van deshabilitados a propósito. Un
+   administrador que se desactive a sí mismo, o que se quite el perfil, pierde
+   el acceso a esta misma pantalla — y si es el único, nadie puede devolvérselo
+   sin entrar al SQL Editor. Es un callejón sin salida fácil de provocar y
+   molesto de deshacer, así que la pantalla simplemente no lo ofrece.
+   ─────────────────────────────────────────────────────────────────────────── */
+async function cambiarActivo(id, valor){
+  if(id === yo) return;
+  const { error } = await core().from('usuarios').update({ activo: valor }).eq('id', id);
+  if(error) return avisar('No se pudo cambiar el estado: ' + error.message, 'mal');
+  avisar(valor ? 'Usuario activado.' : 'Usuario desactivado.', 'ok');
+  cargar();
+}
+
+async function cambiarRol(id, rolId){
+  if(id === yo) return;
+  // Un perfil por persona: se retira el que tenga y se pone el nuevo.
+  const { error: eDel } = await core().from('usuario_rol').delete().eq('usuario_id', id);
+  if(eDel) return avisar('No se pudo cambiar el perfil: ' + eDel.message, 'mal');
+
+  if(rolId){
+    const { error: eIns } = await core().from('usuario_rol')
+      .insert({ usuario_id: id, rol_id: rolId });
+    if(eIns) return avisar('No se pudo asignar el perfil: ' + eIns.message, 'mal');
+  }
+  avisar(rolId ? 'Perfil actualizado.' : 'Perfil retirado.', 'ok');
+  cargar();
+}
+
+cargar();
+</script>
+</body>
+</html>
