@@ -15650,6 +15650,26 @@ function gsMatrixToObjects(values){
   return out;
 }
 
+/* Descarta copias con el MISMO id conservando la PRIMERA. Es la semántica que
+   ya tenía la app: getProduccion() usa Array.find(), que devuelve la primera
+   coincidencia, de modo que el número mostrado siempre fue el de la primera
+   fila. Quedarse con la última cambiaría valores ya vistos y validados (el
+   22/10, PIÑA HABANERA pasaría de 940 a 82). Limpia de una vez las copias que
+   la fusión dejó en la hoja antes de la corrección de gsClaveDe(). */
+function gsDedupPorId(filas, etiqueta){
+  const vistos = new Set(), out = [];
+  let repetidas = 0;
+  (filas||[]).forEach(r=>{
+    const k = String(r && r.id || '');
+    if(k && vistos.has(k)){ repetidas++; return; }
+    if(k) vistos.add(k);
+    out.push(r);
+  });
+  if(repetidas) console.warn('[GS] "'+etiqueta+'": '+repetidas+
+    ' fila(s) con id repetido descartadas al cargar; se conservó la primera de cada una.');
+  return out;
+}
+
 function gsSerializeAll(){
   return {
     Empleados: gsRowsToMatrix(['id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla','sueldoHora','afpComision','ajustePlanilla','horasCierre','fechaIngreso','visible','condiciones'],
@@ -15865,9 +15885,19 @@ const GS_SHEET_KEYS = {
   InvCocina:['productoId','fecha'],
   EfectivoCaja:['fecha']
 };
+/* La clave DEBE calcularse igual a ambos lados de la fusión. El estado local
+   guarda la fecha ya normalizada por normFechaGS(); la hoja puede devolverla
+   como serial numérico o como "22/10/2026" según el locale, porque hay celdas
+   que quedaron con formato de FECHA y no de texto. Sin normalizar aquí, el
+   MISMO registro produce dos claves distintas: la fusión lo cree ausente del
+   estado local y lo "preserva", añadiendo una copia con el mismo id. Así se
+   triplicó el stock de cierre del 22/10 y se duplicó el del 14/08. */
 function gsClaveDe(sheetName, obj){
   const cols = GS_SHEET_KEYS[sheetName] || ['id'];
-  return cols.map(c=>String(obj[c]??'').trim()).join('\u0001');
+  return cols.map(c=>{
+    const v = obj[c];
+    return c === 'fecha' ? normFechaGS(v) : String(v??'').trim();
+  }).join('\u0001');
 }
 /* ══ TOMBSTONES (registros eliminados a propósito) ════════════════════════
    El guardado FUSIONA con el remoto: toda fila que exista en la hoja y no en
@@ -15942,8 +15972,14 @@ gsTombstonesCargar();
 // Lee la hoja remota y devuelve la matriz fusionada con la local.
 // Lanza si la lectura remota falla (para abortar la escritura).
 async function gsFusionarConRemoto(eid, sheetName, matrixLocal){
+  /* Mismas opciones de render que la carga (gsLoadFromSheets). Sin ellas la
+     API devuelve FORMATTED_VALUE y una celda con formato de fecha vuelve como
+     "22/10/2026", mientras que la carga la vio como serial y la normalizó a
+     ISO. Leer igual a ambos lados es la mitad de la simetría; la otra mitad
+     la pone gsClaveDe(). */
   const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+eid+
-    '/values/'+encodeURIComponent(sheetName+'!A:AZ'));
+    '/values/'+encodeURIComponent(sheetName+'!A:AZ')+
+    '?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
   if(r.status===404){ // la hoja aún no existe: nada que fusionar
     return { matrix: matrixLocal, preservados: 0, remotas: 0 };
   }
@@ -16299,14 +16335,14 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         tipoAlerta: r.tipoAlerta, umbral: r.umbral, resaltadoInsumo: r.resaltadoInsumo
       }));
       if(puedeAplicar('Produccion', S.produccion))
-      S.produccion = (byName['Produccion']||[]).map(r=>({
+      S.produccion = gsDedupPorId((byName['Produccion']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
         // Campos legados: se conservan como respaldo del histórico.
         produccion:numOrNull(r.produccion), cierre:numOrNull(r.cierre),
         // Campos vigentes: null si la hoja no los trae (nunca 0 por omisión).
         stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre),
         // Sello de migración: evita recrear producciones ya migradas (y borradas).
-        migradoV2: !!(r.migradoV2 && String(r.migradoV2).toLowerCase()!=='false' && r.migradoV2!=='0') }));
+        migradoV2: !!(r.migradoV2 && String(r.migradoV2).toLowerCase()!=='false' && r.migradoV2!=='0') })), 'Produccion');
       if(puedeAplicar('ProduccionInsumos', S.prodInsumos))
       S.prodInsumos = (byName['ProduccionInsumos']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
@@ -16556,7 +16592,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-12.1';
+const APP_VERSION = '2026-11-12.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
