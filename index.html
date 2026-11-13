@@ -16220,11 +16220,17 @@ function fuenteDatos(){
 }
 const leyendoDeLaBase = () => fuenteDatos() === 'base';
 
+/* Se guarda la PROMESA, no el cliente. La app carga planilla e inventario a
+   la vez, y con un caché del cliente las dos llamadas pasaban el `if` antes
+   de que ninguna terminara: se creaban dos clientes sobre el mismo
+   almacenamiento, que es lo que Supabase advierte con "Multiple GoTrueClient
+   instances". Guardando la promesa, la segunda llamada espera a la primera. */
 let _sbCliente = null;
-async function sbCliente(){
-  if(_sbCliente) return _sbCliente;
-  const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm');
-  _sbCliente = createClient(SB_URL, SB_KEY);
+function sbCliente(){
+  if(!_sbCliente){
+    _sbCliente = import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm')
+      .then(({ createClient }) => createClient(SB_URL, SB_KEY));
+  }
   return _sbCliente;
 }
 
@@ -16348,6 +16354,16 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     const puedeAplicar = (nombreHoja, coleccionLocal)=>{
       const filas = byName[nombreHoja];
       const vacia = !filas || filas.length===0;
+      /* Leyendo de PostgreSQL, "vacío" significa vacío de verdad.
+         La protección existe porque una hoja de cálculo puede volver vacía
+         por un fallo —un Spreadsheet equivocado, un rango mal pedido— y
+         confundir eso con un borrado destruiría datos. Con la base no hay
+         esa ambigüedad: si la consulta falla, el adaptador lanza y no se
+         llega hasta aquí; si llega y no hay filas, es que no hay filas.
+         Conservar lo local aquí sería peor que inútil: la pantalla
+         mostraría datos de Sheets mientras el registro dice que vienen de
+         la base, y no habría forma de saber qué estás mirando. */
+      if(vacia && leyendoDeLaBase()) return true;
       if(vacia && Array.isArray(coleccionLocal) && coleccionLocal.length>0){
         hojasConservadas.push(nombreHoja+' ('+coleccionLocal.length+' registros locales)');
         return false;
@@ -16666,7 +16682,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-13.2';
+const APP_VERSION = '2026-11-13.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
