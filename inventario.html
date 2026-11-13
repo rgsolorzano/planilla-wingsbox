@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wingsbox · Inventario</title>
+<style>
+  :root{
+    --fondo:#faf9f7; --tarjeta:#fff; --texto:#1c1a17; --suave:#6b6660;
+    --borde:#e3dfd9; --acento:#b4472a; --ok:#2f6f4e; --mal:#9a3324;
+    --aviso:#8a6d1f; --tenue:#f3f0ec;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --fondo:#171614; --tarjeta:#201e1b; --texto:#f0ece6; --suave:#a39d95;
+      --borde:#332f2b; --acento:#e0714d; --ok:#6fbf8f; --mal:#e08a73;
+      --aviso:#d9b14e; --tenue:#262320;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--fondo);color:var(--texto);padding:20px 16px 80px;
+    font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .envoltura{max-width:760px;margin:0 auto}
+  header{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;justify-content:space-between}
+  h1{font-size:21px;margin:0}
+  a{color:var(--acento)}
+  .controles{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:16px 0 18px}
+  label{display:block;font-size:12.5px;color:var(--suave);margin-bottom:4px}
+  select,input{font:inherit;font-size:15px;padding:8px 10px;border-radius:9px;
+    border:1px solid var(--borde);background:var(--tarjeta);color:var(--texto)}
+  input[type=number]{width:92px;text-align:right}
+  input.corto{width:72px}
+  .aviso{padding:10px 14px;border-radius:9px;font-size:14px;margin:0 0 14px;
+    border:1px solid var(--borde);background:var(--tarjeta)}
+  .aviso.ok{color:var(--ok)} .aviso.mal{color:var(--mal)} .aviso.ojo{color:var(--aviso)}
+  table{width:100%;border-collapse:collapse;background:var(--tarjeta);
+    border:1px solid var(--borde);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--borde);font-size:14px}
+  th{background:var(--tenue);font-weight:600;color:var(--suave);font-size:12px;
+    text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  td.n{text-align:right}
+  .estado{font-size:12.5px}
+  .estado.ok{color:var(--ok)} .estado.mal{color:var(--mal)} .estado.ojo{color:var(--aviso)}
+  tr.cambiada td{background:color-mix(in srgb, var(--acento) 7%, transparent)}
+  .barra{position:fixed;left:0;right:0;bottom:0;background:var(--tarjeta);
+    border-top:1px solid var(--borde);padding:12px 16px}
+  .barra .dentro{max-width:760px;margin:0 auto;display:flex;gap:12px;
+    align-items:center;justify-content:space-between}
+  button{font:inherit;font-weight:600;padding:10px 18px;border-radius:9px;cursor:pointer;
+    border:1px solid var(--acento);background:var(--acento);color:#fff}
+  button:disabled{opacity:.45;cursor:default}
+  .nota{color:var(--suave);font-size:13px}
+</style>
+</head>
+<body>
+<div class="envoltura">
+  <header><h1>Inventario</h1><a href="login.html">← Volver</a></header>
+  <div class="controles">
+    <div><label for="cat">Categoría</label>
+      <select id="cat">
+        <option value="salon">Salón</option>
+        <option value="menaje">Menaje</option>
+        <option value="cocina">Cocina</option>
+        <option value="licores">Licores</option>
+        <option value="bebidas">Bebidas</option>
+      </select></div>
+    <div><label for="fecha">Fecha</label><input type="date" id="fecha"></div>
+  </div>
+  <div id="salida">Cargando…</div>
+</div>
+<div class="barra"><div class="dentro">
+  <span class="nota" id="resumen"></span>
+  <button id="guardar" disabled>Guardar</button>
+</div></div>
+
+<script type="module">
+const SUPABASE_URL = 'https://ylarfmswevnkzpqqkklg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_tO34kGlfOe9z2WE1t_bgYw_iKWmOGBq';
+
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
+import { crearInventarioLector, crearEscritor, nuevaClave } from './datos-supabase.mjs';
+
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const leer = crearInventarioLector(sb);
+const esc  = crearEscritor(sb);
+
+const $ = id => document.getElementById(id);
+const h = s => String(s ?? '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+const hoy = () => new Date(Date.now() - new Date().getTimezoneOffset()*60000).toISOString().slice(0,10);
+
+/* Qué columnas pide cada categoría. Sale de los datos reales: salón registra
+   la unidad, menaje cuenta rotas y rajadas, el resto solo la cantidad. */
+const COLUMNAS = {
+  salon:   ['cantidad','unidad'],
+  menaje:  ['cantidad','rotas','rajadas'],
+  cocina:  ['cantidad'],
+  licores: ['cantidad'],
+  bebidas: ['cantidad'],
+};
+
+let filas = [];        // {articulo, conteo, borrador, estado}
+let cols = [];
+
+$('fecha').value = hoy();
+$('cat').onchange = cargar;
+$('fecha').onchange = cargar;
+$('guardar').onclick = guardarTodo;
+
+async function cargar(){
+  const { data:{ session } } = await sb.auth.getSession();
+  if(!session){
+    $('salida').innerHTML = '<div class="aviso">No has iniciado sesión. <a href="login.html">Entrar</a></div>';
+    return;
+  }
+  cols = COLUMNAS[$('cat').value];
+  $('salida').innerHTML = '<div class="aviso">Cargando…</div>';
+  try {
+    const datos = await leer($('cat').value, $('fecha').value);
+    filas = datos.map(d => ({ ...d, borrador: valoresDe(d.conteo), estado: null }));
+  } catch(e){
+    $('salida').innerHTML = `<div class="aviso mal">No se pudo cargar: ${h(e.message)}</div>`;
+    return;
+  }
+  pintar();
+}
+
+const valoresDe = c => ({
+  cantidad: c?.cantidad ?? '', unidad: c?.unidad ?? '',
+  rotas: c?.rotas ?? '', rajadas: c?.rajadas ?? '',
+});
+
+/* Una fila cambió si algún campo visible difiere de lo guardado. Solo se
+   envían las cambiadas: así un Guardar no reescribe 114 filas intactas ni
+   provoca conflictos falsos con lo que otra persona esté tocando. */
+function cambiada(f){
+  const g = valoresDe(f.conteo);
+  return cols.some(c => String(f.borrador[c] ?? '') !== String(g[c] ?? ''));
+}
+
+function pintar(){
+  if(!filas.length){
+    $('salida').innerHTML = '<div class="aviso">No hay artículos activos en esta categoría.</div>';
+    $('guardar').disabled = true; $('resumen').textContent = ''; return;
+  }
+  const encabezados = cols.map(c => `<th class="n">${c[0].toUpperCase()+c.slice(1)}</th>`).join('');
+  $('salida').innerHTML = `
+    <table><thead><tr><th>Artículo</th>${encabezados}<th>Estado</th></tr></thead>
+    <tbody>${filas.map((f,i) => {
+      const celdas = cols.map(c => c === 'unidad'
+        ? `<td class="n"><input class="corto" data-i="${i}" data-c="${c}" value="${h(f.borrador[c])}"></td>`
+        : `<td class="n"><input type="number" step="any" data-i="${i}" data-c="${c}" value="${h(f.borrador[c])}"></td>`
+      ).join('');
+      const e = f.estado;
+      return `<tr class="${cambiada(f)?'cambiada':''}">
+        <td>${h(f.articulo.nombre)}</td>${celdas}
+        <td class="estado ${e?.clase||''}">${h(e?.texto||'')}</td></tr>`;
+    }).join('')}</tbody></table>`;
+
+  $('salida').querySelectorAll('input').forEach(inp => {
+    inp.oninput = () => {
+      filas[+inp.dataset.i].borrador[inp.dataset.c] = inp.value;
+      inp.closest('tr').classList.toggle('cambiada', cambiada(filas[+inp.dataset.i]));
+      refrescarBarra();
+    };
+  });
+  refrescarBarra();
+}
+
+function refrescarBarra(){
+  const n = filas.filter(cambiada).length;
+  $('guardar').disabled = n === 0;
+  $('resumen').textContent = n === 0 ? 'Sin cambios por guardar'
+    : `${n} ${n === 1 ? 'artículo modificado' : 'artículos modificados'}`;
+}
+
+async function guardarTodo(){
+  const pendientes = filas.filter(cambiada);
+  $('guardar').disabled = true;
+  $('resumen').textContent = `Guardando ${pendientes.length}…`;
+
+  for(const f of pendientes){
+    /* La clave se genera UNA vez por fila y por intento de guardado del
+       usuario. Si el envío falla por red y se vuelve a dar Guardar, se
+       reutiliza la misma: el servidor reconoce el reintento y no duplica. */
+    f.clave = f.clave || nuevaClave();
+    const r = await esc.guardarConteo({
+      clave: f.clave,
+      articuloId: f.articulo.id,
+      fecha: $('fecha').value,
+      cantidad: Number(f.borrador.cantidad || 0),
+      unidad:  cols.includes('unidad')  ? (f.borrador.unidad || null) : null,
+      rotas:   cols.includes('rotas')   ? num(f.borrador.rotas)   : null,
+      rajadas: cols.includes('rajadas') ? num(f.borrador.rajadas) : null,
+      version: f.conteo?.version ?? null,
+    });
+    aplicar(f, r);
+  }
+  pintar();
+  const malos = filas.filter(f => f.estado && !f.estado.ok).length;
+  $('resumen').textContent = malos
+    ? `${malos} fila(s) necesitan tu atención`
+    : 'Todo guardado.';
+}
+
+function aplicar(f, r){
+  const m = esc.explicar(r);
+  f.estado = { texto: m.texto, clase: m.ok ? 'ok' : (r.estado === 'conflicto' ? 'ojo' : 'mal'), ok: m.ok };
+
+  if(r.estado === 'creado' || r.estado === 'actualizado' || r.estado === 'repetido'){
+    // Se adopta la versión nueva: el siguiente guardado ya parte de ella.
+    f.conteo = { ...(f.conteo||{}), id: r.id, version: r.version, ...numerizar(f.borrador) };
+    f.clave = null;                       // acción terminada: la próxima es otra
+  } else if(r.estado === 'conflicto' && r.actual){
+    /* Alguien más guardó mientras tanto. No se pisa lo suyo ni se descarta lo
+       tuyo: se muestra lo que hay en la base y se te deja decidir. Volver a
+       dar Guardar ahora sí sobrescribe, porque ya viste con qué. */
+    f.conteo = { ...(f.conteo||{}), id: r.id, version: r.version, ...r.actual };
+    f.clave = null;
+    f.estado.texto = `${r.motivo}. Ahora dice ${r.actual.cantidad}. Guarda otra vez para imponer tu valor.`;
+  }
+}
+
+const num = v => (v === '' || v === null || v === undefined) ? null : Number(v);
+const numerizar = b => ({ cantidad: num(b.cantidad), unidad: b.unidad || null,
+                          rotas: num(b.rotas), rajadas: num(b.rajadas) });
+
+cargar();
+</script>
+</body>
+</html>

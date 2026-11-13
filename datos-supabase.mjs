@@ -206,6 +206,74 @@ export function crearLector(consultar){
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   ESCRITURA
+   ---------------------------------------------------------------------------
+   Toda la defensa vive en la base (ver 07_escritura.sql): reintento,
+   concurrencia y permiso. Aquí no se reimplementa nada de eso; esto solo
+   traduce la respuesta a algo que una pantalla pueda mostrar.
+
+   La CLAVE se genera una vez por acción del usuario, no por intento. Es lo
+   que distingue "el usuario quiere guardar dos veces" de "el usuario reintentó
+   lo mismo porque se cortó la conexión". Si se generara en cada envío, el
+   reintento entraría como un guardado nuevo y volveríamos al problema.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+export function nuevaClave(){
+  return (globalThis.crypto?.randomUUID?.())
+      || ('k-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+}
+
+/* Artículos de una categoría junto con el conteo de ese día, si ya existe.
+   Van juntos a propósito: la pantalla necesita la VERSIÓN del conteo para
+   poder guardarlo después. Si se leyeran por separado, entre una consulta y
+   otra alguien podría guardar y la versión llegaría vieja desde el principio. */
+export function crearInventarioLector(sb){
+  return async function leerInventario(categoria, fecha){
+    const [{ data: articulos, error: eA }, { data: conteos, error: eC }] = await Promise.all([
+      sb.schema('core').from('articulos')
+        .select('id, nombre, unidad, categoria, activo').eq('categoria', categoria)
+        .eq('activo', true).order('nombre'),
+      sb.schema('core').from('conteos')
+        .select('id, articulo_id, cantidad, unidad, rotas, rajadas, version, actualizado_por, actualizado_en')
+        .eq('fecha', fecha),
+    ]);
+    if(eA || eC) throw new Error((eA || eC).message);
+    const porArticulo = new Map((conteos || []).map(c => [c.articulo_id, c]));
+    return (articulos || []).map(a => ({ articulo: a, conteo: porArticulo.get(a.id) || null }));
+  };
+}
+
+export function crearEscritor(sb){
+  async function guardarConteo({ clave, articuloId, fecha, cantidad,
+                                 unidad = null, rotas = null, rajadas = null, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_conteo', {
+      p_clave: clave, p_articulo: articuloId, p_fecha: fecha, p_cantidad: cantidad,
+      p_unidad: unidad, p_rotas: rotas, p_rajadas: rajadas, p_version: version,
+    });
+    // Un fallo de red o de la API: ni guardado ni rechazado, no se sabe. El
+    // que reintente con la MISMA clave es exactamente para este caso.
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
+  /* Texto para la pantalla. Se centraliza para que dos pantallas no expliquen
+     el mismo estado de dos formas distintas. */
+  function explicar(r){
+    switch(r?.estado){
+      case 'creado':      return { ok:true,  texto:'Guardado.' };
+      case 'actualizado': return { ok:true,  texto:'Actualizado.' };
+      case 'repetido':    return { ok:true,  texto:'Ya estaba guardado; no se duplicó.' };
+      case 'conflicto':   return { ok:false, texto: r.motivo || 'Hay un conflicto con lo que ya está guardado.' };
+      case 'denegado':    return { ok:false, texto:'No tienes permiso para guardar esto.' };
+      case 'error':       return { ok:false, texto:'No se pudo contactar con el servidor: ' + r.mensaje };
+      default:            return { ok:false, texto:'Respuesta inesperada del servidor.' };
+    }
+  }
+
+  return { guardarConteo, explicar };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    Implementación para el navegador, sobre supabase-js.
    Se pasa el cliente ya creado para que esta pieza no decida credenciales.
    ═══════════════════════════════════════════════════════════════════════════ */
