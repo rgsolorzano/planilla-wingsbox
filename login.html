@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wingsbox · Acceso</title>
+<style>
+  :root{
+    --fondo:#faf9f7; --tarjeta:#fff; --texto:#1c1a17; --suave:#6b6660;
+    --borde:#e3dfd9; --acento:#b4472a; --ok:#2f6f4e; --mal:#9a3324;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --fondo:#171614; --tarjeta:#201e1b; --texto:#f0ece6; --suave:#a39d95;
+      --borde:#332f2b; --acento:#e0714d; --ok:#6fbf8f; --mal:#e08a73;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--fondo);color:var(--texto);
+    font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+  .tarjeta{background:var(--tarjeta);border:1px solid var(--borde);border-radius:14px;
+    padding:28px;max-width:560px;width:100%}
+  h1{font-size:21px;margin:0 0 4px}
+  .sub{color:var(--suave);font-size:14px;margin:0 0 22px}
+  button{font:inherit;font-weight:600;padding:11px 18px;border-radius:9px;cursor:pointer;
+    border:1px solid var(--borde);background:var(--tarjeta);color:var(--texto)}
+  button.principal{background:var(--acento);border-color:var(--acento);color:#fff}
+  button:disabled{opacity:.5;cursor:default}
+  dl{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0 0 20px;font-size:14px}
+  dt{color:var(--suave)}
+  dd{margin:0;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .estado{padding:11px 14px;border-radius:9px;font-size:14px;margin:0 0 18px;
+    border:1px solid var(--borde)}
+  .estado.ok{color:var(--ok)} .estado.mal{color:var(--mal)}
+  .nota{color:var(--suave);font-size:13px;margin-top:18px;padding-top:16px;
+    border-top:1px solid var(--borde)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
+</style>
+</head>
+<body>
+<main class="tarjeta">
+  <h1>Wingsbox</h1>
+  <p class="sub">Acceso al sistema de planilla e inventario</p>
+  <div id="salida"></div>
+</main>
+
+<script type="module">
+/* ───────────────────────────────────────────────────────────────────────────
+   Estas dos constantes son PÚBLICAS por diseño: viajan al navegador de
+   cualquiera que abra la página. Lo que impide que sirvan para ver datos son
+   las políticas RLS de la base, no el secreto de la clave. La clave "secret"
+   de Supabase NUNCA debe aparecer en un archivo como este.
+   ─────────────────────────────────────────────────────────────────────────── */
+const SUPABASE_URL = 'https://ylarfmswevnkzpqqkklg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_tO34kGlfOe9z2WE1t_bgYw_iKWmOGBq';
+
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const salida = document.getElementById('salida');
+const esc = s => String(s ?? '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+
+async function pintar(){
+  const { data:{ session } } = await sb.auth.getSession();
+
+  if(!session){
+    salida.innerHTML = `
+      <p style="margin:0 0 20px">Inicia sesión con la cuenta de Google del restaurante.</p>
+      <button class="principal" id="entrar">Entrar con Google</button>`;
+    document.getElementById('entrar').onclick = async () => {
+      const { error } = await sb.auth.signInWithOAuth({
+        provider: 'google',
+        // Volver a ESTA misma página tras autenticarse.
+        options: { redirectTo: window.location.href.split('#')[0] }
+      });
+      if(error) salida.innerHTML = `<div class="estado mal">${esc(error.message)}</div>`;
+    };
+    return;
+  }
+
+  /* Ya hay sesión. Lo interesante no es el saludo: es comprobar que la base
+     reconoce a este usuario y que, sin rol asignado, no le deja ver nada. */
+  const u = session.user;
+
+  // La ficha que creó el disparador al iniciar sesión por primera vez.
+  const { data: ficha, error: eFicha } =
+    await sb.schema('core').from('usuarios').select('nombre, email, activo').eq('id', u.id).maybeSingle();
+
+  // Prueba de RLS: sin rol, esto debe devolver 0 filas y NINGÚN error.
+  const { count: visibles, error: eInsumos } =
+    await sb.schema('core').from('insumos').select('*', { count:'exact', head:true });
+
+  let estado, clase;
+  if(eFicha){
+    estado = `La base respondió con un error al buscar tu ficha: ${esc(eFicha.message)}`;
+    clase = 'mal';
+  } else if(!ficha){
+    estado = 'La sesión funciona, pero RLS aún no te deja leer tu propia ficha. ' +
+             'Es lo esperado antes de asignarte un rol.';
+    clase = '';
+  } else if(!ficha.activo){
+    estado = 'Tu usuario existe pero está desactivado. Falta asignarle un rol.';
+    clase = '';
+  } else {
+    estado = `Activo. Insumos visibles: ${visibles ?? 0}.`;
+    clase = 'ok';
+  }
+
+  salida.innerHTML = `
+    <div class="estado ${clase}">${estado}</div>
+    <dl>
+      <dt>Correo</dt><dd>${esc(u.email)}</dd>
+      <dt>Id de usuario</dt><dd>${esc(u.id)}</dd>
+      <dt>Ficha en la base</dt><dd>${ficha ? esc(ficha.nombre) : '— no visible —'}</dd>
+      <dt>Insumos visibles</dt><dd>${eInsumos ? esc(eInsumos.message) : (visibles ?? 0)}</dd>
+    </dl>
+    <button id="salir">Cerrar sesión</button>
+    ${ficha && ficha.activo ? '' : `
+    <p class="nota">
+      Para habilitar esta cuenta, corre esto una vez en el SQL Editor de Supabase:<br>
+      <code>select core.asignar_rol('${esc(u.email)}', 'administrador');</code><br>
+      Después recarga esta página.
+    </p>`}`;
+
+  document.getElementById('salir').onclick = async () => {
+    await sb.auth.signOut();
+    location.reload();
+  };
+}
+
+pintar();
+</script>
+</body>
+</html>
