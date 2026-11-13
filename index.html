@@ -2426,9 +2426,7 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
      dentro del período): se paga por horas efectivamente trabajadas, no con
      el sueldo quincenal. Reutiliza el mismo mecanismo del empleado libre. */
   const condRef = condRef0;   // misma condición que rige los importes del tramo
-  // condExtendida ya se hizo cargo del ingreso a mitad de quincena: ese caso
-  // cobra sueldo completo con descuentos, no pago por horas.
-  const motivoParcial = condExtendida ? null : condQuincenaIncompleta(condRef, fechasQ);
+  const motivoParcial = condQuincenaIncompleta(condRef, fechasQ);
   if(motivoParcial){
     const shP = Number(empQ.sueldoHora)||0;
     const sinSH = !(shP > 0);
@@ -16029,6 +16027,17 @@ function gsMatrizValida(sheetName, matrix){
 const GS_BORRADO_MASIVO_MIN = 5;   // se ignora en hojas muy pequeñas
 
 async function gsSaveSheet(domain, sheetName, matrix){
+  /* ── BLOQUEO MIENTRAS SE LEE DE LA BASE ────────────────────────────────
+     Si los datos vinieron de PostgreSQL, escribirlos en el Spreadsheet
+     machacaría la hoja con un estado que no le pertenece, y dejaría las dos
+     fuentes mintiendo cada una por su lado. Peor: el daño no se vería hasta
+     que alguien volviera a Sheets y encontrara sus datos cambiados.
+     El modo de lectura desde la base es, a propósito, de solo lectura. */
+  if(leyendoDeLaBase()){
+    console.warn('[Fuente] Guardado de "'+sheetName+'" BLOQUEADO: la app está leyendo de PostgreSQL.');
+    toast('Estás viendo los datos de la base nueva, en modo solo lectura. Para guardar, vuelve a Google Sheets.','error');
+    return { ok:false, bloqueado:true };
+  }
   /* Guarda de sesión antes de escribir. Solo el fin de sesión de la APP
      impide guardar; un token caducado se renueva aquí mismo, porque un
      guardado es justo el momento en que NO se debe expulsar al usuario.
@@ -16185,6 +16194,65 @@ function syncExoTardGS()   { _syncSheet('planilla','ExoneracionTardanza','ExoTar
    CARGAR desde Google Sheets
    domain: 'planilla' (por defecto, comportamiento sin cambios) o 'inventario'.
    ================================================================ */
+/* ═══════════════════════════════════════════════════════════════════════════
+   INTERRUPTOR DE FUENTE DE DATOS · Sheets ↔ PostgreSQL
+   ---------------------------------------------------------------------------
+   Permite que la app lea de la base nueva sin cambiar NADA de lo que hace
+   después con los datos. El adaptador devuelve las hojas con la misma forma
+   que la API de Google, así que a partir de ese punto el código es el mismo
+   de siempre: la protección de lectura, el mapeo a S.*, los tableros.
+
+   Está en LECTURA por diseño. Mientras el interruptor esté en la base, se
+   bloquea todo guardado: una app que lee de un sitio y escribe en otro
+   corrompe los dos. La escritura se convierte módulo por módulo, y cada uno
+   se habilita cuando su función de guardado está probada.
+
+   Cómo se enciende, desde la consola del navegador:
+     localStorage.wb_fuente = 'base';     location.reload();   // leer de PostgreSQL
+     localStorage.wb_fuente = 'sheets';   location.reload();   // volver a Google Sheets
+   ═══════════════════════════════════════════════════════════════════════════ */
+const SB_URL = 'https://ylarfmswevnkzpqqkklg.supabase.co';
+const SB_KEY = 'sb_publishable_tO34kGlfOe9z2WE1t_bgYw_iKWmOGBq';
+
+function fuenteDatos(){
+  try { return localStorage.getItem('wb_fuente') === 'base' ? 'base' : 'sheets'; }
+  catch(e){ return 'sheets'; }          // modo privado o almacenamiento bloqueado
+}
+const leyendoDeLaBase = () => fuenteDatos() === 'base';
+
+let _sbCliente = null;
+async function sbCliente(){
+  if(_sbCliente) return _sbCliente;
+  const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm');
+  _sbCliente = createClient(SB_URL, SB_KEY);
+  return _sbCliente;
+}
+
+/* Devuelve algo con la misma forma que la respuesta de values:batchGet, para
+   que gsLoadFromSheets siga su curso sin enterarse de la sustitución. */
+async function sbRespuestaDeHojas(domain, hojasPedidas){
+  const sb = await sbCliente();
+  const { data:{ session } } = await sb.auth.getSession();
+  if(!session) throw new Error('No hay sesión en la base. Entra en login.html y vuelve a cargar.');
+
+  const [{ crearLector, consultarConSupabase }, { crearLectorInventario }] = await Promise.all([
+    import('./datos-supabase.mjs'), import('./datos-inventario.mjs')
+  ]);
+  const consultar = consultarConSupabase(sb);
+  const hojas = domain === 'inventario'
+    ? await crearLectorInventario(consultar).leerInventario()
+    : await crearLector(consultar).leerPlanilla();
+
+  console.log('[Fuente] Leyendo de PostgreSQL ('+domain+'). Guardado bloqueado.');
+  return {
+    ok: true, status: 200,
+    json: async () => ({
+      // Solo las hojas que la app pidió, en su mismo formato de rango.
+      valueRanges: hojasPedidas.map(n => ({ range: n+'!A:AZ', values: hojas[n] || [] }))
+    })
+  };
+}
+
 async function gsLoadFromSheets(domain='planilla', opts={}){
   const auto = !!opts.auto; // true = sincronización automática al iniciar sesión (sin diálogo de confirmación)
   if(!isAuthorized()){ if(!auto) toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
@@ -16234,7 +16302,11 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     if(!hojasPedidas.length) throw new Error('El spreadsheet no contiene ninguna de las hojas esperadas del dominio '+domain+'.');
 
     const ranges = hojasPedidas.map(n=>'ranges='+encodeURIComponent(n+'!A:AZ')).join('&');
-    const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
+    /* Único punto donde se decide la fuente. Todo lo que sigue —la protección
+       de lectura, el mapeo a S.*, los tableros— no distingue de dónde vino. */
+    const r = leyendoDeLaBase()
+      ? await sbRespuestaDeHojas(domain, hojasPedidas)
+      : await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
 
     if(!r.ok){
       // Detectar error de autorización específicamente (puede indicar token sin scope correcto)
@@ -16594,7 +16666,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-13.1';
+const APP_VERSION = '2026-11-13.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
