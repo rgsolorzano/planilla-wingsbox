@@ -2426,7 +2426,9 @@ function calcQuincenaBase(emp, year, month, q, fechasSeg, condSeg){
      dentro del período): se paga por horas efectivamente trabajadas, no con
      el sueldo quincenal. Reutiliza el mismo mecanismo del empleado libre. */
   const condRef = condRef0;   // misma condición que rige los importes del tramo
-  const motivoParcial = condQuincenaIncompleta(condRef, fechasQ);
+  // condExtendida ya se hizo cargo del ingreso a mitad de quincena: ese caso
+  // cobra sueldo completo con descuentos, no pago por horas.
+  const motivoParcial = condExtendida ? null : condQuincenaIncompleta(condRef, fechasQ);
   if(motivoParcial){
     const shP = Number(empQ.sueldoHora)||0;
     const sinSH = !(shP > 0);
@@ -16592,7 +16594,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-12.2';
+const APP_VERSION = '2026-11-13.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
