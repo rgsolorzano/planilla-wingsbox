@@ -295,6 +295,47 @@ export function crearEscritor(sb){
     return data;
   }
 
+  /* Catálogos. Dos diferencias con lo anterior, y conviene tenerlas presentes
+     al llamar:
+
+       · La identidad es el id, no el nombre. Por eso renombrar conserva la
+         historia: `id` en null es un alta, con `id` es una edición.
+       · Lo que se manda REEMPLAZA la ficha. La pantalla de catálogo edita el
+         registro completo, así que un campo omitido queda en blanco. Esto es
+         al revés que guardarStock, donde null significa "no lo cambies".
+
+     No hay función de borrado a propósito: retirar un producto es activo
+     false. Sus conteos lo referencian y borrarlo fallaría. */
+  async function guardarArticulo({ clave, id = null, categoria = null, nombre,
+                                   unidad = null, subcategoria = null, tamanoMl = null,
+                                   ozPorBotella = null, stockMinimo = null,
+                                   activo = true, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_articulo', {
+      p_clave: clave, p_id: id, p_categoria: categoria, p_nombre: nombre,
+      p_unidad: unidad, p_subcategoria: subcategoria, p_tamano_ml: tamanoMl,
+      p_oz_botella: ozPorBotella, p_stock_minimo: stockMinimo,
+      p_activo: activo, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
+  async function guardarInsumo({ clave, id = null, nombre, unidad,
+                                 inventario = 'ambos', tipoRegistro = 'ambos',
+                                 orden = null, umbralConsumo = null, umbralMinimo = null,
+                                 alertaConsumo = false, alertaMinimo = false,
+                                 activo = true, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_insumo', {
+      p_clave: clave, p_id: id, p_nombre: nombre, p_unidad: unidad,
+      p_inventario: inventario, p_tipo_registro: tipoRegistro, p_orden: orden,
+      p_umbral_consumo: umbralConsumo, p_umbral_minimo: umbralMinimo,
+      p_alerta_consumo: alertaConsumo, p_alerta_minimo: alertaMinimo,
+      p_activo: activo, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
   /* Texto para la pantalla. Se centraliza para que dos pantallas no expliquen
      el mismo estado de dos formas distintas. */
   function explicar(r){
@@ -309,7 +350,8 @@ export function crearEscritor(sb){
     }
   }
 
-  return { guardarConteo, guardarMovimiento, guardarProduccion, guardarStock, explicar };
+  return { guardarConteo, guardarMovimiento, guardarProduccion, guardarStock,
+           guardarArticulo, guardarInsumo, explicar };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
