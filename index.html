@@ -13360,19 +13360,47 @@ function seedLicores(force){
 }
 function nombreLicor(id){ const b=S.licores.find(x=>x.id===id); return b?b.nombre:'(licor eliminado)'; }
 function ozPorBotella(id){ const b=S.licores.find(x=>x.id===id); return b?b.ozPorBotella:0; }
-// Estructura nueva por registro: { id, bebidaId, fecha, entradaOzs, entradaBots, salidaOzs, salidaBots }
-// La migración desde el formato anterior (momento + onzas + botellas) ocurre en reloadState().
+/* ─── Inventario físico diario de licores ─────────────────────────────────
+   Desde el 16/11/2026 el inventario de licores se toma UNA vez al día y el
+   consumo se deduce comparando dos días seguidos. Ya no se registran entradas
+   y salidas por separado.
+
+   El registro sigue siendo el mismo: { id, bebidaId, fecha, entradaOzs,
+   entradaBots, salidaOzs, salidaBots }. Los campos de ENTRADA pasan a
+   significar el inventario físico del día — que es lo que ya contenían, el
+   conteo con el que abría la jornada — y los de SALIDA dejan de escribirse y
+   dejan de entrar en ningún cálculo.
+
+   No se renombran ni se eliminan: conservar la columna cuesta nada y perder
+   cinco meses de salidas costaría la trazabilidad. La hoja InvLicores
+   mantiene sus siete columnas y los registros viejos quedan intactos. */
 function getInvLicor(licorId, fecha){ return S.invLicores.find(x=>x.bebidaId===licorId && x.fecha===fecha); }
-function invLicorUpsert(licorId, fecha, entradaOzs, entradaBots, salidaOzs, salidaBots){
+
+/* Guarda el inventario físico del día. Las salidas de un registro existente
+   NO se tocan: son historia, y una toma de inventario no las corrige. */
+function invLicorUpsert(licorId, fecha, botellas, onzas){
   let r = getInvLicor(licorId, fecha);
-  if(r){ r.entradaOzs=entradaOzs; r.entradaBots=entradaBots; r.salidaOzs=salidaOzs; r.salidaBots=salidaBots; }
-  else S.invLicores.push({ id:uid(), bebidaId:licorId, fecha, entradaOzs, entradaBots, salidaOzs, salidaBots });
+  if(r){ r.entradaBots=botellas; r.entradaOzs=onzas; }
+  else S.invLicores.push({ id:uid(), bebidaId:licorId, fecha,
+                           entradaOzs:onzas, entradaBots:botellas,
+                           salidaOzs:0, salidaBots:0 });
 }
-// stockLicor ahora recibe el tipo ('entrada'|'salida') para leer los campos correctos del registro.
-function stockLicor(licorId, registro, tipo){
-  if(!registro) return 0;
-  const ozs  = tipo==='salida' ? (registro.salidaOzs||0) : (registro.entradaOzs||0);
-  const bots = tipo==='salida' ? (registro.salidaBots||0) : (registro.entradaBots||0);
+
+/* Inventario físico total de un licor en onzas, o null si ese día no se tomó.
+   null y 0 son cosas distintas: 0 es "no queda nada" y null es "no se contó",
+   y confundirlos inventaría consumos que nadie midió.
+
+   El caso heredado: once registros de junio y del 10/11 traen la entrada en
+   cero y solo la salida llena, porque ese día únicamente se cerró. Un cero
+   que acompaña a una salida no es un conteo, es un campo que nadie llenó, así
+   que esos registros devuelven null. En cambio un registro con todo en cero sí
+   cuenta como inventario cero: es como quedó PISCO GALPON al acabarse. */
+function invFisicoLicor(licorId, registro){
+  if(!registro) return null;
+  const bots = Number(registro.entradaBots)||0;
+  const ozs  = Number(registro.entradaOzs)||0;
+  const sal  = (Number(registro.salidaBots)||0) + (Number(registro.salidaOzs)||0);
+  if(bots===0 && ozs===0 && sal!==0) return null;
   return (bots * ozPorBotella(licorId)) + ozs;
 }
 // Migración automática del formato anterior ({ momento, onzas, botellas }) al nuevo
@@ -13480,16 +13508,16 @@ RENDERERS.invDiarioLicores = function(){
   const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
   const filas = licoresOrdenados.map(b=>{
     const r = getInvLicor(b.id, invLicoresFecha);
+    const inv = invFisicoLicor(b.id, r);
     return `<tr>
       <td>${b.nombre}</td>
-      <td class="num"><input type="number" class="invLicEntOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.entradaOzs?r.entradaOzs:''}" placeholder=""></td>
-      <td class="num"><input type="number" class="invLicEntBot" data-id="${b.id}" min="0" step="1" value="${r&&r.entradaBots?r.entradaBots:''}" placeholder=""></td>
-      <td class="num"><input type="number" class="invLicSalOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.salidaOzs?r.salidaOzs:''}" placeholder=""></td>
-      <td class="num"><input type="number" class="invLicSalBot" data-id="${b.id}" min="0" step="1" value="${r&&r.salidaBots?r.salidaBots:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicBot" data-id="${b.id}" min="0" step="1" value="${r&&r.entradaBots?r.entradaBots:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.entradaOzs?r.entradaOzs:''}" placeholder=""></td>
+      <td class="num" style="color:var(--c-muted)">${inv!==null ? inv.toFixed(1)+' oz' : '&#8212;'}</td>
     </tr>`;
   }).join('');
   el.innerHTML=`
-    <div class="page-head"><div><h1>📋 Inventario Diario de Licores</h1><p>Registra la Entrada y Salida de licores en una sola pantalla. Presiona "Guardar Inventario" para persistir y sincronizar.</p></div></div>
+    <div class="page-head"><div><h1>📋 Inventario Diario de Licores</h1><p>Registra el inventario físico del día: cuántas botellas cerradas y cuántas onzas sueltas hay de cada licor. El consumo se calcula solo, comparando con el día siguiente.</p></div></div>
     <div class="card">
       <div class="form-grid">
         <div class="field"><label>Fecha de inventario</label><input type="date" id="invLicFecha" value="${invLicoresFecha}"></div>
@@ -13500,13 +13528,10 @@ RENDERERS.invDiarioLicores = function(){
       <div class="table-wrap"><table>
         <thead>
           <tr>
-            <th rowspan="2">Licor</th>
-            <th colspan="2" style="text-align:center;background:#e9d5ff;color:#6b21a8">🔓 Entrada</th>
-            <th colspan="2" style="text-align:center;background:#d8b4fe;color:#6b21a8">🔒 Salida</th>
-          </tr>
-          <tr>
-            <th class="num" style="color:#4c1d95">Onzas</th><th class="num" style="color:#4c1d95">Botellas</th>
-            <th class="num" style="color:#4c1d95">Onzas</th><th class="num" style="color:#4c1d95">Botellas</th>
+            <th>Licor</th>
+            <th class="num" style="background:#e9d5ff;color:#4c1d95">Botellas</th>
+            <th class="num" style="background:#e9d5ff;color:#4c1d95">Onzas</th>
+            <th class="num" style="color:#6d28d9">Total</th>
           </tr>
         </thead>
         <tbody>${filas}</tbody>
@@ -13515,7 +13540,7 @@ RENDERERS.invDiarioLicores = function(){
         <button class="btn btn-primary" id="invLicGuardar">💾 Guardar Inventario</button>
         <button class="btn btn-green" id="invLicExport">⬇ Exportar Excel</button>
       </div>
-      <p class="hint">Onzas aceptan decimales; botellas solo enteros. Un único registro por Fecha + Licor; si ya existe se actualizará sin crear duplicados.</p>
+      <p class="hint">Botellas solo enteros; onzas aceptan decimales. <b>Total = (Botellas × Oz por botella) + Onzas</b>. Un único registro por Fecha + Licor; si ya existe se actualizará sin crear duplicados.</p>
     </div>`;
   document.getElementById('invLicFecha').onchange=(e)=>{ invLicoresFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioLicores(); };
   document.getElementById('invLicGuardar').onclick=invLicoresGuardar;
@@ -13524,30 +13549,27 @@ RENDERERS.invDiarioLicores = function(){
 async function invLicoresGuardar(){
   // Validación: onzas admiten decimales ≥0; botellas solo enteros ≥0
   let ok=true;
-  document.querySelectorAll('.invLicEntOz,.invLicSalOz').forEach(inp=>{
+  document.querySelectorAll('.invLicOz').forEach(inp=>{
     const v=inp.value.trim(); const bad=(v!=='' && (isNaN(Number(v))||Number(v)<0));
     inp.classList.toggle('invalid',bad); if(bad) ok=false;
   });
-  document.querySelectorAll('.invLicEntBot,.invLicSalBot').forEach(inp=>{
+  document.querySelectorAll('.invLicBot').forEach(inp=>{
     const v=inp.value.trim(); const bad=(v!=='' && (isNaN(Number(v))||Number(v)<0||!Number.isInteger(Number(v))));
     inp.classList.toggle('invalid',bad); if(bad) ok=false;
   });
   if(!ok){ toast('Onzas deben ser números ≥0 (decimales permitidos); botellas deben ser enteros ≥0','error'); return; }
 
   let guardados=0;
-  document.querySelectorAll('.invLicEntOz').forEach(inp=>{
-    const licorId=inp.dataset.id;
-    const entOzEl =document.querySelector(`.invLicEntOz[data-id="${licorId}"]`);
-    const entBotEl=document.querySelector(`.invLicEntBot[data-id="${licorId}"]`);
-    const salOzEl =document.querySelector(`.invLicSalOz[data-id="${licorId}"]`);
-    const salBotEl=document.querySelector(`.invLicSalBot[data-id="${licorId}"]`);
-    const alguno=[entOzEl,entBotEl,salOzEl,salBotEl].some(el=>el&&el.value.trim()!=='');
-    if(!alguno) return; // fila completamente vacía: no guardar
-    const entOz =entOzEl  ? (entOzEl.value.trim()===''  ? 0 : Number(entOzEl.value))  : 0;
-    const entBot=entBotEl ? (entBotEl.value.trim()==='' ? 0 : Number(entBotEl.value)) : 0;
-    const salOz =salOzEl  ? (salOzEl.value.trim()===''  ? 0 : Number(salOzEl.value))  : 0;
-    const salBot=salBotEl ? (salBotEl.value.trim()==='' ? 0 : Number(salBotEl.value)) : 0;
-    invLicorUpsert(licorId, invLicoresFecha, entOz, entBot, salOz, salBot);
+  document.querySelectorAll('.invLicBot').forEach(botEl=>{
+    const licorId=botEl.dataset.id;
+    const ozEl=document.querySelector(`.invLicOz[data-id="${licorId}"]`);
+    // Fila vacía: no se guarda. Un licor sin conteo debe quedar sin registro,
+    // no registrado en cero, para que el cotejo muestre "—" y no un consumo.
+    const alguno=[botEl,ozEl].some(el=>el&&el.value.trim()!=='');
+    if(!alguno) return;
+    const bot=botEl.value.trim()==='' ? 0 : Number(botEl.value);
+    const oz =ozEl&&ozEl.value.trim()!=='' ? Number(ozEl.value) : 0;
+    invLicorUpsert(licorId, invLicoresFecha, bot, oz);
     guardados++;
   });
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
@@ -13561,9 +13583,10 @@ function invLicoresExportar(){
   const licoresOrdenados=[...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
   const datos=licoresOrdenados.map(b=>{
     const r=getInvLicor(b.id,invLicoresFecha);
+    const inv=invFisicoLicor(b.id,r);
     return { fecha:invLicoresFecha, licor:b.nombre, tamanoMl:b.tamanoMl, ozPorBotella:b.ozPorBotella,
-             entrada_onzas:r?r.entradaOzs:0, entrada_botellas:r?r.entradaBots:0,
-             salida_onzas:r?r.salidaOzs:0, salida_botellas:r?r.salidaBots:0 };
+             botellas:r?r.entradaBots:'', onzas:r?r.entradaOzs:'',
+             inventario_oz: inv!==null ? Number(inv.toFixed(2)) : '' };
   });
   exportarExcelSimple('InvLicores',datos,`inv_licores_${invLicoresFecha}_${excelTimestamp()}.xlsx`);
   toast('Excel de inventario de licores descargado','success');
@@ -13939,11 +13962,29 @@ RENDERERS.alertaInsumos = function(){
   alasCuadreBind();
 };
 
-/* ─── 11C-3: Cotejo de Consumo de Licores ─── */
-// Stock inicial = Entrada de la fecha inicial.
-// Stock final   = Salida de la fecha final.
-// Ya no hay selector de Momento: la Entrada siempre es el inventario inicial
-// y la Salida siempre es el inventario final (nueva estructura del módulo).
+/* ─── 11C-3: Cotejo de Consumo de Licores ───────────────────────────────────
+   El consumo no se registra: se deduce. Lo que se mide cada día es cuánto
+   licor hay, y lo que se bebió entre dos días es la diferencia entre esos dos
+   conteos:
+
+       Consumo del día D = Inventario(D) − Inventario(D+1)
+
+   El consumo aparece en el día al que corresponde, que es el día D: lo que
+   faltaba a la mañana siguiente se bebió durante D. Por eso, para cerrar el
+   último día del rango hay que mirar el inventario del día calendario
+   siguiente, que se consulta pero no se muestra como columna.
+
+       Consumo acumulado = suma de los consumos diarios del rango
+       Consumo total     = Inventario(fecha inicial) − Inventario(fin + 1 día)
+
+   Las dos coinciden cuando están todos los inventarios intermedios, y cuando
+   no coinciden es justamente porque falta alguno: la diferencia entre ambas
+   columnas es información, no un error que convenga tapar.
+
+   Un consumo negativo no se recorta a cero. Significa que al día siguiente
+   había más de lo que había hoy, y eso es un ingreso sin registrar o un
+   conteo mal tomado: algo que alguien tiene que mirar, no que la pantalla
+   deba disimular. */
 /* Mismo período que ANALÍTICA → Cotejos: los últimos 3 días calendario
    completos, hoy excluido. Antes eran "anteayer → hoy" construidos con un
    Date local, que además podía desplazar el día. */
@@ -13955,68 +13996,77 @@ RENDERERS.cotejoLicores = function(){
   const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
   const fechas = rangoFechas(cotejoLicFechaIni, cotejoLicFechaFin);
 
-  // Para cada licor: calcular stock/consumo por día + consumo acumulado + consumo total
+  /* El día posterior al rango: necesario para cerrar el consumo del último
+     día, y nunca visible como columna. */
+  const fechaRef = fechaMasDias(cotejoLicFechaFin, 1);
+
+  // Para cada licor: inventario y consumo por día + acumulado + total
   const filasDatos = licoresOrdenados.map(lic=>{
-    const dias = fechas.map(f=>{
+    // Inventario de cada fecha mostrada y el de la referencia, en onzas.
+    const invDe = f => invFisicoLicor(lic.id, getInvLicor(lic.id, f));
+    const invs  = fechas.map(invDe);
+    const invRef = invDe(fechaRef);
+
+    const dias = fechas.map((f,i)=>{
       const r = getInvLicor(lic.id, f);
-      const sEnt = stockLicor(lic.id, r, 'entrada');
-      const sSal = stockLicor(lic.id, r, 'salida');
-      const tieneEnt = !!r && (r.entradaOzs||r.entradaBots);
-      const tieneSal = !!r && (r.salidaOzs||r.salidaBots);
-      const consumo  = tieneEnt || tieneSal ? sEnt - sSal : null;
-      /* Valores ORIGINALES tal como se registraron, sin convertir botellas a
-         onzas. Solo se usan para mostrar; el consumo sigue calculándose con
-         stockLicor(), que sí totaliza en onzas. */
-      return { sEnt, sSal, consumo, tieneEnt:!!tieneEnt, tieneSal:!!tieneSal,
-        entBot: r ? (r.entradaBots||0) : null, entOz: r ? (r.entradaOzs||0) : null,
-        salBot: r ? (r.salidaBots||0)  : null, salOz: r ? (r.salidaOzs||0)  : null };
+      const inv = invs[i];
+      // El inventario del día siguiente: el de la columna de al lado, o el de
+      // la fecha de referencia cuando este es el último día del rango.
+      const invSig = (i+1 < invs.length) ? invs[i+1] : invRef;
+      const consumo = (inv!==null && invSig!==null) ? inv - invSig : null;
+      /* Botellas y onzas tal como se registraron, sin convertir. Solo para
+         mostrar; el consumo se calcula con el total en onzas. */
+      return { inv, consumo, tieneInv: inv!==null,
+               bot: r ? (r.entradaBots||0) : null,
+               oz:  r ? (r.entradaOzs||0)  : null };
     });
 
-    // Consumo acumulado = SUMA de consumos diarios
-    const acumulado = dias.reduce((s,d)=> d.consumo!==null ? s+d.consumo : s, 0);
-    const tieneAcum = dias.some(d=>d.tieneEnt||d.tieneSal);
+    // Consumo acumulado = suma de los consumos diarios, con su signo. Los días
+    // sin consumo calculable se omiten; no entran como cero.
+    const hayConsumo = dias.some(d=>d.consumo!==null);
+    const acumulado  = hayConsumo ? dias.reduce((s,d)=> d.consumo!==null ? s+d.consumo : s, 0) : null;
+    const tieneAcum  = dias.some(d=>d.tieneInv);
 
-    // Consumo Total = Entrada(fechaIni) - Salida(fechaFin)
-    const rIni = getInvLicor(lic.id, cotejoLicFechaIni);
-    const rFin = getInvLicor(lic.id, cotejoLicFechaFin);
-    const tieneEntIni = !!rIni && (rIni.entradaOzs||rIni.entradaBots);
-    const tieneSalFin = !!rFin && (rFin.salidaOzs||rFin.salidaBots);
-    const sEntIni = tieneEntIni ? stockLicor(lic.id, rIni, 'entrada') : null;
-    const sSalFin = tieneSalFin ? stockLicor(lic.id, rFin, 'salida')  : null;
-    const consumoTotal = (sEntIni!==null && sSalFin!==null) ? sEntIni - sSalFin : null;
+    // Consumo total = Inventario(fecha inicial) − Inventario(día siguiente al final)
+    const invIni = invs.length ? invs[0] : null;
+    const consumoTotal = (invIni!==null && invRef!==null) ? invIni - invRef : null;
 
-    return { lic, dias, acumulado: tieneAcum ? acumulado : null, tieneAcum, consumoTotal, sEntIni, sSalFin };
+    return { lic, dias, acumulado, tieneAcum, consumoTotal, invIni, invRef };
   });
+
+  /* ¿Falta el inventario del día de referencia? Entonces el consumo del
+     último día no se puede calcular y el total del periodo queda incompleto.
+     Se avisa en vez de mostrar un número que parecería completo. */
+  const licoresConDatos = filasDatos.filter(f=>f.tieneAcum);
+  const faltaRef = licoresConDatos.length > 0 && licoresConDatos.every(f=>f.invRef===null);
 
   // Totales por columna de día
   const totDias = fechas.map((_,fi)=>({
-    sEnt:    filasDatos.reduce((s,f)=> f.dias[fi].tieneEnt ? s+f.dias[fi].sEnt : s, 0),
-    sSal:    filasDatos.reduce((s,f)=> f.dias[fi].tieneSal ? s+f.dias[fi].sSal : s, 0),
+    inv:     filasDatos.reduce((s,f)=> f.dias[fi].tieneInv ? s+f.dias[fi].inv : s, 0),
     consumo: filasDatos.reduce((s,f)=> f.dias[fi].consumo!==null ? s+f.dias[fi].consumo : s, 0),
-    hasData: filasDatos.some(f=>f.dias[fi].tieneEnt||f.dias[fi].tieneSal),
+    hasData: filasDatos.some(f=>f.dias[fi].tieneInv),
+    hayConsumo: filasDatos.some(f=>f.dias[fi].consumo!==null),
   }));
   const totAcum = filasDatos.reduce((s,f)=> f.acumulado!==null ? s+f.acumulado : s, 0);
   const totConsumoTotal = filasDatos.reduce((s,f)=> f.consumoTotal!==null ? s+f.consumoTotal : s, 0);
   const hayAlgunConsumoTotal = filasDatos.some(f=>f.consumoTotal!==null);
-  const licoresEvalFmt = filasDatos.filter(f=>f.tieneAcum).length;
+  const licoresEvalFmt = licoresConDatos.length;
 
   // Encabezados: 3 columnas por fecha + Consumo acumulado + Consumo Total
   const DIAS_SEMANA_ES = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
   const hdrFechas = fechas.map(f=>{
     const dow = DIAS_SEMANA_ES[new Date(f+'T12:00:00').getDay()];
-    return `<th colspan="5" class="num" style="text-align:center;background:#ede9fe;border-left:2px solid #c4b5fd;padding:4px 2px">` +
+    return `<th colspan="3" class="num" style="text-align:center;background:#ede9fe;border-left:2px solid #c4b5fd;padding:4px 2px">` +
            `<div style="font-weight:700;font-size:11px">${fmtFechaCorta(f)}</div>` +
            `<div style="font-weight:400;font-size:10px;color:#7c3aed;margin-top:1px">${dow}</div></th>`;
   }).join('');
-  /* Entrada y Salida se desagregan en BOT y OZ mostrando el dato original;
-     Consumo permanece en onzas, con su cálculo intacto. */
+  /* El inventario se muestra tal como se registró, en botellas y onzas
+     sueltas; el consumo va en onzas, que es la unidad en que se compara. */
   const subEst = (extra='')=>`font-size:10px;font-weight:600;white-space:nowrap;background:#f5f3ff;color:#6d28d9;${extra}`;
   const hdrSub = fechas.map(()=>
-    `<th class="num" style="${subEst('border-left:2px solid #c4b5fd')}" title="Entrada: botellas registradas">Ent.<br>bot</th>` +
-    `<th class="num" style="${subEst()}" title="Entrada: onzas registradas">Ent.<br>oz</th>` +
-    `<th class="num" style="${subEst('border-left:1px solid #ddd6fe')}" title="Salida: botellas registradas">Sal.<br>bot</th>` +
-    `<th class="num" style="${subEst()}" title="Salida: onzas registradas">Sal.<br>oz</th>` +
-    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff;border-left:1px solid #ddd6fe" title="Consumo del día en onzas">Consumo<br>oz</th>`
+    `<th class="num" style="${subEst('border-left:2px solid #c4b5fd')}" title="Inventario físico: botellas contadas">Bot.</th>` +
+    `<th class="num" style="${subEst()}" title="Inventario físico: onzas sueltas contadas">Oz</th>` +
+    `<th class="num" style="font-size:10px;font-weight:600;color:#7c3aed;white-space:nowrap;background:#f5f3ff;border-left:1px solid #ddd6fe" title="Consumo del día: inventario de este día menos el del día siguiente">Consumo<br>oz</th>`
   ).join('');
 
   // Estilos de encabezados sticky con colores explícitos (no dependen de herencia)
@@ -14029,10 +14079,8 @@ RENDERERS.cotejoLicores = function(){
     // como fueron registrados, sin conversión alguna.
     const val = v => (v===null || v===undefined) ? '&#8212;' : v;
     const celdas = f.dias.map(d=>
-      `<td class="num" style="border-left:2px solid #e9d5ff">${d.tieneEnt ? val(d.entBot) : '&#8212;'}</td>` +
-      `<td class="num">${d.tieneEnt ? val(d.entOz) : '&#8212;'}</td>` +
-      `<td class="num" style="border-left:1px solid #ede9fe">${d.tieneSal ? val(d.salBot) : '&#8212;'}</td>` +
-      `<td class="num">${d.tieneSal ? val(d.salOz) : '&#8212;'}</td>` +
+      `<td class="num" style="border-left:2px solid #e9d5ff">${d.tieneInv ? val(d.bot) : '&#8212;'}</td>` +
+      `<td class="num">${d.tieneInv ? val(d.oz) : '&#8212;'}</td>` +
       `<td class="num" style="border-left:1px solid #ede9fe;color:${d.consumo!==null&&d.consumo>0?'#059669':d.consumo!==null&&d.consumo<0?'#dc2626':'inherit'}">${d.consumo!==null ? d.consumo.toFixed(1) : '&#8212;'}</td>`
     ).join('');
     const acumCell = f.acumulado!==null
@@ -14041,22 +14089,28 @@ RENDERERS.cotejoLicores = function(){
     const totalCell = f.consumoTotal!==null
       ? `<td class="num" style="font-weight:700;border-left:3px solid #1e1b4b;color:${f.consumoTotal>0?'#059669':f.consumoTotal<0?'#dc2626':'inherit'}">${f.consumoTotal.toFixed(1)} oz</td>`
       : `<td class="num" style="border-left:3px solid #1e1b4b;color:var(--c-muted)">&#8212;</td>`;
-    const sinDatos = !f.tieneAcum && f.dias.every(d=>!d.tieneEnt&&!d.tieneSal);
+    const sinDatos = !f.tieneAcum;
     const cls = sinDatos ? 'row-vac' : '';
     const bg  = sinDatos ? '#f5f3ff' : '#fff';
     return `<tr class="${cls}"><td class="cotejo-col-licor" style="background:${bg}">${f.lic.nombre}</td>${celdas}${acumCell}${totalCell}</tr>`;
-  }).join('') : `<tr><td colspan="${5*fechas.length+3}" class="empty">No hay licores registrados.</td></tr>`;
+  }).join('') : `<tr><td colspan="${3*fechas.length+3}" class="empty">No hay licores registrados.</td></tr>`;
 
-  // Fila Total
+  /* Fila Total. El inventario del día ocupa las dos columnas de Bot. y Oz
+     totalizado en onzas, porque sumar botellas de capacidades distintas no
+     querría decir nada. */
   const totCeldas = totDias.map(t=>
-    `<td class="num" style="border-left:2px solid #c4b5fd">${t.hasData ? t.sEnt.toFixed(1) : '&#8212;'}</td>` +
-    `<td class="num">${t.hasData ? t.sSal.toFixed(1) : '&#8212;'}</td>` +
-    `<td class="num" style="font-weight:700">${t.hasData ? t.consumo.toFixed(1) : '&#8212;'}</td>`
+    `<td class="num" colspan="2" style="border-left:2px solid #c4b5fd">${t.hasData ? t.inv.toFixed(1)+' oz' : '&#8212;'}</td>` +
+    `<td class="num" style="font-weight:700;border-left:1px solid #ede9fe">${t.hayConsumo ? t.consumo.toFixed(1) : '&#8212;'}</td>`
   ).join('');
 
   el.innerHTML = `
     <div class="page-head"><div><h1>&#x1F4CA; Cotejo de Consumo de Licores</h1>
-      <p>Detalle d&#237;a a d&#237;a del stock de entrada, salida y consumo. <b>Consumo acumulado</b>: suma de consumos diarios. <b>Consumo total</b>: Entrada inicial &#8722; Salida final.</p></div></div>
+      <p>Inventario f&#237;sico d&#237;a a d&#237;a y el consumo que se deduce de &#233;l. <b>Consumo del d&#237;a</b>: lo que hab&#237;a ese d&#237;a menos lo que hab&#237;a al siguiente.</p></div></div>
+    ${faltaRef ? `<div class="card" style="border-left:4px solid #f59e0b;background:#fffbeb">
+      <b>&#9888; Falta el inventario del ${fmtFecha(fechaRef)}.</b> Sin &#233;l no se puede calcular el consumo del
+      ${fmtFecha(cotejoLicFechaFin)}, as&#237; que esa columna aparece en gui&#243;n y el consumo total del periodo
+      est&#225; incompleto. Registra el inventario de ese d&#237;a para cerrarlo.
+    </div>` : ''}
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Fecha inicial</label><input type="date" id="cotLicIniF" value="${cotejoLicFechaIni}"></div>
@@ -14065,8 +14119,8 @@ RENDERERS.cotejoLicores = function(){
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       <div class="summary" style="padding:14px 16px;border-bottom:1px solid var(--c-line)">
-        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoLicFechaIni)} &#8212; Entrada</div></div>
-        <div class="item"><div class="l">Inventario final</div><div class="v">${fmtFecha(cotejoLicFechaFin)} &#8212; Salida</div></div>
+        <div class="item"><div class="l">Inventario inicial</div><div class="v">${fmtFecha(cotejoLicFechaIni)}</div></div>
+        <div class="item"><div class="l">Se compara contra</div><div class="v">${fmtFecha(fechaRef)}${faltaRef?' &#8212; sin registro':''}</div></div>
         <div class="item"><div class="l">Licores con datos</div><div class="v">${licoresEvalFmt} de ${licoresOrdenados.length}</div></div>
         <div class="item total"><div class="l">Consumo acumulado total</div><div class="v">${totAcum.toFixed(1)} oz</div></div>
       </div>
@@ -14077,7 +14131,7 @@ RENDERERS.cotejoLicores = function(){
               <th class="cotejo-corner" rowspan="2">Licor</th>
               ${hdrFechas}
               <th rowspan="2" style="${acumHdrStyle}">Consumo<br>acumulado</th>
-              <th rowspan="2" style="${totHdrStyle}">Consumo total<br><span style="font-weight:400;font-size:9px;opacity:.85">(Entrada ini. &#8722; Salida fin.)</span></th>
+              <th rowspan="2" style="${totHdrStyle}">Consumo total<br><span style="font-weight:400;font-size:9px;opacity:.85">(Inv. ${fmtFechaCorta(cotejoLicFechaIni)} &#8722; Inv. ${fmtFechaCorta(fechaRef)})</span></th>
             </tr>
             <tr>${hdrSub}</tr>
           </thead>
@@ -14091,11 +14145,13 @@ RENDERERS.cotejoLicores = function(){
         </table>
       </div>
       <p class="hint" style="padding:8px 14px;margin:0;border-top:1px solid var(--c-line)">
-        <b>Stock = (Botellas &#215; Oz por botella) + Onzas</b> &#183;
-        <b>Consumo diario = Entrada &#8722; Salida del mismo d&#237;a</b> &#183;
-        <b>Consumo acumulado = suma de consumos diarios</b> &#183;
-        <b>Consumo total = Entrada fecha inicial &#8722; Salida fecha final</b>.
-        Filas en gris: sin registros en ninguna fecha del per&#237;odo.
+        <b>Inventario = (Botellas &#215; Oz por botella) + Onzas</b> &#183;
+        <b>Consumo del d&#237;a D = Inventario(D) &#8722; Inventario(D+1)</b> &#183;
+        <b>Consumo acumulado = suma de los consumos diarios</b> &#183;
+        <b>Consumo total = Inventario(${fmtFechaCorta(cotejoLicFechaIni)}) &#8722; Inventario(${fmtFechaCorta(fechaRef)})</b>.
+        Un consumo negativo significa que al d&#237;a siguiente hab&#237;a m&#225;s: ingreso sin registrar o conteo por revisar.
+        Gui&#243;n (&#8212;): falta el inventario de alguno de los dos d&#237;as, y no se asume cero.
+        Filas en gris: sin inventario en ninguna fecha del per&#237;odo.
       </p>
     </div>`;
 
@@ -16682,7 +16738,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-13.3';
+const APP_VERSION = '2026-11-16.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
