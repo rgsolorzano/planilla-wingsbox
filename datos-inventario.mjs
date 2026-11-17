@@ -12,11 +12,13 @@
 
    DOS DECISIONES QUE CONVIENE CONOCER
 
-   1. Los catálogos se devuelven COMPLETOS, incluidos los artículos
-      desactivados. La app vieja no conoce la columna 'activo', así que
-      filtrarlos dejaría conteos históricos apuntando a un artículo que no
-      existe. Las pantallas NUEVAS sí filtran por activo; ahí es donde la
-      desactivación de los duplicados surte efecto.
+   1. Los catálogos incluyen los artículos vigentes MÁS los retirados que
+      todavía guarden conteos o movimientos. La app vieja no conoce la columna
+      'activo'; filtrar solo por ella dejaría conteos históricos apuntando a
+      un artículo que no existe, y devolver el catálogo completo mostraba
+      filas repetidas de productos ya retirados. La regla es la misma para
+      cualquier producto que se retire en el futuro, sin casos especiales.
+      Las pantallas NUEVAS sí filtran solo por activo.
 
    2. Las pestañas Bebidas e InvBebidas se devuelven vacías. Son un catálogo
       de licores abandonado y sus 12 movimientos del 19/06 quedaron fuera de
@@ -47,7 +49,28 @@ export function crearLectorInventario(consultar){
       order: 'nombre',
     });
     const porId = new Map(articulos.map(a => [a.id, a]));
-    const de = cat => articulos.filter(a => a.categoria === cat);
+
+    /* Los dos registros de movimiento se leen aquí arriba, antes de armar los
+       catálogos, porque son ellos los que dicen qué artículo tiene historia.
+       Son consultas independientes: adelantarlas no cambia nada más. */
+    const conteos = (await consultar('conteos', {
+      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas',
+    })).sort(porClaves(r => r.fecha, r => r.id_externo));
+
+    const movimientos = await consultar('movimientos', {
+      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
+    });
+
+    /* Un artículo entra al catálogo si está vigente, o si está retirado pero
+       todavía guarda historia. Lo segundo es lo que evita que un conteo de
+       julio apunte a un artículo que la app no conoce. Y como la fusión de
+       los duplicados de salón dejó las fichas antiguas sin conteos, esas
+       desaparecen por esta misma regla, sin necesidad de nombrarlas. */
+    const conHistoria = new Set();
+    for(const c of conteos) conHistoria.add(c.articulo_id);
+    for(const m of movimientos) conHistoria.add(m.articulo_id);
+    const de = cat => articulos.filter(a =>
+      a.categoria === cat && (a.activo || conHistoria.has(a.id)));
 
     hojas.Licores = [['id','nombre','tamanoMl','ozPorBotella']];
     for(const a of de('licores'))
@@ -77,9 +100,6 @@ export function crearLectorInventario(consultar){
     hojas.Cocina = [['id','nombre','unidad']];
 
     /* ── Conteos: una tabla, cuatro pestañas, según la categoría ────────── */
-    const conteos = (await consultar('conteos', {
-      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas',
-    })).sort(porClaves(r => r.fecha, r => r.id_externo));
     const conteosDe = cat => conteos.filter(c => porId.get(c.articulo_id)?.categoria === cat);
     const ext = c => porId.get(c.articulo_id)?.id_externo ?? '';
 
@@ -105,10 +125,6 @@ export function crearLectorInventario(consultar){
        guarda como dos movimientos, con el id original más ':e' o ':s'. Aquí
        se vuelven a juntar por ese id base, que es justo para lo que se
        guardó con ese sufijo. */
-    const movimientos = await consultar('movimientos', {
-      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
-    });
-
     const filasLic = new Map();
     for(const m of movimientos){
       if(porId.get(m.articulo_id)?.categoria !== 'licores') continue;
