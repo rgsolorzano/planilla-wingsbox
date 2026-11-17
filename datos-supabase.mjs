@@ -256,6 +256,45 @@ export function crearEscritor(sb){
     return data;
   }
 
+  /* Movimientos de artículo: licores, bebidas y cocina.
+
+     Para licores, 'ingreso' es el INVENTARIO FÍSICO del día desde el
+     16/11/2026: botellas cerradas en p_botellas y onzas sueltas en
+     p_cantidad. El consumo no se guarda, se deduce comparando dos días
+     seguidos. Los movimientos de 'salida' anteriores a esa fecha son
+     historia y esta función no los toca. */
+  async function guardarMovimiento({ clave, articuloId, fecha, tipo, cantidad,
+                                     botellas = null, detalle = null, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_movimiento', {
+      p_clave: clave, p_articulo: articuloId, p_fecha: fecha, p_tipo: tipo,
+      p_cantidad: cantidad, p_botellas: botellas, p_detalle: detalle, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
+  async function guardarProduccion({ clave, insumoId, fecha, cantidad, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_produccion', {
+      p_clave: clave, p_insumo: insumoId, p_fecha: fecha,
+      p_cantidad: cantidad, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
+  /* Stock diario. Un campo en null significa "no lo cambies", no "ponlo en
+     null": la pantalla de apertura guarda el inicial sin conocer el cierre y
+     la de cierre al revés. Si null borrara, cada una pisaría a la otra. */
+  async function guardarStock({ clave, insumoId, fecha, inicial = null,
+                                cierre = null, conservado = null, version = null }){
+    const { data, error } = await sb.schema('core').rpc('guardar_stock', {
+      p_clave: clave, p_insumo: insumoId, p_fecha: fecha, p_inicial: inicial,
+      p_cierre: cierre, p_conservado: conservado, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
   /* Texto para la pantalla. Se centraliza para que dos pantallas no expliquen
      el mismo estado de dos formas distintas. */
   function explicar(r){
@@ -270,7 +309,7 @@ export function crearEscritor(sb){
     }
   }
 
-  return { guardarConteo, explicar };
+  return { guardarConteo, guardarMovimiento, guardarProduccion, guardarStock, explicar };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
