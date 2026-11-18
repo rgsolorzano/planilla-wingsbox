@@ -86,9 +86,20 @@ export function crearLectorInventario(consultar){
        Hacerla una columna más cambiaría la forma de la pestaña y la app no
        sabría qué hacer con ella. Pero sin versión no se puede actualizar sin
        pisar a otro: guardar_conteo la exige justamente para eso. */
-    for(const c of conteos)
-      versionConteo.set(claveConteo(porId.get(c.articulo_id)?.id_externo, c.fecha, c.unidad),
-                        c.version);
+    let sinVersion = 0, sinArticulo = 0;
+    for(const c of conteos){
+      const ext = porId.get(c.articulo_id)?.id_externo;
+      if(!ext){ sinArticulo++; continue; }
+      if(c.version === undefined || c.version === null){ sinVersion++; continue; }
+      versionConteo.set(claveConteo(ext, c.fecha, c.unidad), c.version);
+    }
+    /* Si estos números no cuadran, el guardado va a fallar más tarde con un
+       "ya existe un conteo" que no explica nada. Mejor verlo aquí. */
+    if(sinVersion || sinArticulo || versionConteo.size !== conteos.length)
+      console.warn('[Conteos] versiones mapeadas', versionConteo.size, 'de', conteos.length,
+                   '· sin version:', sinVersion, '· sin artículo:', sinArticulo);
+    else
+      console.log('[Conteos] ' + conteos.length + ' conteos leídos, todos con versión.');
 
     const conHistoria = new Set();
     for(const c of conteos) conHistoria.add(c.articulo_id);

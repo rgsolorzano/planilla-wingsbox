@@ -10528,6 +10528,9 @@ RENDERERS.invDiarioSalon = function(){
         const { msg, tipo } = sbExplicarConteos(r, 'Inventario de salón');
         if(!r.ok) await sbRecargarTrasFallo();
         toast(msg, tipo);
+      }catch(e){
+        console.error('[Conteos] salón:', e);
+        toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
       }finally{ btn.disabled=false; btn.textContent=txt; }
     }else{
       syncSalonInventario();
@@ -11233,6 +11236,9 @@ RENDERERS.invDiarioCocina = function(){
            de dejar al usuario creyendo que sí. */
         if(elim) toast('Se quitaron '+elim+' registro(s) en esta pantalla, pero el borrado todavía no está disponible en la base: siguen ahí.','error');
         else toast(msg, tipo);
+      }catch(e){
+        console.error('[Conteos] cocina:', e);
+        toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
       }finally{ btn.disabled=false; btn.textContent=txt; }
     }else{
       syncCocinaInventario();
@@ -11501,6 +11507,9 @@ RENDERERS.invDiarioMenaje = function(){
         const { msg, tipo } = sbExplicarConteos(r, 'Inventario de menaje');
         if(!r.ok) await sbRecargarTrasFallo();
         toast(msg, tipo);
+      }catch(e){
+        console.error('[Conteos] menaje:', e);
+        toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
       }finally{ btn.disabled=false; btn.textContent=txt; }
     }else{
       syncMenajeInventario();
@@ -14702,10 +14711,15 @@ async function stockBebidasGuardar(){
   save(K.stockBebidas,S.stockBebidas);
 
   if(leyendoDeLaBase()){
-    const r=await sbGuardarConteos(cambiadas);
-    const { msg, tipo } = sbExplicarConteos(r, 'Stock de bebidas');
-    if(!r.ok) await sbRecargarTrasFallo();
-    toast(msg, tipo);
+    try{
+      const r=await sbGuardarConteos(cambiadas);
+      const { msg, tipo } = sbExplicarConteos(r, 'Stock de bebidas');
+      if(!r.ok) await sbRecargarTrasFallo();
+      toast(msg, tipo);
+    }catch(e){
+      console.error('[Conteos] bebidas:', e);
+      toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
+    }
   }else{
     toast(`Stock guardado (${guardados} bebida(s)).`,'success');
     const ok2=await gsSaveSheet('inventario','StockBebidas',gsSerializeSheet('inventario','StockBebidas'));
@@ -16485,6 +16499,10 @@ async function sbGuardarConteos(celdas){
 
   for(const c of celdas){
     const articuloId = _sbLectorInv.uuidDe(c.productoId);
+    const version = _sbLectorInv.versionDe(c.productoId, c.fecha, c.unidad);
+    if(version === null)
+      console.warn('[Conteos] sin versión conocida para', c.productoId, c.fecha, c.unidad,
+                   '· se mandará como fila nueva');
     if(!articuloId){
       res.incidencias.push({ celda:c, estado:'desconocido',
         motivo:'ese artículo no existe en la base' });
@@ -16494,7 +16512,7 @@ async function sbGuardarConteos(celdas){
       clave: accion + ':' + c.productoId + ':' + (c.unidad || ''),
       articuloId, fecha: c.fecha, cantidad: c.cantidad,
       unidad: c.unidad || null, rotas: c.rotas ?? null, rajadas: c.rajadas ?? null,
-      version: _sbLectorInv.versionDe(c.productoId, c.fecha, c.unidad),
+      version,
     });
 
     if(r.estado === 'creado' || r.estado === 'actualizado'){
@@ -16505,7 +16523,7 @@ async function sbGuardarConteos(celdas){
     }else if(r.estado === 'repetido'){
       res.repetidos++;
     }else{
-      console.warn('[Conteos] no se guardó', c, r);
+      console.warn('[Conteos] no se guardó', { celda:c, versionEnviada:version, respuesta:r });
       res.incidencias.push({ celda:c, estado:r.estado,
         motivo:r.motivo || r.mensaje || 'sin detalle' });
       res.ok = false;
@@ -16987,7 +17005,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.5';
+const APP_VERSION = '2026-11-17.6';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
