@@ -12435,7 +12435,7 @@ RENDERERS.insumos = function(){
         `).join('') : `<tr><td colspan="13" class="empty">No hay insumos. Crea el primero arriba.</td></tr>`}</tbody>
       </table></div>
       ${S.insumos.length? `<div class="actions"><button class="btn btn-primary" id="insActualizar">💾 Actualizar</button></div>
-      <p class="hint">Guarda y sincroniza con Google Sheets todos los cambios de configuración realizados arriba.</p>` : ''}
+      <p class="hint">Guarda y sincroniza la configuración de esta tabla: clasificación, umbrales y alertas. El nombre y la unidad se guardan solos al darle a <b>Guardar</b> en el formulario, y el orden al moverlo con las flechas.</p>` : ''}
     </div>`;
   document.getElementById('insSave').onclick = insumoSave;
   document.getElementById('insClear').onclick = ()=>{ editInsumoId=null; RENDERERS.insumos(); };
@@ -12462,10 +12462,37 @@ function insumosBindUmbrales(){
     };
   });
 }
+// El orden ya se sincroniza dentro de insumoMover(), con syncInsumos().
 window.insumoSubir = function(id){ if(insumoMover(id,-1)) RENDERERS.insumos(); };
 window.insumoBajar = function(id){ if(insumoMover(id, 1)) RENDERERS.insumos(); };
 
-function insumoSave(){
+/* ─── Guardar tiene que significar guardar ───────────────────────────────
+   Hasta el 17/11/2026, crear, renombrar, eliminar o reordenar un insumo solo
+   escribía en localStorage. El cambio se veía en pantalla y nunca llegaba al
+   Spreadsheet, porque la sincronización vivía ÚNICAMENTE en el botón
+   "Actualizar" de la tabla de abajo, pensado para la configuración de
+   alertas. Nada en la pantalla lo decía.
+
+   Así se perdió el renombre de SALCHICHA VIENESSA a (Bolsa) y (Pqt): quedó
+   guardado en el navegador, se corrigió a mano en la base, y el Spreadsheet
+   siguió con los dos nombres iguales hasta que el cotejo lo encontró.
+
+   Ahora cada acción guarda y sincroniza, y dice cuál de las dos cosas pasó. */
+async function insumosGuardarYSincronizar(hecho){
+  save(K.insumos, S.insumos);
+  /* Se usa la variante CONFIRMADA, no syncInsumos(). syncInsumos() dispara y
+     se olvida: manda la escritura y se traga el error en la consola, que está
+     bien para el reordenado pero no aquí. Si un renombre no llega a la hoja,
+     el usuario tiene que enterarse en el momento, no tres semanas después al
+     cotejar. */
+  const r = await _syncSheetConfirmado('inventario','Insumos','Insumos');
+  toast(r.ok ? hecho + ' y sincronizado'
+             : hecho + ' en este dispositivo, pero NO llegó a Google Sheets: ' + r.motivo,
+        r.ok ? 'success' : 'error');
+  return r.ok;
+}
+
+async function insumoSave(){
   const nombre = document.getElementById('insNombre').value.trim();
   const unidad = document.getElementById('insUnidad').value.trim();
   let ok = true;
@@ -12476,7 +12503,8 @@ function insumoSave(){
     // Solo actualiza nombre y unidad; la configuración de alertas se cambia
     // en la tabla y se guarda con "Actualizar".
     Object.assign(i, { nombre, unidad });
-    save(K.insumos, S.insumos); editInsumoId=null; toast('Insumo actualizado','success');
+    editInsumoId=null;
+    await insumosGuardarYSincronizar('Insumo actualizado');
   }else{
     // Nuevo insumo: alerta por consumo activada por defecto (comportamiento histórico).
     // Clasificación obligatoria por defecto y alta al FINAL del orden global,
@@ -12488,7 +12516,7 @@ function insumoSave(){
       resaltadoCelda:true,
       inventario:'dia', tipoRegistro:'ambos', orden:S.insumos.length,
       alertaRendimiento:true, rendMin:RENDIMIENTO_MIN_DEF, rendMax:RENDIMIENTO_MAX_DEF });
-    save(K.insumos, S.insumos); toast('Insumo creado','success');
+    await insumosGuardarYSincronizar('Insumo creado');
   }
   RENDERERS.insumos();
 }
@@ -12558,13 +12586,12 @@ async function insumosActualizarResaltados(){
   }
 }
 window.insumoEdit = function(id){ editInsumoId=id; RENDERERS.insumos(); window.scrollTo({top:0,behavior:'smooth'}); };
-window.insumoDel = function(id){
+window.insumoDel = async function(id){
   if(!confirm('¿Eliminar este insumo? Los registros históricos de producción ya guardados no se eliminan, pero ya no podrás registrar nueva producción para él.')) return;
   if(editInsumoId===id) editInsumoId=null;
   gsMarcarEliminado('Insumos', {id});
   S.insumos = S.insumos.filter(i=>i.id!==id);
-  save(K.insumos, S.insumos);
-  toast('Insumo eliminado','warn');
+  await insumosGuardarYSincronizar('Insumo eliminado');
   RENDERERS.insumos();
   if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
 };
@@ -16092,7 +16119,14 @@ async function gsSaveSheet(domain, sheetName, matrix){
   if(leyendoDeLaBase()){
     console.warn('[Fuente] Guardado de "'+sheetName+'" BLOQUEADO: la app está leyendo de PostgreSQL.');
     toast('Estás viendo los datos de la base nueva, en modo solo lectura. Para guardar, vuelve a Google Sheets.','error');
-    return { ok:false, bloqueado:true };
+    /* Devuelve false, no un objeto. Antes devolvía { ok:false, bloqueado:true },
+       que en JavaScript es VERDADERO: los once sitios que llaman aquí hacen
+       `const ok = await gsSaveSheet(...)` y luego `if(ok)`, así que todos
+       anunciaban "sincronizado correctamente" justo cuando el guardado había
+       quedado bloqueado. Nadie leía nunca el campo .bloqueado, de modo que el
+       objeto no aportaba nada y sí hacía daño. El aviso al usuario ya lo da
+       el toast de arriba. */
+    return false;
   }
   /* Guarda de sesión antes de escribir. Solo el fin de sesión de la APP
      impide guardar; un token caducado se renueva aquí mismo, porque un
@@ -16738,7 +16772,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-16.1';
+const APP_VERSION = '2026-11-17.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
