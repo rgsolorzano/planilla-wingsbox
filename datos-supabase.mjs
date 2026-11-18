@@ -437,8 +437,21 @@ export function consultarConSupabase(sb){
       return r.data;
     };
 
+    /* Medición. Llevamos dos intentos de acelerar la carga guiados por
+       suposiciones —primero los viajes de ida y vuelta, luego las reglas de
+       seguridad— y ninguno de los dos era el cuello. Así que ahora cada
+       consulta dice cuánto tardó y cuántas filas trajo, y se decide con eso
+       delante. */
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    let peticiones = 1;
+    const reporta = (n) => {
+      const ms = Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0);
+      console.log(`[Carga] ${tabla}: ${ms} ms · ${n} fila(s) · ${peticiones} petición(es)`
+        + ` · ${peticiones > 1 ? Math.round(ms/peticiones) + ' ms por petición' : ''}`);
+    };
+
     const filas = datos(await pide(0));
-    if(filas.length < TRAMO) return filas;        // cabía entero
+    if(filas.length < TRAMO){ reporta(filas.length); return filas; }   // cabía entero
 
     if(!order)
       throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
@@ -449,6 +462,7 @@ export function consultarConSupabase(sb){
       const tanda = [];
       for(let k = 0; k < A_LA_VEZ; k++) tanda.push(pide(desde + k * TRAMO));
       let completa = true;
+      peticiones += A_LA_VEZ;
       for(const r of await Promise.all(tanda)){
         const d = datos(r);
         filas.push(...d);
@@ -460,6 +474,7 @@ export function consultarConSupabase(sb){
       }
       if(!completa) break;
     }
+    reporta(filas.length);
     return filas;
   };
 }
