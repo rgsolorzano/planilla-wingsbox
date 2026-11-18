@@ -317,6 +317,10 @@ export function crearLectorInventario(consultar){
     leerInventario,
     /* Lo que la escritura necesita y la hoja reconstruida no puede llevar. */
     uuidDe: idExterno => uuidPorExterno.get(idExterno) || null,
+    /* ¿Llegó a leerse algo? Si una consulta se pasó del tiempo límite, el
+       traductor queda vacío y conviene distinguir "no existe ese artículo" de
+       "no hay datos", que mandan a buscar en sitios muy distintos. */
+    tieneCatalogo: () => uuidPorExterno.size > 0,
     versionDe: (idExterno, fecha, unidad) =>
       versionConteo.get(claveConteo(idExterno, fecha, unidad)) ?? null,
     versionStockDe: (idExterno, fecha) => versionStock.get(idExterno + '|' + fecha) ?? null,

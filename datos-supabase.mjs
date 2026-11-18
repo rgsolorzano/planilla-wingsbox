@@ -403,72 +403,62 @@ export function crearEscritor(sb){
 export function consultarConSupabase(sb){
   return async function consultar(tabla, { select, order, igual } = {}){
     /* PostgREST devuelve como mucho 1,000 filas por respuesta y seis tablas ya
-       pasan de eso, así que hay que pedirlas por tramos.
-
-       Dos cuidados, los dos aprendidos a golpes:
+       pasan de eso, así que hay que pedirlas por tramos. Tres cosas que costó
+       aprender, cada una de un fallo distinto:
 
        · Paginar SIN un orden estable no está definido. PostgreSQL puede
          devolver las filas en distinto orden en cada consulta, y entonces
          entre un tramo y el siguiente unas se repiten y otras no aparecen
          nunca. El daño es silencioso: la app recibe una hoja incompleta sin un
-         solo error. Pasó, y solo se notó al guardar. Por eso un segundo tramo
-         sin orden es un error en voz alta.
+         solo error, y solo se nota al guardar. Por eso un segundo tramo sin
+         orden es un error en voz alta.
 
-       · Pedir los tramos de uno en uno cuesta un viaje de ida y vuelta cada
-         vez: con 6,012 conteos, siete viajes seguidos para una sola tabla. El
-         primer tramo se pide YA CON el censo —PostgREST lo devuelve en la
-         misma respuesta— y con ese número los tramos que faltan se piden
-         todos a la vez. Dos viajes en lugar de siete, sin preguntar dos
-         veces. */
+       · Pedirlos de uno en uno cuesta un viaje de ida y vuelta cada vez: con
+         6,012 conteos, siete viajes seguidos para una sola tabla.
+
+       · Y preguntar CUÁNTOS hay para pedirlos de golpe —que fue el primer
+         intento— tampoco sirve: un count exacto recorre la tabla entera
+         aplicando las reglas de seguridad fila por fila, y en conteos se pasa
+         del tiempo límite del servidor. La consulta muere y con ella la carga.
+
+       Así que no se pregunta: se piden varios tramos A LA VEZ y se para en
+       cuanto uno viene corto, que es la señal de que no queda nada. Misma
+       ventaja que el censo y sin consulta cara. */
     const TRAMO = 1000;
-    const pide = (desde, opts) => {
-      let q = sb.schema('core').from(tabla).select(select, opts);
+    const A_LA_VEZ = 6;
+    const pide = (desde) => {
+      let q = sb.schema('core').from(tabla).select(select);
       if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
       if(order) q = q.order(order);
       return q.range(desde, desde + TRAMO - 1);
     };
+    const datos = (r) => {
+      if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+      return r.data;
+    };
 
-    // El primer tramo trae los datos y, de paso, cuántas filas hay en total.
-    const primero = await pide(0, { count: 'exact' });
-    if(primero.error) throw new Error(`${tabla}: ${primero.error.message}`);
-    if(primero.data.length < TRAMO) return primero.data;   // cabía entero
+    const filas = datos(await pide(0));
+    if(filas.length < TRAMO) return filas;        // cabía entero
 
     if(!order)
       throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
         + 'pero no se pidió ningún orden. Sin un orden único la paginación '
         + 'se salta filas. Añade order a esta consulta.');
 
-    const filas = primero.data.slice();
-    const total = typeof primero.count === 'number' ? primero.count : null;
-
-    if(total !== null){
-      const pendientes = [];
-      for(let desde = TRAMO; desde < total; desde += TRAMO) pendientes.push(pide(desde));
-      const tandas = await Promise.all(pendientes);
-      for(const r of tandas){
-        if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
-        filas.push(...r.data);
+    for(let desde = TRAMO; ; desde += TRAMO * A_LA_VEZ){
+      const tanda = [];
+      for(let k = 0; k < A_LA_VEZ; k++) tanda.push(pide(desde + k * TRAMO));
+      let completa = true;
+      for(const r of await Promise.all(tanda)){
+        const d = datos(r);
+        filas.push(...d);
+        /* Un tramo corto cierra la tabla. Los que se pidieron después en la
+           misma tanda vienen vacíos y no aportan nada, así que se descartan:
+           seguir concatenándolos daría igual, pero parar aquí deja claro que
+           la lista termina donde terminan los datos. */
+        if(d.length < TRAMO){ completa = false; break; }
       }
-      /* El censo se midió al pedir el primer tramo. Si alguien insertó
-         mientras tanto, la cola quedaría fuera; solo se sigue pidiendo si el
-         último tramo vino lleno, que es la única señal de que puede faltar
-         algo. Lo normal es no entrar aquí. */
-      const ultimo = tandas.length ? tandas[tandas.length - 1] : primero;
-      if(ultimo.data.length === TRAMO)
-        for(let desde = filas.length; ; desde += TRAMO){
-          const r = await pide(desde);
-          if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
-          filas.push(...r.data);
-          if(r.data.length < TRAMO) break;
-        }
-    }else{
-      // Sin censo: de uno en uno, más lento pero siempre correcto.
-      for(let desde = TRAMO; ; desde += TRAMO){
-        const r = await pide(desde);
-        if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
-        filas.push(...r.data);
-        if(r.data.length < TRAMO) break;
-      }
+      if(!completa) break;
     }
     return filas;
   };

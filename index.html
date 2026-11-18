@@ -16576,6 +16576,13 @@ async function sbGuardarConteos(celdas){
     return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
   if(!celdas.length) return { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
 
+  /* Si la lectura del inventario falló —por ejemplo, una consulta que se
+     pasó del tiempo límite— el traductor de ids queda vacío. Entonces TODO
+     parecería inexistente, y acusar a cada artículo de no existir manda a
+     buscar el problema donde no está. */
+  if(!_sbLectorInv.uuidDe('__hay_datos__') && !_sbLectorInv.tieneCatalogo())
+    return { ok:false, motivo:'no se pudieron cargar los datos del inventario. Recarga la página e inténtalo de nuevo.' };
+
   const escritor = await sbEscritor();
   /* Una clave por ACCIÓN del usuario. Las de cada celda cuelgan de ella, así
      que reintentar el mismo clic reencuentra exactamente las mismas claves y
@@ -16640,6 +16647,13 @@ async function sbBorrarConteos(celdas){
     return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
   if(!celdas.length) return { ok:true, borrados:0, ausentes:0, repetidos:0, incidencias:[] };
 
+  /* Si la lectura del inventario falló —por ejemplo, una consulta que se
+     pasó del tiempo límite— el traductor de ids queda vacío. Entonces TODO
+     parecería inexistente, y acusar a cada artículo de no existir manda a
+     buscar el problema donde no está. */
+  if(!_sbLectorInv.uuidDe('__hay_datos__') && !_sbLectorInv.tieneCatalogo())
+    return { ok:false, motivo:'no se pudieron cargar los datos del inventario. Recarga la página e inténtalo de nuevo.' };
+
   const escritor = await sbEscritor();
   const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
   const res = { ok:true, borrados:0, ausentes:0, repetidos:0, incidencias:[] };
@@ -16684,6 +16698,13 @@ async function sbGuardarStock(celdas){
   if(!_sbLectorInv)
     return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
   if(!celdas.length) return { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  /* Si la lectura del inventario falló —por ejemplo, una consulta que se
+     pasó del tiempo límite— el traductor de ids queda vacío. Entonces TODO
+     parecería inexistente, y acusar a cada artículo de no existir manda a
+     buscar el problema donde no está. */
+  if(!_sbLectorInv.uuidDe('__hay_datos__') && !_sbLectorInv.tieneCatalogo())
+    return { ok:false, motivo:'no se pudieron cargar los datos del inventario. Recarga la página e inténtalo de nuevo.' };
 
   const escritor = await sbEscritor();
   const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
@@ -17192,7 +17213,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-18.3';
+const APP_VERSION = '2026-11-18.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
