@@ -1461,7 +1461,27 @@ function sesGuardActividad(){
   return true;
 }
 
-function goto(page){
+/* Pantallas con formulario que pueden tener algo escrito sin guardar. Un
+   repintado automático las reconstruye desde los datos guardados y se lleva
+   por delante lo que la persona estaba escribiendo: pasó dos veces con el
+   stock de cierre de Producción, que desaparecía solo. Un refresco en segundo
+   plano no vale lo que vale un dato a medio escribir. */
+const EDICION_EN_CURSO = {
+  produccion: () => typeof prodHayCambiosSinGuardar === 'function' && prodHayCambiosSinGuardar(),
+};
+function hayEdicionEnCurso(page){
+  try{ return !!(EDICION_EN_CURSO[page] && EDICION_EN_CURSO[page]()); }
+  catch(e){ return false; }
+}
+
+/* refresco: lo llama una carga que terminó en segundo plano, no el usuario.
+   Si la pantalla tiene algo a medio escribir, se deja como está. */
+function goto(page, { refresco = false } = {}){
+  if(refresco && page === currentPage && hayEdicionEnCurso(page)){
+    console.log('[Render] Repintado pospuesto: hay datos sin guardar en "'+page+'".');
+    gsUpdateSyncStatus('Se cargaron datos nuevos. Guarda lo que tienes escrito para verlos.','warn');
+    return;
+  }
   // Cada cambio de módulo revalida la sesión: navegar ya no da una falsa
   // sensación de sesión activa tras una suspensión prolongada.
   sesGuardActividad();
@@ -17137,7 +17157,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     console.log('[Sync] Carga completada. '+resumen+' | total filas GS: '+totalRows+' | '+(Date.now()-t0)+'ms');
     if(!auto) toast('Datos cargados desde Google Sheets ('+resumen+')','success');
     gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
-    goto(currentPage);
+    goto(currentPage, { refresco:true });
   }catch(err){
     console.error(err);
     if(auto){
@@ -17172,7 +17192,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-18.2';
+const APP_VERSION = '2026-11-18.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
