@@ -12425,10 +12425,20 @@ async function guardarProduccion(){
   });
   if(!ok){ toast('Los valores deben ser numéricos y no negativos','error'); return; }
 
-  let guardados = 0;
+  let guardados = 0, limpiados = 0;
   Object.entries(porInsumo).forEach(([insumoId, vals])=>{
     const iniVacio = vals.stockInicial===undefined || vals.stockInicial==='';
     const cieVacio = vals.stockCierre===undefined || vals.stockCierre==='';
+    /* Vaciar una casilla que tenía valor no lo borra: guardar_stock entiende
+       un campo vacío como "déjalo como estaba", que es lo que permite que la
+       pantalla de apertura y la de cierre no se pisen. El efecto es que el
+       valor reaparece al repintar, y en silencio eso parece un fallo. Se
+       cuenta para poder decirlo. */
+    const prev = getStockReg(insumoId, prodFecha);
+    if(prev){
+      if(iniVacio && prev.stockInicial !== null && prev.stockInicial !== undefined) limpiados++;
+      if(cieVacio && prev.stockCierre  !== null && prev.stockCierre  !== undefined) limpiados++;
+    }
     if(iniVacio && cieVacio) return; // fila vacía: no se crea/actualiza registro
     // Upsert por (insumo, fecha) sobre el registro de STOCK. Un campo vacío se
     // guarda como null (dato inexistente), NUNCA como 0.
@@ -12445,6 +12455,10 @@ async function guardarProduccion(){
   let conservados = 0;
   const ventasListas = porcionesListasPara(prodFecha);
   if(prodInvFiltro === 'noche' && ventasListas) conservados = conservarSalsasSinMovimiento(prodFecha);
+
+  if(limpiados)
+    toast('Vaciar una casilla todavía no borra el valor guardado: ese dato sigue en la base y '
+          + 'vuelve a aparecer al refrescar. Si hay que quitarlo, dilo y se añade el borrado.','warn');
 
   if(!guardados && !conservados){
     if(prodInvFiltro === 'noche' && !ventasListas)
@@ -16790,6 +16804,79 @@ function sbExplicarConteos(r, etiqueta){
   return { msg: etiqueta + resumen + ', pero ' + detalle, tipo:'error' };
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   PANTALLA DE CARGA
+   -----------------------------------------------------------------------
+   Mientras los datos se están trayendo, la app enseña los módulos vacíos o a
+   medio llenar y deja escribir en ellos. Eso ya costó un dato perdido: se
+   escribía un stock de cierre, terminaba la carga y el valor desaparecía —o
+   peor, se guardaba contra un catálogo que todavía no existía y el aviso
+   acusaba al insumo de no existir.
+
+   La raíz no es el repintado, es que se puede trabajar antes de que haya con
+   qué. Así que mientras haya una carga en marcha, la pantalla se tapa y lo
+   dice. Si la carga falla, el aviso se queda —con el motivo— y hay un botón
+   para seguir de todos modos, porque dejar a alguien encerrado detrás de un
+   error es peor que dejarle entrar avisado.
+   ═══════════════════════════════════════════════════════════════════════ */
+const cargaEnVuelo = new Set();
+
+function cargaTapaElemento(){
+  let el = document.getElementById('cargaTapa');
+  if(el) return el;
+  el = document.createElement('div');
+  el.id = 'cargaTapa';
+  el.style.cssText = 'position:fixed;inset:0;z-index:9999;display:none;'
+    + 'background:rgba(30,27,55,.92);color:#fff;'
+    + 'align-items:center;justify-content:center;text-align:center;padding:24px';
+  el.innerHTML =
+    '<div style="max-width:420px">'
+    + '<div id="cargaTapaGiro" style="width:38px;height:38px;margin:0 auto 18px;'
+    +   'border:3px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;'
+    +   'animation:cargaGira 900ms linear infinite"></div>'
+    + '<div id="cargaTapaTitulo" style="font-size:18px;font-weight:700;margin-bottom:8px">Cargando datos…</div>'
+    + '<div id="cargaTapaDetalle" style="font-size:13px;opacity:.85;line-height:1.5"></div>'
+    + '<button id="cargaTapaSeguir" style="display:none;margin-top:18px;padding:9px 18px;'
+    +   'border:0;border-radius:8px;background:#fff;color:#1e1b37;font-weight:600;cursor:pointer">'
+    +   'Continuar de todos modos</button>'
+    + '</div>';
+  const est = document.createElement('style');
+  est.textContent = '@keyframes cargaGira{to{transform:rotate(360deg)}}';
+  document.head.appendChild(est);
+  document.body.appendChild(el);
+  el.querySelector('#cargaTapaSeguir').onclick = ()=>{ cargaEnVuelo.clear(); cargaPintaTapa(); };
+  return el;
+}
+
+function cargaPintaTapa(error){
+  const el = cargaTapaElemento();
+  const giro = el.querySelector('#cargaTapaGiro');
+  const titulo = el.querySelector('#cargaTapaTitulo');
+  const detalle = el.querySelector('#cargaTapaDetalle');
+  const seguir = el.querySelector('#cargaTapaSeguir');
+
+  if(error){
+    el.style.display = 'flex'; giro.style.display = 'none';
+    titulo.textContent = 'No se pudieron cargar todos los datos';
+    detalle.textContent = error;
+    seguir.style.display = 'inline-block';
+    return;
+  }
+  if(!cargaEnVuelo.size){ el.style.display = 'none'; return; }
+  el.style.display = 'flex'; giro.style.display = 'block';
+  seguir.style.display = 'none';
+  titulo.textContent = 'Cargando datos…';
+  const qué = [...cargaEnVuelo].map(d => d==='inventario' ? 'inventario' : 'planilla').join(' y ');
+  detalle.textContent = 'Trayendo ' + qué + ' desde la base. Son varios miles de registros, '
+    + 'así que puede tardar unos segundos. La pantalla se desbloquea sola al terminar.';
+}
+
+function cargaInicio(domain){ cargaEnVuelo.add(domain); cargaPintaTapa(); }
+function cargaFin(domain, error){
+  cargaEnVuelo.delete(domain);
+  cargaPintaTapa(error || undefined);
+}
+
 async function gsLoadFromSheets(domain='planilla', opts={}){
   const auto = !!opts.auto; // true = sincronización automática al iniciar sesión (sin diálogo de confirmación)
   if(!isAuthorized()){ if(!auto) toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
@@ -16800,6 +16887,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       : 'Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?';
     if(!confirm(confirmMsg)) return;
   }
+  cargaInicio(domain);
   try{
     const t0 = Date.now();
     gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
@@ -17190,9 +17278,13 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
                 (err && err.message ? ' ('+err.message+')' : '');
       gsUpdateSyncStatus(m,'error');
       if(typeof toast==='function') toast(m,'error');
+      cargaFin(domain, m);
+      gsRenderControls();
+      return;
     }
     else gsHandleError(err, 'cargar');
   }
+  cargaFin(domain);
   gsRenderControls();
 }
 
@@ -17213,7 +17305,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-18.4';
+const APP_VERSION = '2026-11-18.5';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
