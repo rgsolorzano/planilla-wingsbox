@@ -11213,7 +11213,7 @@ RENDERERS.invDiarioCocina = function(){
       }
     }
     let nuevos=0, act=0, elim=0;
-    const cambiadas=[];
+    const cambiadas=[], borradas=[];
     inputs.forEach(inp=>{
       const v=cocinaValidarCantidad(inp.value);
       const antes=getInvCocina(inp.dataset.prod, cocinaFecha);
@@ -11221,21 +11221,22 @@ RENDERERS.invDiarioCocina = function(){
       if(res==='nuevo') nuevos++; else if(res==='actualizado') act++; else if(res==='eliminado') elim++;
       if(res==='nuevo' || (res==='actualizado' && (!antes || antes.cantidad!==v.valor)))
         cambiadas.push({productoId:inp.dataset.prod, fecha:cocinaFecha, unidad:null, cantidad:v.valor});
+      // Vaciar una celda es "este día no se contó", que no es contar cero.
+      if(res==='eliminado')
+        borradas.push({productoId:inp.dataset.prod, fecha:cocinaFecha, unidad:null});
     });
     save(K.cocinaInventario,S.cocinaInventario);
 
     if(leyendoDeLaBase()){
       btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
       try{
-        const r=await sbGuardarConteos(cambiadas);
+        /* Guardar y borrar son dos llamadas, pero para quien da al botón fue
+           un solo clic: el resultado se cuenta junto. */
+        const r = sbUnirResultados(await sbGuardarConteos(cambiadas),
+                                   await sbBorrarConteos(borradas));
         const { msg, tipo } = sbExplicarConteos(r, 'Inventario de cocina');
         if(!r.ok) await sbRecargarTrasFallo();
-        /* Vaciar una celda borra el registro, y guardar_conteo no borra: crea
-           o actualiza. Mientras no exista una función de borrado en la base,
-           esa parte del guardado NO se aplica allá, y hay que decirlo en vez
-           de dejar al usuario creyendo que sí. */
-        if(elim) toast('Se quitaron '+elim+' registro(s) en esta pantalla, pero el borrado todavía no está disponible en la base: siguen ahí.','error');
-        else toast(msg, tipo);
+        toast(msg, tipo);
       }catch(e){
         console.error('[Conteos] cocina:', e);
         toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
@@ -16555,6 +16556,60 @@ async function sbRecargarTrasFallo(){
   catch(e){ console.error('[Conteos] no se pudo recargar tras el fallo:', e); }
 }
 
+/* Borra conteos que el usuario dejó en blanco.
+   celdas: [{ productoId, fecha, unidad }] */
+async function sbBorrarConteos(celdas){
+  if(!_sbLectorInv)
+    return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  if(!celdas.length) return { ok:true, borrados:0, ausentes:0, repetidos:0, incidencias:[] };
+
+  const escritor = await sbEscritor();
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, borrados:0, ausentes:0, repetidos:0, incidencias:[] };
+
+  for(const c of celdas){
+    const articuloId = _sbLectorInv.uuidDe(c.productoId);
+    if(!articuloId){
+      res.incidencias.push({ celda:c, estado:'desconocido',
+        motivo:'ese artículo no existe en la base' });
+      res.ok = false; continue;
+    }
+    const version = _sbLectorInv.versionDe(c.productoId, c.fecha, c.unidad);
+    const r = await escritor.borrarConteo({
+      clave: accion + ':borrar:' + c.productoId + ':' + (c.unidad || ''),
+      articuloId, fecha: c.fecha, unidad: c.unidad || null, version,
+    });
+
+    if(r.estado === 'borrado' || r.estado === 'ausente'){
+      // Ya no hay fila: su versión deja de valer para nada.
+      _sbLectorInv.anotarVersion(c.productoId, c.fecha, c.unidad, null);
+      res[r.estado === 'borrado' ? 'borrados' : 'ausentes']++;
+    }else if(r.estado === 'repetido'){
+      res.repetidos++;
+    }else{
+      console.warn('[Conteos] no se borró', { celda:c, versionEnviada:version, respuesta:r });
+      res.incidencias.push({ celda:c, estado:r.estado,
+        motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+
+/* Junta el resultado de guardar y el de borrar en una sola frase. Son dos
+   llamadas distintas pero para el usuario fue un solo clic en Guardar. */
+function sbUnirResultados(guardado, borrado){
+  return {
+    ok: guardado.ok && borrado.ok,
+    motivo: guardado.motivo || borrado.motivo,
+    creados: guardado.creados || 0,
+    actualizados: guardado.actualizados || 0,
+    repetidos: (guardado.repetidos || 0) + (borrado.repetidos || 0),
+    borrados: borrado.borrados || 0,
+    incidencias: [...(guardado.incidencias || []), ...(borrado.incidencias || [])],
+  };
+}
+
 /* El texto que ve el usuario. Se centraliza para que las cuatro pantallas no
    expliquen lo mismo de cuatro maneras distintas. */
 function sbExplicarConteos(r, etiqueta){
@@ -16562,6 +16617,7 @@ function sbExplicarConteos(r, etiqueta){
   const hechos = [];
   if(r.creados)      hechos.push(r.creados + ' nuevo' + (r.creados!==1?'s':''));
   if(r.actualizados) hechos.push(r.actualizados + ' actualizado' + (r.actualizados!==1?'s':''));
+  if(r.borrados)     hechos.push(r.borrados + ' borrado' + (r.borrados!==1?'s':''));
   if(r.repetidos)    hechos.push(r.repetidos + ' ya estaba' + (r.repetidos!==1?'n':''));
   const resumen = hechos.length ? ' (' + hechos.join(', ') + ')' : '';
 
@@ -16569,7 +16625,7 @@ function sbExplicarConteos(r, etiqueta){
      secas, el usuario no podría distinguir un guardado real de uno que no
      tenía nada que guardar, y esa distinción es justo la que deja ver que
      solo viaja lo que cambió. */
-  if(r.ok && !r.creados && !r.actualizados && !r.repetidos)
+  if(r.ok && !r.creados && !r.actualizados && !r.repetidos && !r.borrados)
     return { msg: etiqueta + ': no había cambios que guardar', tipo:'info' };
   if(r.ok) return { msg: etiqueta + ' guardado en la base' + resumen, tipo:'success' };
 
@@ -17013,7 +17069,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.7';
+const APP_VERSION = '2026-11-17.9';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

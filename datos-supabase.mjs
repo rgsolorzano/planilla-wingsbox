@@ -56,16 +56,60 @@ export function crearLector(consultar){
 
   /** Las hojas del dominio de planilla, tal como las espera la app. */
   async function leerPlanilla(){
+    /* Todas las consultas se lanzan A LA VEZ y se esperan más abajo, cada una
+       donde ya se usaba. Antes iban en fila india, y eso son tantos viajes de
+       ida y vuelta seguidos como consultas. Ninguna depende de otra. */
+    const _p_feriados = consultar('feriados', { select: 'id_externo, fecha, nombre', order: 'fecha' });
+    const _p_vt = consultar('validacion_tarjeta', { select: 'fecha, niubiz, caja', order: 'fecha' });
+    const _p_condiciones_laborales = consultar('condiciones_laborales', {
+      select: 'id_externo, desde, hasta, puesto, sueldo_quincenal, sueldo_planilla, ' +
+              'sueldo_hora, afp_comision, ajuste_planilla, horas_cierre, es_libre, ' +
+              'empleados!inner(id_externo)',
+    });
+    const _p_condiciones_laborales2 = consultar('condiciones_laborales', {
+      select: 'puesto, empleados!inner(id_externo, nombre)',
+      igual: { puesto: 'Mesero' },
+    });
+    const _p_empleados = consultar('empleados', {
+      select: 'id_externo, nombre, documento, fecha_ingreso, activo, visible',
+      order: 'nombre',          // lo ordena PostgreSQL, con su propia colación
+    });
+    const _p_horarios = consultar('horarios', {
+      select: 'dia_semana, libre, entrada, salida, orden, ' +
+              'empleados!inner(id_externo), condiciones_laborales(id_externo)',
+      order: 'orden',
+    });
+    const _p_marcaciones = consultar('marcaciones', {
+      select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
+              'empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_dias_libres = consultar('dias_libres', {
+      select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
+    });
+    const _p_considerar_hora_extra = consultar('considerar_hora_extra', {
+      select: 'fecha, considerar, empleados!inner(id_externo)',
+    });
+    const _p_exoneraciones_tardanza = consultar('exoneraciones_tardanza', {
+      select: 'fecha, activa, horas, empleados!inner(id_externo)',
+    });
+    const _p_propinas = consultar('propinas', {
+      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_movs = Object.fromEntries(['descuentos','pagos_extra'].map(tabla => [tabla,
+      consultar(tabla, {
+        select: 'id, id_externo, fecha, tipo, monto, detalle, empleados!inner(id_externo)',
+      })]));
+
     const hojas = {};
 
     /* ── Empleados ─────────────────────────────────────────────────────────
        Las columnas sueltas son la condición VIGENTE; la columna 'condiciones'
        lleva el histórico completo en JSON. Así lo guarda hoy la app. */
-    const condiciones = await consultar('condiciones_laborales', {
-      select: 'id_externo, desde, hasta, puesto, sueldo_quincenal, sueldo_planilla, ' +
-              'sueldo_hora, afp_comision, ajuste_planilla, horas_cierre, es_libre, ' +
-              'empleados!inner(id_externo)',
-    });
+    const condiciones = await _p_condiciones_laborales;
     const porEmpleado = new Map();
     for(const c of condiciones.sort(porClaves(r => r.empleados.id_externo, r => r.desde))){
       const lista = porEmpleado.get(c.empleados.id_externo) || [];
@@ -79,10 +123,7 @@ export function crearLector(consultar){
       porEmpleado.set(c.empleados.id_externo, lista);
     }
 
-    const empleados = await consultar('empleados', {
-      select: 'id_externo, nombre, documento, fecha_ingreso, activo, visible',
-      order: 'nombre',          // lo ordena PostgreSQL, con su propia colación
-    });
+    const empleados = await _p_empleados;
     hojas.Empleados = [[
       'id','nombre','documento','tipo','esLibre','activo','sueldoQuincenal','sueldoPlanilla',
       'sueldoHora','afpComision','ajustePlanilla','horasCierre','fechaIngreso','visible','condiciones'
@@ -101,11 +142,7 @@ export function crearLector(consultar){
     }
 
     /* ── Horarios ──────────────────────────────────────────────────────── */
-    const horarios = await consultar('horarios', {
-      select: 'dia_semana, libre, entrada, salida, orden, ' +
-              'empleados!inner(id_externo), condiciones_laborales(id_externo)',
-      order: 'orden',
-    });
+    const horarios = await _p_horarios;
     hojas.Horarios = [['empleadoId','dia','libre','entrada','salida','condicionId']];
     for(const h of horarios){
       hojas.Horarios.push([
@@ -115,12 +152,7 @@ export function crearLector(consultar){
     }
 
     /* ── Marcaciones ───────────────────────────────────────────────────── */
-    const marcaciones = (await consultar('marcaciones', {
-      select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
-              'empleados!inner(id_externo)',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
+    const marcaciones = (await _p_marcaciones).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.Marcaciones = [['id','empleadoId','fecha','entradaReal','salidaReal','origen','origenEntrada','origenSalida']];
     for(const m of marcaciones){
       hojas.Marcaciones.push([
@@ -134,9 +166,8 @@ export function crearLector(consultar){
        hoja. No afecta ningún importe, pero sin él dos descuentos del mismo
        empleado y día salen en orden arbitrario. */
     for(const [hoja, tabla] of [['Descuentos','descuentos'], ['PagosExtra','pagos_extra']]){
-      const filas = (await consultar(tabla, {
-        select: 'id, id_externo, fecha, tipo, monto, detalle, empleados!inner(id_externo)',
-      })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
+      const filas = (await _p_movs[tabla]).sort(
+        porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
       hojas[hoja] = [['id','empleadoId','fecha','tipo','monto','detalle']];
       for(const d of filas){
         hojas[hoja].push([d.id_externo || d.id, d.empleados.id_externo, d.fecha,
@@ -149,33 +180,27 @@ export function crearLector(consultar){
        pestaña DiasLibres no figura en GS_SHEET_KEYS, así que la app la
        identifica por ['id']: devolver el UUID haría que la fusión viera 44
        filas nuevas donde hay 44 conocidas y duplicara la pestaña entera. */
-    const libres = (await consultar('dias_libres', {
-      select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
+    const libres = (await _p_dias_libres).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.DiasLibres = [['id','empleadoId','fecha','tipo','comentario']];
     for(const d of libres){
       hojas.DiasLibres.push([d.id_externo || d.id, d.empleados.id_externo, d.fecha, d.tipo, t(d.detalle)]);
     }
     // Los feriados valen para toda la casa: en la hoja llevan empleadoId '*'.
-    const feriados = await consultar('feriados', { select: 'id_externo, fecha, nombre', order: 'fecha' });
+    const feriados = await _p_feriados;
     for(const f of feriados)
       hojas.DiasLibres.push([t(f.id_externo), '*', f.fecha, 'Feriado', t(f.nombre)]);
 
     /* ── Interruptores por día ─────────────────────────────────────────── */
-    const extras = (await consultar('considerar_hora_extra', {
-      select: 'fecha, considerar, empleados!inner(id_externo)',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
+    const extras = (await _p_considerar_hora_extra).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.ConsiderarHoraExtra = [['empleadoId','fecha','considerar']];
     for(const c of extras) hojas.ConsiderarHoraExtra.push([c.empleados.id_externo, c.fecha, b01(c.considerar)]);
 
-    const exos = (await consultar('exoneraciones_tardanza', {
-      select: 'fecha, activa, horas, empleados!inner(id_externo)',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
+    const exos = (await _p_exoneraciones_tardanza).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.ExoneracionTardanza = [['empleadoId','fecha','activa','horas']];
     for(const x of exos) hojas.ExoneracionTardanza.push([x.empleados.id_externo, x.fecha, b01(x.activa), num(x.horas)]);
 
     /* ── Conciliación de tarjeta ───────────────────────────────────────── */
-    const vt = await consultar('validacion_tarjeta', { select: 'fecha, niubiz, caja', order: 'fecha' });
+    const vt = await _p_vt;
     hojas.ValidacionTarjeta = [['fecha','niubiz','caja']];
     for(const v of vt) hojas.ValidacionTarjeta.push([v.fecha, num(v.niubiz), num(v.caja)]);
 
@@ -184,11 +209,7 @@ export function crearLector(consultar){
        puede tener varias propinas el mismo día (una por medio de pago, y a
        veces varias del mismo medio). Sin el desempate salen en orden
        arbitrario y dos lecturas seguidas pueden diferir. */
-    const propinas = (await consultar('propinas', {
-      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
+    const propinas = (await _p_propinas).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
     hojas.Propinas = [['id','empleadoId','fecha','tipo','monto','ov']];
     for(const p of propinas){
       hojas.Propinas.push([p.id_externo || p.id, p.empleados.id_externo, p.fecha,
@@ -196,10 +217,7 @@ export function crearLector(consultar){
     }
 
     /* ── Meseros: quien tenga alguna condición con ese puesto ──────────── */
-    const meseros = await consultar('condiciones_laborales', {
-      select: 'puesto, empleados!inner(id_externo, nombre)',
-      igual: { puesto: 'Mesero' },
-    });
+    const meseros = await _p_condiciones_laborales2;
     const vistos = new Map();
     for(const m of meseros) vistos.set(m.empleados.id_externo, m.empleados.nombre);
     hojas.Meseros = [['id','nombre']];
@@ -261,6 +279,21 @@ export function crearEscritor(sb){
     });
     // Un fallo de red o de la API: ni guardado ni rechazado, no se sabe. El
     // que reintente con la MISMA clave es exactamente para este caso.
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
+  /* Borrar un conteo. En cocina, vaciar una celda significa "este día no se
+     contó este producto", que no es contar cero. Exige la versión a la vista
+     —borrar el trabajo de otro con una foto vieja es justo lo que se evita—
+     y el permiso inventario:editar, más alto que el de registrar.
+
+     'ausente' no es un fallo: lo que el usuario quería ya se cumple. */
+  async function borrarConteo({ clave, articuloId, fecha, unidad = null, version = null }){
+    const { data, error } = await sb.schema('core').rpc('borrar_conteo', {
+      p_clave: clave, p_articulo: articuloId, p_fecha: fecha,
+      p_unidad: unidad, p_version: version,
+    });
     if(error) return { estado: 'error', mensaje: error.message };
     return data;
   }
@@ -359,7 +392,7 @@ export function crearEscritor(sb){
     }
   }
 
-  return { guardarConteo, guardarMovimiento, guardarProduccion, guardarStock,
+  return { guardarConteo, borrarConteo, guardarMovimiento, guardarProduccion, guardarStock,
            guardarArticulo, guardarInsumo, explicar };
 }
 
@@ -369,34 +402,73 @@ export function crearEscritor(sb){
    ═══════════════════════════════════════════════════════════════════════════ */
 export function consultarConSupabase(sb){
   return async function consultar(tabla, { select, order, igual } = {}){
-    /* PostgREST pagina a 1,000 filas y seis tablas ya pasan de eso, así que
-       hay que pedirlas por tramos. Pero paginar SIN un orden estable no está
-       definido: PostgreSQL puede devolver las filas en distinto orden en cada
-       consulta, y entonces entre un tramo y el siguiente unas se repiten y
-       otras no aparecen nunca. El daño es silencioso —la app recibe una hoja
-       incompleta sin un solo error— y aquí ya se vio: faltaban versiones de
-       conteos y el guardado respondía "ya existe un conteo" sobre filas que
-       la app creía nuevas.
+    /* PostgREST devuelve como mucho 1,000 filas por respuesta y seis tablas ya
+       pasan de eso, así que hay que pedirlas por tramos.
 
-       Por eso un segundo tramo sin orden es un error y se dice en voz alta,
-       en vez de devolver datos que parecen buenos. El orden, además, tiene que
-       ser ÚNICO: ordenar 6,000 conteos por fecha no desempata nada. */
-    const filas = [];
+       Dos cuidados, los dos aprendidos a golpes:
+
+       · Paginar SIN un orden estable no está definido. PostgreSQL puede
+         devolver las filas en distinto orden en cada consulta, y entonces
+         entre un tramo y el siguiente unas se repiten y otras no aparecen
+         nunca. El daño es silencioso: la app recibe una hoja incompleta sin un
+         solo error. Pasó, y solo se notó al guardar. Por eso un segundo tramo
+         sin orden es un error en voz alta.
+
+       · Pedir los tramos de uno en uno cuesta un viaje de ida y vuelta cada
+         vez: con 6,012 conteos, siete viajes seguidos para una sola tabla. El
+         primer tramo se pide YA CON el censo —PostgREST lo devuelve en la
+         misma respuesta— y con ese número los tramos que faltan se piden
+         todos a la vez. Dos viajes en lugar de siete, sin preguntar dos
+         veces. */
     const TRAMO = 1000;
-    for(let desde = 0; ; desde += TRAMO){
-      if(desde > 0 && !order)
-        throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
-          + 'pero no se pidió ningún orden. Sin un orden único la paginación '
-          + 'se salta filas. Añade order a esta consulta.');
-      // La consulta se arma de nuevo en cada tramo: reutilizar el constructor
-      // de supabase-js entre llamadas acumula estado que no se ve.
-      let q = sb.schema('core').from(tabla).select(select);
+    const pide = (desde, opts) => {
+      let q = sb.schema('core').from(tabla).select(select, opts);
       if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
       if(order) q = q.order(order);
-      const { data, error } = await q.range(desde, desde + TRAMO - 1);
-      if(error) throw new Error(`${tabla}: ${error.message}`);
-      filas.push(...data);
-      if(data.length < TRAMO) break;
+      return q.range(desde, desde + TRAMO - 1);
+    };
+
+    // El primer tramo trae los datos y, de paso, cuántas filas hay en total.
+    const primero = await pide(0, { count: 'exact' });
+    if(primero.error) throw new Error(`${tabla}: ${primero.error.message}`);
+    if(primero.data.length < TRAMO) return primero.data;   // cabía entero
+
+    if(!order)
+      throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
+        + 'pero no se pidió ningún orden. Sin un orden único la paginación '
+        + 'se salta filas. Añade order a esta consulta.');
+
+    const filas = primero.data.slice();
+    const total = typeof primero.count === 'number' ? primero.count : null;
+
+    if(total !== null){
+      const pendientes = [];
+      for(let desde = TRAMO; desde < total; desde += TRAMO) pendientes.push(pide(desde));
+      const tandas = await Promise.all(pendientes);
+      for(const r of tandas){
+        if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+        filas.push(...r.data);
+      }
+      /* El censo se midió al pedir el primer tramo. Si alguien insertó
+         mientras tanto, la cola quedaría fuera; solo se sigue pidiendo si el
+         último tramo vino lleno, que es la única señal de que puede faltar
+         algo. Lo normal es no entrar aquí. */
+      const ultimo = tandas.length ? tandas[tandas.length - 1] : primero;
+      if(ultimo.data.length === TRAMO)
+        for(let desde = filas.length; ; desde += TRAMO){
+          const r = await pide(desde);
+          if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+          filas.push(...r.data);
+          if(r.data.length < TRAMO) break;
+        }
+    }else{
+      // Sin censo: de uno en uno, más lento pero siempre correcto.
+      for(let desde = TRAMO; ; desde += TRAMO){
+        const r = await pide(desde);
+        if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+        filas.push(...r.data);
+        if(r.data.length < TRAMO) break;
+      }
     }
     return filas;
   };
