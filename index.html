@@ -10526,6 +10526,7 @@ RENDERERS.invDiarioSalon = function(){
       try{
         const r=await sbGuardarConteos(cambiadas);
         const { msg, tipo } = sbExplicarConteos(r, 'Inventario de salón');
+        if(!r.ok) await sbRecargarTrasFallo();
         toast(msg, tipo);
       }finally{ btn.disabled=false; btn.textContent=txt; }
     }else{
@@ -11223,7 +11224,9 @@ RENDERERS.invDiarioCocina = function(){
     if(leyendoDeLaBase()){
       btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
       try{
-        const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Inventario de cocina');
+        const r=await sbGuardarConteos(cambiadas);
+        const { msg, tipo } = sbExplicarConteos(r, 'Inventario de cocina');
+        if(!r.ok) await sbRecargarTrasFallo();
         /* Vaciar una celda borra el registro, y guardar_conteo no borra: crea
            o actualiza. Mientras no exista una función de borrado en la base,
            esa parte del guardado NO se aplica allá, y hay que decirlo en vez
@@ -11494,7 +11497,9 @@ RENDERERS.invDiarioMenaje = function(){
     if(leyendoDeLaBase()){
       btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
       try{
-        const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Inventario de menaje');
+        const r=await sbGuardarConteos(cambiadas);
+        const { msg, tipo } = sbExplicarConteos(r, 'Inventario de menaje');
+        if(!r.ok) await sbRecargarTrasFallo();
         toast(msg, tipo);
       }finally{ btn.disabled=false; btn.textContent=txt; }
     }else{
@@ -14697,7 +14702,9 @@ async function stockBebidasGuardar(){
   save(K.stockBebidas,S.stockBebidas);
 
   if(leyendoDeLaBase()){
-    const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Stock de bebidas');
+    const r=await sbGuardarConteos(cambiadas);
+    const { msg, tipo } = sbExplicarConteos(r, 'Stock de bebidas');
+    if(!r.ok) await sbRecargarTrasFallo();
     toast(msg, tipo);
   }else{
     toast(`Stock guardado (${guardados} bebida(s)).`,'success');
@@ -16498,12 +16505,28 @@ async function sbGuardarConteos(celdas){
     }else if(r.estado === 'repetido'){
       res.repetidos++;
     }else{
+      console.warn('[Conteos] no se guardó', c, r);
       res.incidencias.push({ celda:c, estado:r.estado,
         motivo:r.motivo || r.mensaje || 'sin detalle' });
       res.ok = false;
     }
   }
   return res;
+}
+
+/* Si algo no se guardó, la pantalla no puede quedarse mostrando el valor que
+   el usuario escribió: el estado local ya se había cambiado antes de llamar a
+   la base, así que mostraría el valor nuevo mientras la base conserva el
+   viejo. Peor aún, el siguiente guardado no lo reintentaría, porque la app
+   creería que ya no hay nada que cambiar, y el registro quedaría perdido sin
+   que nadie se entere.
+
+   Releer el inventario entero es más de lo estrictamente necesario, pero deja
+   la pantalla diciendo exactamente lo que hay en la base, que es lo único
+   aceptable después de un fallo. Solo ocurre cuando algo falla. */
+async function sbRecargarTrasFallo(){
+  try{ await gsLoadFromSheets('inventario', { auto:true }); }
+  catch(e){ console.error('[Conteos] no se pudo recargar tras el fallo:', e); }
 }
 
 /* El texto que ve el usuario. Se centraliza para que las cuatro pantallas no
@@ -16524,11 +16547,19 @@ function sbExplicarConteos(r, etiqueta){
     return { msg: etiqueta + ': no había cambios que guardar', tipo:'info' };
   if(r.ok) return { msg: etiqueta + ' guardado en la base' + resumen, tipo:'success' };
 
-  const conflictos = r.incidencias.filter(i => i.estado === 'conflicto').length;
-  const denegados  = r.incidencias.filter(i => i.estado === 'denegado').length;
+  /* El motivo lo da la base y aquí se repite tal cual. Antes esta función
+     afirmaba "los cambió alguien más" para CUALQUIER conflicto, incluido el
+     que ocurre cuando somos nosotros los que no sabíamos la versión. Decirle
+     a alguien que otro editó su registro cuando está trabajando solo no es un
+     detalle de redacción: lo manda a buscar un problema que no existe. */
+  const conflictos = r.incidencias.filter(i => i.estado === 'conflicto');
+  const denegados  = r.incidencias.filter(i => i.estado === 'denegado');
   let detalle;
-  if(conflictos) detalle = conflictos + ' registro(s) los cambió alguien más mientras editabas. Recarga para ver lo que hay ahora.';
-  else if(denegados) detalle = 'no tienes permiso para guardar ' + denegados + ' registro(s).';
+  if(conflictos.length)
+    detalle = conflictos.length + ' registro(s) no se guardaron: ' + conflictos[0].motivo +
+              '. Se recargó lo que hay en la base.';
+  else if(denegados.length)
+    detalle = 'no tienes permiso para guardar ' + denegados.length + ' registro(s).';
   else detalle = r.incidencias[0].motivo;
   return { msg: etiqueta + resumen + ', pero ' + detalle, tipo:'error' };
 }
@@ -16956,7 +16987,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.3';
+const APP_VERSION = '2026-11-17.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
