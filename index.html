@@ -12184,11 +12184,35 @@ RENDERERS.produccion = function(){
     if(!vpdEstado.cargando && vpdEstado.rango !== clave){
       vpdEstado.cargando = true;
       vpdCargarPorciones(RP.desde, RP.hasta).then(()=>{
-        if(currentPage==='produccion') RENDERERS.produccion();
+        /* Repintar aquí borraría lo que el usuario esté escribiendo. Pasó:
+           alguien tecleaba el cierre de ALAS EN SALMUERA, esta carga terminaba
+           y el número desaparecía antes de poder guardarlo. El repintado solo
+           sirve para mostrar estimaciones con las ventas ya cargadas, así que
+           puede esperar; lo que no puede esperar es el dato que la persona
+           tiene a medio escribir. Se pospone y se hace en cuanto la pantalla
+           esté limpia. */
+        if(currentPage!=='produccion') return;
+        if(prodHayCambiosSinGuardar()){ prodRepintadoPendiente = true; return; }
+        RENDERERS.produccion();
       });
     }
   }
 };
+
+/* ¿Hay algo escrito que todavía no se guardó? Se compara cada casilla con lo
+   que dice el estado, que es lo que se pintó. Mirar solo el foco no bastaría:
+   el usuario puede escribir y pasar a otra casilla sin guardar. */
+function prodHayCambiosSinGuardar(){
+  for(const inp of document.querySelectorAll('.prodInput')){
+    const r = getStockReg(inp.dataset.insumo, prodFecha);
+    const guardado = r ? (inp.dataset.campo==='stockInicial' ? r.stockInicial : r.stockCierre) : null;
+    const enPantalla = inp.value.trim();
+    if(enPantalla === '' ? guardado !== null && guardado !== undefined
+                         : Number(enPantalla) !== Number(guardado)) return true;
+  }
+  return false;
+}
+let prodRepintadoPendiente = false;
 /* ── SECCIÓN "REGISTRAR PRODUCCIÓN" (filas dinámicas) ──────────────
    Permite cargar la producción de varios insumos para una misma fecha
    en una sola acción. Disponible para CUALQUIER insumo, sin importar
@@ -12433,6 +12457,7 @@ async function guardarProduccion(){
       console.error('[Stock] producción:', e);
       toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
     }
+    prodRepintadoPendiente = false;
     RENDERERS.produccion();
   }else{
     toast(`Stock guardado (${guardados} insumo(s))`
@@ -17147,7 +17172,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-18.1';
+const APP_VERSION = '2026-11-18.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
