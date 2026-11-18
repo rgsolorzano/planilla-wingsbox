@@ -67,10 +67,14 @@ export function crearLectorInventario(consultar){
        Son consultas independientes: adelantarlas no cambia nada más. */
     const conteos = (await consultar('conteos', {
       select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.id_externo));
 
     const movimientos = await consultar('movimientos', {
       select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     });
 
     /* Un artículo entra al catálogo si está vigente, o si está retirado pero
@@ -197,6 +201,8 @@ export function crearLectorInventario(consultar){
        app ve un dato ya migrado y no intenta volver a migrarlo. */
     const stock = (await consultar('stock_diario', {
       select: 'id_externo, insumo_id, fecha, stock_inicial, stock_cierre',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.id_externo));
     hojas.Produccion = [['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre','migradoV2']];
     for(const s of stock)
@@ -205,6 +211,8 @@ export function crearLectorInventario(consultar){
 
     const produccion = (await consultar('produccion', {
       select: 'id_externo, insumo_id, fecha, cantidad',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.id_externo));
     hojas.ProduccionInsumos = [['id','insumoId','fecha','cantidad']];
     for(const p of produccion)
@@ -232,6 +240,8 @@ export function crearLectorInventario(consultar){
     /* ── Propinas y meseros: viven en planilla, la app los lee aquí ─────── */
     const propinas = (await consultar('propinas', {
       select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
     hojas.Propinas = [['id','empleadoId','fecha','tipo','monto','ov']];
     for(const p of propinas){

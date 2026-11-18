@@ -118,6 +118,8 @@ export function crearLector(consultar){
     const marcaciones = (await consultar('marcaciones', {
       select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
               'empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.Marcaciones = [['id','empleadoId','fecha','entradaReal','salidaReal','origen','origenEntrada','origenSalida']];
     for(const m of marcaciones){
@@ -184,6 +186,8 @@ export function crearLector(consultar){
        arbitrario y dos lecturas seguidas pueden diferir. */
     const propinas = (await consultar('propinas', {
       select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
     })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
     hojas.Propinas = [['id','empleadoId','fecha','tipo','monto','ov']];
     for(const p of propinas){
@@ -365,14 +369,30 @@ export function crearEscritor(sb){
    ═══════════════════════════════════════════════════════════════════════════ */
 export function consultarConSupabase(sb){
   return async function consultar(tabla, { select, order, igual } = {}){
-    let q = sb.schema('core').from(tabla).select(select);
-    if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
-    if(order) q = q.order(order);
-    // PostgREST pagina a 1,000 filas por defecto y las marcaciones ya pasan de
-    // eso. Sin paginar, la app recibiría una planilla incompleta sin avisar.
+    /* PostgREST pagina a 1,000 filas y seis tablas ya pasan de eso, así que
+       hay que pedirlas por tramos. Pero paginar SIN un orden estable no está
+       definido: PostgreSQL puede devolver las filas en distinto orden en cada
+       consulta, y entonces entre un tramo y el siguiente unas se repiten y
+       otras no aparecen nunca. El daño es silencioso —la app recibe una hoja
+       incompleta sin un solo error— y aquí ya se vio: faltaban versiones de
+       conteos y el guardado respondía "ya existe un conteo" sobre filas que
+       la app creía nuevas.
+
+       Por eso un segundo tramo sin orden es un error y se dice en voz alta,
+       en vez de devolver datos que parecen buenos. El orden, además, tiene que
+       ser ÚNICO: ordenar 6,000 conteos por fecha no desempata nada. */
     const filas = [];
     const TRAMO = 1000;
     for(let desde = 0; ; desde += TRAMO){
+      if(desde > 0 && !order)
+        throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
+          + 'pero no se pidió ningún orden. Sin un orden único la paginación '
+          + 'se salta filas. Añade order a esta consulta.');
+      // La consulta se arma de nuevo en cada tramo: reutilizar el constructor
+      // de supabase-js entre llamadas acumula estado que no se ve.
+      let q = sb.schema('core').from(tabla).select(select);
+      if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
+      if(order) q = q.order(order);
       const { data, error } = await q.range(desde, desde + TRAMO - 1);
       if(error) throw new Error(`${tabla}: ${error.message}`);
       filas.push(...data);
