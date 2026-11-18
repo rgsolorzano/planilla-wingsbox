@@ -402,78 +402,77 @@ export function crearEscritor(sb){
    ═══════════════════════════════════════════════════════════════════════════ */
 export function consultarConSupabase(sb){
   return async function consultar(tabla, { select, order, igual } = {}){
-    /* PostgREST devuelve como mucho 1,000 filas por respuesta y seis tablas ya
-       pasan de eso, así que hay que pedirlas por tramos. Tres cosas que costó
-       aprender, cada una de un fallo distinto:
+    /* Traer una tabla que no cabe en una respuesta. Tres intentos hicieron
+       falta para acertar, y la medición del 18/11 es la que lo decidió:
 
-       · Paginar SIN un orden estable no está definido. PostgreSQL puede
-         devolver las filas en distinto orden en cada consulta, y entonces
-         entre un tramo y el siguiente unas se repiten y otras no aparecen
-         nunca. El daño es silencioso: la app recibe una hoja incompleta sin un
-         solo error, y solo se nota al guardar. Por eso un segundo tramo sin
-         orden es un error en voz alta.
+         marcaciones:  1,436 filas en 7 peticiones · 1,111 ms cada una
+         produccion:   1,967 filas en 7 peticiones · 1,882 ms cada una
+         propinas:     1,063 filas en 7 peticiones · 2,205 ms cada una
 
-       · Pedirlos de uno en uno cuesta un viaje de ida y vuelta cada vez: con
-         6,012 conteos, siete viajes seguidos para una sola tabla.
+       Dos cosas saltan a la vista. La primera es que sobran peticiones: con
+       1,436 filas bastaban dos, no siete. Las otras cinco eran el disparo
+       especulativo del intento anterior, que pedía seis tramos a la vez y
+       paraba al llegar uno corto —pero los seis ya habían salido—. La segunda
+       es que el tiempo por petición SUBE cuanto más hay en vuelo: el servidor
+       las encola. Paralelizar no acelera nada; solo reparte la misma espera.
 
-       · Y preguntar CUÁNTOS hay para pedirlos de golpe —que fue el primer
-         intento— tampoco sirve: un count exacto recorre la tabla entera
-         aplicando las reglas de seguridad fila por fila, y en conteos se pasa
-         del tiempo límite del servidor. La consulta muere y con ella la carga.
-
-       Así que no se pregunta: se piden varios tramos A LA VEZ y se para en
-       cuanto uno viene corto, que es la señal de que no queda nada. Misma
-       ventaja que el censo y sin consulta cara. */
-    const TRAMO = 1000;
-    const A_LA_VEZ = 6;
-    const pide = (desde) => {
+       Así que la regla es pedir POCAS VECES, no pedir a la vez. Se empieza
+       pidiendo tramos grandes. Si el servidor devuelve menos de lo pedido hay
+       dos explicaciones posibles —se acabaron las filas, o el servidor tiene
+       su propio tope— y confundirlas perdería datos en silencio, que es
+       justo el fallo que ya nos costó una tarde. Así que se comprueba con una
+       petición más: si viene vacía, se acabaron; si trae filas, era el tope y
+       se adopta como tamaño de tramo. */
+    const TRAMO_GRANDE = 5000;
+    const pide = (desde, cuantas) => {
       let q = sb.schema('core').from(tabla).select(select);
       if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
       if(order) q = q.order(order);
-      return q.range(desde, desde + TRAMO - 1);
+      return q.range(desde, desde + cuantas - 1);
     };
-    const datos = (r) => {
+
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    let peticiones = 0;
+    const trae = async (desde, cuantas) => {
+      peticiones++;
+      const r = await pide(desde, cuantas);
       if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
       return r.data;
     };
-
-    /* Medición. Llevamos dos intentos de acelerar la carga guiados por
-       suposiciones —primero los viajes de ida y vuelta, luego las reglas de
-       seguridad— y ninguno de los dos era el cuello. Así que ahora cada
-       consulta dice cuánto tardó y cuántas filas trajo, y se decide con eso
-       delante. */
-    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-    let peticiones = 1;
     const reporta = (n) => {
       const ms = Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0);
-      console.log(`[Carga] ${tabla}: ${ms} ms · ${n} fila(s) · ${peticiones} petición(es)`
-        + ` · ${peticiones > 1 ? Math.round(ms/peticiones) + ' ms por petición' : ''}`);
+      console.log(`[Carga] ${tabla}: ${ms} ms · ${n} fila(s) · ${peticiones} petición(es)`);
     };
 
-    const filas = datos(await pide(0));
-    if(filas.length < TRAMO){ reporta(filas.length); return filas; }   // cabía entero
+    let tramo = TRAMO_GRANDE;
+    const filas = await trae(0, tramo);
 
-    if(!order)
-      throw new Error(`${tabla}: pasa de ${TRAMO} filas y hay que paginarla, `
-        + 'pero no se pidió ningún orden. Sin un orden único la paginación '
-        + 'se salta filas. Añade order a esta consulta.');
-
-    for(let desde = TRAMO; ; desde += TRAMO * A_LA_VEZ){
-      const tanda = [];
-      for(let k = 0; k < A_LA_VEZ; k++) tanda.push(pide(desde + k * TRAMO));
-      let completa = true;
-      peticiones += A_LA_VEZ;
-      for(const r of await Promise.all(tanda)){
-        const d = datos(r);
-        filas.push(...d);
-        /* Un tramo corto cierra la tabla. Los que se pidieron después en la
-           misma tanda vienen vacíos y no aportan nada, así que se descartan:
-           seguir concatenándolos daría igual, pero parar aquí deja claro que
-           la lista termina donde terminan los datos. */
-        if(d.length < TRAMO){ completa = false; break; }
+    while(true){
+      if(filas.length % tramo === 0 && filas.length > 0){
+        // El último tramo vino lleno: puede quedar más.
+        if(!order)
+          throw new Error(`${tabla}: no cabe en una sola respuesta y hay que pedirla por `
+            + 'tramos, pero no se pidió ningún orden. Sin un orden único la paginación '
+            + 'se salta filas. Añade order a esta consulta.');
+        const mas = await trae(filas.length, tramo);
+        filas.push(...mas);
+        if(mas.length < tramo) break;
+        continue;
       }
-      if(!completa) break;
+      /* Vino corto. ¿Se acabaron las filas o el servidor tiene un tope? Una
+         petición más lo aclara, y es barata comparada con perder datos. */
+      if(filas.length === 0) break;
+      const sonda = await trae(filas.length, tramo);
+      if(!sonda.length) break;                  // se acabaron de verdad
+      if(!order)
+        throw new Error(`${tabla}: el servidor devuelve como mucho ${filas.length} filas `
+          + 'por respuesta y hay que paginar, pero no se pidió ningún orden. '
+          + 'Añade order a esta consulta.');
+      tramo = filas.length;                     // ese era el tope del servidor
+      filas.push(...sonda);
+      if(sonda.length < tramo) break;
     }
+
     reporta(filas.length);
     return filas;
   };
