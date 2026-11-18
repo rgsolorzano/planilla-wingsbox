@@ -45,7 +45,7 @@ export function crearLectorInventario(consultar){
     /* ── Catálogo de artículos, una consulta para las cinco categorías ──── */
     const articulos = await consultar('articulos', {
       select: 'id, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
-              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo',
+              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
       order: 'nombre',
     });
     const porId = new Map(articulos.map(a => [a.id, a]));
@@ -94,10 +94,14 @@ export function crearLectorInventario(consultar){
     for(const a of de('menaje'))
       hojas.MenajeArticulos.push([a.id_externo, a.nombre]);
 
-    /* La pestaña Cocina vive vacía en el Spreadsheet: su catálogo está
-       sembrado en el código de la app. Se devuelve vacía igual, para que la
-       app siga sembrándolo como siempre. */
-    hojas.Cocina = [['id','nombre','unidad']];
+    /* La pestaña Cocina vivía vacía en el Spreadsheet —su catálogo estaba
+       sembrado en el código de la app— y por eso se devolvía vacía. Desde el
+       17/11/2026 la hoja ya trae los 31 artículos con los mismos ids, así que
+       se devuelve lo que hay en la base: devolverla vacía obligaría a la app
+       a volver a sembrarla y dejaría el 'orden' en blanco. */
+    hojas.Cocina = [['id','nombre','unidad','orden']];
+    for(const a of de('cocina'))
+      hojas.Cocina.push([a.id_externo, a.nombre, t(a.unidad), a.orden ?? '']);
 
     /* ── Conteos: una tabla, cuatro pestañas, según la categoría ────────── */
     const conteosDe = cat => conteos.filter(c => porId.get(c.articulo_id)?.categoria === cat);

@@ -143,16 +143,21 @@ export function crearLector(consultar){
     }
 
     /* ── Días libres, con los feriados devueltos a su forma de hoja ──────── */
+    /* El id que viaja a la hoja es el de la app, no el de PostgreSQL. La
+       pestaña DiasLibres no figura en GS_SHEET_KEYS, así que la app la
+       identifica por ['id']: devolver el UUID haría que la fusión viera 44
+       filas nuevas donde hay 44 conocidas y duplicara la pestaña entera. */
     const libres = (await consultar('dias_libres', {
-      select: 'id, fecha, tipo, detalle, empleados!inner(id_externo)',
+      select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
     })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.DiasLibres = [['id','empleadoId','fecha','tipo','comentario']];
     for(const d of libres){
-      hojas.DiasLibres.push([d.id, d.empleados.id_externo, d.fecha, d.tipo, t(d.detalle)]);
+      hojas.DiasLibres.push([d.id_externo || d.id, d.empleados.id_externo, d.fecha, d.tipo, t(d.detalle)]);
     }
     // Los feriados valen para toda la casa: en la hoja llevan empleadoId '*'.
-    const feriados = await consultar('feriados', { select: 'fecha, nombre', order: 'fecha' });
-    for(const f of feriados) hojas.DiasLibres.push(['', '*', f.fecha, 'Feriado', t(f.nombre)]);
+    const feriados = await consultar('feriados', { select: 'id_externo, fecha, nombre', order: 'fecha' });
+    for(const f of feriados)
+      hojas.DiasLibres.push([t(f.id_externo), '*', f.fecha, 'Feriado', t(f.nombre)]);
 
     /* ── Interruptores por día ─────────────────────────────────────────── */
     const extras = (await consultar('considerar_hora_extra', {
