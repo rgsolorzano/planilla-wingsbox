@@ -12358,6 +12358,12 @@ function guardarRegistroProduccion(){
 }
 
 async function guardarProduccion(){
+  /* Foto del día ANTES de tocar nada. El diff se calcula al final contra
+     esta foto, no al vuelo, porque además de lo que el usuario escribe hay
+     cierres que se conservan solos (conservarSalsasSinMovimiento). Si solo
+     mirásemos los inputs, esos cambios no llegarían a la base. */
+  const antes = new Map(S.produccion.filter(r => r.fecha === prodFecha)
+    .map(r => [r.insumoId, { ini: r.stockInicial ?? null, cie: r.stockCierre ?? null }]));
   const inputs = document.querySelectorAll('.prodInput');
   const porInsumo = {};
   inputs.forEach(inp=>{
@@ -12404,10 +12410,36 @@ async function guardarProduccion(){
     return;
   }
   save(K.produccion, S.produccion);
-  toast(`Stock guardado (${guardados} insumo(s))`
-        + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : '') + '.','success');
-  RENDERERS.produccion();
-  syncProduccion();
+
+  if(leyendoDeLaBase()){
+    /* Qué cambió de verdad, campo por campo. Un campo que no cambió viaja en
+       null, que para guardar_stock significa "déjalo como está": así el
+       registro de apertura no pisa el cierre ni al revés. */
+    const cambios = [];
+    for(const r of S.produccion.filter(r => r.fecha === prodFecha)){
+      const a = antes.get(r.insumoId);
+      const ini = r.stockInicial ?? null, cie = r.stockCierre ?? null;
+      if(a && a.ini === ini && a.cie === cie) continue;
+      cambios.push({ insumoId:r.insumoId, fecha:prodFecha,
+                     inicial: (!a || a.ini !== ini) ? ini : null,
+                     cierre:  (!a || a.cie !== cie) ? cie : null });
+    }
+    try{
+      const r = await sbGuardarStock(cambios);
+      const { msg, tipo } = sbExplicarConteos(r, 'Stock de producción');
+      if(!r.ok) await sbRecargarTrasFallo();
+      toast(msg + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : ''), tipo);
+    }catch(e){
+      console.error('[Stock] producción:', e);
+      toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
+    }
+    RENDERERS.produccion();
+  }else{
+    toast(`Stock guardado (${guardados} insumo(s))`
+          + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : '') + '.','success');
+    RENDERERS.produccion();
+    syncProduccion();
+  }
   // Refresca el módulo "Alerta de Insumos" si está abierto en otra pestaña/grupo
   // del menú, para reflejar inmediatamente cualquier cambio sin recarga manual.
   if(typeof RENDERERS.alertaInsumos==='function') RENDERERS.alertaInsumos();
@@ -16596,6 +16628,52 @@ async function sbBorrarConteos(celdas){
   return res;
 }
 
+/* Guarda el stock diario de insumos (la pantalla de Producción).
+   celdas: [{ insumoId, fecha, inicial, cierre }]
+
+   inicial y cierre pueden venir en null, y eso significa "no lo cambies", no
+   "ponlo en null": la pantalla de apertura guarda el inicial sin conocer el
+   cierre y la de cierre al revés. Si null borrara, cada una pisaría a la otra.
+   core.guardar_stock está escrita con esa misma regla. */
+async function sbGuardarStock(celdas){
+  if(!_sbLectorInv)
+    return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  if(!celdas.length) return { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  const escritor = await sbEscritor();
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  for(const c of celdas){
+    const insumoId = _sbLectorInv.uuidDe(c.insumoId);
+    if(!insumoId){
+      res.incidencias.push({ celda:c, estado:'desconocido',
+        motivo:'ese insumo no existe en la base' });
+      res.ok = false; continue;
+    }
+    const version = _sbLectorInv.versionStockDe(c.insumoId, c.fecha);
+    const r = await escritor.guardarStock({
+      clave: accion + ':stock:' + c.insumoId,
+      insumoId, fecha: c.fecha,
+      inicial: c.inicial ?? null, cierre: c.cierre ?? null,
+      version,
+    });
+
+    if(r.estado === 'creado' || r.estado === 'actualizado'){
+      _sbLectorInv.anotarVersionStock(c.insumoId, c.fecha, r.version);
+      res[r.estado === 'creado' ? 'creados' : 'actualizados']++;
+    }else if(r.estado === 'repetido'){
+      res.repetidos++;
+    }else{
+      console.warn('[Stock] no se guardó', { celda:c, versionEnviada:version, respuesta:r });
+      res.incidencias.push({ celda:c, estado:r.estado,
+        motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+
 /* Junta el resultado de guardar y el de borrar en una sola frase. Son dos
    llamadas distintas pero para el usuario fue un solo clic en Guardar. */
 function sbUnirResultados(guardado, borrado){
@@ -17069,7 +17147,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.9';
+const APP_VERSION = '2026-11-18.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

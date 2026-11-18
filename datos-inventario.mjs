@@ -45,18 +45,67 @@ export const claveConteo = (idExterno, fecha, unidad) =>
 export function crearLectorInventario(consultar){
   /* Se llenan al leer y los consulta la escritura. Viven fuera de
      leerInventario para que sobrevivan a la lectura que los pobló. */
-  const uuidPorExterno = new Map();
+  const uuidPorExterno = new Map();   // artículos e insumos, por su id de la hoja
   const versionConteo  = new Map();
+  const versionStock   = new Map();   // stock_diario, por insumo y fecha
 
   async function leerInventario(){
-    const hojas = {};
+    /* Las nueve consultas se lanzan A LA VEZ y se esperan más abajo, cada
+       una donde ya se usaba. Antes iban una detrás de otra: veintitrés viajes
+       de ida y vuelta en fila, que son casi veinte segundos antes de poder
+       trabajar. Ninguna depende de otra, así que no había razón para la cola.
 
-    /* ── Catálogo de artículos, una consulta para las cinco categorías ──── */
-    const articulos = await consultar('articulos', {
+       Await sobre una promesa que ya está en marcha devuelve al instante; el
+       resto del archivo no cambia. */
+    const _p_articulos = consultar('articulos', {
       select: 'id, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
               'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
       order: 'nombre',
     });
+    const _p_conteos = consultar('conteos', {
+      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_movimientos = consultar('movimientos', {
+      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_insumos = consultar('insumos', {
+      select: 'id, id_externo, nombre, unidad, inventario, tipo_registro, orden, ' +
+              'umbral_consumo, umbral_minimo, alerta_consumo, alerta_minimo, ' +
+              'resaltado_celda, alerta_rendimiento, rendimiento_min, rendimiento_max',
+      order: 'orden',
+    });
+    const _p_stock_diario = consultar('stock_diario', {
+      select: 'id_externo, insumo_id, fecha, stock_inicial, stock_cierre, version',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_produccion = consultar('produccion', {
+      select: 'id_externo, insumo_id, fecha, cantidad',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_efectivo_caja = consultar('efectivo_caja', {
+      select: 'id_externo, fecha, turno, responsable, apertura, cierre',
+    });
+    const _p_propinas = consultar('propinas', {
+      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    });
+    const _p_empleados = consultar('empleados', {
+      select: 'id_externo, nombre, es_mesero',
+      igual: { es_mesero: true },
+      order: 'nombre',
+    });
+
+    const hojas = {};
+
+    /* ── Catálogo de artículos, una consulta para las cinco categorías ──── */
+    const articulos = await _p_articulos;
     const porId = new Map(articulos.map(a => [a.id, a]));
     /* La app habla en ids del Spreadsheet; la base, en uuid. Este mapa es el
        traductor que necesita la escritura. */
@@ -65,17 +114,9 @@ export function crearLectorInventario(consultar){
     /* Los dos registros de movimiento se leen aquí arriba, antes de armar los
        catálogos, porque son ellos los que dicen qué artículo tiene historia.
        Son consultas independientes: adelantarlas no cambia nada más. */
-    const conteos = (await consultar('conteos', {
-      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.id_externo));
+    const conteos = (await _p_conteos).sort(porClaves(r => r.fecha, r => r.id_externo));
 
-    const movimientos = await consultar('movimientos', {
-      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    });
+    const movimientos = await _p_movimientos;
 
     /* Un artículo entra al catálogo si está vigente, o si está retirado pero
        todavía guarda historia. Lo segundo es lo que evita que un conteo de
@@ -191,13 +232,11 @@ export function crearLectorInventario(consultar){
     hojas.MovCocina = [['id','productoId','fecha','cantidad','tipoMovimiento']];
 
     /* ── Insumos de cocina y su stock diario ─────────────────────────────── */
-    const insumos = await consultar('insumos', {
-      select: 'id, id_externo, nombre, unidad, inventario, tipo_registro, orden, ' +
-              'umbral_consumo, umbral_minimo, alerta_consumo, alerta_minimo, ' +
-              'resaltado_celda, alerta_rendimiento, rendimiento_min, rendimiento_max',
-      order: 'orden',
-    });
+    const insumos = await _p_insumos;
     const insPorId = new Map(insumos.map(i => [i.id, i]));
+    // Los insumos entran al mismo traductor que los artículos: la escritura
+    // necesita el uuid y la app solo conoce el id de la hoja.
+    for(const i of insumos) uuidPorExterno.set(i.id_externo, i.id);
     hojas.Insumos = [['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo',
                       'alertaMinimo','resaltadoCelda','inventario','tipoRegistro','orden',
                       'alertaRendimiento','rendMin','rendMax']];
@@ -210,30 +249,27 @@ export function crearLectorInventario(consultar){
     /* La base guarda la forma v2 (stockInicial / stockCierre). Las columnas
        viejas 'produccion' y 'cierre' salen vacías y migradoV2 en 1: así la
        app ve un dato ya migrado y no intenta volver a migrarlo. */
-    const stock = (await consultar('stock_diario', {
-      select: 'id_externo, insumo_id, fecha, stock_inicial, stock_cierre',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.id_externo));
+    const stock = (await _p_stock_diario).sort(porClaves(r => r.fecha, r => r.id_externo));
+    /* Lo mismo que con los conteos: la versión no cabe en la hoja
+       reconstruida, pero sin ella no se puede actualizar sin pisar a otro. */
+    for(const r of stock){
+      const ext = insPorId.get(r.insumo_id)?.id_externo;
+      if(ext && r.version !== undefined && r.version !== null)
+        versionStock.set(ext + '|' + r.fecha, r.version);
+    }
     hojas.Produccion = [['id','insumoId','fecha','produccion','cierre','stockInicial','stockCierre','migradoV2']];
     for(const s of stock)
       hojas.Produccion.push([t(s.id_externo), insPorId.get(s.insumo_id)?.id_externo ?? '',
         s.fecha, '', '', s.stock_inicial ?? '', s.stock_cierre ?? '', 1]);
 
-    const produccion = (await consultar('produccion', {
-      select: 'id_externo, insumo_id, fecha, cantidad',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.id_externo));
+    const produccion = (await _p_produccion).sort(porClaves(r => r.fecha, r => r.id_externo));
     hojas.ProduccionInsumos = [['id','insumoId','fecha','cantidad']];
     for(const p of produccion)
       hojas.ProduccionInsumos.push([t(p.id_externo), insPorId.get(p.insumo_id)?.id_externo ?? '',
                                     p.fecha, n0(p.cantidad)]);
 
     /* ── Arqueo de efectivo: el jsonb vuelve a ser 24 columnas ──────────── */
-    const caja = (await consultar('efectivo_caja', {
-      select: 'id_externo, fecha, turno, responsable, apertura, cierre',
-    })).sort(porClaves(r => r.fecha, r => r.id_externo));
+    const caja = (await _p_efectivo_caja).sort(porClaves(r => r.fecha, r => r.id_externo));
     const cols = ['id','fecha','turno','responsable','apBolsa'];
     for(let i = 0; i <= 10; i++) cols.push('ap' + i);
     cols.push('clBolsa');
@@ -249,11 +285,7 @@ export function crearLectorInventario(consultar){
     }
 
     /* ── Propinas y meseros: viven en planilla, la app los lee aquí ─────── */
-    const propinas = (await consultar('propinas', {
-      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    })).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
+    const propinas = (await _p_propinas).sort(porClaves(r => r.fecha, r => r.empleados.id_externo, r => r.id_externo));
     hojas.Propinas = [['id','empleadoId','fecha','tipo','monto','ov']];
     for(const p of propinas){
       const fila = [p.id_externo || p.id, p.empleados.id_externo, p.fecha, p.medio, n0(p.monto)];
@@ -268,11 +300,7 @@ export function crearLectorInventario(consultar){
        en vez de 9: la lista incluye a dos personas inactivas y excluye a
        otras cuatro que también fueron meseras. Es una lista mantenida a
        mano y se guarda como tal. */
-    const meseros = await consultar('empleados', {
-      select: 'id_externo, nombre, es_mesero',
-      igual: { es_mesero: true },
-      order: 'nombre',
-    });
+    const meseros = await _p_empleados;
     hojas.Meseros = [['id','nombre']];
     for(const m of meseros) hojas.Meseros.push([m.id_externo, m.nombre]);
 
@@ -291,6 +319,10 @@ export function crearLectorInventario(consultar){
     uuidDe: idExterno => uuidPorExterno.get(idExterno) || null,
     versionDe: (idExterno, fecha, unidad) =>
       versionConteo.get(claveConteo(idExterno, fecha, unidad)) ?? null,
+    versionStockDe: (idExterno, fecha) => versionStock.get(idExterno + '|' + fecha) ?? null,
+    anotarVersionStock: (idExterno, fecha, version) =>
+      version === null ? versionStock.delete(idExterno + '|' + fecha)
+                       : versionStock.set(idExterno + '|' + fecha, version),
     /* Tras una escritura, la versión cambia: si no se anota, el siguiente
        guardado del mismo día llegaría con la vieja y daría conflicto. */
     anotarVersion: (idExterno, fecha, unidad, version) =>
