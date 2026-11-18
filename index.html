@@ -16414,13 +16414,21 @@ function sbCliente(){
 
 /* Devuelve algo con la misma forma que la respuesta de values:batchGet, para
    que gsLoadFromSheets siga su curso sin enterarse de la sustitución. */
+/* El navegador cachea los módulos, y el index.html se pide con ?v=… pero
+   estos no. El resultado es que una versión nueva de la app puede acabar
+   corriendo con adaptadores viejos sacados de la caché, y entonces un arreglo
+   que ya está publicado parece no funcionar. Pasó exactamente eso con la
+   paginación: el index.html era nuevo y el adaptador, viejo. Al colgarles la
+   versión de la app, cada publicación trae los suyos. */
+const modulo = nombre => './' + nombre + '.mjs?v=' + APP_VERSION;
+
 async function sbRespuestaDeHojas(domain, hojasPedidas){
   const sb = await sbCliente();
   const { data:{ session } } = await sb.auth.getSession();
   if(!session) throw new Error('No hay sesión en la base. Entra en login.html y vuelve a cargar.');
 
   const [{ crearLector, consultarConSupabase }, { crearLectorInventario }] = await Promise.all([
-    import('./datos-supabase.mjs'), import('./datos-inventario.mjs')
+    import(modulo('datos-supabase')), import(modulo('datos-inventario'))
   ]);
   const consultar = consultarConSupabase(sb);
   let hojas;
@@ -16477,7 +16485,7 @@ let _sbEscritor  = null;
 async function sbEscritor(){
   if(!_sbEscritor){
     const sb = await sbCliente();
-    const { crearEscritor } = await import('./datos-supabase.mjs');
+    const { crearEscritor } = await import(modulo('datos-supabase'));
     _sbEscritor = crearEscritor(sb);
   }
   return _sbEscritor;
@@ -17005,7 +17013,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.6';
+const APP_VERSION = '2026-11-17.7';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
