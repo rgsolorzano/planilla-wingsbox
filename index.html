@@ -10492,11 +10492,15 @@ RENDERERS.invDiarioSalon = function(){
   document.getElementById('salonFechaInp').onchange=e=>{
     salonFecha=e.target.value||salonFecha; RENDERERS.invDiarioSalon();
   };
-  document.getElementById('salonGuardar').onclick=function(){
+  document.getElementById('salonGuardar').onclick=async function(){
+    const btn=this;
     const fecha=salonFecha;
     if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast('Selecciona una fecha válida','error');return;}
     const unidadesDe=new Map(S.salonProductos.map(p=>[p.id,new Set(p.unidades)]));
     let nuevos=0, actualizados=0;
+    /* Lo que de verdad cambió. Mandar a la base las 40 celdas de la pantalla
+       cuando el usuario tocó tres sería escribir 37 veces lo mismo. */
+    const cambiadas=[];
     document.querySelectorAll('.salon-inp').forEach(inp=>{
       if(inp.value.trim()==='') return; // vacío = sin registro (no se guarda ni se borra)
       const productoId=inp.dataset.prod, unidad=inp.dataset.unit;
@@ -10507,13 +10511,27 @@ RENDERERS.invDiarioSalon = function(){
       if(!unidades || !unidades.has(unidad)) return;
       const cantidad=Math.max(0,Number(inp.value)||0);
       const r=getSalonStock(productoId,fecha,unidad);
-      if(r){ if(r.cantidad!==cantidad){r.cantidad=cantidad;} actualizados++; }
-      else { S.salonInventario.push({id:uid(),productoId,fecha,unidad,cantidad}); nuevos++; }
+      if(r){
+        if(r.cantidad!==cantidad){ r.cantidad=cantidad; cambiadas.push({productoId,fecha,unidad,cantidad}); }
+        actualizados++;
+      }
+      else { S.salonInventario.push({id:uid(),productoId,fecha,unidad,cantidad});
+             cambiadas.push({productoId,fecha,unidad,cantidad}); nuevos++; }
     });
     salonSanearInventario(false); // red de seguridad final: dedupe por (producto, fecha, unidad)
     save(K.salonInventario,S.salonInventario);
-    syncSalonInventario();
-    toast(`Inventario de salón guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
+
+    if(leyendoDeLaBase()){
+      btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
+      try{
+        const r=await sbGuardarConteos(cambiadas);
+        const { msg, tipo } = sbExplicarConteos(r, 'Inventario de salón');
+        toast(msg, tipo);
+      }finally{ btn.disabled=false; btn.textContent=txt; }
+    }else{
+      syncSalonInventario();
+      toast(`Inventario de salón guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
+    }
     RENDERERS.invDiarioSalon();
   };
 };
@@ -11177,7 +11195,8 @@ RENDERERS.invDiarioCocina = function(){
   if(mf) mf.onchange=(e)=>{ cocinaFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioCocina(); };
 
   document.getElementById('cocFecha').onchange=(e)=>{ cocinaFecha=e.target.value||fechaHoy(); RENDERERS.invDiarioCocina(); };
-  document.getElementById('cocGuardar').onclick=()=>{
+  document.getElementById('cocGuardar').onclick=async function(){
+    const btn=this;
     const inputs=[...document.querySelectorAll('.cocina-inp')];
     // Validación ANTES de guardar nada: un decimal aborta toda la operación.
     for(const inp of inputs){
@@ -11190,13 +11209,32 @@ RENDERERS.invDiarioCocina = function(){
       }
     }
     let nuevos=0, act=0, elim=0;
+    const cambiadas=[];
     inputs.forEach(inp=>{
       const v=cocinaValidarCantidad(inp.value);
+      const antes=getInvCocina(inp.dataset.prod, cocinaFecha);
       const res=cocinaUpsert(inp.dataset.prod, cocinaFecha, v.valor);
       if(res==='nuevo') nuevos++; else if(res==='actualizado') act++; else if(res==='eliminado') elim++;
+      if(res==='nuevo' || (res==='actualizado' && (!antes || antes.cantidad!==v.valor)))
+        cambiadas.push({productoId:inp.dataset.prod, fecha:cocinaFecha, unidad:null, cantidad:v.valor});
     });
-    save(K.cocinaInventario,S.cocinaInventario); syncCocinaInventario();
-    toast('Inventario guardado: '+nuevos+' nuevo(s), '+act+' actualizado(s)'+(elim?', '+elim+' sin registro':'')+'.','success');
+    save(K.cocinaInventario,S.cocinaInventario);
+
+    if(leyendoDeLaBase()){
+      btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
+      try{
+        const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Inventario de cocina');
+        /* Vaciar una celda borra el registro, y guardar_conteo no borra: crea
+           o actualiza. Mientras no exista una función de borrado en la base,
+           esa parte del guardado NO se aplica allá, y hay que decirlo en vez
+           de dejar al usuario creyendo que sí. */
+        if(elim) toast('Se quitaron '+elim+' registro(s) en esta pantalla, pero el borrado todavía no está disponible en la base: siguen ahí.','error');
+        else toast(msg, tipo);
+      }finally{ btn.disabled=false; btn.textContent=txt; }
+    }else{
+      syncCocinaInventario();
+      toast('Inventario guardado: '+nuevos+' nuevo(s), '+act+' actualizado(s)'+(elim?', '+elim+' sin registro':'')+'.','success');
+    }
     RENDERERS.invDiarioCocina();
   };
 };
@@ -11415,7 +11453,8 @@ RENDERERS.invDiarioMenaje = function(){
       validarFila(inp.dataset.art);
     };
   });
-  document.getElementById('menajeGuardar').onclick=function(){
+  document.getElementById('menajeGuardar').onclick=async function(){
+    const btn=this;
     const fecha=menajeFecha;
     if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast('Selecciona una fecha válida','error');return;}
     const ids=new Set(S.menajeArticulos.map(a=>a.id));
@@ -11432,6 +11471,8 @@ RENDERERS.invDiarioMenaje = function(){
       return; // no se guarda nada
     }
     let nuevos=0, actualizados=0;
+    // Solo lo que de verdad cambió viaja a la base.
+    const cambiadas=[];
     S.menajeArticulos.forEach(a=>{
       const articuloId=a.id;
       if(!ids.has(articuloId)) return; // guarda de integridad
@@ -11439,13 +11480,27 @@ RENDERERS.invDiarioMenaje = function(){
       if(v.total===null && v.rotas===null && v.rajadas===null) return; // sin datos: no se guarda
       const cantidad=v.total||0, rotas=v.rotas||0, rajadas=v.rajadas||0;
       const r=getMenajeStock(articuloId,fecha);
-      if(r){ r.cantidad=cantidad; r.rotas=rotas; r.rajadas=rajadas; actualizados++; }
-      else { S.menajeInventario.push({id:uid(),articuloId,fecha,cantidad,rotas,rajadas}); nuevos++; }
+      if(r){
+        const cambia = r.cantidad!==cantidad || (r.rotas||0)!==rotas || (r.rajadas||0)!==rajadas;
+        r.cantidad=cantidad; r.rotas=rotas; r.rajadas=rajadas; actualizados++;
+        if(cambia) cambiadas.push({productoId:articuloId,fecha,unidad:null,cantidad,rotas,rajadas});
+      }
+      else { S.menajeInventario.push({id:uid(),articuloId,fecha,cantidad,rotas,rajadas});
+             cambiadas.push({productoId:articuloId,fecha,unidad:null,cantidad,rotas,rajadas}); nuevos++; }
     });
     menajeSanearInventario(false); // red de seguridad: dedupe por (artículo, fecha)
     save(K.menajeInventario,S.menajeInventario);
-    syncMenajeInventario();
-    toast(`Inventario de menaje guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
+
+    if(leyendoDeLaBase()){
+      btn.disabled=true; const txt=btn.textContent; btn.textContent='Guardando…';
+      try{
+        const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Inventario de menaje');
+        toast(msg, tipo);
+      }finally{ btn.disabled=false; btn.textContent=txt; }
+    }else{
+      syncMenajeInventario();
+      toast(`Inventario de menaje guardado (${nuevos} nuevo${nuevos!==1?'s':''}, ${actualizados} actualizado${actualizados!==1?'s':''})`,'success');
+    }
     RENDERERS.invDiarioMenaje();
   };
 };
@@ -14627,16 +14682,28 @@ async function stockBebidasGuardar(){
   inputs.forEach(inp=>{ const v=inp.value.trim(); const bad=(v!==''&&(isNaN(Number(v))||Number(v)<0)); inp.classList.toggle('invalid',bad); if(bad)ok=false; });
   if(!ok){ toast('Los valores de stock deben ser numéricos y no negativos','error'); return; }
   let guardados=0;
+  // Solo lo que de verdad cambió viaja a la base.
+  const cambiadas=[];
   inputs.forEach(inp=>{
     if(inp.value.trim()==='') return;
-    upsertStockBebida(inp.dataset.id, stockBebidasFecha, Number(inp.value));
+    const id=inp.dataset.id, cantidad=Number(inp.value);
+    const antes=getStockBebida(id, stockBebidasFecha);
+    if(!antes || antes.stock!==cantidad)
+      cambiadas.push({productoId:id, fecha:stockBebidasFecha, unidad:null, cantidad});
+    upsertStockBebida(id, stockBebidasFecha, cantidad);
     guardados++;
   });
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
   save(K.stockBebidas,S.stockBebidas);
-  toast(`Stock guardado (${guardados} bebida(s)).`,'success');
-  const ok2=await gsSaveSheet('inventario','StockBebidas',gsSerializeSheet('inventario','StockBebidas'));
-  if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+
+  if(leyendoDeLaBase()){
+    const { msg, tipo } = sbExplicarConteos(await sbGuardarConteos(cambiadas), 'Stock de bebidas');
+    toast(msg, tipo);
+  }else{
+    toast(`Stock guardado (${guardados} bebida(s)).`,'success');
+    const ok2=await gsSaveSheet('inventario','StockBebidas',gsSerializeSheet('inventario','StockBebidas'));
+    if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+  }
   RENDERERS.stockDiarioBebidas();
 }
 function stockBebidasExportar(){
@@ -16335,11 +16402,18 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
     import('./datos-supabase.mjs'), import('./datos-inventario.mjs')
   ]);
   const consultar = consultarConSupabase(sb);
-  const hojas = domain === 'inventario'
-    ? await crearLectorInventario(consultar).leerInventario()
-    : await crearLector(consultar).leerPlanilla();
+  let hojas;
+  if(domain === 'inventario'){
+    /* El lector se conserva: además de las hojas, guarda el uuid de cada
+       artículo y la versión de cada conteo, que es lo que la escritura
+       necesita y la hoja reconstruida no puede llevar encima. */
+    _sbLectorInv = crearLectorInventario(consultar);
+    hojas = await _sbLectorInv.leerInventario();
+  }else{
+    hojas = await crearLector(consultar).leerPlanilla();
+  }
 
-  console.log('[Fuente] Leyendo de PostgreSQL ('+domain+'). Guardado bloqueado.');
+  console.log('[Fuente] Leyendo de PostgreSQL ('+domain+').');
   return {
     ok: true, status: 200,
     json: async () => ({
@@ -16347,6 +16421,116 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
       valueRanges: hojasPedidas.map(n => ({ range: n+'!A:AZ', values: hojas[n] || [] }))
     })
   };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ESCRITURA DE CONTEOS EN POSTGRESQL
+   -----------------------------------------------------------------------
+   Primer módulo que deja de ser de solo lectura. Cubre las cuatro pantallas
+   de conteo diario —salón, menaje, cocina y bebidas— porque las cuatro
+   guardan lo mismo: cuánto hay de un artículo, un día, en una unidad.
+
+   No se escribe con un INSERT suelto sino llamando a core.guardar_conteo,
+   que trae tres defensas que un INSERT no da:
+
+     · Idempotencia. La clave se genera UNA vez por clic en Guardar, no por
+       intento. Si la conexión se corta y el usuario reintenta, la segunda
+       llamada devuelve 'repetido' y no vuelve a escribir.
+
+     · Concurrencia. Para actualizar hay que decir qué versión se tenía a la
+       vista. Si alguien más la cambió mientras tanto, responde 'conflicto'
+       en vez de pisarlo en silencio.
+
+     · Permiso real. Un UPDATE que RLS no permite NO lanza error: filtra, no
+       encuentra la fila y afecta cero. La función cuenta las filas y
+       responde 'denegado'; si confiáramos en la ausencia de error diríamos
+       "Guardado" sin haber guardado.
+
+   Lo que esta función NO hace es decidir qué celdas cambiaron: eso lo sabe
+   cada pantalla, y mandar solo lo que cambió es lo que mantiene el número
+   de llamadas en el orden de lo que el usuario tocó.
+   ═══════════════════════════════════════════════════════════════════════ */
+let _sbLectorInv = null;
+let _sbEscritor  = null;
+
+async function sbEscritor(){
+  if(!_sbEscritor){
+    const sb = await sbCliente();
+    const { crearEscritor } = await import('./datos-supabase.mjs');
+    _sbEscritor = crearEscritor(sb);
+  }
+  return _sbEscritor;
+}
+
+/* celdas: [{ productoId, fecha, unidad, cantidad, rotas, rajadas }]
+   Devuelve un resumen para que la pantalla pueda decir la verdad. */
+async function sbGuardarConteos(celdas){
+  if(!_sbLectorInv)
+    return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  if(!celdas.length) return { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  const escritor = await sbEscritor();
+  /* Una clave por ACCIÓN del usuario. Las de cada celda cuelgan de ella, así
+     que reintentar el mismo clic reencuentra exactamente las mismas claves y
+     la base reconoce el reintento. */
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  for(const c of celdas){
+    const articuloId = _sbLectorInv.uuidDe(c.productoId);
+    if(!articuloId){
+      res.incidencias.push({ celda:c, estado:'desconocido',
+        motivo:'ese artículo no existe en la base' });
+      res.ok = false; continue;
+    }
+    const r = await escritor.guardarConteo({
+      clave: accion + ':' + c.productoId + ':' + (c.unidad || ''),
+      articuloId, fecha: c.fecha, cantidad: c.cantidad,
+      unidad: c.unidad || null, rotas: c.rotas ?? null, rajadas: c.rajadas ?? null,
+      version: _sbLectorInv.versionDe(c.productoId, c.fecha, c.unidad),
+    });
+
+    if(r.estado === 'creado' || r.estado === 'actualizado'){
+      // La versión cambió: sin anotarla, el siguiente guardado del mismo día
+      // llegaría con la vieja y la base lo rechazaría por conflicto.
+      _sbLectorInv.anotarVersion(c.productoId, c.fecha, c.unidad, r.version);
+      res[r.estado === 'creado' ? 'creados' : 'actualizados']++;
+    }else if(r.estado === 'repetido'){
+      res.repetidos++;
+    }else{
+      res.incidencias.push({ celda:c, estado:r.estado,
+        motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+
+/* El texto que ve el usuario. Se centraliza para que las cuatro pantallas no
+   expliquen lo mismo de cuatro maneras distintas. */
+function sbExplicarConteos(r, etiqueta){
+  if(r.motivo) return { msg: r.motivo, tipo:'error' };
+  const hechos = [];
+  if(r.creados)      hechos.push(r.creados + ' nuevo' + (r.creados!==1?'s':''));
+  if(r.actualizados) hechos.push(r.actualizados + ' actualizado' + (r.actualizados!==1?'s':''));
+  if(r.repetidos)    hechos.push(r.repetidos + ' ya estaba' + (r.repetidos!==1?'n':''));
+  const resumen = hechos.length ? ' (' + hechos.join(', ') + ')' : '';
+
+  /* "Nada que mandar" merece su propia frase. Si se dijera "guardado" a
+     secas, el usuario no podría distinguir un guardado real de uno que no
+     tenía nada que guardar, y esa distinción es justo la que deja ver que
+     solo viaja lo que cambió. */
+  if(r.ok && !r.creados && !r.actualizados && !r.repetidos)
+    return { msg: etiqueta + ': no había cambios que guardar', tipo:'info' };
+  if(r.ok) return { msg: etiqueta + ' guardado en la base' + resumen, tipo:'success' };
+
+  const conflictos = r.incidencias.filter(i => i.estado === 'conflicto').length;
+  const denegados  = r.incidencias.filter(i => i.estado === 'denegado').length;
+  let detalle;
+  if(conflictos) detalle = conflictos + ' registro(s) los cambió alguien más mientras editabas. Recarga para ver lo que hay ahora.';
+  else if(denegados) detalle = 'no tienes permiso para guardar ' + denegados + ' registro(s).';
+  else detalle = r.incidencias[0].motivo;
+  return { msg: etiqueta + resumen + ', pero ' + detalle, tipo:'error' };
 }
 
 async function gsLoadFromSheets(domain='planilla', opts={}){
@@ -16772,7 +16956,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-17.1';
+const APP_VERSION = '2026-11-17.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

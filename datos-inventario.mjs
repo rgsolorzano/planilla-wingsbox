@@ -37,7 +37,16 @@ const porClaves = (...claves) => (a, b) => {
   return 0;
 };
 
+/* Clave de un conteo tal como la nombra la app: producto, fecha y unidad.
+   La unidad puede no existir (cocina y bebidas no la usan) y ahí vale ''. */
+export const claveConteo = (idExterno, fecha, unidad) =>
+  `${idExterno}|${fecha}|${unidad ?? ''}`;
+
 export function crearLectorInventario(consultar){
+  /* Se llenan al leer y los consulta la escritura. Viven fuera de
+     leerInventario para que sobrevivan a la lectura que los pobló. */
+  const uuidPorExterno = new Map();
+  const versionConteo  = new Map();
 
   async function leerInventario(){
     const hojas = {};
@@ -49,12 +58,15 @@ export function crearLectorInventario(consultar){
       order: 'nombre',
     });
     const porId = new Map(articulos.map(a => [a.id, a]));
+    /* La app habla en ids del Spreadsheet; la base, en uuid. Este mapa es el
+       traductor que necesita la escritura. */
+    for(const a of articulos) uuidPorExterno.set(a.id_externo, a.id);
 
     /* Los dos registros de movimiento se leen aquí arriba, antes de armar los
        catálogos, porque son ellos los que dicen qué artículo tiene historia.
        Son consultas independientes: adelantarlas no cambia nada más. */
     const conteos = (await consultar('conteos', {
-      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas',
+      select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
     })).sort(porClaves(r => r.fecha, r => r.id_externo));
 
     const movimientos = await consultar('movimientos', {
@@ -66,6 +78,14 @@ export function crearLectorInventario(consultar){
        julio apunte a un artículo que la app no conoce. Y como la fusión de
        los duplicados de salón dejó las fichas antiguas sin conteos, esas
        desaparecen por esta misma regla, sin necesidad de nombrarlas. */
+    /* La versión de cada conteo se guarda aquí, no en la hoja reconstruida.
+       Hacerla una columna más cambiaría la forma de la pestaña y la app no
+       sabría qué hacer con ella. Pero sin versión no se puede actualizar sin
+       pisar a otro: guardar_conteo la exige justamente para eso. */
+    for(const c of conteos)
+      versionConteo.set(claveConteo(porId.get(c.articulo_id)?.id_externo, c.fecha, c.unidad),
+                        c.version);
+
     const conHistoria = new Set();
     for(const c of conteos) conHistoria.add(c.articulo_id);
     for(const m of movimientos) conHistoria.add(m.articulo_id);
@@ -244,5 +264,15 @@ export function crearLectorInventario(consultar){
     return hojas;
   }
 
-  return { leerInventario };
+  return {
+    leerInventario,
+    /* Lo que la escritura necesita y la hoja reconstruida no puede llevar. */
+    uuidDe: idExterno => uuidPorExterno.get(idExterno) || null,
+    versionDe: (idExterno, fecha, unidad) =>
+      versionConteo.get(claveConteo(idExterno, fecha, unidad)) ?? null,
+    /* Tras una escritura, la versión cambia: si no se anota, el siguiente
+       guardado del mismo día llegaría con la vieja y daría conflicto. */
+    anotarVersion: (idExterno, fecha, unidad, version) =>
+      versionConteo.set(claveConteo(idExterno, fecha, unidad), version),
+  };
 }
