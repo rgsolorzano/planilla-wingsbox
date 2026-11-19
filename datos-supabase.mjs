@@ -400,7 +400,21 @@ export function crearEscritor(sb){
    Implementación para el navegador, sobre supabase-js.
    Se pasa el cliente ya creado para que esta pieza no decida credenciales.
    ═══════════════════════════════════════════════════════════════════════════ */
+/* El tope de filas por respuesta del servidor, aprendido en la primera
+   consulta de la sesión. Supabase corta en 1,000 salvo que se cambie en los
+   ajustes del proyecto (API → Max rows).
+
+   Importa porque, sin saberlo, cada tabla paga una petición de más: cuando
+   una respuesta viene corta hay que averiguar si se acabaron las filas o si
+   el servidor cortó, y eso cuesta una sonda. En la medición del 18/11 esa
+   sonda aparecía en las 21 tablas, incluidas las de cuatro filas. Una vez
+   conocido el tope, una respuesta corta ya no es ambigua y la sonda sobra. */
 export function consultarConSupabase(sb){
+  /* Vive aquí, no en el módulo: el tope es de la conexión con la que se
+     consulta, no un hecho global del programa. Ponerlo fuera hacía que una
+     conexión le dictara el tope a otra, lo que además volvía las pruebas
+     dependientes del orden en que se corren. */
+  let topeServidor = null;
   return async function consultar(tabla, { select, order, igual } = {}){
     /* Traer una tabla que no cabe en una respuesta. Tres intentos hicieron
        falta para acertar, y la medición del 18/11 es la que lo decidió:
@@ -444,7 +458,7 @@ export function consultarConSupabase(sb){
       console.log(`[Carga] ${tabla}: ${ms} ms · ${n} fila(s) · ${peticiones} petición(es)`);
     };
 
-    let tramo = TRAMO_GRANDE;
+    let tramo = topeServidor || TRAMO_GRANDE;
     const filas = await trae(0, tramo);
 
     while(true){
@@ -459,16 +473,31 @@ export function consultarConSupabase(sb){
         if(mas.length < tramo) break;
         continue;
       }
-      /* Vino corto. ¿Se acabaron las filas o el servidor tiene un tope? Una
-         petición más lo aclara, y es barata comparada con perder datos. */
+      /* Vino corto. Si ya sabemos cuánto corta el servidor, no hay ambigüedad:
+         corto significa que se acabaron las filas. */
       if(filas.length === 0) break;
+      if(topeServidor && filas.length < topeServidor) break;
+
+      /* Todavía no lo sabemos: ¿se acabaron las filas o el servidor cortó?
+         Una petición más lo aclara, y es barata comparada con perder datos.
+         La respuesta se guarda para toda la sesión, así que esto se paga una
+         sola vez y no una por tabla. */
       const sonda = await trae(filas.length, tramo);
-      if(!sonda.length) break;                  // se acabaron de verdad
+      if(!sonda.length){
+        /* Se acabaron. Y si pedimos menos de lo que cabía, no aprendimos
+           ningún tope: el servidor nunca llegó a cortarnos. */
+        break;
+      }
       if(!order)
         throw new Error(`${tabla}: el servidor devuelve como mucho ${filas.length} filas `
           + 'por respuesta y hay que paginar, pero no se pidió ningún orden. '
           + 'Añade order a esta consulta.');
       tramo = filas.length;                     // ese era el tope del servidor
+      if(!topeServidor){
+        topeServidor = tramo;
+        console.log(`[Carga] El servidor devuelve como mucho ${tramo} filas por respuesta.`
+          + ' Se puede subir en Supabase: Settings → API → Max rows.');
+      }
       filas.push(...sonda);
       if(sonda.length < tramo) break;
     }
