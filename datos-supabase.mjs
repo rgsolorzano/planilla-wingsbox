@@ -447,10 +447,21 @@ export function consultarConSupabase(sb){
 
     const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     let peticiones = 0;
+    /* PostgREST ya dice si quedan filas, y lo dice en el código HTTP: 200
+       cuando la respuesta cubre toda la colección, 206 (Partial Content)
+       cuando se quedó corta. Usarlo quita la sonda POR COMPLETO —no solo en
+       las tablas que ya conocían el tope— y era lo que seguía costando una
+       petición de más en las veintiuna, porque todas arrancan a la vez y
+       terminan antes de que ninguna grande descubra dónde corta el servidor.
+
+       Si algún día la respuesta no trajera código, se vuelve al método de la
+       sonda, que es más lento pero no se inventa nada. */
+    let ultimoParcial = null;      // true = hay más · false = completo · null = no se sabe
     const trae = async (desde, cuantas) => {
       peticiones++;
       const r = await pide(desde, cuantas);
       if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+      ultimoParcial = r.status === 206 ? true : (r.status === 200 ? false : null);
       return r.data;
     };
     const reporta = (n) => {
@@ -462,6 +473,9 @@ export function consultarConSupabase(sb){
     const filas = await trae(0, tramo);
 
     while(true){
+      // El servidor dijo que la respuesta estaba completa: no hay más.
+      if(ultimoParcial === false) break;
+
       if(filas.length % tramo === 0 && filas.length > 0){
         // El último tramo vino lleno: puede quedar más.
         if(!order)
@@ -477,6 +491,17 @@ export function consultarConSupabase(sb){
          corto significa que se acabaron las filas. */
       if(filas.length === 0) break;
       if(topeServidor && filas.length < topeServidor) break;
+      /* Dijo que hay más aunque la respuesta viniera corta: ese corte ES el
+         tope del servidor. Se aprende sin gastar una petición. */
+      if(ultimoParcial === true && !topeServidor){
+        topeServidor = filas.length;
+        tramo = topeServidor;
+        console.log(`[Carga] El servidor devuelve como mucho ${tramo} filas por respuesta.`
+          + ' Se puede subir en Supabase: Settings → API → Max rows.');
+        const mas = await trae(filas.length, tramo);
+        filas.push(...mas);
+        continue;
+      }
 
       /* Todavía no lo sabemos: ¿se acabaron las filas o el servidor cortó?
          Una petición más lo aclara, y es barata comparada con perder datos.
