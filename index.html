@@ -10587,9 +10587,28 @@ RENDERERS.consolidadoSalon = function(){
   // Bolsa no tiene "Días en 0"; si el producto solo tiene Bolsa → null
   function unidadControladora(p){ return p.unidades.find(u=>u==='Caja'||u==='Paquete')||null; }
 
-  // Calcula dias en cero para cada fecha (solo días con registro explícito cuentan)
+  /* Días consecutivos en 0, contando desde CINCO DÍAS ANTES del rango.
+
+     Antes el contador arrancaba en 0 en la primera fecha a la vista, así que
+     un producto que llevaba diez días en 0 mostraba «1» el primer día del
+     rango: el número dependía de dónde empezaras a mirar, no de la realidad.
+
+     Cinco días es el arranque acordado —no desde el origen de los registros—,
+     y además fija lo mínimo que la carga por ventana tendrá que traer para
+     que esta columna siga saliendo bien: inicio del rango menos cinco.
+
+     Los días sin registro no cuentan ni rompen la racha: la racha se conserva
+     y se sigue contando cuando vuelve a haber registro, que es como estaba. */
+  const DIAS_ARRASTRE_CERO = 5;
   function calcDiasEnCero(productoId, unidad){
     let cero=0;
+    // Arrastre: se recorren los cinco días previos sin pintarlos.
+    for(let i=DIAS_ARRASTRE_CERO; i>=1; i--){
+      const f = fechaMasDias(fechas[0], -i);
+      const r = getSalonStock(productoId,f,unidad);
+      if(r==null) continue;
+      if(r.cantidad>0) cero=0; else cero++;
+    }
     return fechas.map(f=>{
       const r=getSalonStock(productoId,f,unidad);
       if(r==null) return {v:null,dz:null};
@@ -17326,7 +17345,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-20.5';
+const APP_VERSION = '2026-11-20.6';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
