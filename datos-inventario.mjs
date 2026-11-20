@@ -62,11 +62,21 @@ export function crearLectorInventario(consultar){
               'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
       order: 'nombre',
     });
-    const _p_conteos = consultar('conteos', {
+    /* Conteos es la tabla más grande (6,012 filas), así que su primera página
+       es la que calibra: en cuanto se sabe que una respuesta cabe al menos
+       5,000 filas, ninguna de las otras ocho necesita preguntar si su
+       respuesta corta era un corte del servidor. Esa página no se desperdicia,
+       la recoge la consulta de abajo.
+
+       Es lo único que no va en paralelo, y da igual: conteos marca el tiempo
+       de la carga de todos modos. El 20/11 esto eran 18 peticiones; ahora 10. */
+    const CONTEOS = {
       select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
-    });
+    };
+    if(consultar.calibrar) await consultar.calibrar('conteos', CONTEOS);
+    const _p_conteos = consultar('conteos', CONTEOS);
     const _p_movimientos = consultar('movimientos', {
       select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
       // Orden único: sin él, paginar de mil en mil se salta filas.

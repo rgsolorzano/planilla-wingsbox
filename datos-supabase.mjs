@@ -79,12 +79,18 @@ export function crearLector(consultar){
               'empleados!inner(id_externo), condiciones_laborales(id_externo)',
       order: 'orden',
     });
-    const _p_marcaciones = consultar('marcaciones', {
+    /* Marcaciones es la mayor del dominio (1,436 filas) y su primera página
+       calibra para las diez restantes: deja puesta la cota de cuántas filas
+       cabe en una respuesta, y así ninguna vuelve a preguntarlo. La página se
+       guarda y la recoge la consulta de aquí abajo. */
+    const MARCACIONES = {
       select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
               'empleados!inner(id_externo)',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
-    });
+    };
+    if(consultar.calibrar) await consultar.calibrar('marcaciones', MARCACIONES);
+    const _p_marcaciones = consultar('marcaciones', MARCACIONES);
     const _p_dias_libres = consultar('dias_libres', {
       select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
     });
@@ -410,12 +416,26 @@ export function crearEscritor(sb){
    sonda aparecía en las 21 tablas, incluidas las de cuatro filas. Una vez
    conocido el tope, una respuesta corta ya no es ambigua y la sonda sobra. */
 export function consultarConSupabase(sb){
-  /* Vive aquí, no en el módulo: el tope es de la conexión con la que se
-     consulta, no un hecho global del programa. Ponerlo fuera hacía que una
-     conexión le dictara el tope a otra, lo que además volvía las pruebas
-     dependientes del orden en que se corren. */
-  let topeServidor = null;
-  return async function consultar(tabla, { select, order, igual } = {}){
+  /* Viven aquí, no en el módulo: son hechos de la conexión con la que se
+     consulta, no del programa. Fuera, una conexión le dictaría el tope a otra
+     y las pruebas dependerían del orden en que se corren. */
+  let topeServidor = null;   // cuánto corta el servidor, si se ha averiguado
+  /* La cota de abajo: el mayor número de filas que este servidor ha devuelto
+     en UNA respuesta. Es lo que evita casi todas las sondas, y la idea es más
+     simple que el tope exacto: si alguna vez contestó 5,000 filas de golpe,
+     entonces corta en 5,000 o más, y cualquier respuesta de menos de 5,000 no
+     puede ser un corte —está completa—. No hace falta saber dónde corta: basta
+     saber que corta más arriba.
+
+     Sin esto la sonda no servía de nada en la práctica, porque solo se
+     aprendía el tope cuando alguna tabla lo alcanzaba, y con el tope en 5,000
+     ninguna lo alcanza. Resultado medido el 20/11: las veinte tablas pagaban
+     sonda, hasta la de cuatro filas. */
+  let pisoTope = 0;
+  const primeraPagina = new Map();   // lo que dejó calibrar(), para no repetirlo
+  const firma = (tabla, o) => JSON.stringify([tabla, o.select, o.order, o.igual]);
+
+  async function consultar(tabla, { select, order, igual } = {}){
     /* Traer una tabla que no cabe en una respuesta. Tres intentos hicieron
        falta para acertar, y la medición del 18/11 es la que lo decidió:
 
@@ -471,6 +491,7 @@ export function consultarConSupabase(sb){
       peticiones++;
       const r = await pide(desde, cuantas);
       if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+      if(r.data.length > pisoTope) pisoTope = r.data.length;
       return r.data;
     };
     const reporta = (n) => {
@@ -479,7 +500,20 @@ export function consultarConSupabase(sb){
     };
 
     let tramo = topeServidor || TRAMO_GRANDE;
-    const filas = await trae(0, tramo);
+    /* Si calibrar() ya trajo esta primera página, se usa y no se vuelve a
+       pedir: la calibración no cuesta ninguna petición de más. */
+    const clave = firma(tabla, { select, order, igual });
+    const guardada = primeraPagina.get(clave);
+    let filas, yaCompleta = false;
+    if(guardada){
+      primeraPagina.delete(clave);
+      filas = guardada.filas.slice();
+      peticiones += guardada.peticiones;
+      yaCompleta = guardada.completa;
+    } else {
+      filas = await trae(0, tramo);
+    }
+    if(yaCompleta){ reporta(filas.length); return filas; }
 
     while(true){
       if(filas.length % tramo === 0 && filas.length > 0){
@@ -497,6 +531,9 @@ export function consultarConSupabase(sb){
          corto significa que se acabaron las filas. */
       if(filas.length === 0) break;
       if(topeServidor && filas.length < topeServidor) break;
+      /* Por debajo de lo que este servidor ya ha devuelto de una vez: no
+         puede ser un corte suyo, así que se acabaron las filas. */
+      if(filas.length < pisoTope) break;
       /* Todavía no lo sabemos: ¿se acabaron las filas o el servidor cortó?
          Una petición más lo aclara, y es barata comparada con perder datos.
          La respuesta se guarda para toda la sesión, así que esto se paga una
@@ -523,5 +560,54 @@ export function consultarConSupabase(sb){
 
     reporta(filas.length);
     return filas;
+  }
+
+  /* Trae la primera página de la tabla MÁS GRANDE y resuelve de una vez la
+     ambigüedad de las respuestas cortas, dejando la cota puesta para todas las
+     demás. Quien llame espera esto ANTES de lanzar el resto en paralelo.
+
+     No gasta nada: esa página hacía falta igual, se guarda y la consulta de
+     verdad la recoge. Lo único que se paga es que la tabla grande empiece
+     sola, y es la que marca el tiempo de todos modos. */
+  consultar.calibrar = async function calibrar(tabla, opciones = {}){
+    const { select, order, igual } = opciones;
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    let peticiones = 0;
+    const pedir = async (desde, cuantas) => {
+      peticiones++;
+      let q = sb.schema('core').from(tabla).select(select);
+      if(igual) for(const [col, val] of Object.entries(igual)) q = q.eq(col, val);
+      if(order) q = q.order(order);
+      const r = await q.range(desde, desde + cuantas - 1);
+      if(r.error) throw new Error(`${tabla}: ${r.error.message}`);
+      if(r.data.length > pisoTope) pisoTope = r.data.length;
+      return r.data;
+    };
+    const tramo = topeServidor || 5000;
+    const filas = await pedir(0, tramo);
+    let completa = false;
+    /* Vino corta y no hay con qué compararla: una petición más dice si se
+       acabaron las filas o si el servidor cortó. Es la única sonda de toda la
+       carga, y deja a las otras veinte sin pagarla. */
+    if(filas.length > 0 && filas.length < tramo && filas.length >= pisoTope){
+      const sonda = await pedir(filas.length, tramo);
+      if(sonda.length){
+        topeServidor = filas.length;
+        console.log(`[Carga] El servidor devuelve como mucho ${topeServidor} filas por respuesta.`
+          + ' Se puede subir en Supabase: Settings → API → Max rows.');
+        filas.push(...sonda);
+      } else {
+        /* La sonda dijo que se acabaron. Se anota, porque si no la consulta de
+           verdad vuelve a sondear: su regla es «corta = completa SI queda por
+           debajo de la cota», y estas filas son justo la cota. */
+        completa = true;
+      }
+    }
+    primeraPagina.set(firma(tabla, { select, order, igual }), { filas, peticiones, completa });
+    const ms = Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0);
+    console.log(`[Carga] calibrado con ${tabla}: ${ms} ms · ${peticiones} petición(es)`
+      + ` · una respuesta cabe al menos ${pisoTope} fila(s)`);
   };
+
+  return consultar;
 }
