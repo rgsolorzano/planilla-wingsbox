@@ -16519,9 +16519,30 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
   const { data:{ session } } = await sb.auth.getSession();
   if(!session) throw new Error('No hay sesión en la base. Entra en login.html y vuelve a cargar.');
 
-  const [{ crearLector, consultarConSupabase }, { crearLectorInventario }] = await Promise.all([
+  function avisaVersiones(modulos){
+    const desfasados = Object.entries(modulos).filter(([, v]) => v !== APP_VERSION);
+    if(!desfasados.length){
+      console.log(`[App] versión ${APP_VERSION} · index y módulos coinciden`);
+      return;
+    }
+    console.error(`[App] ¡VERSIONES DESCUADRADAS! index.html dice ${APP_VERSION}, pero: `
+      + desfasados.map(([n, v]) => `${n} dice ${v || 'nada (archivo viejo)'}`).join(' · ')
+      + '. Estás corriendo una mezcla: sube los archivos que faltan y recarga con '
+      + 'Ctrl+Shift+R. No guardes nada hasta que coincidan.');
+  }
+
+  const [modPlanilla, modInventario] = await Promise.all([
     import(modulo('datos-supabase')), import(modulo('datos-inventario'))
   ]);
+  const { crearLector, consultarConSupabase } = modPlanilla;
+  const { crearLectorInventario } = modInventario;
+  /* Que la consola diga qué versión está corriendo de verdad, archivo por
+     archivo. El ?v= de la URL solo dice qué pidió el index; no prueba que el
+     servidor tenga ese archivo ni que el navegador no esté sirviendo el de
+     antes desde la caché. Una subida a medias nos tuvo buscando un fallo que
+     ya estaba arreglado, y mirando la consola no había forma de saberlo. */
+  avisaVersiones({ 'datos-supabase': modPlanilla.VERSION,
+                   'datos-inventario': modInventario.VERSION });
   const consultar = consultarConSupabase(sb);
   let hojas;
   if(domain === 'inventario'){
@@ -17305,7 +17326,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-20.3';
+const APP_VERSION = '2026-11-20.5';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

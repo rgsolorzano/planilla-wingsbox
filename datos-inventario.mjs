@@ -25,6 +25,11 @@
       la migración por decisión del 13/11/2026.
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
+   si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
+   código que ya se arregló, y eso costó una tarde de dar vueltas. */
+export const VERSION = '2026-11-20.5';
+
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
 const b01 = x => (x === true || x === 't' || x === 1) ? 1 : 0;
@@ -57,25 +62,27 @@ export function crearLectorInventario(consultar){
 
        Await sobre una promesa que ya está en marcha devuelve al instante; el
        resto del archivo no cambia. */
-    const _p_articulos = consultar('articulos', {
-      select: 'id, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
-              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
-      order: 'nombre',
-    });
-    /* Conteos es la tabla más grande (6,012 filas), así que su primera página
-       es la que calibra: en cuanto se sabe que una respuesta cabe al menos
-       5,000 filas, ninguna de las otras ocho necesita preguntar si su
-       respuesta corta era un corte del servidor. Esa página no se desperdicia,
-       la recoge la consulta de abajo.
+    /* La calibración va PRIMERO, antes de lanzar nada: estaba después de
+       articulos y esa consulta ya había salido sin la cota, pagando una
+       petición de más. Lo que calibra no sirve si el resto ya está en vuelo.
 
-       Es lo único que no va en paralelo, y da igual: conteos marca el tiempo
-       de la carga de todos modos. El 20/11 esto eran 18 peticiones; ahora 10. */
+       Conteos es la mayor (6,012 filas) y su primera página se guarda, así que
+       la recoge su propia consulta más abajo. Es lo único que no va en
+       paralelo, y da igual: conteos marca el tiempo de la carga de todos
+       modos. La cota queda puesta también para planilla, que comparte
+       conexión. */
     const CONTEOS = {
       select: 'id, id_externo, articulo_id, fecha, cantidad, unidad, rotas, rajadas, version',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     };
     if(consultar.calibrar) await consultar.calibrar('conteos', CONTEOS);
+
+    const _p_articulos = consultar('articulos', {
+      select: 'id, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
+              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
+      order: 'nombre',
+    });
     const _p_conteos = consultar('conteos', CONTEOS);
     const _p_movimientos = consultar('movimientos', {
       select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',

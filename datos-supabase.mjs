@@ -18,6 +18,11 @@
    errores— es la misma en los dos casos.
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
+   si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
+   código que ya se arregló, y eso costó una tarde de dar vueltas. */
+export const VERSION = '2026-11-20.5';
+
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
 /** Número cuando lo es; '' cuando no hay dato. Nunca 0 por omisión. */
@@ -59,6 +64,24 @@ export function crearLector(consultar){
     /* Todas las consultas se lanzan A LA VEZ y se esperan más abajo, cada una
        donde ya se usaba. Antes iban en fila india, y eso son tantos viajes de
        ida y vuelta seguidos como consultas. Ninguna depende de otra. */
+    /* La calibración va PRIMERO, antes de lanzar nada. La traza del 20/11 lo
+       dejó claro: estaba a mitad del archivo, y las seis consultas declaradas
+       por encima ya habían salido sin la cota puesta, así que seguían pagando
+       sonda —empleados, horarios, validacion_tarjeta—. Lo que calibra no sirve
+       de nada si el resto ya está en vuelo.
+
+       Marcaciones es la mayor del dominio (1,436 filas) y su primera página se
+       guarda, así que la recoge su propia consulta más abajo sin volver a
+       pedirla. La cota se comparte con inventario, que usa la misma conexión:
+       si inventario cargó antes, aquí ya no se sondea nada. */
+    const MARCACIONES = {
+      select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
+              'empleados!inner(id_externo)',
+      // Orden único: sin él, paginar de mil en mil se salta filas.
+      order: 'id',
+    };
+    if(consultar.calibrar) await consultar.calibrar('marcaciones', MARCACIONES);
+
     const _p_feriados = consultar('feriados', { select: 'id_externo, fecha, nombre', order: 'fecha' });
     const _p_vt = consultar('validacion_tarjeta', { select: 'fecha, niubiz, caja', order: 'fecha' });
     const _p_condiciones_laborales = consultar('condiciones_laborales', {
@@ -79,17 +102,6 @@ export function crearLector(consultar){
               'empleados!inner(id_externo), condiciones_laborales(id_externo)',
       order: 'orden',
     });
-    /* Marcaciones es la mayor del dominio (1,436 filas) y su primera página
-       calibra para las diez restantes: deja puesta la cota de cuántas filas
-       cabe en una respuesta, y así ninguna vuelve a preguntarlo. La página se
-       guarda y la recoge la consulta de aquí abajo. */
-    const MARCACIONES = {
-      select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
-              'empleados!inner(id_externo)',
-      // Orden único: sin él, paginar de mil en mil se salta filas.
-      order: 'id',
-    };
-    if(consultar.calibrar) await consultar.calibrar('marcaciones', MARCACIONES);
     const _p_marcaciones = consultar('marcaciones', MARCACIONES);
     const _p_dias_libres = consultar('dias_libres', {
       select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
