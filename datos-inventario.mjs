@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-20.6';
+export const VERSION = '2026-11-20.7';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
@@ -47,11 +47,22 @@ const porClaves = (...claves) => (a, b) => {
 export const claveConteo = (idExterno, fecha, unidad) =>
   `${idExterno}|${fecha}|${unidad ?? ''}`;
 
+/* Clave de un movimiento tal como lo identifica la base: artículo, fecha y
+   tipo. No lleva el id de la hoja a propósito; ver el mapa versionMov. */
+export const claveMovimiento = (idExterno, fecha, tipo) =>
+  `${idExterno}|${fecha}|${tipo}`;
+
 export function crearLectorInventario(consultar){
   /* Se llenan al leer y los consulta la escritura. Viven fuera de
      leerInventario para que sobrevivan a la lectura que los pobló. */
   const uuidPorExterno = new Map();   // artículos e insumos, por su id de la hoja
   const versionConteo  = new Map();
+  /* Movimientos, por ARTÍCULO + FECHA + TIPO, que es como los identifica
+     core.guardar_movimiento. Tentaba usar el id_externo, que es más corto,
+     pero esa función no lo guarda: todo movimiento que escriba la app nace
+     con id_externo en null, así que una versión guardada bajo esa clave sería
+     inencontrable justo para las filas que la app acaba de crear. */
+  const versionMov     = new Map();
   const versionStock   = new Map();   // stock_diario, por insumo y fecha
 
   async function leerInventario(){
@@ -85,7 +96,7 @@ export function crearLectorInventario(consultar){
     });
     const _p_conteos = consultar('conteos', CONTEOS);
     const _p_movimientos = consultar('movimientos', {
-      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas',
+      select: 'id, id_externo, articulo_id, fecha, tipo, cantidad, cantidad_botellas, version',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
@@ -161,7 +172,11 @@ export function crearLectorInventario(consultar){
 
     const conHistoria = new Set();
     for(const c of conteos) conHistoria.add(c.articulo_id);
-    for(const m of movimientos) conHistoria.add(m.articulo_id);
+    for(const m of movimientos){
+      conHistoria.add(m.articulo_id);
+      const a = porId.get(m.articulo_id);
+      if(a) versionMov.set(claveMovimiento(a.id_externo, m.fecha, m.tipo), m.version);
+    }
     const de = cat => articulos.filter(a =>
       a.categoria === cat && (a.activo || conHistoria.has(a.id)));
 
@@ -225,7 +240,13 @@ export function crearLectorInventario(consultar){
     const filasLic = new Map();
     for(const m of movimientos){
       if(porId.get(m.articulo_id)?.categoria !== 'licores') continue;
-      const base = String(m.id_externo || '').replace(/:(e|s)$/, '');
+      /* Las filas que escribe la app nacen sin id_externo, porque
+         guardar_movimiento no lo guarda. Sin un id propio todas caerían en
+         la misma clave '' y se verían como UNA sola fila. El id derivado del
+         artículo y la fecha es además estable entre recargas, cosa que un
+         uid() al azar no era. */
+      const base = m.id_externo ? String(m.id_externo).replace(/:(e|s)$/, '')
+                                : `lic:${ext(m)}:${m.fecha}`;
       const f = filasLic.get(base) || { id: base, bebidaId: ext(m), fecha: m.fecha,
         entradaOzs: 0, entradaBots: 0, salidaOzs: 0, salidaBots: 0 };
       if(m.tipo === 'ingreso'){ f.entradaOzs = n0(m.cantidad); f.entradaBots = n0(m.cantidad_botellas); }
@@ -348,5 +369,11 @@ export function crearLectorInventario(consultar){
        guardado del mismo día llegaría con la vieja y daría conflicto. */
     anotarVersion: (idExterno, fecha, unidad, version) =>
       versionConteo.set(claveConteo(idExterno, fecha, unidad), version),
+    /* Movimientos: artículo, fecha y tipo. Null si esa fila todavía no está
+       en la base, que es lo que guardar_movimiento espera para crearla. */
+    versionMovDe: (idExterno, fecha, tipo) =>
+      versionMov.get(claveMovimiento(idExterno, fecha, tipo)) ?? null,
+    anotarVersionMov: (idExterno, fecha, tipo, version) =>
+      versionMov.set(claveMovimiento(idExterno, fecha, tipo), version),
   };
 }

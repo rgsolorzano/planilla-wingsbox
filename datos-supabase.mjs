@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-20.6';
+export const VERSION = '2026-11-20.7';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 

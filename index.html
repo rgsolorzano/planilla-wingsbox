@@ -11012,6 +11012,33 @@ function syncMenajeInventario() { _syncSheet('inventario','MenajeInventario','Me
 function syncCocinaProductos()  { _syncSheet('inventario','Cocina',   'Cocina',    S.cocinaProductos.length); }
 function syncCocinaInventario() { _syncSheet('inventario','InvCocina','InvCocina', S.cocinaInventario.length); }
 function syncCocinaMovimientos(){ _syncSheet('inventario','MovCocina','MovCocina', S.cocinaMovimientos.length); }
+/* Mismo caso que en bebidas: la pantalla deja registrar varios movimientos del
+   mismo producto y tipo en un día y la base guarda uno por producto, fecha y
+   tipo, así que viaja el TOTAL del día recalculado desde el estado local.
+   Aquí el tipo ya se llama igual en los dos sitios —ingreso y salida—, sin la
+   traducción que hace falta en bebidas. */
+function cocMovTotales(fecha, pares){
+  return [...pares].map(clave => {
+    const corte = clave.lastIndexOf('|');
+    const productoId = clave.slice(0, corte), tipo = clave.slice(corte + 1);
+    let total = 0;
+    for(const m of S.cocinaMovimientos)
+      if(m.productoId === productoId && m.fecha === fecha && m.tipo === tipo)
+        total += Number(m.cantidad) || 0;
+    return { productoId, fecha, tipo, cantidad: total };
+  });
+}
+async function sbMovCocinaSincronizar(fecha, pares){
+  try{
+    const r = await sbGuardarMovimientos(cocMovTotales(fecha, pares));
+    const { msg, tipo } = sbExplicarConteos(r, 'Movimientos de cocina');
+    if(!r.ok) await sbRecargarTrasFallo();
+    toast(msg, tipo);
+  }catch(e){
+    console.error('[Movimientos] cocina:', e);
+    toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
+  }
+}
 
 // ── Estado de edición ─────────────────────────────────────────────
 let editMenajeArtId = null;
@@ -11092,15 +11119,23 @@ RENDERERS.cocinaAdmin = function(){
 };
 /* Elimina UN movimiento por su id: los demás del mismo día y producto se
    conservan. El tombstone evita que reaparezca al fusionar con el remoto. */
-window.cocinaMovEliminar = function(id){
+window.cocinaMovEliminar = async function(id){
   const m=S.cocinaMovimientos.find(x=>x.id===id); if(!m) return;
   const p=S.cocinaProductos.find(x=>x.id===m.productoId);
   if(!confirm('¿Eliminar este movimiento?\n\n'+(p?cocinaEtiqueta(p):'(producto eliminado)')+
     ' · '+(m.tipo==='salida'?'Salida':'Ingreso')+' '+m.cantidad+' · '+fmtFecha(m.fecha))) return;
   S.cocinaMovimientos=S.cocinaMovimientos.filter(x=>x.id!==id);
   if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('MovCocina', m);
-  save(K.cocinaMovimientos,S.cocinaMovimientos); syncCocinaMovimientos();
-  toast('Movimiento eliminado','success');
+  save(K.cocinaMovimientos,S.cocinaMovimientos);
+  if(leyendoDeLaBase()){
+    /* El total queda sin este movimiento. Si era el último del día, vale 0:
+       la base no borra movimientos, así que la fila se queda en cero. Para el
+       neto es lo mismo. */
+    await sbMovCocinaSincronizar(m.fecha, new Set([m.productoId + '|' + m.tipo]));
+  }else{
+    syncCocinaMovimientos();
+    toast('Movimiento eliminado','success');
+  }
   RENDERERS.invDiarioCocina();
 };
 
@@ -11211,7 +11246,7 @@ RENDERERS.invDiarioCocina = function(){
     const btnAdd=document.getElementById('cocMovAdd');
     if(btnAdd) btnAdd.onclick=()=>movBody.appendChild(filaMov());
     const btnSave=document.getElementById('cocMovSave');
-    if(btnSave) btnSave.onclick=()=>{
+    if(btnSave) btnSave.onclick=async ()=>{
       const filas=[...movBody.children];
       const nuevos=[];
       // Validación COMPLETA antes de guardar: un error aborta toda la operación.
@@ -11229,8 +11264,14 @@ RENDERERS.invDiarioCocina = function(){
       }
       if(!nuevos.length){ toast('No hay movimientos que guardar.','info'); return; }
       S.cocinaMovimientos.push(...nuevos);              // cada uno con su id único
-      save(K.cocinaMovimientos,S.cocinaMovimientos); syncCocinaMovimientos();
-      toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      save(K.cocinaMovimientos,S.cocinaMovimientos);
+      if(leyendoDeLaBase()){
+        await sbMovCocinaSincronizar(cocinaFecha,
+          new Set(nuevos.map(x => x.productoId + '|' + x.tipo)));
+      }else{
+        syncCocinaMovimientos();
+        toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      }
       RENDERERS.invDiarioCocina();
     };
   }
@@ -13767,6 +13808,7 @@ async function invLicoresGuardar(){
   if(!ok){ toast('Onzas deben ser números ≥0 (decimales permitidos); botellas deben ser enteros ≥0','error'); return; }
 
   let guardados=0;
+  const contados=[];                 // lo que se mandará a la base, si toca
   document.querySelectorAll('.invLicBot').forEach(botEl=>{
     const licorId=botEl.dataset.id;
     const ozEl=document.querySelector(`.invLicOz[data-id="${licorId}"]`);
@@ -13777,13 +13819,32 @@ async function invLicoresGuardar(){
     const bot=botEl.value.trim()==='' ? 0 : Number(botEl.value);
     const oz =ozEl&&ozEl.value.trim()!=='' ? Number(ozEl.value) : 0;
     invLicorUpsert(licorId, invLicoresFecha, bot, oz);
+    contados.push({ productoId:licorId, fecha:invLicoresFecha, tipo:'ingreso',
+                    cantidad:oz, botellas:bot });
     guardados++;
   });
   if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
   save(K.invLicores,S.invLicores);
-  toast(`Inventario guardado (${guardados} licor(es)).`,'success');
-  const ok2=await gsSaveSheet('inventario','InvLicores',gsSerializeSheet('inventario','InvLicores'));
-  if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+
+  if(leyendoDeLaBase()){
+    /* El inventario físico del día viaja como movimiento de tipo 'ingreso':
+       botellas cerradas en `botellas`, onzas sueltas en `cantidad`. El
+       consumo no se manda, lo deduce el cotejo comparando dos días seguidos.
+       Las salidas históricas anteriores al 16/11 no se tocan. */
+    try{
+      const r = await sbGuardarMovimientos(contados);
+      const { msg, tipo } = sbExplicarConteos(r, 'Inventario de licores');
+      if(!r.ok) await sbRecargarTrasFallo();
+      toast(msg, tipo);
+    }catch(e){
+      console.error('[Movimientos] licores:', e);
+      toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
+    }
+  }else{
+    toast(`Inventario guardado (${guardados} licor(es)).`,'success');
+    const ok2=await gsSaveSheet('inventario','InvLicores',gsSerializeSheet('inventario','InvLicores'));
+    if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+  }
   RENDERERS.invDiarioLicores();
 }
 function invLicoresExportar(){
@@ -14488,13 +14549,63 @@ function bebMovsDe(fecha){
     .sort((a,b)=>String(a.id).localeCompare(String(b.id)));
 }
 function syncMovBebidas(){ _syncSheet('inventario','MovBebidas','MovBebidas', S.bebidasMovs.length); }
-window.bebMovEliminar = function(id){
+/* La pantalla deja registrar VARIOS movimientos de la misma bebida y tipo en
+   un día; la base guarda UNO por artículo, fecha y tipo. Mandar cada uno por
+   separado haría que el segundo pisara al primero y la cantidad se perdería
+   sin aviso.
+
+   Así que no se manda cada movimiento: se manda el TOTAL del día, recalculado
+   desde el estado local, que ya incluye lo que se acaba de añadir o quitar.
+   Vale igual para guardar y para eliminar —eliminar es el mismo total con un
+   sumando menos—, y por eso no hace falta una función de borrado en la base.
+
+   Consecuencia que conviene conocer: dos entradas sueltas de 10 y 5 de la
+   misma bebida vuelven de la base como una sola de 15. El neto del día no
+   cambia, porque bebMovNeto ya sumaba todos; lo que se pierde al recargar es
+   el detalle fila a fila. */
+function bebMovTotales(fecha, pares){
+  return [...pares].map(clave => {
+    const corte = clave.lastIndexOf('|');
+    const bebidaId = clave.slice(0, corte), etiqueta = clave.slice(corte + 1);
+    let total = 0;
+    for(const m of S.bebidasMovs)
+      if(m.bebidaId === bebidaId && m.fecha === fecha
+         && bebMovTipoNorm(m.tipoMovimiento) === etiqueta)
+        total += Number(m.cantidad) || 0;
+    return { productoId: bebidaId, fecha,
+             tipo: etiqueta === 'Entrada' ? 'ingreso' : 'salida',
+             cantidad: total };
+  });
+}
+/* Manda a la base los totales del día de los pares tocados. */
+async function sbMovBebidasSincronizar(fecha, pares, etiqueta){
+  try{
+    const r = await sbGuardarMovimientos(bebMovTotales(fecha, pares));
+    const { msg, tipo } = sbExplicarConteos(r, etiqueta);
+    if(!r.ok) await sbRecargarTrasFallo();
+    toast(msg, tipo);
+  }catch(e){
+    console.error('[Movimientos] bebidas:', e);
+    toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
+  }
+}
+window.bebMovEliminar = async function(id){
   const m=S.bebidasMovs.find(x=>x.id===id); if(!m) return;
   if(!confirm('¿Eliminar este movimiento?')) return;
   if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('MovBebidas', m);
+  const par = m.bebidaId + '|' + bebMovTipoNorm(m.tipoMovimiento), fecha = m.fecha;
   S.bebidasMovs = S.bebidasMovs.filter(x=>x.id!==id);
-  save(K.bebidasMovs,S.bebidasMovs); syncMovBebidas();
-  toast('Movimiento eliminado','success');
+  save(K.bebidasMovs,S.bebidasMovs);
+  if(leyendoDeLaBase()){
+    /* El total queda recalculado sin este movimiento. Si era el último del
+       día, el total es 0: la fila se queda en la base valiendo cero en vez de
+       desaparecer, porque la base no tiene borrado de movimientos. Para el
+       neto del día es lo mismo; en la lista se verá una fila en 0. */
+    await sbMovBebidasSincronizar(fecha, new Set([par]), 'Movimientos de bebidas');
+  }else{
+    syncMovBebidas();
+    toast('Movimiento eliminado','success');
+  }
   RENDERERS.stockDiarioBebidas();
 };
 
@@ -14772,7 +14883,7 @@ RENDERERS.stockDiarioBebidas = function(){
     const add=document.getElementById('bebMovAdd');
     if(add) add.onclick=()=>bebMovBody.appendChild(filaBebMov());
     const sv=document.getElementById('bebMovSave');
-    if(sv) sv.onclick=()=>{
+    if(sv) sv.onclick=async ()=>{
       const nuevos=[];
       // Validación COMPLETA antes de guardar: un error aborta toda la operación.
       for(const tr of [...bebMovBody.children]){
@@ -14789,8 +14900,14 @@ RENDERERS.stockDiarioBebidas = function(){
       }
       if(!nuevos.length){ toast('No hay movimientos que guardar.','info'); return; }
       S.bebidasMovs.push(...nuevos);                     // cada uno con su id único
-      save(K.bebidasMovs,S.bebidasMovs); syncMovBebidas();
-      toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      save(K.bebidasMovs,S.bebidasMovs);
+      if(leyendoDeLaBase()){
+        const pares = new Set(nuevos.map(x => x.bebidaId + '|' + bebMovTipoNorm(x.tipoMovimiento)));
+        await sbMovBebidasSincronizar(stockBebidasFecha, pares, 'Movimientos de bebidas');
+      }else{
+        syncMovBebidas();
+        toast(nuevos.length+' movimiento(s) guardado(s).','success');
+      }
       RENDERERS.stockDiarioBebidas();
     };
   }
@@ -16794,6 +16911,70 @@ async function sbGuardarStock(celdas){
   return res;
 }
 
+/* Movimientos de artículo: el inventario físico diario de licores y las
+   entradas y salidas de bebidas y cocina.
+
+   Dos cosas que conviene tener presentes al llamar, porque no funcionan como
+   los conteos:
+
+   · La base identifica un movimiento por ARTÍCULO + FECHA + TIPO. No hay dos
+     ingresos del mismo licor el mismo día; el segundo guardado actualiza al
+     primero. Por eso no hace falta mandar el id de la fila de la hoja, y de
+     hecho la base no lo guarda.
+
+   · En licores, 'ingreso' NO es una entrada de mercadería: es el inventario
+     físico que se contó ese día, botellas cerradas en `botellas` y onzas
+     sueltas en `cantidad`. El consumo no se guarda, se deduce comparando dos
+     días seguidos. Mandar aquí un consumo sería corromper el inventario.
+
+   movs: [{ productoId, fecha, tipo, cantidad, botellas }]  */
+async function sbGuardarMovimientos(movs){
+  if(!_sbLectorInv)
+    return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  if(!movs.length) return { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  if(!_sbLectorInv.uuidDe('__hay_datos__') && !_sbLectorInv.tieneCatalogo())
+    return { ok:false, motivo:'no se pudieron cargar los datos del inventario. Recarga la página e inténtalo de nuevo.' };
+
+  const escritor = await sbEscritor();
+  // Una clave por ACCIÓN: reintentar el mismo clic reencuentra las mismas
+  // claves y la base lo reconoce como reintento en vez de duplicar.
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+
+  for(const m of movs){
+    const articuloId = _sbLectorInv.uuidDe(m.productoId);
+    if(!articuloId){
+      res.incidencias.push({ celda:m, estado:'desconocido',
+        motivo:'ese artículo no existe en la base' });
+      res.ok = false; continue;
+    }
+    const version = _sbLectorInv.versionMovDe(m.productoId, m.fecha, m.tipo);
+    const r = await escritor.guardarMovimiento({
+      clave: accion + ':mov:' + m.productoId + ':' + m.tipo,
+      articuloId, fecha: m.fecha, tipo: m.tipo,
+      cantidad: m.cantidad ?? 0,
+      botellas: m.botellas ?? null,
+    version,
+    });
+
+    if(r.estado === 'creado' || r.estado === 'actualizado'){
+      // Sin anotar la versión nueva, el siguiente guardado del mismo día
+      // llegaría con la vieja y la base lo rechazaría por conflicto.
+      _sbLectorInv.anotarVersionMov(m.productoId, m.fecha, m.tipo, r.version);
+      res[r.estado === 'creado' ? 'creados' : 'actualizados']++;
+    }else if(r.estado === 'repetido'){
+      res.repetidos++;
+    }else{
+      console.warn('[Movimientos] no se guardó', { mov:m, versionEnviada:version, respuesta:r });
+      res.incidencias.push({ celda:m, estado:r.estado,
+        motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+
 /* Junta el resultado de guardar y el de borrar en una sola frase. Son dos
    llamadas distintas pero para el usuario fue un solo clic en Guardar. */
 function sbUnirResultados(guardado, borrado){
@@ -17345,7 +17526,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-20.6';
+const APP_VERSION = '2026-11-20.7';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
