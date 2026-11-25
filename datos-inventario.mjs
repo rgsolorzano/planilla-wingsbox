@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.2';
+export const VERSION = '2026-11-25.3';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
@@ -95,8 +95,8 @@ export function crearLectorInventario(consultar){
     if(consultar.calibrar) await consultar.calibrar('conteos', CONTEOS);
 
     const _p_articulos = consultar('articulos', {
-      select: 'id, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
-              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, orden',
+      select: 'id, version, id_externo, categoria, subcategoria, nombre, unidad, tamano_ml, ' +
+              'oz_por_botella, stock_minimo, botellas_vacias, unidades, activo, eliminado, orden',
       order: 'nombre',
     });
     const _p_conteos = consultar('conteos', CONTEOS);
@@ -106,7 +106,7 @@ export function crearLectorInventario(consultar){
       order: 'id',
     });
     const _p_insumos = consultar('insumos', {
-      select: 'id, id_externo, nombre, unidad, inventario, tipo_registro, orden, ' +
+      select: 'id, version, activo, id_externo, nombre, unidad, inventario, tipo_registro, orden, ' +
               'umbral_consumo, umbral_minimo, alerta_consumo, alerta_minimo, ' +
               'resaltado_celda, alerta_rendimiento, rendimiento_min, rendimiento_max',
       order: 'orden',
@@ -183,12 +183,29 @@ export function crearLectorInventario(consultar){
       const a = porId.get(m.articulo_id);
       if(a) versionMov.set(claveMovimiento(a.id_externo, m.fecha, m.tipo), m.version);
     }
-    const de = cat => articulos.filter(a =>
-      a.categoria === cat && (a.activo || conHistoria.has(a.id)));
+    /* Qué artículos aparecen en cada catálogo. Decisión del usuario (25/11):
+       un artículo eliminado ya no aparece, como en la hoja. Antes se incluían
+       los retirados que tuvieran historia, y PISCO GALPON —borrado de la
+       hoja— seguía saliendo en modo base.
+
+       Bebidas es la excepción, porque su pestaña SÍ tiene columna activo: en
+       su formulario hay una casilla para desactivar sin borrar, y una bebida
+       desactivada tiene que seguir en la lista para poder reactivarla. Allí
+       solo desaparece lo eliminado. En las demás no existe "desactivado" para
+       la app, así que lo inactivo no aparece.
+
+       La historia de un eliminado no se pierde: conteos y movimientos se
+       siguen reconstruyendo, porque el traductor de ids recorre TODOS los
+       artículos, no solo los de esta lista. */
+    const de = cat => articulos.filter(a => a.categoria === cat && !a.eliminado
+      && (cat === 'bebidas' || a.activo));
+    const fila = (hoja, a) => (meta[hoja] || (meta[hoja] = [])).push({ id: a.id, version: a.version });
 
     hojas.Licores = [['id','nombre','tamanoMl','ozPorBotella']];
-    for(const a of de('licores'))
+    for(const a of de('licores')){
       hojas.Licores.push([a.id_externo, a.nombre, n0(a.tamano_ml), n0(a.oz_por_botella)]);
+      fila('Licores', a);
+    }
 
     hojas.BebidasCat = [['id','categoria','nombre','activo','nroBotellasVacias','stockMinimo']];
     for(const a of de('bebidas')){
@@ -198,15 +215,20 @@ export function crearLectorInventario(consultar){
                     t(a.botellas_vacias), t(a.stock_minimo)];
       while(fila.length > 4 && fila[fila.length-1] === '') fila.pop();
       hojas.BebidasCat.push(fila);
+      (meta.BebidasCat || (meta.BebidasCat = [])).push({ id: a.id, version: a.version });
     }
 
     hojas.SalonProductos = [['id','nombre','unidades']];
-    for(const a of de('salon'))
+    for(const a of de('salon')){
       hojas.SalonProductos.push([a.id_externo, a.nombre, t(a.unidades)]);
+      fila('SalonProductos', a);
+    }
 
     hojas.MenajeArticulos = [['id','nombre']];
-    for(const a of de('menaje'))
+    for(const a of de('menaje')){
       hojas.MenajeArticulos.push([a.id_externo, a.nombre]);
+      fila('MenajeArticulos', a);
+    }
 
     /* La pestaña Cocina vivía vacía en el Spreadsheet —su catálogo estaba
        sembrado en el código de la app— y por eso se devolvía vacía. Desde el
@@ -214,8 +236,10 @@ export function crearLectorInventario(consultar){
        se devuelve lo que hay en la base: devolverla vacía obligaría a la app
        a volver a sembrarla y dejaría el 'orden' en blanco. */
     hojas.Cocina = [['id','nombre','unidad','orden']];
-    for(const a of de('cocina'))
+    for(const a of de('cocina')){
       hojas.Cocina.push([a.id_externo, a.nombre, t(a.unidad), a.orden ?? '']);
+      fila('Cocina', a);
+    }
 
     /* ── Conteos: una tabla, cuatro pestañas, según la categoría ────────── */
     const conteosDe = cat => conteos.filter(c => porId.get(c.articulo_id)?.categoria === cat);
@@ -301,11 +325,16 @@ export function crearLectorInventario(consultar){
     hojas.Insumos = [['id','nombre','unidad','umbralConsumo','umbralMinimo','alertaConsumo',
                       'alertaMinimo','resaltadoCelda','inventario','tipoRegistro','orden',
                       'alertaRendimiento','rendMin','rendMax']];
-    for(const i of insumos)
+    /* Un insumo retirado no aparece (la pestaña no tiene columna activo),
+       pero sigue en el traductor de ids de arriba: su stock histórico se
+       reconstruye igual. */
+    for(const i of insumos.filter(i => i.activo !== false)){
+      (meta.Insumos || (meta.Insumos = [])).push({ id: i.id, version: i.version });
       hojas.Insumos.push([i.id_externo, i.nombre, t(i.unidad), n0(i.umbral_consumo),
         n0(i.umbral_minimo), b01(i.alerta_consumo), b01(i.alerta_minimo),
         b01(i.resaltado_celda), t(i.inventario), t(i.tipo_registro), n0(i.orden),
         b01(i.alerta_rendimiento), n0(i.rendimiento_min), n0(i.rendimiento_max)]);
+    }
 
     /* La base guarda la forma v2 (stockInicial / stockCierre). Las columnas
        viejas 'produccion' y 'cierre' salen vacías y migradoV2 en 1: así la
@@ -389,6 +418,10 @@ export function crearLectorInventario(consultar){
     /* La meta de la última lectura, aparte de las hojas: la app recorre las
        hojas por nombre y una clave extra ahí dentro sería una pestaña más. */
     meta: () => ultimaMeta,
+    /* Tras crear una ficha desde la app, su uuid. Sin esto, un conteo de un
+       artículo recién creado fallaría con "no existe en la base" hasta la
+       siguiente recarga. */
+    anotarUuid: (idExterno, uuid) => { if(idExterno && uuid) uuidPorExterno.set(idExterno, uuid); },
     /* Lo que la escritura necesita y la hoja reconstruida no puede llevar. */
     uuidDe: idExterno => uuidPorExterno.get(idExterno) || null,
     /* ¿Llegó a leerse algo? Si una consulta se pasó del tiempo límite, el

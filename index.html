@@ -16682,12 +16682,7 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
     import(modulo('datos-supabase')), import(modulo('datos-inventario')),
     import(modulo('sincronizar-base'))
   ]);
-  if(!_sbMotor) _sbMotor = modMotor.crearMotor({
-    rpc: sbLlamarFuncion,
-    claveApp: (hoja, fila) => gsClaveDe(hoja, fila),
-    uid: () => (typeof uid === 'function' ? uid() : String(Date.now()) + Math.random()),
-    log: m => console.log(m),
-  });
+  if(!_sbMotor) _sbMotor = sbCrearMotor(modMotor, sbLlamarFuncion);
   const { crearLector, consultarConSupabase } = modPlanilla;
   const { crearLectorInventario } = modInventario;
   /* Que la consola diga qué versión está corriendo de verdad, archivo por
@@ -17011,6 +17006,25 @@ async function sbGuardarMovimientos(movs){
 /* var y no let: con let, cualquier sync…() que corriera durante la carga del
    script antes de esta línea lanzaría ReferenceError y tumbaría la app. */
 var _sbMotor = null;
+
+/* El motor se arma aquí y no dentro de la lectura, para que las pruebas lo
+   construyan IGUAL —con su aviso de fichas nuevas incluido— cambiando solo
+   la forma de llamar a la base. */
+function sbCrearMotor(modMotor, rpc){
+  return modMotor.crearMotor({
+    rpc,
+    claveApp: (hoja, fila) => gsClaveDe(hoja, fila),
+    uid: () => (typeof uid === 'function' ? uid() : String(Date.now()) + Math.random()),
+    log: m => console.log(m),
+    /* Una ficha recién creada desde la app: su uuid al traductor de ids del
+       inventario. Sin esto, contar un licor recién creado fallaría con "no
+       existe en la base" hasta recargar. */
+    alEscribir: (hoja, fila, r) => {
+      if(_sbLectorInv && r && r.id && ['Licores','BebidasCat','SalonProductos','MenajeArticulos','Cocina','Insumos'].includes(hoja))
+        _sbLectorInv.anotarUuid(String(fila.id), r.id);
+    },
+  });
+}
 
 async function sbLlamarFuncion(fn, params){
   const sb = await sbCliente();
@@ -17622,7 +17636,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.2';
+const APP_VERSION = '2026-11-25.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

@@ -36,7 +36,7 @@
    de calcular la clave de la app. Así se prueba en Node contra la base real.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-export const VERSION = '2026-11-25.2';
+export const VERSION = '2026-11-25.3';
 
 /* ── Normalización: la MISMA que usa el comparador ───────────────────────── */
 const canonico = x => Array.isArray(x) ? x.map(canonico)
@@ -95,7 +95,47 @@ const movimientoPlanilla = (fn, tabla) => ({
     params: { p_tabla: tabla, p_id: m.id, p_version: m.version } }),
 });
 
+/* Catálogos: una ficha por artículo, identificada por el id de la app. Cada
+   pestaña manda SOLO sus columnas, y la base actualiza solo esas (ver 43):
+   así guardar un licor desde su pestaña no deja en blanco lo que esa pestaña
+   no muestra. Eliminar no borra: lo retira, y su historia se queda. */
+const catalogo = (categoria, columnas) => ({
+  clave: o => String(o.id),
+  catalogo: true,
+  guardar: (o, ant, m) => [{ fn: 'guardar_articulo', params: () => ({
+    p_id: m?.id ?? null, p_categoria: categoria, p_nombre: o.nombre,
+    p_id_externo: String(o.id), p_version: m?.version ?? null,
+    p_activo: null,             // solo Bebidas lo lleva; null = no tocarlo
+    ...columnas(o) }) }],
+  borrar: (ant, m) => ({ fn: 'retirar_articulo', params: { p_id: m.id, p_version: m.version } }),
+});
+
 export const HOJAS = {
+  Licores:         catalogo('licores', o => ({ p_tamano_ml: num(o.tamanoMl), p_oz_botella: num(o.ozPorBotella) })),
+  BebidasCat:      catalogo('bebidas', o => ({ p_subcategoria: o.categoria || null, p_activo: sino(o.activo),
+                                              p_stock_minimo: num(o.stockMinimo),
+                                              p_botellas_vacias: num(o.nroBotellasVacias) })),
+  SalonProductos:  catalogo('salon',   o => ({ p_unidades: o.unidades || null })),
+  MenajeArticulos: catalogo('menaje',  () => ({})),
+  Cocina:          catalogo('cocina',  o => ({ p_unidad: o.unidad || null, p_orden: num(o.orden) })),
+
+  /* Insumos: su pestaña lleva TODAS sus columnas, así que se manda la ficha
+     entera. */
+  Insumos: {
+    clave: o => String(o.id),
+    catalogo: true,
+    guardar: (o, ant, m) => [{ fn: 'guardar_insumo', params: () => ({
+      p_id: m?.id ?? null, p_nombre: o.nombre, p_unidad: o.unidad,
+      p_inventario: o.inventario || 'ambos', p_tipo_registro: o.tipoRegistro || 'ambos',
+      p_orden: num(o.orden) === null ? null : Math.round(num(o.orden)),
+      p_umbral_consumo: num(o.umbralConsumo), p_umbral_minimo: num(o.umbralMinimo),
+      p_alerta_consumo: sino(o.alertaConsumo), p_alerta_minimo: sino(o.alertaMinimo),
+      p_activo: null, p_version: m?.version ?? null, p_id_externo: String(o.id),
+      p_resaltado_celda: sino(o.resaltadoCelda), p_alerta_rendimiento: sino(o.alertaRendimiento),
+      p_rendimiento_min: num(o.rendMin), p_rendimiento_max: num(o.rendMax) }) }],
+    borrar: (ant, m) => ({ fn: 'retirar_insumo', params: { p_id: m.id, p_version: m.version } }),
+  },
+
   Marcaciones: {
     clave: o => `${o.empleadoId}|${norm(o.fecha)}`,
     deEmpleado: o => o.empleadoId,
@@ -270,7 +310,7 @@ const OK = new Set(['creado', 'actualizado', 'repetido', 'borrado', 'ausente']);
    claveApp(hoja, fila)  → la clave con que la app marca los borrados (gsClaveDe)
    uid()                 → un id único por acción, para las claves de reintento
    ═══════════════════════════════════════════════════════════════════════════ */
-export function crearMotor({ rpc, claveApp, uid, log = () => {} }){
+export function crearMotor({ rpc, claveApp, uid, log = () => {}, alEscribir = () => {} }){
   const fotos = new Map();                 // 'dominio/Hoja' → { filas:[obj], meta:[{id,version}] }
   const empleados = new Map();             // id de la app → { id, version }
   const condiciones = new Map();           // id de la app → { id, version }
@@ -433,6 +473,9 @@ export function crearMotor({ rpc, claveApp, uid, log = () => {} }){
           escrito = true;
           if (r.estado === 'repetido') res.repetidos++;
           op.alGuardar?.(r);
+          // Quien llama se entera: tras crear una ficha de catálogo, el
+          // traductor de ids del inventario tiene que conocerla ya.
+          alEscribir(hoja, o, r, op.fn);
           // La meta de la FILA es la de su última escritura propia (en
           // Empleados, la de la persona; las condiciones van en su mapa).
           if (op.fn !== 'guardar_condicion_laboral' && op.fn !== 'borrar_fila_planilla')
