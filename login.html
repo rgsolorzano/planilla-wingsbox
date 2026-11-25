@@ -132,7 +132,7 @@ async function pintar(){
     ${ficha && ficha.activo ? '' : `
     <p class="nota">
       Para habilitar esta cuenta, corre esto una vez en el SQL Editor de Supabase:<br>
-      <code>select core.asignar_rol('${esc(u.email)}', 'administrador');</code><br>
+      <code>select core.asignar_rol('${esc(u.email)}', '${u.email === 'wingsbox.oficial@gmail.com' ? 'local' : 'administrador'}');</code><br>
       Después recarga esta página.
     </p>`}`;
 
