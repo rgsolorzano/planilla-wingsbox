@@ -11021,11 +11021,13 @@ function cocMovTotales(fecha, pares){
   return [...pares].map(clave => {
     const corte = clave.lastIndexOf('|');
     const productoId = clave.slice(0, corte), tipo = clave.slice(corte + 1);
-    let total = 0;
+    let total = 0, n = 0;
     for(const m of S.cocinaMovimientos)
-      if(m.productoId === productoId && m.fecha === fecha && m.tipo === tipo)
-        total += Number(m.cantidad) || 0;
-    return { productoId, fecha, tipo, cantidad: total };
+      if(m.productoId === productoId && m.fecha === fecha && m.tipo === tipo){
+        total += Number(m.cantidad) || 0; n++;
+      }
+    // Igual que en bebidas: sin movimientos del par, se borra en vez de dejar un 0.
+    return { productoId, fecha, tipo, cantidad: total, ...(n ? {} : { borrar:true }) };
   });
 }
 async function sbMovCocinaSincronizar(fecha, pares){
@@ -12485,19 +12487,23 @@ async function guardarProduccion(){
   });
   if(!ok){ toast('Los valores deben ser numéricos y no negativos','error'); return; }
 
-  let guardados = 0, limpiados = 0;
+  let guardados = 0;
+  const aVaciar = [];   // { insumoId, campo:'inicial'|'cierre'|'ambos' }
   Object.entries(porInsumo).forEach(([insumoId, vals])=>{
     const iniVacio = vals.stockInicial===undefined || vals.stockInicial==='';
     const cieVacio = vals.stockCierre===undefined || vals.stockCierre==='';
-    /* Vaciar una casilla que tenía valor no lo borra: guardar_stock entiende
-       un campo vacío como "déjalo como estaba", que es lo que permite que la
-       pantalla de apertura y la de cierre no se pisen. El efecto es que el
-       valor reaparece al repintar, y en silencio eso parece un fallo. Se
-       cuenta para poder decirlo. */
+    /* Vaciar una casilla que TENÍA valor es pedir borrarlo. Solo cuenta la
+       casilla que está en pantalla (=== ''): la que no se muestra en este
+       filtro llega undefined y significa "no la toques", que es lo que deja
+       que la pantalla de apertura y la de cierre no se pisen. */
     const prev = getStockReg(insumoId, prodFecha);
-    if(prev){
-      if(iniVacio && prev.stockInicial !== null && prev.stockInicial !== undefined) limpiados++;
-      if(cieVacio && prev.stockCierre  !== null && prev.stockCierre  !== undefined) limpiados++;
+    const tiene = v => v !== null && v !== undefined;
+    const iniFuera = vals.stockInicial === '' && prev && tiene(prev.stockInicial);
+    const cieFuera = vals.stockCierre  === '' && prev && tiene(prev.stockCierre);
+    if(iniFuera || cieFuera){
+      aVaciar.push({ insumoId, campo: iniFuera && cieFuera ? 'ambos' : iniFuera ? 'inicial' : 'cierre' });
+      if(iniFuera) prev.stockInicial = null;
+      if(cieFuera) prev.stockCierre  = null;
     }
     if(iniVacio && cieVacio) return; // fila vacía: no se crea/actualiza registro
     // Upsert por (insumo, fecha) sobre el registro de STOCK. Un campo vacío se
@@ -12516,11 +12522,25 @@ async function guardarProduccion(){
   const ventasListas = porcionesListasPara(prodFecha);
   if(prodInvFiltro === 'noche' && ventasListas) conservados = conservarSalsasSinMovimiento(prodFecha);
 
-  if(limpiados)
-    toast('Vaciar una casilla todavía no borra el valor guardado: ese dato sigue en la base y '
-          + 'vuelve a aparecer al refrescar. Si hay que quitarlo, dilo y se añade el borrado.','warn');
+  if(aVaciar.length){
+    const nombres = aVaciar.map(v => { const i = S.insumos.find(x => x.id === v.insumoId); return i ? i.nombre : v.insumoId; });
+    if(!confirm('Vas a borrar '+aVaciar.length+' valor(es) de stock del '+fmtFecha(prodFecha)+': '+nombres.join(', ')+
+                '.\nQuedarán como «no contado». Si lo que hay es cero, escribe 0.\n\n¿Borrar?')){
+      // Cancelado: se devuelven los valores tal como estaban.
+      for(const [id, a] of antes){ const r = getStockReg(id, prodFecha); if(r){ r.stockInicial = a.ini; r.stockCierre = a.cie; } }
+      return;
+    }
+    /* Un registro sin inicial ni cierre ya no dice nada: se quita. */
+    const vacios = S.produccion.filter(r => r.fecha === prodFecha && aVaciar.some(v => v.insumoId === r.insumoId)
+                                         && (r.stockInicial ?? null) === null && (r.stockCierre ?? null) === null
+                                         && numOrNull(r.produccion) === null && numOrNull(r.cierre) === null);  // campos antiguos: historia
+    if(vacios.length){
+      S.produccion = S.produccion.filter(r => !vacios.includes(r));
+      if(!leyendoDeLaBase()) vacios.forEach(r => gsMarcarEliminado('Produccion', r));
+    }
+  }
 
-  if(!guardados && !conservados){
+  if(!guardados && !conservados && !aVaciar.length){
     if(prodInvFiltro === 'noche' && !ventasListas)
       toast('Aún se están cargando las ventas del día. Espera unos segundos y vuelve a Guardar para conservar el cierre de las salsas sin movimiento.','warn');
     else
@@ -12538,12 +12558,20 @@ async function guardarProduccion(){
       const a = antes.get(r.insumoId);
       const ini = r.stockInicial ?? null, cie = r.stockCierre ?? null;
       if(a && a.ini === ini && a.cie === cie) continue;
-      cambios.push({ insumoId:r.insumoId, fecha:prodFecha,
-                     inicial: (!a || a.ini !== ini) ? ini : null,
-                     cierre:  (!a || a.cie !== cie) ? cie : null });
+      const cambio = { insumoId:r.insumoId, fecha:prodFecha,
+                       inicial: (!a || a.ini !== ini) ? ini : null,
+                       cierre:  (!a || a.cie !== cie) ? cie : null };
+      // Un campo vaciado llega aquí como null: eso lo hace sbBorrarStock.
+      if(cambio.inicial === null && cambio.cierre === null) continue;
+      cambios.push(cambio);
     }
     try{
-      const r = await sbGuardarStock(cambios);
+      /* Primero los borrados: cambian la versión de la fila, y un guardado
+         de la otra casilla del mismo insumo tiene que ir con la nueva. */
+      const rb = await sbBorrarStock(aVaciar.map(v => ({ ...v, fecha:prodFecha })));
+      const rg = rb.motivo ? rb : await sbGuardarStock(cambios);
+      const r = rb.motivo ? rb : { ...rg, ok: rb.ok && rg.ok, borrados: rb.borrados,
+                                   incidencias: [...rb.incidencias, ...rg.incidencias] };
       const { msg, tipo } = sbExplicarConteos(r, 'Stock de producción');
       if(!r.ok) await sbRecargarTrasFallo();
       toast(msg + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : ''), tipo);
@@ -14593,14 +14621,17 @@ function bebMovTotales(fecha, pares){
   return [...pares].map(clave => {
     const corte = clave.lastIndexOf('|');
     const bebidaId = clave.slice(0, corte), etiqueta = clave.slice(corte + 1);
-    let total = 0;
+    let total = 0, n = 0;
     for(const m of S.bebidasMovs)
       if(m.bebidaId === bebidaId && m.fecha === fecha
-         && bebMovTipoNorm(m.tipoMovimiento) === etiqueta)
-        total += Number(m.cantidad) || 0;
+         && bebMovTipoNorm(m.tipoMovimiento) === etiqueta){
+        total += Number(m.cantidad) || 0; n++;
+      }
+    /* Sin movimientos de ese par en el día: se BORRA. Mandar total 0 dejaba
+       en la base una fila en cero que reaparecía en la lista al recargar. */
     return { productoId: bebidaId, fecha,
              tipo: etiqueta === 'Entrada' ? 'ingreso' : 'salida',
-             cantidad: total };
+             cantidad: total, ...(n ? {} : { borrar:true }) };
   });
 }
 /* Manda a la base los totales del día de los pares tocados. */
@@ -16929,6 +16960,39 @@ async function sbBorrarConteos(celdas){
   return res;
 }
 
+/* Vacía valores de stock: celdas [{ insumoId, fecha, campo }], con campo
+   'inicial', 'cierre' o 'ambos'. Si la fila se queda sin ninguno, la base
+   la borra. 'ausente' no es un fallo: lo que se quería ya se cumple. */
+async function sbBorrarStock(celdas){
+  if(!celdas.length) return { ok:true, borrados:0, incidencias:[] };
+  if(!_sbLectorInv)
+    return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.', incidencias:[] };
+  const escritor = await sbEscritor();
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, borrados:0, incidencias:[] };
+  for(const c of celdas){
+    const insumoId = _sbLectorInv.uuidDe(c.insumoId);
+    if(!insumoId){
+      res.incidencias.push({ celda:c, estado:'desconocido', motivo:'ese insumo no existe en la base' });
+      res.ok = false; continue;
+    }
+    const version = _sbLectorInv.versionStockDe(c.insumoId, c.fecha);
+    const r = await escritor.borrarStock({ clave: accion + ':borrar-stock:' + c.insumoId,
+                                           insumoId, fecha: c.fecha, campo: c.campo, version });
+    if(r.estado === 'borrado' || r.estado === 'ausente' || r.estado === 'repetido'){
+      // Fila eliminada (o ya no estaba): su versión deja de valer. Vaciada: la nueva.
+      _sbLectorInv.anotarVersionStock(c.insumoId, c.fecha,
+        r.estado === 'borrado' && r.fila === 'vaciada' ? r.version : null);
+      res.borrados++;
+    }else{
+      console.warn('[Stock] no se borró', { celda:c, versionEnviada:version, respuesta:r });
+      res.incidencias.push({ celda:c, estado:r.estado, motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+
 /* Guarda el stock diario de insumos (la pantalla de Producción).
    celdas: [{ insumoId, fecha, inicial, cierre }]
 
@@ -17707,7 +17771,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.5';
+const APP_VERSION = '2026-11-25.6';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

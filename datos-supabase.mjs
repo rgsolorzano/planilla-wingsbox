@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.5';
+export const VERSION = '2026-11-25.6';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -377,6 +377,16 @@ export function crearEscritor(sb){
     return data;
   }
 
+  /* Vaciar stock: campo 'inicial', 'cierre' o 'ambos'. Si la fila queda sin
+     ninguno (y no está marcada como conservada) la base la borra. */
+  async function borrarStock({ clave, insumoId, fecha, campo = 'cierre', version = null }){
+    const { data, error } = await sb.schema('core').rpc('borrar_stock', {
+      p_clave: clave, p_insumo: insumoId, p_fecha: fecha, p_campo: campo, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
   async function guardarProduccion({ clave, insumoId, fecha, cantidad, version = null }){
     const { data, error } = await sb.schema('core').rpc('guardar_produccion', {
       p_clave: clave, p_insumo: insumoId, p_fecha: fecha,
@@ -454,7 +464,7 @@ export function crearEscritor(sb){
     }
   }
 
-  return { guardarConteo, borrarConteo, guardarMovimiento, borrarMovimiento, guardarProduccion, guardarStock,
+  return { guardarConteo, borrarConteo, guardarMovimiento, borrarMovimiento, borrarStock, guardarProduccion, guardarStock,
            guardarArticulo, guardarInsumo, explicar };
 }
 
