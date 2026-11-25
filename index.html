@@ -1476,12 +1476,18 @@ function hayEdicionEnCurso(page){
 
 /* refresco: lo llama una carga que terminó en segundo plano, no el usuario.
    Si la pantalla tiene algo a medio escribir, se deja como está. */
-function goto(page, { refresco = false } = {}){
-  if(refresco && page === currentPage && hayEdicionEnCurso(page)){
+function goto(page, { refresco = false, pantallaLimpia = false } = {}){
+  /* pantallaLimpia: quien llama ya comprobó, ANTES de cambiar el estado, que
+     no había nada sin guardar (la puesta al día con lo de otros). Volver a
+     mirarlo aquí daría un falso positivo: el detector de Producción compara
+     la pantalla con el estado, y el estado acaba de cambiar. */
+  if(refresco && !pantallaLimpia && page === currentPage && hayEdicionEnCurso(page)){
     console.log('[Render] Repintado pospuesto: hay datos sin guardar en "'+page+'".');
     gsUpdateSyncStatus('Se cargaron datos nuevos. Guarda lo que tienes escrito para verlos.','warn');
     return;
   }
+  // Cambiar de módulo es el momento en que se espera ver lo último.
+  if(!refresco && typeof sbBuscarCambios === 'function') setTimeout(() => sbBuscarCambios('cambio de módulo'), 0);
   // Cada cambio de módulo revalida la sesión: navegar ya no da una falsa
   // sensación de sesión activa tras una suspensión prolongada.
   sesGuardActividad();
@@ -16773,7 +16779,200 @@ function sbCliente(){
    versión de la app, cada publicación trae los suyos. */
 const modulo = nombre => './' + nombre + '.mjs?v=' + APP_VERSION;
 
-async function sbRespuestaDeHojas(domain, hojasPedidas){
+/* ═══════════════════════════════════════════════════════════════════════
+   VER LO QUE GUARDÓ OTRO, SIN RECARGAR
+   -----------------------------------------------------------------------
+   La app lee todo al entrar y desde ahí trabaja con su copia. Esto la pone
+   al día preguntando a la base «¿qué cambió desde el número X?»
+   (core.cambios_desde, 49_registro_cambios.sql) y trayendo solo esas filas:
+   el resto sale de la copia que guarda consultarConSupabase.
+
+   Cuándo pregunta: al cambiar de módulo, al volver a la pestaña, cada 30 s
+   con la pestaña a la vista, y en cuanto otra pestaña de este navegador
+   avisa de que guardó.
+
+   Cuándo NO aplica lo nuevo, y lo deja para después:
+     · si hay algo escrito sin guardar en pantalla — repintar lo borraría,
+       y peor: la pantalla mostraría el valor viejo junto a un estado nuevo,
+       y guardar lo devolvería a la base pisando el cambio del otro;
+     · si hay una escritura en marcha o empezó una mientras se leía: lo
+       leído podría ser anterior a ella y traería versiones viejas.
+
+   Solape: se pregunta desde 200 cambios antes del último visto. Un cambio
+   que recibió su número antes pero se confirmó después no se pierde; los
+   ya vistos se reconocen por su número y no se repiten.
+   ═══════════════════════════════════════════════════════════════════════ */
+var _sbConsultar = null;
+const sbCambios = { cursor:null, vistos:new Set(), activo:true, corriendo:false, otraVez:false,
+                    pendiente:false, arranque:null, escriturasAlEmpezar:0, cargados:new Set() };
+let _sbEscriturasEnVuelo = 0, _sbEscriturasHechas = 0;
+const SB_CAMBIOS_SOLAPE = 200, SB_CAMBIOS_CADA_MS = 30000;
+const SB_TABLAS_DOMINIO = {
+  inventario: new Set(['articulos','conteos','movimientos','insumos','stock_diario','produccion',
+                       'efectivo_caja','propinas','empleados']),
+  planilla:   new Set(['empleados','condiciones_laborales','horarios','marcaciones','descuentos','pagos_extra',
+                       'dias_libres','feriados','considerar_hora_extra','exoneraciones_tardanza',
+                       'validacion_tarjeta','propinas']),
+};
+let _sbCanal = null;
+try{ _sbCanal = new BroadcastChannel('wingsbox-cambios'); }catch(e){ /* navegador sin BroadcastChannel */ }
+
+/* Toda escritura a la base pasa por aquí: así se sabe si hay una en marcha.
+   Al terminar la última se avisa a las otras pestañas. */
+function sbEscribiendo(promesa){
+  _sbEscriturasEnVuelo++; _sbEscriturasHechas++;
+  return Promise.resolve(promesa).finally(() => {
+    _sbEscriturasEnVuelo--;
+    if(_sbEscriturasEnVuelo === 0){
+      try{ _sbCanal && _sbCanal.postMessage({ tipo:'guardado' }); }catch(e){}
+      if(sbCambios.pendiente) setTimeout(() => sbBuscarCambios('tras guardar'), 400);
+    }
+  });
+}
+
+function sbDominiosCargados(){
+  const r = currentRole();
+  if(!r) return [];
+  return r.domain === 'planilla+inventario' ? ['planilla','inventario'] : [r.domain];
+}
+
+/* El número desde el que preguntar se toma ANTES de la primera lectura:
+   lo que cambie mientras se lee entra en la primera consulta. */
+function sbCambiosArrancar(){
+  if(sbCambios.cursor !== null || !sbCambios.activo) return Promise.resolve();
+  if(sbCambios.arranque) return sbCambios.arranque;
+  sbCambios.arranque = (async () => {
+    try{
+      const sb = await sbCliente();
+      const { data, error } = await sb.schema('core').rpc('cambios_desde', { p_desde: null });
+      if(error || !data || typeof data.hasta !== 'number') throw new Error(error ? error.message : 'respuesta inesperada');
+      sbCambios.cursor = data.hasta;
+      console.log('[Cambios] Atento a lo que guarden otros desde el cambio nº ' + data.hasta + '.');
+    }catch(e){
+      sbCambios.activo = false;
+      console.warn('[Cambios] La base no responde a cambios_desde (' + (e.message || e) + '). '
+        + '¿Falta correr 49_registro_cambios.sql? La app funciona igual, pero no verá lo que guarden otros sin recargar.');
+    }finally{ sbCambios.arranque = null; }
+  })();
+  return sbCambios.arranque;
+}
+
+async function sbBuscarCambios(motivo){
+  if(!leyendoDeLaBase() || !sbCambios.activo || sbCambios.cursor === null || !isAuthorized()) return;
+  if(sbCambios.corriendo){ sbCambios.otraVez = true; return; }
+  if(document.hidden || cargaEnVuelo.size) return;
+  if(_sbEscriturasEnVuelo || hayCambiosEnPantalla()){ sbCambios.pendiente = true; return; }
+  sbCambios.corriendo = true;
+  sbCambios.escriturasAlEmpezar = _sbEscriturasHechas;
+  try{
+    const sb = await sbCliente();
+    const desde = Math.max(0, sbCambios.cursor - SB_CAMBIOS_SOLAPE);
+    const { data, error } = await sb.schema('core').rpc('cambios_desde', { p_desde: desde });
+    if(error) throw new Error(error.message);
+    if(!data || data.estado) return;
+    const nuevos = (data.cambios || []).filter(c => !sbCambios.vistos.has(c.seq));
+    const dominios = new Set();
+    if(data.incompleto){
+      // Lo pedido ya se podó (pestaña abierta días sin mirar): se relee todo.
+      if(_sbConsultar) _sbConsultar.olvidar();
+      sbDominiosCargados().forEach(d => dominios.add(d));
+    }else{
+      if(nuevos.length && _sbConsultar) _sbConsultar.anotarCambios(nuevos);
+      for(const c of nuevos)
+        for(const [d, tablas] of Object.entries(SB_TABLAS_DOMINIO)) if(tablas.has(c.tabla)) dominios.add(d);
+    }
+    let todoBien = true, pospuesto = false;
+    for(const d of sbDominiosCargados()){
+      if(!dominios.has(d)) continue;
+      const r = await gsLoadFromSheets(d, { auto:true, silencioso:true });
+      if(r !== 'ok') todoBien = false;
+      if(r === 'pospuesto') pospuesto = true;
+    }
+    /* Pospuesto porque se guardó algo mientras se leía: ese guardado ya
+       terminó, así que se reintenta enseguida. Si es porque hay algo escrito,
+       el reintento se detiene en la primera comprobación sin gastar nada. */
+    if(pospuesto) setTimeout(() => sbBuscarCambios('reintento'), 1500);
+    if(todoBien){
+      for(const c of nuevos) sbCambios.vistos.add(c.seq);
+      sbCambios.cursor = Math.max(sbCambios.cursor, Number(data.hasta) || 0);
+      for(const n of sbCambios.vistos) if(n <= sbCambios.cursor - 2 * SB_CAMBIOS_SOLAPE) sbCambios.vistos.delete(n);
+      sbCambios.pendiente = false;
+      if(dominios.size) console.log('[Cambios] Al día (' + motivo + '): ' + nuevos.length
+        + ' cambio(s) de otros en ' + [...dominios].join(' y ') + '.');
+    }else{
+      sbCambios.pendiente = true;      // se reintenta: no se avanza el número
+    }
+    if(data.mas) sbCambios.otraVez = true;
+  }catch(e){
+    console.warn('[Cambios] No se pudo preguntar por cambios (' + motivo + '):', e && e.message || e);
+  }finally{
+    sbCambios.corriendo = false;
+    if(sbCambios.otraVez){ sbCambios.otraVez = false; setTimeout(() => sbBuscarCambios('seguir'), 50); }
+  }
+}
+
+/* ── ¿Hay algo escrito sin guardar en pantalla? ──────────────────────────
+   Se compara cada casilla visible con lo que tenía cuando se pintó (foto que
+   se toma al terminar cada renderer). Una casilla creada después —una fila
+   añadida con «+ Agregar»— se compara con su valor de fábrica. Los filtros
+   (fechas, búsquedas) no cuentan: cambiarlos no es un dato por guardar. */
+const _sbPintado = new WeakMap();
+const SB_CASILLAS = 'input, select, textarea';
+function sbValorCasilla(el){
+  if(el.type === 'checkbox' || el.type === 'radio') return el.checked ? '1' : '0';
+  if(el.tagName === 'SELECT') return el.selectedIndex + ':' + el.value;
+  return el.value;
+}
+function sbValorDeFabrica(el){
+  if(el.type === 'checkbox' || el.type === 'radio') return el.defaultChecked ? '1' : '0';
+  if(el.tagName === 'SELECT'){
+    let i = [...el.options].findIndex(o => o.defaultSelected);
+    if(i < 0) i = el.options.length ? 0 : -1;
+    return i + ':' + (i >= 0 ? el.options[i].value : '');
+  }
+  return el.defaultValue;
+}
+function sbCasillaCuenta(el){
+  if(el.disabled || el.readOnly) return false;
+  if(['hidden','button','submit','reset','file','date','month','week','search','range','color','image'].includes(el.type)) return false;
+  if(el.closest('.sidebar, #authGate, #googleConectar, #toasts, #cargaTapa')) return false;
+  if(/busc|filtro|filter|search/i.test([el.id, el.name, el.className, el.placeholder].join(' '))) return false;
+  return el.getClientRects().length > 0;          // solo lo que se ve
+}
+function sbFotoPintado(){
+  document.querySelectorAll(SB_CASILLAS).forEach(el => _sbPintado.set(el, sbValorCasilla(el)));
+}
+function hayCambiosEnPantalla(){
+  if(hayEdicionEnCurso(currentPage)) return true;
+  for(const el of document.querySelectorAll(SB_CASILLAS)){
+    if(!sbCasillaCuenta(el)) continue;
+    const antes = _sbPintado.has(el) ? _sbPintado.get(el) : sbValorDeFabrica(el);
+    if(sbValorCasilla(el) !== antes) return true;
+  }
+  return false;
+}
+/* Cada renderer, al terminar, deja su foto. Se envuelven una vez, al
+   arrancar, cuando ya están todos definidos. */
+function sbEnvolverRenderers(){
+  for(const k of Object.keys(RENDERERS)){
+    const f = RENDERERS[k];
+    if(typeof f !== 'function' || f.__conFoto) continue;
+    const g = function(...a){ const r = f.apply(this, a); try{ sbFotoPintado(); }catch(e){} return r; };
+    g.__conFoto = true;
+    RENDERERS[k] = g;
+  }
+}
+function sbCambiosEscuchar(){
+  setInterval(() => sbBuscarCambios('cada 30 s'), SB_CAMBIOS_CADA_MS);
+  document.addEventListener('visibilitychange', () => { if(!document.hidden) sbBuscarCambios('volver a la pestaña'); });
+  window.addEventListener('focus', () => sbBuscarCambios('volver a la ventana'));
+  if(_sbCanal) _sbCanal.onmessage = ev => {
+    if(ev && ev.data && ev.data.tipo === 'guardado') setTimeout(() => sbBuscarCambios('otra pestaña guardó'), 300);
+  };
+}
+
+async function sbRespuestaDeHojas(domain, hojasPedidas, opciones = {}){
+  const silencioso = !!opciones.silencioso;
   const sb = await sbCliente();
   const { data:{ session } } = await sb.auth.getSession();
   if(!session) throw new Error('No hay sesión en la base. Entra en login.html y vuelve a cargar.');
@@ -16805,25 +17004,48 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
   avisaVersiones({ 'datos-supabase': modPlanilla.VERSION,
                    'datos-inventario': modInventario.VERSION,
                    'sincronizar-base': modMotor.VERSION });
-  const consultar = consultarConSupabase(sb);
+  /* Una sola conexión de consulta para toda la sesión: es la que guarda las
+     copias que permiten refrescar trayendo solo lo que cambió. */
+  if(!_sbConsultar) _sbConsultar = consultarConSupabase(sb);
+  const consultar = _sbConsultar;
+  if(!silencioso){
+    await sbCambiosArrancar();
+    /* Releer un dominio ya leído (la recarga tras un fallo de guardado) va
+       entero a la base: es justo cuando no conviene fiarse de ninguna copia. */
+    if(sbCambios.cargados.has(domain)) consultar.olvidar();
+  }
+  /* Antes de tocar la foto del motor o el estado: si mientras se leía el
+     usuario empezó a escribir o se guardó algo, esto se descarta y se
+     reintenta luego. De aquí a que el estado quede aplicado no hay más
+     esperas reales, así que nada puede colarse en medio. */
+  const pospuesto = () => {
+    if(!silencioso) return;
+    if(_sbEscriturasEnVuelo || _sbEscriturasHechas !== sbCambios.escriturasAlEmpezar || hayCambiosEnPantalla()){
+      const e = new Error('Actualización pospuesta'); e.codigo = 'POSPUESTO'; throw e;
+    }
+  };
   let hojas;
   if(domain === 'inventario'){
     /* El lector se conserva: además de las hojas, guarda el uuid de cada
        artículo y la versión de cada conteo, que es lo que la escritura
        necesita y la hoja reconstruida no puede llevar encima. */
-    _sbLectorInv = crearLectorInventario(consultar);
-    hojas = await _sbLectorInv.leerInventario();
+    const lector = crearLectorInventario(consultar);
+    hojas = await lector.leerInventario();
+    pospuesto();
+    _sbLectorInv = lector;
     _sbMotor.fotografiar('inventario', hojas, _sbLectorInv.meta());
   }else{
     const lector = crearLector(consultar);
     hojas = await lector.leerPlanilla();
+    pospuesto();
     /* La foto de lo leído es contra lo que el motor compara al guardar.
        Se toma en CADA lectura, también en la recarga tras un fallo: así la
        foto nunca dice algo distinto de lo que dice la base. */
     _sbMotor.fotografiar('planilla', hojas, lector.meta());
   }
+  sbCambios.cargados.add(domain);
 
-  console.log('[Fuente] Leyendo de PostgreSQL ('+domain+').');
+  if(!silencioso) console.log('[Fuente] Leyendo de PostgreSQL ('+domain+').');
   return {
     ok: true, status: 200,
     json: async () => ({
@@ -16868,6 +17090,12 @@ async function sbEscritor(){
     const sb = await sbCliente();
     const { crearEscritor } = await import(modulo('datos-supabase'));
     _sbEscritor = crearEscritor(sb);
+    // Cada escritura cuenta como «en marcha» mientras dura (ver sbEscribiendo).
+    for(const k of Object.keys(_sbEscritor))
+      if(typeof _sbEscritor[k] === 'function' && k !== 'explicar'){
+        const f = _sbEscritor[k];
+        _sbEscritor[k] = (...a) => sbEscribiendo(f(...a));
+      }
   }
   return _sbEscritor;
 }
@@ -17189,7 +17417,7 @@ function sbCrearMotor(modMotor, rpc){
 
 async function sbLlamarFuncion(fn, params){
   const sb = await sbCliente();
-  const { data, error } = await sb.schema('core').rpc(fn, params);
+  const { data, error } = await sbEscribiendo(sb.schema('core').rpc(fn, params));
   // Un error de PostgREST no es un 'conflicto' ni un 'denegado': es que la
   // llamada no llegó a hacerse. Se dice tal cual, para que no se confunda.
   if(error) return { estado:'error', motivo: error.message || String(error) };
@@ -17221,7 +17449,10 @@ async function sbSincronizarPestana(domain, sheet, label){
   if(!_sbMotor) return { ok:false, motivo:'Todavía no se leyó la base. Recarga la página.' };
   const marcasDe = h => new Set((gsTombstones.get(h) || new Map()).keys());
   let motivo = '';
-  const r = await _sbMotor.sincronizar(domain, sheet, gsSerializeSheet(domain, sheet), {
+  /* Toda la sincronización cuenta como escritura en marcha, no solo cada
+     llamada: entre dos llamadas de la misma tanda no debe colarse una
+     puesta al día que cambie la foto contra la que el motor compara. */
+  const r = await sbEscribiendo(_sbMotor.sincronizar(domain, sheet, gsSerializeSheet(domain, sheet), {
     marcas: marcasDe(sheet),
     marcasEmpleados: marcasDe('Empleados'),
     /* Corre DENTRO de la cola del motor: la siguiente sincronización espera
@@ -17241,7 +17472,7 @@ async function sbSincronizarPestana(domain, sheet, label){
       gsTombstonesGuardar();
       await sbRecargarDominio(domain);
     },
-  });
+  }));
   if(!r.ok) toast(motivo || sbExplicarMotor(r, label), 'error');
   return r.ok ? { ok:true } : { ok:false, motivo: motivo || sbExplicarMotor(r, label) };
 }
@@ -17371,6 +17602,10 @@ function cargaFin(domain, error){
 
 async function gsLoadFromSheets(domain='planilla', opts={}){
   const auto = !!opts.auto; // true = sincronización automática al iniciar sesión (sin diálogo de confirmación)
+  /* silencioso: puesta al día con lo que guardaron otros (sbBuscarCambios).
+     Sin pantalla de carga ni mensajes: si no hay nada que contar, no se
+     cuenta nada. Devuelve 'ok', 'pospuesto' o 'error'. */
+  const silencioso = !!opts.silencioso;
   if(!isAuthorized()){ if(!auto) toast('Acceso no autorizado. Inicia sesión con la cuenta habilitada.','error'); return; }
   const cfg = gsDomainCfg(domain);
   if(!auto){
@@ -17379,10 +17614,10 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       : 'Esto reemplazará los datos actuales (empleados, horarios, marcaciones, descuentos, pagos extra, días libres y preferencias) con los últimos datos guardados en Google Sheets. ¿Continuar?';
     if(!confirm(confirmMsg)) return;
   }
-  cargaInicio(domain);
+  if(!silencioso) cargaInicio(domain);
   try{
     const t0 = Date.now();
-    gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
+    if(!silencioso) gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
     if(!auto) toast('Cargando últimos datos…','info');
     /* En modo base no se toca Google: ni para resolver el spreadsheet ni
        para listar sus hojas. Si no, una recarga tras un fallo de guardado
@@ -17391,7 +17626,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     const id = base ? (roleGsheetId(currentRole(), domain) || 'base') : await gsEnsureSpreadsheet(domain);
     if(!id){ if(!auto) toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
-    console.log('[Sync] Inicio carga domain='+domain+(base?' desde la base':' id='+id)+' user='+correoSesion());
+    if(!silencioso) console.log('[Sync] Inicio carga domain='+domain+(base?' desde la base':' id='+id)+' user='+correoSesion());
 
     /* ── SOLO SE PIDEN RANGOS DE HOJAS QUE EXISTEN ────────────────────────
        values:batchGet responde 400 ("Unable to parse range") si CUALQUIERA de
@@ -17426,7 +17661,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     /* Único punto donde se decide la fuente. Todo lo que sigue —la protección
        de lectura, el mapeo a S.*, los tableros— no distingue de dónde vino. */
     const r = leyendoDeLaBase()
-      ? await sbRespuestaDeHojas(domain, hojasPedidas)
+      ? await sbRespuestaDeHojas(domain, hojasPedidas, { silencioso })
       : await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'/values:batchGet?'+ranges+'&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING');
 
     if(!r.ok){
@@ -17457,7 +17692,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       rowsPerSheet[name] = byName[name].length;
     });
 
-    console.log('[Sync] Hojas leídas ('+domain+'):', JSON.stringify(rowsPerSheet), '| ms='+(Date.now()-t0));
+    if(!silencioso) console.log('[Sync] Hojas leídas ('+domain+'):', JSON.stringify(rowsPerSheet), '| ms='+(Date.now()-t0));
 
     /* ── PROTECCIÓN DE LECTURA ─────────────────────────────────────────────
        Una hoja ausente o con 0 filas NO es una orden de borrado. Si el estado
@@ -17759,11 +17994,24 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     const resumen = domain==='inventario'
       ? `${S.insumos.length} insumos, ${S.produccion.length} registros de producción, ${S.bebidasCat.length} bebidas`
       : `${S.emp.length} empleados, ${S.mar.length} marcaciones, ${S.prop.length} propinas`;
-    console.log('[Sync] Carga completada. '+resumen+' | total filas GS: '+totalRows+' | '+(Date.now()-t0)+'ms');
-    if(!auto) toast('Datos cargados desde Google Sheets ('+resumen+')','success');
-    gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
-    goto(currentPage, { refresco:true });
+    if(silencioso) console.log('[Cambios] '+domain+' al día en '+(Date.now()-t0)+' ms.');
+    else{
+      console.log('[Sync] Carga completada. '+resumen+' | total filas GS: '+totalRows+' | '+(Date.now()-t0)+'ms');
+      if(!auto) toast('Datos cargados desde Google Sheets ('+resumen+')','success');
+      gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
+    }
+    goto(currentPage, { refresco:true, pantallaLimpia: silencioso });
   }catch(err){
+    if(err && err.codigo === 'POSPUESTO'){
+      console.log('[Cambios] '+domain+': hay algo sin guardar o una escritura en marcha; se actualiza después.');
+      if(!silencioso) cargaFin(domain);
+      return 'pospuesto';
+    }
+    if(silencioso){
+      // Un fallo de red al ponerse al día no merece alarma: se reintenta solo.
+      console.warn('[Cambios] No se pudo poner al día '+domain+':', err && err.message || err);
+      return 'error';
+    }
     console.error(err);
     if(auto){
       /* Antes esto solo escribía una línea de estado: una carga fallida al
@@ -17780,8 +18028,9 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     }
     else gsHandleError(err, 'cargar');
   }
-  cargaFin(domain);
+  if(!silencioso) cargaFin(domain);
   gsRenderControls();
+  return 'ok';
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -17801,7 +18050,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.8';
+const APP_VERSION = '2026-11-25.9';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -19007,6 +19256,8 @@ function gsRevokeToken(){
   // Control de acceso: la app queda oculta tras la pantalla de login.
   document.getElementById('authLoginBtn').onclick = authSignIn;
   document.getElementById('authLogoutBtn').onclick = authLogout;
+  sbEnvolverRenderers();
+  sbCambiosEscuchar();
   authTrySilent();
 })();
 

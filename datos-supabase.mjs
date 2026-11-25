@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.8';
+export const VERSION = '2026-11-25.9';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -501,7 +501,110 @@ export function consultarConSupabase(sb){
   const primeraPagina = new Map();   // lo que dejó calibrar(), para no repetirlo
   const firma = (tabla, o) => JSON.stringify([tabla, o.select, o.order, o.igual]);
 
-  async function consultar(tabla, { select, order, igual } = {}){
+  /* ── COPIAS: refrescar trayendo solo lo que cambió ─────────────────────
+     Cada consulta completa se guarda. La siguiente vez que el lector pide la
+     misma consulta, si nadie avisó de cambios, se devuelve la copia sin ir a
+     la base; si se avisó (anotarCambios, con lo que dice core.cambios_desde),
+     se traen SOLO esas filas por su id y se mezclan.
+
+     Dos casos no se pueden mezclar fila a fila, y se vuelven a pedir enteros:
+       · la consulta no trae la columna id (feriados, validación de tarjeta:
+         su identidad es la fecha) — son tablas pequeñas;
+       · cambió una tabla que la consulta trae ANIDADA (propinas trae el
+         nombre del empleado): no hay forma de saber qué filas la usan.
+
+     Se devuelve una copia de cada fila: si un lector la retocara, la
+     siguiente lectura partiría de un dato ya transformado. */
+  const copias = new Map();
+  const columnasRaiz = sel => {
+    const cols = []; let prof = 0, actual = '';
+    for (const ch of String(sel)) {
+      if (ch === '(') prof++;
+      if (ch === ')') prof--;
+      if (ch === ',' && prof === 0) { cols.push(actual.trim()); actual = ''; continue; }
+      actual += ch;
+    }
+    if (actual.trim()) cols.push(actual.trim());
+    return cols;
+  };
+  const anidadas = sel => new Set([...String(sel).matchAll(/([a-z_]+)(?:![a-z_]+)?\(/g)].map(m => m[1]));
+  const compara = order => {
+    if (!order) return null;
+    return (a, b) => {
+      const x = a[order], y = b[order];
+      if (x === y) return 0;
+      if (x === null || x === undefined) return 1;        // como PostgreSQL: nulos al final
+      if (y === null || y === undefined) return -1;
+      if (typeof x === 'number' && typeof y === 'number') return x - y;
+      return String(x) < String(y) ? -1 : 1;
+    };
+  };
+  const copiaDeFilas = filas => filas.map(f => ({ ...f }));
+
+  async function refrescarCopia(c){
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    let nuevas = 0;
+    for (const id of c.quitar) c.porId.delete(id);
+    const ids = [...c.traer];
+    for (let i = 0; i < ids.length; i += 100) {
+      const tramo = ids.slice(i, i + 100);
+      let q = sb.schema('core').from(c.tabla).select(c.select).in('id', tramo);
+      if (c.igual) for (const [col, val] of Object.entries(c.igual)) q = q.eq(col, val);
+      const r = await q;
+      if (r.error) throw new Error(`${c.tabla}: ${r.error.message}`);
+      const llegaron = new Set();
+      for (const f of r.data) { if (!c.porId.has(f.id)) nuevas++; c.porId.set(f.id, f); llegaron.add(f.id); }
+      // Pedida y no llegó: se borró, dejó de cumplir el filtro, o ya no se puede ver.
+      for (const id of tramo) if (!llegaron.has(id)) c.porId.delete(id);
+    }
+    c.filas = [...c.porId.values()];
+    if (nuevas && c.orden) {
+      c.filas.sort(c.orden);                         // estable: lo que ya estaba conserva su orden
+      c.porId = new Map(c.filas.map(f => [f.id, f])); // y el mapa sigue ese orden para la próxima vez
+    }
+    const ms = Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0);
+    console.log(`[Cambios] ${c.tabla}: ${c.traer.size} fila(s) traídas, ${c.quitar.size} quitada(s) · ${ms} ms`);
+    c.traer.clear(); c.quitar.clear();
+  }
+
+  async function consultar(tabla, opciones = {}){
+    const { select, order, igual } = opciones;
+    const clave = firma(tabla, { select, order, igual });
+    const c = copias.get(clave);
+    if (c && !c.invalida) {
+      if (c.traer.size || c.quitar.size) await refrescarCopia(c);
+      return copiaDeFilas(c.filas);
+    }
+    const filas = await consultarTodo(tabla, opciones);
+    const conId = columnasRaiz(select).includes('id');
+    copias.set(clave, {
+      tabla, select, igual, orden: compara(order),
+      filas, porId: conId ? new Map(filas.map(f => [f.id, f])) : null,
+      depende: anidadas(select), traer: new Set(), quitar: new Set(), invalida: false,
+    });
+    return copiaDeFilas(filas);
+  }
+
+  /* cambios: [{ tabla, clave, accion: 'I'|'U'|'D' }], tal como los da
+     core.cambios_desde. Solo anota; las filas se traen en la próxima lectura. */
+  consultar.anotarCambios = function anotarCambios(cambios){
+    for (const c of copias.values()) {
+      if (c.invalida) continue;
+      for (const x of cambios) {
+        if (x.tabla === c.tabla) {
+          if (!c.porId) { c.invalida = true; break; }
+          if (x.accion === 'D') { c.quitar.add(x.clave); c.traer.delete(x.clave); }
+          else { c.traer.add(x.clave); c.quitar.delete(x.clave); }
+        } else if (c.depende.has(x.tabla)) { c.invalida = true; break; }
+      }
+      // Muchos a la vez: es más barato releerla entera que pedirlos de cien en cien.
+      if (c.traer.size > 500) c.invalida = true;
+    }
+  };
+  /* Olvida todo: la siguiente lectura va entera a la base. */
+  consultar.olvidar = function olvidar(){ copias.clear(); primeraPagina.clear(); };
+
+  async function consultarTodo(tabla, { select, order, igual } = {}){
     /* Traer una tabla que no cabe en una respuesta. Tres intentos hicieron
        falta para acertar, y la medición del 18/11 es la que lo decidió:
 
@@ -637,6 +740,9 @@ export function consultarConSupabase(sb){
      sola, y es la que marca el tiempo de todos modos. */
   consultar.calibrar = async function calibrar(tabla, opciones = {}){
     const { select, order, igual } = opciones;
+    // Con copia vigente no hay nada que calibrar: esa consulta no irá a la base.
+    const copia = copias.get(firma(tabla, { select, order, igual }));
+    if (copia && !copia.invalida) return;
     const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     let peticiones = 0;
     const pedir = async (desde, cuantas) => {

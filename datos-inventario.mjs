@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.8';
+export const VERSION = '2026-11-25.9';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
@@ -112,12 +112,12 @@ export function crearLectorInventario(consultar){
       order: 'orden',
     });
     const _p_stock_diario = consultar('stock_diario', {
-      select: 'id_externo, insumo_id, fecha, stock_inicial, stock_cierre, version',
+      select: 'id, id_externo, insumo_id, fecha, stock_inicial, stock_cierre, version',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
     const _p_produccion = consultar('produccion', {
-      select: 'id_externo, insumo_id, fecha, cantidad',
+      select: 'id, id_externo, insumo_id, fecha, cantidad',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
