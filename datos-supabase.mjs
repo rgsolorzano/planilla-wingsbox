@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.3';
+export const VERSION = '2026-11-25.5';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -366,6 +366,17 @@ export function crearEscritor(sb){
     return data;
   }
 
+  /* Borrar un movimiento (artículo + fecha + tipo). En licores, borrar el
+     'ingreso' de un día declara que ese día no se contó. Exige la versión
+     a la vista y el permiso inventario:editar. 'ausente' no es un fallo. */
+  async function borrarMovimiento({ clave, articuloId, fecha, tipo, version = null }){
+    const { data, error } = await sb.schema('core').rpc('borrar_movimiento', {
+      p_clave: clave, p_articulo: articuloId, p_fecha: fecha, p_tipo: tipo, p_version: version,
+    });
+    if(error) return { estado: 'error', mensaje: error.message };
+    return data;
+  }
+
   async function guardarProduccion({ clave, insumoId, fecha, cantidad, version = null }){
     const { data, error } = await sb.schema('core').rpc('guardar_produccion', {
       p_clave: clave, p_insumo: insumoId, p_fecha: fecha,
@@ -443,7 +454,7 @@ export function crearEscritor(sb){
     }
   }
 
-  return { guardarConteo, borrarConteo, guardarMovimiento, guardarProduccion, guardarStock,
+  return { guardarConteo, borrarConteo, guardarMovimiento, borrarMovimiento, guardarProduccion, guardarStock,
            guardarArticulo, guardarInsumo, explicar };
 }
 

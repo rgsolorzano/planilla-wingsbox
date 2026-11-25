@@ -1450,7 +1450,7 @@ let currentPage='empleados';
    antes de cualquier operación autenticada, de modo que la expiración se
    detecta al primer movimiento y no al fallar un guardado. */
 function sesGuardActividad(){
-  if(!gsState.accessToken) return true;
+  if(!sesionActiva()) return true;
   /* Solo el fin de sesión decidido por la APP (tope o inactividad) expulsa
      al usuario. Un token de Google caducado con la sesión viva no es motivo:
      se renueva en segundo plano desde el interceptor de interacciones. */
@@ -13754,13 +13754,16 @@ RENDERERS.invDiarioLicores = function(){
     return;
   }
   const licoresOrdenados = [...S.licores].sort((a,b)=>a.nombre.localeCompare(b.nombre));
+  /* Un conteo guardado se muestra con sus ceros. Antes un 0 se pintaba en
+     blanco, y un licor contado en 0/0 parecía «no contado»: ahora que vaciar
+     la fila borra el conteo, guardar cualquier otro licor lo habría borrado. */
   const filas = licoresOrdenados.map(b=>{
     const r = getInvLicor(b.id, invLicoresFecha);
     const inv = invFisicoLicor(b.id, r);
     return `<tr>
       <td>${b.nombre}</td>
-      <td class="num"><input type="number" class="invLicBot" data-id="${b.id}" min="0" step="1" value="${r&&r.entradaBots?r.entradaBots:''}" placeholder=""></td>
-      <td class="num"><input type="number" class="invLicOz" data-id="${b.id}" min="0" step="0.01" value="${r&&r.entradaOzs?r.entradaOzs:''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicBot" data-id="${b.id}" min="0" step="1" value="${inv!==null ? (Number(r.entradaBots)||0) : ''}" placeholder=""></td>
+      <td class="num"><input type="number" class="invLicOz" data-id="${b.id}" min="0" step="0.01" value="${inv!==null ? (Number(r.entradaOzs)||0) : ''}" placeholder=""></td>
       <td class="num" style="color:var(--c-muted)">${inv!==null ? inv.toFixed(1)+' oz' : '&#8212;'}</td>
     </tr>`;
   }).join('');
@@ -13809,13 +13812,21 @@ async function invLicoresGuardar(){
 
   let guardados=0;
   const contados=[];                 // lo que se mandará a la base, si toca
+  const aBorrar=[];                  // conteos guardados cuya fila se vació
   document.querySelectorAll('.invLicBot').forEach(botEl=>{
     const licorId=botEl.dataset.id;
     const ozEl=document.querySelector(`.invLicOz[data-id="${licorId}"]`);
     // Fila vacía: no se guarda. Un licor sin conteo debe quedar sin registro,
     // no registrado en cero, para que el cotejo muestre "—" y no un consumo.
     const alguno=[botEl,ozEl].some(el=>el&&el.value.trim()!=='');
-    if(!alguno) return;
+    if(!alguno){
+      /* Si ese día YA tenía un conteo, vaciar la fila es pedir borrarlo.
+         Un registro heredado con solo salidas no es un conteo (invFisicoLicor
+         da null) y no se toca: las salidas son historia. */
+      const r=getInvLicor(licorId, invLicoresFecha);
+      if(r && invFisicoLicor(licorId, r)!==null) aBorrar.push(r);
+      return;
+    }
     const bot=botEl.value.trim()==='' ? 0 : Number(botEl.value);
     const oz =ozEl&&ozEl.value.trim()!=='' ? Number(ozEl.value) : 0;
     invLicorUpsert(licorId, invLicoresFecha, bot, oz);
@@ -13823,7 +13834,22 @@ async function invLicoresGuardar(){
                     cantidad:oz, botellas:bot });
     guardados++;
   });
-  if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
+  if(!guardados && !aBorrar.length){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
+  if(aBorrar.length){
+    const nombres=aBorrar.map(r=>{ const l=S.licores.find(x=>x.id===r.bebidaId); return l?l.nombre:r.bebidaId; });
+    if(!confirm('Vas a borrar el conteo del '+fmtFecha(invLicoresFecha)+' de: '+nombres.join(', ')+
+                '.\nEse día quedará como «no contado» y el consumo del día anterior no se podrá calcular.'+
+                '\nSi lo que hay es cero, escribe 0 en vez de dejarlo vacío.\n\n¿Borrar?')) return;
+    aBorrar.forEach(r=>{
+      contados.push({ productoId:r.bebidaId, fecha:invLicoresFecha, tipo:'ingreso', borrar:true });
+      const salidas=(Number(r.salidaBots)||0)+(Number(r.salidaOzs)||0);
+      if(salidas){ r.entradaBots=0; r.entradaOzs=0; }          // conserva la salida histórica
+      else{
+        S.invLicores=S.invLicores.filter(x=>x!==r);
+        if(!leyendoDeLaBase()) gsMarcarEliminado('InvLicores', r);
+      }
+    });
+  }
   save(K.invLicores,S.invLicores);
 
   if(leyendoDeLaBase()){
@@ -13841,7 +13867,7 @@ async function invLicoresGuardar(){
       toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
     }
   }else{
-    toast(`Inventario guardado (${guardados} licor(es)).`,'success');
+    toast(`Inventario guardado (${guardados} licor(es)`+(aBorrar.length?`, ${aBorrar.length} borrado(s)`:'')+`).`,'success');
     const ok2=await gsSaveSheet('inventario','InvLicores',gsSerializeSheet('inventario','InvLicores'));
     if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
   }
@@ -15659,6 +15685,14 @@ function gsSignOut(){
   if(tok && gsReady() && google.accounts.oauth2.revoke){
     try{ google.accounts.oauth2.revoke(tok, ()=>{}); }catch(e){ /* noop */ }
   }
+  /* Modo base: este botón solo desconecta Google; la sesión de la app es
+     la de la base y se cierra con «Cerrar sesión» de la cabecera. */
+  if(leyendoDeLaBase()){
+    gsDesconectarGoogle('desconexión pedida por el usuario');
+    toast('Google desconectado','warn');
+    gsRenderControls();
+    return;
+  }
   gsState.accessToken = null;
   gsState.email = null;
   gsState.tokenExpiry = 0;
@@ -15712,7 +15746,7 @@ function sesMarcarActividad(){ sesUltimaActividad = Date.now(); }
 // ¿Terminó la sesión por decisión de la APP? (tope o inactividad)
 // Es independiente del token: aquí no interviene el reloj de Google.
 function sesionAppTerminada(){
-  if(!gsState.accessToken) return null;
+  if(!sesionActiva()) return null;
   const fin = Number(gsState.sesionFin||0);
   if(fin > 0 && Date.now() >= fin) return 'tope de sesión alcanzado';
   if(Date.now() - sesUltimaActividad >= SESION_INACTIVIDAD_MS) return 'inactividad prolongada';
@@ -15804,7 +15838,10 @@ async function gsFetchUserEmail(){
 
 /* ---------- Wrapper de fetch con manejo de token expirado (401) ---------- */
 async function gsApiFetch(url, options={}){
-  if(!gsState.accessToken) throw new Error('NO_SESSION');
+  if(!gsState.accessToken){
+    if(!leyendoDeLaBase()) throw new Error('NO_SESSION');
+    await googleConectar();                 // modo base: Google se pide al usarlo
+  }
   /* Guardia previo. ANTES lanzaba SESSION_EXPIRED en cuanto caducaba el
      token, lo que dejaba INALCANZABLE el bloque de renovación por 401 de más
      abajo: esa era la ruta muerta que provocaba el login cada hora.
@@ -15834,13 +15871,27 @@ async function gsApiFetch(url, options={}){
       opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
       r = await fetch(url, opt);
     }catch(e){
+      /* Modo base: perder Google no es perder la sesión. Se suelta el token,
+         se pide conectar de nuevo (con el clic del aviso) y se reintenta. */
+      if(leyendoDeLaBase()){
+        gsDesconectarGoogle('Google rechazó la renovación');
+        await googleConectar();
+        opt.headers['Authorization'] = 'Bearer '+gsState.accessToken;
+        r = await fetch(url, opt);
+        if(r.status !== 401) return r;
+        gsDesconectarGoogle('401 tras reconectar');
+        throw errGoogleDesconectado();
+      }
       /* Google rechazó la renovación: la sesión ya no puede sostenerse
          (revocada o cerrada en Google). Es la ÚNICA confirmación fiable. */
       console.warn('[Sesión] Google rechazó la renovación tras un 401:', e && e.message || e);
       gsState.accessToken = null; gsClearSession();
       throw new Error('SESSION_EXPIRED');
     }
-    if(r.status === 401){ gsState.accessToken = null; gsClearSession(); throw new Error('SESSION_EXPIRED'); }
+    if(r.status === 401){
+      if(leyendoDeLaBase()){ gsDesconectarGoogle('401 tras renovar'); throw errGoogleDesconectado(); }
+      gsState.accessToken = null; gsClearSession(); throw new Error('SESSION_EXPIRED');
+    }
   }
   return r;
 }
@@ -16970,6 +17021,22 @@ async function sbGuardarMovimientos(movs){
       res.ok = false; continue;
     }
     const version = _sbLectorInv.versionMovDe(m.productoId, m.fecha, m.tipo);
+    if(m.borrar){
+      /* 'ausente' también vale: lo que se pedía —que no esté— ya se cumple.
+         Se olvida la versión: si se vuelve a contar ese día, es un alta. */
+      const r = await escritor.borrarMovimiento({
+        clave: accion + ':borrar:' + m.productoId + ':' + m.tipo,
+        articuloId, fecha: m.fecha, tipo: m.tipo, version });
+      if(r.estado === 'borrado' || r.estado === 'ausente' || r.estado === 'repetido'){
+        _sbLectorInv.anotarVersionMov(m.productoId, m.fecha, m.tipo, null);
+        res.borrados = (res.borrados||0) + 1;
+      }else{
+        console.warn('[Movimientos] no se borró', { mov:m, versionEnviada:version, respuesta:r });
+        res.incidencias.push({ celda:m, estado:r.estado, motivo:r.motivo || r.mensaje || 'sin detalle' });
+        res.ok = false;
+      }
+      continue;
+    }
     const r = await escritor.guardarMovimiento({
       clave: accion + ':mov:' + m.productoId + ':' + m.tipo,
       articuloId, fecha: m.fecha, tipo: m.tipo,
@@ -17223,10 +17290,14 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     const t0 = Date.now();
     gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
     if(!auto) toast('Cargando últimos datos…','info');
-    const id = await gsEnsureSpreadsheet(domain);
+    /* En modo base no se toca Google: ni para resolver el spreadsheet ni
+       para listar sus hojas. Si no, una recarga tras un fallo de guardado
+       quedaba muda en cuanto el token de Google caducaba. */
+    const base = leyendoDeLaBase();
+    const id = base ? (roleGsheetId(currentRole(), domain) || 'base') : await gsEnsureSpreadsheet(domain);
     if(!id){ if(!auto) toast('No se encontró una hoja asociada.','error'); gsUpdateSyncStatus('No se encontró una hoja asociada.','error'); return; }
 
-    console.log('[Sync] Inicio carga domain='+domain+' id='+id+' user='+gsState.email);
+    console.log('[Sync] Inicio carga domain='+domain+(base?' desde la base':' id='+id)+' user='+correoSesion());
 
     /* ── SOLO SE PIDEN RANGOS DE HOJAS QUE EXISTEN ────────────────────────
        values:batchGet responde 400 ("Unable to parse range") si CUALQUIERA de
@@ -17238,7 +17309,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
        presentes. Una hoja ausente deja su entrada fuera de byName, y
        puedeAplicar() conserva los datos locales de esa colección. */
     let hojasPedidas = cfg.sheets;
-    try{
+    if(!base) try{
       const rMeta = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+encodeURIComponent(id)+'?fields=sheets.properties.title');
       if(rMeta.ok){
         const metaJson = await rMeta.json().catch(()=>null);
@@ -17636,7 +17707,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.3';
+const APP_VERSION = '2026-11-25.5';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -17802,6 +17873,7 @@ function sesBloquearYRecargar(titulo, mensaje, motivo, opts){
   if(!conservar){
     gsState.accessToken = null;
     gsClearSession();
+    if(leyendoDeLaBase()) sbCerrarSesionLocal();   // la recarga llega 2,5 s después
   }
   console.warn('[Sesión] '+titulo+' ('+motivo+'). Recargando…'+
     (conservar?' La sesión se conserva: solo cambia la versión.':' Se cierra la sesión.')+
@@ -18061,10 +18133,10 @@ async function sesValidarAlReactivar(){
      debe expulsar a nadie: solo termina la sesión si la app lo decide
      (tope o inactividad). El token se renovará con la primera interacción,
      que es el gesto que Google exige. */
-  if(gsState.accessToken){
+  if(sesionActiva()){
     const finApp = sesionAppTerminada();
     if(finApp){ sesManejarExpiracion('reactivación · '+finApp); return; }
-    if(!tokenGoogleVigente()) console.log('[Sesión] Reactivación con el token caducado; se renovará con la primera interacción.');
+    if(gsState.accessToken && !tokenGoogleVigente()) console.log('[Sesión] Reactivación con el token caducado; se renovará con la primera interacción.');
   }
   // La versión es del CÓDIGO, no de la sesión: se comprueba siempre, incluso
   // en la pantalla de login, donde antes se salía antes de llegar aquí.
@@ -18082,7 +18154,7 @@ async function sesValidarAlReactivar(){
 function sesInterceptarInteraccion(ev){
   if(sesBloqueada){ ev.stopPropagation(); ev.preventDefault(); return; }
   // Sin sesión iniciada aún (pantalla de login): no hay nada que validar.
-  if(!gsState.accessToken) return;
+  if(!sesionActiva()) return;
 
   /* ORDEN CRÍTICO: primero se EVALÚA la sesión con la marca de actividad
      ANTERIOR y solo después se actualiza. Al revés —marcar y luego
@@ -18110,7 +18182,9 @@ function sesInterceptarInteraccion(ev){
       /* Solo si Google RECHAZA la renovación repetidamente se concluye que
          la sesión ya no puede sostenerse (revocada, o cerrada en Google). */
       if(r==='fallo' && !tokenGoogleVigente() && sesRenovacionesFallidas >= SES_RENOV_MAX_FALLOS){
-        sesManejarExpiracion('no se pudo renovar la sesión con Google');
+        // En modo base solo se pierde Google, no la sesión de la app.
+        if(leyendoDeLaBase()){ sesRenovacionesFallidas = 0; gsDesconectarGoogle('no se pudo renovar el token'); }
+        else sesManejarExpiracion('no se pudo renovar la sesión con Google');
       }
     });
   }
@@ -18156,7 +18230,7 @@ if(!window.__sesTimer){
   window.__sesTimer = setInterval(()=>{
     if(sesBloqueada) return;
     // Solo el fin de sesión de la APP expulsa; el token lo renueva el gesto.
-    if(gsState.accessToken){
+    if(sesionActiva()){
       const finApp = sesionAppTerminada();
       if(finApp){ sesManejarExpiracion('vencimiento en uso · '+finApp); return; }
     }
@@ -18167,6 +18241,12 @@ if(!window.__sesTimer){
 sesComprobarVersion('arranque', true);
 // Coherencia entre pestañas: si una cierra sesión, las demás lo reflejan.
 window.addEventListener('storage', (e)=>{
+  if(leyendoDeLaBase()){
+    // Manda la sesión de la base; que otra pestaña suelte Google solo suelta Google.
+    if(e.key===SB_CLAVE_SESION && !e.newValue && sbSesion.email) sesManejarExpiracion('cierre de sesión en otra pestaña');
+    else if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){ gsState.accessToken = null; gsState.tokenExpiry = 0; }
+    return;
+  }
   if(e.key===AUTH_KEYS.token && !e.newValue && gsState.accessToken){
     sesManejarExpiracion('cierre de sesión en otra pestaña');
   }
@@ -18250,6 +18330,7 @@ window.auditarMarcacionesDuplicadas = auditarMarcacionesDuplicadas;
 window.limpiarMarcacionesDuplicadas = limpiarMarcacionesDuplicadas;
 
 function gsHandleError(err, accion){
+  if(err && err.codigo==='GOOGLE_DESCONECTADO'){ toast(err.message,'warn'); return; }
   if(err && (err.message==='SESSION_EXPIRED' || err.message==='NO_SESSION')){
     // Punto único: conserva lo tecleado, invalida la sesión y pide login.
     sesManejarExpiracion('respuesta 401 del servidor');
@@ -18273,7 +18354,16 @@ function gsUpdateSyncStatus(msg, type){
   });
   const side = document.getElementById('gsSideStatus');
   if(side){
-    side.textContent = gsIsSignedIn() ? ('🟢 '+(gsState.email||'Conectado')) : '⚪ Google: sin sesión';
+    if(leyendoDeLaBase()){
+      // La sesión es la de la base; Google es un extra que se conecta al pulsar.
+      const g = gsIsSignedIn();
+      side.textContent = '🟢 '+(sbSesion.email||'Sin sesión')+(g ? ' · Google ✓' : ' · ⚪ Google: sin conectar');
+      side.style.cursor = g ? '' : 'pointer';
+      side.title = g ? ('Google: '+(gsState.email||'conectado')) : 'Pulsa para conectar Google (analítica, ventas, formulario)';
+      side.onclick = g ? null : googleConectarManual;
+    } else {
+      side.textContent = gsIsSignedIn() ? ('🟢 '+(gsState.email||'Conectado')) : '⚪ Google: sin sesión';
+    }
   }
 }
 
@@ -18337,14 +18427,102 @@ function gsBindControls(domain='planilla'){
    junto a ACCOUNT_ROLES más arriba).
    ================================================================ */
 // ¿La sesión actual de Google corresponde a alguna cuenta autorizada?
+/* ── QUIÉN ERES, SEGÚN LA FUENTE ─────────────────────────────────────────
+   En modo hoja la identidad es la cuenta de Google del token, como siempre.
+   En modo base es la sesión de Supabase (la de login.html), que no caduca
+   cada hora: así entrar, leer y guardar no dependen de Google. El token de
+   Google queda solo para lo que sigue viviendo en Sheets (analítica, ventas,
+   formulario de marcaciones) y se pide al usarlo: ver googleConectar(). */
+var sbSesion = { email: null };
+const SB_CLAVE_SESION = 'sb-ylarfmswevnkzpqqkklg-auth-token';   // donde supabase-js guarda la sesión
+function correoSesion(){ return leyendoDeLaBase() ? sbSesion.email : gsState.email; }
+function sesionActiva(){ return leyendoDeLaBase() ? !!sbSesion.email : !!gsState.accessToken; }
 function isAuthorized(){
+  if(leyendoDeLaBase()) return !!sbSesion.email && !!currentRole();
   return gsIsSignedIn() && !!currentRole();
 }
 // Rol (dominio + módulos permitidos) de la cuenta conectada, o null si no
 // hay sesión o el correo no está en ACCOUNT_ROLES.
 function currentRole(){
-  const email = (gsState.email||'').trim().toLowerCase();
+  const email = (correoSesion()||'').trim().toLowerCase();
   return ACCOUNT_ROLES[email] || null;
+}
+/* Cierra SOLO la sesión de Supabase de este navegador (scope local: no
+   echa a los demás equipos). Si la red falla, signOut devuelve error sin
+   borrar la sesión; por eso se borra también la clave a mano: un tope de
+   sesión que se pudiera esquivar por no tener red no sería un tope. */
+function sbCerrarSesionLocal(){
+  sbSesion.email = null;
+  return sbCliente()
+    .then(sb => sb.auth.signOut({ scope:'local' }))
+    .catch(e => console.warn('[Sesión] signOut de Supabase falló:', e && e.message || e))
+    .finally(() => { try{ localStorage.removeItem(SB_CLAVE_SESION); }catch(e){} });
+}
+/* Suelta el token de Google SIN tocar la sesión de la app: en modo base
+   perder Google no es perder la sesión. No borra el inicio de sesión
+   (AUTH_KEYS.inicio): eso reiniciaría el tope de 12 h. */
+function gsDesconectarGoogle(motivo){
+  gsState.accessToken = null; gsState.tokenExpiry = 0; gsState.email = null;
+  [AUTH_KEYS.token, AUTH_KEYS.exp, AUTH_KEYS.email].forEach(k=>{ try{ localStorage.removeItem(k); }catch(e){} });
+  console.warn('[Google] Desconectado ('+motivo+'). La base sigue funcionando; Google se pedirá cuando una sección lo necesite.');
+  gsUpdateSyncStatus('Google desconectado. La app sigue funcionando con la base.','info');
+}
+
+/* ── GOOGLE A DEMANDA (solo modo base) ───────────────────────────────────
+   gsApiFetch llama aquí cuando no hay token. Se muestra un aviso con un
+   botón: el clic es el GESTO que Google exige para abrir su ventana sin
+   que el bloqueador la impida. Varias peticiones a la vez comparten un
+   solo aviso. "Ahora no" deja de preguntar hasta que el usuario pulse el
+   indicador de Google del menú: si no, cada carga automática de analítica
+   volvería a sacar el aviso. */
+let _googleConexion = null, _googleRehusado = false;
+function errGoogleDesconectado(){
+  const e = new Error('Google no está conectado y esta sección lo necesita. Conéctalo con «Google: sin conectar» en el menú lateral.');
+  e.codigo = 'GOOGLE_DESCONECTADO';
+  return e;
+}
+function googleConectar(){
+  if(tokenGoogleVigente()) return Promise.resolve();
+  if(_googleRehusado) return Promise.reject(errGoogleDesconectado());
+  if(_googleConexion) return _googleConexion;
+  _googleConexion = gsWaitForLib().then(() => new Promise((resolve, reject) => {
+    const d = document.createElement('div');
+    d.id = 'googleConectar';
+    d.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(27,19,64,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    d.innerHTML = `<div style="background:#fff;border-radius:14px;max-width:440px;width:100%;padding:24px 26px;box-shadow:0 18px 50px rgba(0,0,0,.3)">
+        <h2 style="margin:0 0 8px;font-size:18px;color:#1f1638">Conectar con Google</h2>
+        <p style="margin:0 0 16px;font-size:14px;color:#6b6385;line-height:1.5">Esta sección usa datos que siguen en Google Sheets. El resto de la app no lo necesita.</p>
+        <div id="googleConectarMsg" style="font-size:13px;color:#9a3324;min-height:0;margin:0 0 10px"></div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+          <button class="btn btn-ghost" id="googleConectarNo">Ahora no</button>
+          <button class="btn btn-primary" id="googleConectarSi">Conectar con Google</button>
+        </div></div>`;
+    document.body.appendChild(d);
+    const quitar = () => d.remove();
+    d.querySelector('#googleConectarNo').onclick = () => { _googleRehusado = true; quitar(); reject(errGoogleDesconectado()); };
+    d.querySelector('#googleConectarSi').onclick = () => {
+      const msg = d.querySelector('#googleConectarMsg');
+      msg.textContent = '';
+      gsRequestToken(true)                       // dentro del clic: sin bloqueo de ventanas
+        .then(async () => {
+          await gsFetchUserEmail();
+          gsPersistSession();
+          quitar();
+          const g = (gsState.email||'').toLowerCase(), app = (sbSesion.email||'').toLowerCase();
+          if(g && app && g !== app)
+            toast('Google se conectó con '+g+', distinta de la sesión ('+app+'). Si la sección no carga, conecta la misma cuenta.','warn');
+          gsUpdateSyncStatus('Google conectado ('+(gsState.email||'cuenta de Google')+').','success');
+          resolve();
+        })
+        .catch(e => { msg.textContent = 'Google no conectó ('+(e && e.message || e)+'). Puedes reintentar.'; });
+    };
+  })).finally(() => { _googleConexion = null; });
+  return _googleConexion;
+}
+// Desde el indicador del menú: vuelve a permitir el aviso y lo abre.
+function googleConectarManual(){
+  _googleRehusado = false;
+  googleConectar().catch(()=>{});
 }
 // ¿La cuenta conectada puede ver/usar el módulo "page"?
 function moduloPermitido(page){
@@ -18521,6 +18699,14 @@ function authSetMsg(msg, type){
 
 // Inicia sesión con Google y valida que el correo tenga un rol asignado.
 async function authSignIn(){
+  /* Modo base: se entra por login.html (Supabase con Google), que devuelve
+     aquí al terminar. Esa página ya está autorizada como retorno del OAuth
+     en Supabase; enviar el retorno directo a index.html exigiría añadirlo. */
+  if(leyendoDeLaBase()){
+    try{ localStorage.setItem('wb_volver', location.href.split('#')[0]); }catch(e){}
+    location.href = 'login.html';
+    return;
+  }
   try{
     authSetMsg('Conectando con Google…','info');
     await gsWaitForLib();
@@ -18537,7 +18723,40 @@ async function authSignIn(){
 // Reintento silencioso al cargar (mantiene la sesión si Google la conserva).
 // NUNCA dispara la sincronización automática: representa una página
 // refrescada con una sesión que YA estaba activa, no un inicio de sesión.
+/* Modo base: la sesión es la de Supabase, que se renueva sola. Se respetan
+   los mismos topes de la app (12 h desde el inicio, 4 h sin actividad).
+   Google NO se toca aquí: si quedó un token vigente se aprovecha, y si no,
+   se pedirá cuando una sección lo necesite. */
+async function authTrySilentBase(){
+  let session = null;
+  try{
+    const sb = await sbCliente();
+    ({ data:{ session } } = await sb.auth.getSession());
+  }catch(e){
+    console.warn('[Sesión] No se pudo consultar la sesión de la base:', e && e.message || e);
+    authSetMsg('No se pudo conectar con la base. Revisa la conexión y recarga.','error');
+    return;
+  }
+  if(!session || !session.user || !session.user.email){
+    authSetMsg('Inicia sesión para continuar.','info');
+    return;
+  }
+  const ini = Number(localStorage.getItem(AUTH_KEYS.inicio)||0);
+  if(ini > 0 && Date.now() >= ini + SESION_MAX_MS){
+    console.warn('[Sesión] El tope de sesión se agotó mientras la app estaba cerrada. Se pedirá iniciar sesión.');
+    gsClearSession();
+    await sbCerrarSesionLocal();
+    authSetMsg('Tu sesión llegó a su tope de '+Math.round(SESION_MAX_MS/3600000)+' h. Vuelve a iniciar sesión.','info');
+    return;
+  }
+  sbSesion.email = String(session.user.email).trim().toLowerCase();
+  gsRestoreSession();             // fija el inicio de sesión y, si sigue vivo, el token de Google
+  if(!currentRole()){ authDeny(sbSesion.email); return; }
+  authGrant(!ini);                // sin inicio guardado = sesión nueva: arranca el tope
+}
+
 async function authTrySilent(){
+  if(leyendoDeLaBase()) return authTrySilentBase();
   if(!localStorage.getItem(AUTH_KEYS.email)) return; // sin sesión previa: mostrar login
   // 1) Restaurar un token aún válido sin contactar a Google (mantiene la sesión al refrescar).
   if(gsRestoreSession() && isAuthorized()){ authGrant(false); return; }
@@ -18593,12 +18812,12 @@ function authGrant(viaLogin){
     sesMarcarActividad();
     sesComprobarVersion('inicio de sesión', true);
   }
-  authSetMsg('Acceso concedido. Bienvenido, '+gsState.email,'success');
-  toast('Bienvenido, '+gsState.email,'success');
+  authSetMsg('Acceso concedido. Bienvenido, '+correoSesion(),'success');
+  toast('Bienvenido, '+correoSesion(),'success');
   /* Si la sesión anterior terminó con un formulario a medias, se ofrece
      recuperarlo. Se hace tras pintar el módulo, nunca antes. */
   setTimeout(()=>{ try{ sesOfrecerBorrador(); }catch(e){} }, 600);
-  gsUpdateSyncStatus('Sesión iniciada ('+gsState.email+').','success');
+  gsUpdateSyncStatus('Sesión iniciada ('+correoSesion()+').','success');
 
   const role = currentRole();
   const domain = role ? role.domain : 'planilla';
@@ -18647,6 +18866,7 @@ function authGrant(viaLogin){
 // Deniega acceso: revoca el token y mantiene la app oculta.
 function authDeny(email){
   gsRevokeToken();
+  if(leyendoDeLaBase()) sbCerrarSesionLocal();
   gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
   document.body.classList.remove('authed');
   gsClearSession();
@@ -18658,6 +18878,7 @@ function authDeny(email){
 // Cierra sesión: bloquea la app y vuelve al login.
 function authLogout(){
   gsRevokeToken();
+  if(leyendoDeLaBase()) sbCerrarSesionLocal();
   gsState.accessToken=null; gsState.email=null; gsState.tokenExpiry=0;
   gsClearSession();
   document.body.classList.remove('authed');

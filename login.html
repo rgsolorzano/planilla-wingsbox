@@ -91,6 +91,19 @@ async function pintar(){
   const { count: visibles, error: eInsumos } =
     await sb.schema('core').from('insumos').select('*', { count:'exact', head:true });
 
+  /* Si se llegó aquí desde la app (modo base), se vuelve a ella en cuanto la
+     cuenta está habilitada. Sin ficha activa se queda aquí, que es donde se
+     explica qué falta. Solo se vuelve a una página de este mismo sitio. */
+  let volver = null;
+  try{ volver = localStorage.getItem('wb_volver'); }catch(e){}
+  if(volver && ficha && ficha.activo){
+    try{ localStorage.removeItem('wb_volver'); }catch(e){}
+    try{
+      const u = new URL(volver, location.href);
+      if(u.origin === location.origin){ location.replace(u.href); return; }
+    }catch(e){}
+  }
+
   let estado, clase;
   if(eFicha){
     estado = `La base respondió con un error al buscar tu ficha: ${esc(eFicha.message)}`;
