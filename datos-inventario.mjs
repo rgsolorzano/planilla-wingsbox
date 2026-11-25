@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.6';
+export const VERSION = '2026-11-25.8';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);

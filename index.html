@@ -14982,9 +14982,15 @@ async function stockBebidasGuardar(){
   if(!ok){ toast('Los valores de stock deben ser numéricos y no negativos','error'); return; }
   let guardados=0;
   // Solo lo que de verdad cambió viaja a la base.
-  const cambiadas=[];
+  const cambiadas=[], aBorrar=[];
   inputs.forEach(inp=>{
-    if(inp.value.trim()==='') return;
+    if(inp.value.trim()===''){
+      // Vaciar una bebida que ya tenía conteo ese día es pedir borrarlo:
+      // "no se contó", que no es contar cero. Igual que en Cocina.
+      const r=getStockBebida(inp.dataset.id, stockBebidasFecha);
+      if(r) aBorrar.push(r);
+      return;
+    }
     const id=inp.dataset.id, cantidad=Number(inp.value);
     const antes=getStockBebida(id, stockBebidasFecha);
     if(!antes || antes.stock!==cantidad)
@@ -14992,12 +14998,20 @@ async function stockBebidasGuardar(){
     upsertStockBebida(id, stockBebidasFecha, cantidad);
     guardados++;
   });
-  if(!guardados){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
+  if(!guardados && !aBorrar.length){ toast('Ingresa al menos un valor antes de guardar','error'); return; }
+  if(aBorrar.length){
+    const nombres=aBorrar.map(r=>{ const b=S.bebidasCat.find(x=>x.id===r.bebidaId); return b?b.nombre:r.bebidaId; });
+    if(!confirm('Vas a borrar el stock del '+fmtFecha(stockBebidasFecha)+' de: '+nombres.join(', ')+
+                '.\nEse día quedará como «no contado». Si lo que hay es cero, escribe 0.\n\n¿Borrar?')) return;
+    S.stockBebidas=S.stockBebidas.filter(x=>!aBorrar.includes(x));
+    if(!leyendoDeLaBase()) gsMarcarEliminados('StockBebidas', aBorrar);
+  }
   save(K.stockBebidas,S.stockBebidas);
 
   if(leyendoDeLaBase()){
     try{
-      const r=await sbGuardarConteos(cambiadas);
+      const r=sbUnirResultados(await sbGuardarConteos(cambiadas),
+        await sbBorrarConteos(aBorrar.map(x=>({ productoId:x.bebidaId, fecha:stockBebidasFecha, unidad:null }))));
       const { msg, tipo } = sbExplicarConteos(r, 'Stock de bebidas');
       if(!r.ok) await sbRecargarTrasFallo();
       toast(msg, tipo);
@@ -15006,7 +15020,7 @@ async function stockBebidasGuardar(){
       toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
     }
   }else{
-    toast(`Stock guardado (${guardados} bebida(s)).`,'success');
+    toast(`Stock guardado (${guardados} bebida(s)`+(aBorrar.length?`, ${aBorrar.length} borrada(s)`:'')+`).`,'success');
     const ok2=await gsSaveSheet('inventario','StockBebidas',gsSerializeSheet('inventario','StockBebidas'));
     if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
   }
@@ -16713,6 +16727,22 @@ function syncExoTardGS()   { _syncSheet('planilla','ExoneracionTardanza','ExoTar
 const SB_URL = 'https://ylarfmswevnkzpqqkklg.supabase.co';
 const SB_KEY = 'sb_publishable_tO34kGlfOe9z2WE1t_bgYw_iKWmOGBq';
 
+/* Cambiar de fuente con un enlace, para los teléfonos del local donde no hay
+   consola: index.html?fuente=base (o ?fuente=sheets para volver). Se guarda
+   en este navegador y el parámetro se quita de la dirección, para que un
+   marcador o una recarga no lo repitan sin querer. Va antes de cualquier
+   lectura: el script todavía no ha pedido nada. */
+(function(){
+  try{
+    const u = new URL(location.href), f = u.searchParams.get('fuente');
+    if(f === 'base' || f === 'sheets'){
+      localStorage.setItem('wb_fuente', f);
+      u.searchParams.delete('fuente');
+      history.replaceState(null, '', u.pathname + u.search + u.hash);
+      console.log('[Fuente] Este navegador queda en modo ' + (f === 'base' ? 'base' : 'hoja') + '.');
+    }
+  }catch(e){ console.warn('[Fuente] No se pudo aplicar ?fuente=:', e); }
+})();
 function fuenteDatos(){
   try { return localStorage.getItem('wb_fuente') === 'base' ? 'base' : 'sheets'; }
   catch(e){ return 'sheets'; }          // modo privado o almacenamiento bloqueado
@@ -17771,7 +17801,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.6';
+const APP_VERSION = '2026-11-25.8';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
