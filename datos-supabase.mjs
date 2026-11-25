@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-20.7';
+export const VERSION = '2026-11-25.2';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -75,7 +75,7 @@ export function crearLector(consultar){
        pedirla. La cota se comparte con inventario, que usa la misma conexión:
        si inventario cargó antes, aquí ya no se sondea nada. */
     const MARCACIONES = {
-      select: 'id, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
+      select: 'id, version, fecha, entrada_real, salida_real, origen, origen_entrada, origen_salida, ' +
               'empleados!inner(id_externo)',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
@@ -83,9 +83,9 @@ export function crearLector(consultar){
     if(consultar.calibrar) await consultar.calibrar('marcaciones', MARCACIONES);
 
     const _p_feriados = consultar('feriados', { select: 'id_externo, fecha, nombre', order: 'fecha' });
-    const _p_vt = consultar('validacion_tarjeta', { select: 'fecha, niubiz, caja', order: 'fecha' });
+    const _p_vt = consultar('validacion_tarjeta', { select: 'fecha, niubiz, caja, version', order: 'fecha' });
     const _p_condiciones_laborales = consultar('condiciones_laborales', {
-      select: 'id_externo, desde, hasta, puesto, sueldo_quincenal, sueldo_planilla, ' +
+      select: 'id, version, id_externo, desde, hasta, puesto, sueldo_quincenal, sueldo_planilla, ' +
               'sueldo_hora, afp_comision, ajuste_planilla, horas_cierre, es_libre, ' +
               'empleados!inner(id_externo)',
     });
@@ -94,35 +94,44 @@ export function crearLector(consultar){
       igual: { puesto: 'Mesero' },
     });
     const _p_empleados = consultar('empleados', {
-      select: 'id_externo, nombre, documento, fecha_ingreso, activo, visible',
+      select: 'id, version, id_externo, nombre, documento, fecha_ingreso, activo, visible',
       order: 'nombre',          // lo ordena PostgreSQL, con su propia colación
     });
     const _p_horarios = consultar('horarios', {
-      select: 'dia_semana, libre, entrada, salida, orden, ' +
+      select: 'id, version, dia_semana, libre, entrada, salida, orden, ' +
               'empleados!inner(id_externo), condiciones_laborales(id_externo)',
       order: 'orden',
     });
     const _p_marcaciones = consultar('marcaciones', MARCACIONES);
     const _p_dias_libres = consultar('dias_libres', {
-      select: 'id, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
+      select: 'id, version, id_externo, fecha, tipo, detalle, empleados!inner(id_externo)',
     });
     const _p_considerar_hora_extra = consultar('considerar_hora_extra', {
-      select: 'fecha, considerar, empleados!inner(id_externo)',
+      select: 'id, version, fecha, considerar, empleados!inner(id_externo)',
     });
     const _p_exoneraciones_tardanza = consultar('exoneraciones_tardanza', {
-      select: 'fecha, activa, horas, empleados!inner(id_externo)',
+      select: 'id, version, fecha, activa, horas, empleados!inner(id_externo)',
     });
     const _p_propinas = consultar('propinas', {
-      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      select: 'id, version, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
     const _p_movs = Object.fromEntries(['descuentos','pagos_extra'].map(tabla => [tabla,
       consultar(tabla, {
-        select: 'id, id_externo, fecha, tipo, monto, detalle, empleados!inner(id_externo)',
+        select: 'id, version, id_externo, fecha, tipo, monto, detalle, empleados!inner(id_externo)',
       })]));
 
     const hojas = {};
+    /* Lo que la hoja no puede llevar encima y la escritura necesita: el id de
+       cada fila EN LA BASE y su versión. Va en una lista paralela a cada
+       matriz, fila por fila, para que quien escribe identifique la fila con
+       su propia clave sin que el lector tenga que adivinar cuál es. */
+    const meta = {};
+    const fila = (hoja, m) => (meta[hoja] || (meta[hoja] = [])).push(m);
+    /* Condiciones laborales, por su id en la app: van DENTRO de cada
+       empleado como JSON, así que no tienen fila propia a la que alinearse. */
+    meta.condiciones = {};
 
     /* ── Empleados ─────────────────────────────────────────────────────────
        Las columnas sueltas son la condición VIGENTE; la columna 'condiciones'
@@ -131,6 +140,7 @@ export function crearLector(consultar){
     const porEmpleado = new Map();
     for(const c of condiciones.sort(porClaves(r => r.empleados.id_externo, r => r.desde))){
       const lista = porEmpleado.get(c.empleados.id_externo) || [];
+      if(c.id_externo) meta.condiciones[c.id_externo] = { id: c.id, version: c.version };
       lista.push({
         id: c.id_externo, desde: c.desde, hasta: c.hasta || null, tipo: c.puesto,
         sueldoQuincenal: num(c.sueldo_quincenal), sueldoPlanilla: num(c.sueldo_planilla),
@@ -157,6 +167,7 @@ export function crearLector(consultar){
         vig.horasCierre ?? 0, t(e.fecha_ingreso), b01(e.visible),
         cs.length ? JSON.stringify(cs) : '',
       ]);
+      fila('Empleados', { id: e.id, version: e.version });
     }
 
     /* ── Horarios ──────────────────────────────────────────────────────── */
@@ -167,6 +178,7 @@ export function crearLector(consultar){
         h.empleados.id_externo, Number(h.dia_semana), b01(h.libre),
         hm(h.entrada), hm(h.salida), t(h.condiciones_laborales?.id_externo),
       ]);
+      fila('Horarios', { id: h.id, version: h.version });
     }
 
     /* ── Marcaciones ───────────────────────────────────────────────────── */
@@ -177,6 +189,7 @@ export function crearLector(consultar){
         m.id, m.empleados.id_externo, m.fecha, hm(m.entrada_real), hm(m.salida_real),
         m.origen, t(m.origen_entrada), t(m.origen_salida),
       ]);
+      fila('Marcaciones', { id: m.id, version: m.version });
     }
 
     /* ── Descuentos y pagos extra ──────────────────────────────────────────
@@ -190,6 +203,7 @@ export function crearLector(consultar){
       for(const d of filas){
         hojas[hoja].push([d.id_externo || d.id, d.empleados.id_externo, d.fecha,
                           d.tipo, num(d.monto), t(d.detalle)]);
+        fila(hoja, { id: d.id, version: d.version });
       }
     }
 
@@ -202,25 +216,38 @@ export function crearLector(consultar){
     hojas.DiasLibres = [['id','empleadoId','fecha','tipo','comentario']];
     for(const d of libres){
       hojas.DiasLibres.push([d.id_externo || d.id, d.empleados.id_externo, d.fecha, d.tipo, t(d.detalle)]);
+      fila('DiasLibres', { id: d.id, version: d.version });
     }
     // Los feriados valen para toda la casa: en la hoja llevan empleadoId '*'.
     const feriados = await _p_feriados;
-    for(const f of feriados)
+    for(const f of feriados){
       hojas.DiasLibres.push([t(f.id_externo), '*', f.fecha, 'Feriado', t(f.nombre)]);
+      // Los feriados no tienen versión: se escriben una vez al año.
+      fila('DiasLibres', { feriado: true });
+    }
 
     /* ── Interruptores por día ─────────────────────────────────────────── */
     const extras = (await _p_considerar_hora_extra).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.ConsiderarHoraExtra = [['empleadoId','fecha','considerar']];
-    for(const c of extras) hojas.ConsiderarHoraExtra.push([c.empleados.id_externo, c.fecha, b01(c.considerar)]);
+    for(const c of extras){
+      hojas.ConsiderarHoraExtra.push([c.empleados.id_externo, c.fecha, b01(c.considerar)]);
+      fila('ConsiderarHoraExtra', { id: c.id, version: c.version });
+    }
 
     const exos = (await _p_exoneraciones_tardanza).sort(porClaves(r => r.fecha, r => r.empleados.id_externo));
     hojas.ExoneracionTardanza = [['empleadoId','fecha','activa','horas']];
-    for(const x of exos) hojas.ExoneracionTardanza.push([x.empleados.id_externo, x.fecha, b01(x.activa), num(x.horas)]);
+    for(const x of exos){
+      hojas.ExoneracionTardanza.push([x.empleados.id_externo, x.fecha, b01(x.activa), num(x.horas)]);
+      fila('ExoneracionTardanza', { id: x.id, version: x.version });
+    }
 
     /* ── Conciliación de tarjeta ───────────────────────────────────────── */
     const vt = await _p_vt;
     hojas.ValidacionTarjeta = [['fecha','niubiz','caja']];
-    for(const v of vt) hojas.ValidacionTarjeta.push([v.fecha, num(v.niubiz), num(v.caja)]);
+    for(const v of vt){
+      hojas.ValidacionTarjeta.push([v.fecha, num(v.niubiz), num(v.caja)]);
+      fila('ValidacionTarjeta', { version: v.version });
+    }
 
     /* ── Propinas: vive en inventario, pero la app la lee en ambos ─────── */
     /* id_externo desempata, igual que en los descuentos: una misma persona
@@ -232,6 +259,7 @@ export function crearLector(consultar){
     for(const p of propinas){
       hojas.Propinas.push([p.id_externo || p.id, p.empleados.id_externo, p.fecha,
                            p.medio, num(p.monto), t(p.ov)]);
+      fila('Propinas', { id: p.id, version: p.version });
     }
 
     /* ── Meseros: quien tenga alguna condición con ese puesto ──────────── */
@@ -244,10 +272,15 @@ export function crearLector(consultar){
     // Meta es configuración de la app, no datos de negocio: no vive en la base.
     hojas.Meta = [['clave','valor'], ['app','WingsBox Planilla']];
 
+    ultimaMeta = meta;
     return hojas;
   }
 
-  return { leerPlanilla };
+  let ultimaMeta = {};
+  /* La meta de la última lectura. Se pide aparte, no viaja dentro de las
+     hojas: la app recorre las hojas por nombre y una clave extra ahí dentro
+     sería una "pestaña" más que nadie espera. */
+  return { leerPlanilla, meta: () => ultimaMeta };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

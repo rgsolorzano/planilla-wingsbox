@@ -16543,6 +16543,15 @@ function gsSerializeSheet(domain, sheetName){
 // Son fire-and-forget: los CRUD las llaman sin await para no bloquear la UI.
 // Los errores se logean en consola y se muestran vía gsHandleError() internamente.
 function _syncSheet(domain, sheet, label, count){
+  /* En modo base, las pestañas que sabe escribir el motor van a la base. Y
+     van ANTES de isAuthorized(): esa comprobación exige el token de Google
+     vigente y saca el rol del correo de Google. Puesta delante, cada guardado
+     de planilla se saltaría EN SILENCIO al caducar el token —cada hora—.
+     En la base los permisos los decide la propia base, con RLS. */
+  if(leyendoDeLaBase() && _sbMotor && _sbMotor.maneja(sheet)){
+    sbSincronizarPestana(domain, sheet, label);
+    return;
+  }
   if(!isAuthorized()) return;
   console.log('['+label+'] Sincronizando hoja "'+sheet+'" ('+count+' registros)...');
   gsSaveSheet(domain, sheet, gsSerializeSheet(domain, sheet)).catch(e=>console.error('['+label+'] Error:', e));
@@ -16551,6 +16560,8 @@ function _syncSheet(domain, sheet, label, count){
    anunciar un guardado exitoso sin confirmarlo (ver propGuardarNuevo).
    Resuelve {ok, motivo} en vez de tragarse el error en consola. */
 async function _syncSheetConfirmado(domain, sheet, label){
+  if(leyendoDeLaBase() && _sbMotor && _sbMotor.maneja(sheet))
+    return sbSincronizarPestana(domain, sheet, label);
   if(!isAuthorized()) return { ok:false, motivo:'Sesión no autorizada.' };
   try{
     const ok = await gsSaveSheet(domain, sheet, gsSerializeSheet(domain, sheet));
@@ -16667,9 +16678,16 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
       + 'Ctrl+Shift+R. No guardes nada hasta que coincidan.');
   }
 
-  const [modPlanilla, modInventario] = await Promise.all([
-    import(modulo('datos-supabase')), import(modulo('datos-inventario'))
+  const [modPlanilla, modInventario, modMotor] = await Promise.all([
+    import(modulo('datos-supabase')), import(modulo('datos-inventario')),
+    import(modulo('sincronizar-base'))
   ]);
+  if(!_sbMotor) _sbMotor = modMotor.crearMotor({
+    rpc: sbLlamarFuncion,
+    claveApp: (hoja, fila) => gsClaveDe(hoja, fila),
+    uid: () => (typeof uid === 'function' ? uid() : String(Date.now()) + Math.random()),
+    log: m => console.log(m),
+  });
   const { crearLector, consultarConSupabase } = modPlanilla;
   const { crearLectorInventario } = modInventario;
   /* Que la consola diga qué versión está corriendo de verdad, archivo por
@@ -16678,7 +16696,8 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
      antes desde la caché. Una subida a medias nos tuvo buscando un fallo que
      ya estaba arreglado, y mirando la consola no había forma de saberlo. */
   avisaVersiones({ 'datos-supabase': modPlanilla.VERSION,
-                   'datos-inventario': modInventario.VERSION });
+                   'datos-inventario': modInventario.VERSION,
+                   'sincronizar-base': modMotor.VERSION });
   const consultar = consultarConSupabase(sb);
   let hojas;
   if(domain === 'inventario'){
@@ -16687,8 +16706,14 @@ async function sbRespuestaDeHojas(domain, hojasPedidas){
        necesita y la hoja reconstruida no puede llevar encima. */
     _sbLectorInv = crearLectorInventario(consultar);
     hojas = await _sbLectorInv.leerInventario();
+    _sbMotor.fotografiar('inventario', hojas, _sbLectorInv.meta());
   }else{
-    hojas = await crearLector(consultar).leerPlanilla();
+    const lector = crearLector(consultar);
+    hojas = await lector.leerPlanilla();
+    /* La foto de lo leído es contra lo que el motor compara al guardar.
+       Se toma en CADA lectura, también en la recarga tras un fallo: así la
+       foto nunca dice algo distinto de lo que dice la base. */
+    _sbMotor.fotografiar('planilla', hojas, lector.meta());
   }
 
   console.log('[Fuente] Leyendo de PostgreSQL ('+domain+').');
@@ -16973,6 +16998,77 @@ async function sbGuardarMovimientos(movs){
     }
   }
   return res;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MOTOR DE SINCRONIZACIÓN CON LA BASE · el pegamento con la app
+   -----------------------------------------------------------------------
+   La lógica vive en sincronizar-base.mjs, probada contra la base real. Aquí
+   solo se le da lo que necesita de la app —cómo llamar a la base, la clave
+   con que la app marca los borrados— y se decide qué hacer con el
+   resultado.
+   ═══════════════════════════════════════════════════════════════════════ */
+/* var y no let: con let, cualquier sync…() que corriera durante la carga del
+   script antes de esta línea lanzaría ReferenceError y tumbaría la app. */
+var _sbMotor = null;
+
+async function sbLlamarFuncion(fn, params){
+  const sb = await sbCliente();
+  const { data, error } = await sb.schema('core').rpc(fn, params);
+  // Un error de PostgREST no es un 'conflicto' ni un 'denegado': es que la
+  // llamada no llegó a hacerse. Se dice tal cual, para que no se confunda.
+  if(error) return { estado:'error', motivo: error.message || String(error) };
+  return data;
+}
+
+/* Si Empleados falla, el borrado de un empleado no se hizo: las marcas de sus
+   registros tampoco deben sobrevivir, o el siguiente guardado de cualquiera
+   de esas pestañas los borraría uno a uno. */
+const SB_DEPENDEN_DE_EMPLEADO = ['Horarios','Marcaciones','Descuentos','PagosExtra','DiasLibres'];
+
+function sbExplicarMotor(r, etiqueta){
+  const que = r.incidencias.slice(0, 3).map(i => {
+    const motivo = String(i.motivo || '').replace(/^./, c => c.toUpperCase());
+    return i.estado === 'conflicto' || i.estado === 'denegado' || i.estado === 'desconocido'
+      ? motivo : (i.estado + ': ' + motivo);
+  }).join(' · ');
+  const mas = r.incidencias.length > 3 ? ' (y ' + (r.incidencias.length - 3) + ' más)' : '';
+  return (etiqueta || r.hoja) + ': no se guardó en la base. ' + que + mas
+       + '. La pantalla vuelve a mostrar lo que hay guardado.';
+}
+
+async function sbRecargarDominio(domain){
+  try{ await gsLoadFromSheets(domain, { auto:true }); }
+  catch(e){ console.error('[Base] no se pudo recargar '+domain+' tras el fallo:', e); }
+}
+
+async function sbSincronizarPestana(domain, sheet, label){
+  if(!_sbMotor) return { ok:false, motivo:'Todavía no se leyó la base. Recarga la página.' };
+  const marcasDe = h => new Set((gsTombstones.get(h) || new Map()).keys());
+  let motivo = '';
+  const r = await _sbMotor.sincronizar(domain, sheet, gsSerializeSheet(domain, sheet), {
+    marcas: marcasDe(sheet),
+    marcasEmpleados: marcasDe('Empleados'),
+    /* Corre DENTRO de la cola del motor: la siguiente sincronización espera
+       a que esto termine, recarga incluida. Si no esperara, compararía
+       contra la foto vieja y repetiría lo que acaba de fallar. */
+    alTerminar: async r => {
+      const m = gsTombstones.get(sheet);
+      if(m && r.marcasAplicadas.length){ r.marcasAplicadas.forEach(k => m.delete(k)); gsTombstonesGuardar(); }
+      if(r.ok) return;
+      motivo = sbExplicarMotor(r, label);
+      console.warn('[Base] '+sheet+':', r.incidencias);
+      /* Lo que no se pudo borrar vuelve a aparecer con la recarga. Sus marcas
+         se descartan: si sobrevivieran, el siguiente guardado lo intentaría
+         otra vez sin que nadie lo pidiera. */
+      gsTombstones.delete(sheet);
+      if(sheet === 'Empleados') SB_DEPENDEN_DE_EMPLEADO.forEach(h => gsTombstones.delete(h));
+      gsTombstonesGuardar();
+      await sbRecargarDominio(domain);
+    },
+  });
+  if(!r.ok) toast(motivo || sbExplicarMotor(r, label), 'error');
+  return r.ok ? { ok:true } : { ok:false, motivo: motivo || sbExplicarMotor(r, label) };
 }
 
 /* Junta el resultado de guardar y el de borrar en una sola frase. Son dos
@@ -17526,7 +17622,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-20.7';
+const APP_VERSION = '2026-11-25.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────

@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-20.7';
+export const VERSION = '2026-11-25.2';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
@@ -63,6 +63,11 @@ export function crearLectorInventario(consultar){
      con id_externo en null, así que una versión guardada bajo esa clave sería
      inencontrable justo para las filas que la app acaba de crear. */
   const versionMov     = new Map();
+  /* El id en la base y la versión de cada fila, en una lista paralela a cada
+     matriz (como en el lector de planilla). Solo para las pestañas que se
+     escriben a través del motor de sincronización; las demás de inventario
+     llevan su propio mapa de versiones desde antes. */
+  let ultimaMeta = {};
   const versionStock   = new Map();   // stock_diario, por insumo y fecha
 
   async function leerInventario(){
@@ -117,20 +122,21 @@ export function crearLectorInventario(consultar){
       order: 'id',
     });
     const _p_efectivo_caja = consultar('efectivo_caja', {
-      select: 'id_externo, fecha, turno, responsable, apertura, cierre',
+      select: 'id, version, id_externo, fecha, turno, responsable, apertura, cierre',
     });
     const _p_propinas = consultar('propinas', {
-      select: 'id, id_externo, fecha, medio, monto, ov, empleados!inner(id_externo)',
+      select: 'id, version, id_externo, fecha, medio, monto, ov, empleados!inner(id, id_externo)',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
     const _p_empleados = consultar('empleados', {
-      select: 'id_externo, nombre, es_mesero',
+      select: 'id, id_externo, nombre, es_mesero',
       igual: { es_mesero: true },
       order: 'nombre',
     });
 
     const hojas = {};
+    const meta = {};
 
     /* ── Catálogo de artículos, una consulta para las cinco categorías ──── */
     const articulos = await _p_articulos;
@@ -258,16 +264,33 @@ export function crearLectorInventario(consultar){
       hojas.InvLicores.push([f.id, f.bebidaId, f.fecha, f.entradaOzs, f.entradaBots,
                              f.salidaOzs, f.salidaBots]);
 
+    /* Los movimientos que escribe la app nacen sin id_externo, porque
+       guardar_movimiento no lo guarda. La app aguanta un id vacío —le pone
+       uno al azar al leer—, pero entonces cambia en cada recarga y nadie
+       puede emparejar esa fila de una vez a la siguiente: el comparador del
+       25/11 la mostró con la clave en blanco. Un id derivado de artículo,
+       fecha y tipo es estable, y es justo lo que identifica al movimiento en
+       la base. */
+    const idMov = (m, prefijo) => m.id_externo || `${prefijo}:${ext(m)}:${m.fecha}:${m.tipo}`;
+
     hojas.MovBebidas = [['id','bebidaId','fecha','cantidad','tipoMovimiento']];
     for(const m of movimientos.filter(m => porId.get(m.articulo_id)?.categoria === 'bebidas')
-                              .sort(porClaves(r => r.fecha, r => r.id_externo)))
-      hojas.MovBebidas.push([m.id_externo, ext(m), m.fecha, n0(m.cantidad),
+                              .sort(porClaves(r => r.fecha, r => idMov(r, 'mb'))))
+      hojas.MovBebidas.push([idMov(m, 'mb'), ext(m), m.fecha, n0(m.cantidad),
                              // Capitalizado como en la hoja. La app lo normaliza
                              // igual, pero reproducirlo exacto deja el comparador
                              // limpio y así las diferencias que salgan son reales.
                              m.tipo === 'ingreso' ? 'Entrada' : 'Salida']);
 
-    hojas.MovCocina = [['id','productoId','fecha','cantidad','tipoMovimiento']];
+    /* Cocina estuvo VACÍA hasta el 25/11: había cabecera y ningún bucle.
+       La escritura de movimientos de cocina se conectó el 20/11, pero su
+       lectura nunca, así que lo que se guardaba desaparecía al recargar.
+       La columna es 'tipo' en minúsculas, que es como la lee la app
+       (S.cocinaMovimientos), no 'tipoMovimiento' como en bebidas. */
+    hojas.MovCocina = [['id','productoId','fecha','cantidad','tipo']];
+    for(const m of movimientos.filter(m => porId.get(m.articulo_id)?.categoria === 'cocina')
+                              .sort(porClaves(r => r.fecha, r => idMov(r, 'mc'))))
+      hojas.MovCocina.push([idMov(m, 'mc'), ext(m), m.fecha, n0(m.cantidad), m.tipo]);
 
     /* ── Insumos de cocina y su stock diario ─────────────────────────────── */
     const insumos = await _p_insumos;
@@ -320,6 +343,7 @@ export function crearLectorInventario(consultar){
       fila.push(n0(z.bolsa));
       for(let i = 0; i <= 10; i++) fila.push(n0(z['d' + i]));
       hojas.EfectivoCaja.push(fila);
+      (meta.EfectivoCaja || (meta.EfectivoCaja = [])).push({ id: c.id, version: c.version });
     }
 
     /* ── Propinas y meseros: viven en planilla, la app los lee aquí ─────── */
@@ -332,6 +356,8 @@ export function crearLectorInventario(consultar){
       // comparador en cero.
       if(t(p.ov) !== '') fila.push(p.ov);
       hojas.Propinas.push(fila);
+      (meta.Propinas || (meta.Propinas = [])).push({ id: p.id, version: p.version });
+      (meta.empleados || (meta.empleados = {}))[p.empleados.id_externo] = { id: p.empleados.id };
     }
 
     /* La marca es_mesero, no el puesto. Deducirla de puesto='Mesero' daba 13
@@ -340,7 +366,13 @@ export function crearLectorInventario(consultar){
        mano y se guarda como tal. */
     const meseros = await _p_empleados;
     hojas.Meseros = [['id','nombre']];
-    for(const m of meseros) hojas.Meseros.push([m.id_externo, m.nombre]);
+    /* El id de cada mesero EN LA BASE. La cuenta de inventario registra
+       propinas sin acceso a planilla, así que nunca lee la pestaña Empleados:
+       sin esto no sabría a quién apuntar una propina nueva. */
+    for(const m of meseros){
+      hojas.Meseros.push([m.id_externo, m.nombre]);
+      (meta.empleados || (meta.empleados = {}))[m.id_externo] = { id: m.id };
+    }
 
     // Catálogo de licores abandonado: ver la cabecera de este archivo.
     hojas.Bebidas    = [['id','nombre','tamanoMl','ozPorBotella']];
@@ -348,11 +380,15 @@ export function crearLectorInventario(consultar){
 
     hojas.Meta = [['clave','valor'], ['app','WingsBox Inventario']];
 
+    ultimaMeta = meta;
     return hojas;
   }
 
   return {
     leerInventario,
+    /* La meta de la última lectura, aparte de las hojas: la app recorre las
+       hojas por nombre y una clave extra ahí dentro sería una pestaña más. */
+    meta: () => ultimaMeta,
     /* Lo que la escritura necesita y la hoja reconstruida no puede llevar. */
     uuidDe: idExterno => uuidPorExterno.get(idExterno) || null,
     /* ¿Llegó a leerse algo? Si una consulta se pasó del tiempo límite, el
