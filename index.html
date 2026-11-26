@@ -18298,7 +18298,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-26.3';
+const APP_VERSION = '2026-11-26.4';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -19195,13 +19195,28 @@ const NAV_GROUPS_INVENTARIO = [
   { id:'inv-admin',  ico:'📂', label:'Administración y Configuración',
     modules:['insumos','licores','bebidasAdmin','salonAdmin','menajeAdmin','cocinaAdmin','syncInventario'] },
   { id:'inv-diario', ico:'📝', label:'Registro Diario',
-    // 'propinas' se trasladó aquí desde el grupo PROPINAS de planilla.
-    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje','invDiarioCocina','propinas'] },
+    // 'propinas' volvió a su grupo PROPINAS (ver NAV_GROUP_PROPINAS).
+    modules:['produccion','invDiarioLicores','stockDiarioBebidas','invDiarioSalon','invDiarioMenaje','invDiarioCocina'] },
   { id:'inv-cons',   ico:'📊', label:'Consolidados y Cotejos',
     modules:['inventarioConsolidado','alertaInsumos','cotejoLicores','consolidadoStockBebidas','consolidadoSalon','consolidadoMenaje','consolidadoCocina'] },
   { id:'inv-caja',   ico:'💰', label:'Caja',
     modules:['efectivoCaja','consolidadoCaja'] }
 ];
+
+/* ── Grupo PROPINAS ──
+   El registro (Propinas) y el consolidado viven juntos. La cuenta del local
+   ve el grupo con SOLO el registro: el consolidado no está entre sus módulos
+   (ACCOUNT_ROLES) y el filtro por rol lo deja fuera. Para esa cuenta el grupo
+   se añade tras su Registro Diario (ver gruposDelDominio); para la cuenta
+   combinada sale una sola vez, en la sección PLANILLA. */
+const NAV_GROUP_PROPINAS = { id:'pl-propinas', ico:'💵', label:'Propinas',
+  modules:['propinas','propinasConsolidado'] };
+function gruposDelDominio(domain){
+  if(domain !== 'inventario') return NAV_GROUPS_PLANILLA;
+  const g = NAV_GROUPS_INVENTARIO.slice();
+  g.splice(g.findIndex(x => x.id === 'inv-diario') + 1, 0, NAV_GROUP_PROPINAS);
+  return g;
+}
 
 // ── Grupos accordion del dominio PLANILLA (Multiboxes) ──
 const NAV_GROUPS_PLANILLA = [
@@ -19209,11 +19224,7 @@ const NAV_GROUPS_PLANILLA = [
     modules:['empleados','horarios','cuadrante','admin'] },
   { id:'pl-registro', ico:'📝', label:'Registro de Información',
     modules:['marcaciones','descuentos','pagos','libres'] },
-  /* 'propinas' salió de aquí: el registro diario ahora está en
-     INVENTARIO → Registro Diario. En planilla solo queda el consolidado,
-     que sigue siendo exclusivo de multiboxes.peru. */
-  { id:'pl-propinas', ico:'💵', label:'Propinas',
-    modules:['propinasConsolidado'] },
+  NAV_GROUP_PROPINAS,
   { id:'pl-reportes', ico:'📊', label:'Planilla y Reportes',
     modules:['calculo','consolidado','boleta'] },
   { id:'anal',        ico:'📈', label:'Analítica',
@@ -19264,7 +19275,8 @@ function buildCombinedNavHtml(activePage, suppressAutoOpen, role){
   sections.forEach(sec=>{
     let secHtml = '';
     sec.groups.forEach(g=>{
-      const modulos = g.modules.filter(m=>!role || role.modules.includes(m));
+      const modulos = g.modules.filter(m=> (!role || role.modules.includes(m))
+                                          && !(leyendoDeLaBase() && MODULOS_SOLO_HOJA.includes(m)));
       if(!modulos.length) return;
       const hayActivo = modulos.includes(activePage);
       if(hayActivo && !suppressAutoOpen) navGroupState[g.id] = true;
@@ -19301,7 +19313,7 @@ function renderNavAccordion(activePage, suppressAutoOpen){
     return;
   }
 
-  const groups = domain === 'inventario' ? NAV_GROUPS_INVENTARIO : NAV_GROUPS_PLANILLA;
+  const groups = gruposDelDominio(domain);
   let html = '';
   groups.forEach(g=>{
     // Filtra módulos que el rol permite ver (sin rol: muestra todos del grupo)
