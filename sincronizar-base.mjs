@@ -36,7 +36,7 @@
    de calcular la clave de la app. Así se prueba en Node contra la base real.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-export const VERSION = '2026-11-26.2';
+export const VERSION = '2026-11-26.3';
 
 /* ── Normalización: la MISMA que usa el comparador ───────────────────────── */
 const canonico = x => Array.isArray(x) ? x.map(canonico)

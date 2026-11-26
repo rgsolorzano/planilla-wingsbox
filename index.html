@@ -8444,7 +8444,7 @@ async function propGuardarNuevo(){
   if(!res.ok){
     S.prop = previo;                             // revierte: nada quedó guardado
     save(K.prop,S.prop);
-    toast('No se pudo guardar en Google Sheets: '+res.motivo+' No se registró nada; revisa la conexión y vuelve a intentarlo.','error');
+    toast('No se pudo guardar en '+destinoDatos()+': '+res.motivo+' No se registró nada; revisa la conexión y vuelve a intentarlo.','error');
     return;                                      // el formulario conserva los datos
   }
   toast(filas.length>1? `${filas.length} propinas registradas` : 'Propina registrada', 'success');
@@ -8507,7 +8507,7 @@ async function propActualizar(){
   if(!res.ok){
     S.prop = previo;                                   // nada quedó modificado
     save(K.prop,S.prop);
-    toast('No se pudo guardar el cambio en Google Sheets: '+res.motivo+' No se modificó nada.','error');
+    toast('No se pudo guardar el cambio en '+destinoDatos()+': '+res.motivo+' No se modificó nada.','error');
     return;                                            // sigue en modo edición
   }
   toast('Propina actualizada','success');
@@ -8543,7 +8543,7 @@ window.propDel=async function(itemId){
     S.prop = previo;                        // el registro NO se eliminó
     save(K.prop,S.prop);
     if(typeof gsTombstonesConfirmadas==='function') gsTombstonesConfirmadas('Propinas');
-    toast('No se pudo eliminar en Google Sheets: '+res.motivo+' El registro sigue ahí.','error');
+    toast('No se pudo eliminar en '+destinoDatos()+': '+res.motivo+' El registro sigue ahí.','error');
     RENDERERS.propinas();
     return;
   }
@@ -8653,6 +8653,8 @@ function propPadronCardHTML(){
   const rol = (typeof currentRole==='function') ? currentRole() : null;
   // Sin spreadsheet de inventario en el rol no hay destino posible.
   if(!rol || !rol.inventarioGsheetId) return '';
+  // En modo base la cuenta del local lee los meseros de la base: no hay nada que publicar.
+  if(leyendoDeLaBase()) return '';
   const padron = meseroPadronExport();
   return `
     <div class="card">
@@ -8826,7 +8828,7 @@ function renderPropinasConsolidado(){
 
     <div class="card">
       <h2>Validación de tarjeta (Niubiz vs Caja)</h2>
-      <p class="hint" style="margin-top:0">Regla: <b>Niubiz = Caja + propinas por tarjeta del día</b>. Ingresa los montos por día y presiona <b>Guardar</b> para persistirlos y sincronizarlos con Google Sheets. Los cambios no se guardan automáticamente.</p>
+      <p class="hint" style="margin-top:0">Regla: <b>Niubiz = Caja + propinas por tarjeta del día</b>. Ingresa los montos por día y presiona <b>Guardar</b> para persistirlos y sincronizarlos con ${destinoDatos()}. Los cambios no se guardan automáticamente.</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Fecha</th><th>Monto Niubiz</th><th>Monto Caja</th><th class="num">Propinas tarjeta del día</th><th>Validación</th></tr></thead>
         <tbody>${valRows}</tbody>
@@ -12318,7 +12320,7 @@ RENDERERS.produccion = function(){
         <button class="btn btn-primary" id="btnGuardarProduccion">💾 Guardar</button>
         <button class="btn btn-green" id="btnExportProduccion">⬇ Exportar Excel (este día)</button>
       </div>
-      <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con Google Sheets.</p>
+      <p class="hint">Los registros se guardan por fecha e insumo: si ya existe uno para esta fecha e insumo se actualiza (no se duplica) y no se sobrescriben los registros de otras fechas. Al guardar también se sincroniza con ${destinoDatos()}.</p>
     </div>`;
   document.getElementById('prodFecha').onchange = (e)=>{ prodFecha = e.target.value || fechaHoy(); RENDERERS.produccion(); };
   document.getElementById('prodInvFiltro').onchange = (e)=>{ prodInvFiltro = e.target.value || 'ambos'; RENDERERS.produccion(); };
@@ -13675,6 +13677,7 @@ window.invDeleteDia = async function(fecha){
 
 /* ---------- Administración de sincronización (Inventario) ---------- */
 RENDERERS.syncInventario = function(){
+  // En modo base no se llega aquí (moduloPermitido); por si acaso, a la tarjeta de la base.
   const el = document.getElementById('page-syncInventario');
   el.innerHTML = `
     <div class="page-head"><div><h1>☁️ Administración de sincronización (Inventario)</h1><p>Estado de conexión, sincronización manual y última actualización con Google Sheets para Producción e Insumos.</p></div></div>
@@ -17199,6 +17202,16 @@ async function sbRespuestaDeHojas(domain, hojasPedidas, opciones = {}){
   if(!_sbConsultar) _sbConsultar = consultarConSupabase(sb);
   const consultar = _sbConsultar;
   if(!silencioso){
+    /* Las marcas de borrado de la época de la hoja no sirven en modo base, y
+       una vieja podría hacer que el motor borre en la base una fila que la app
+       filtró al cargar (un artículo inactivo, un duplicado saneado). Se
+       descartan antes de la primera foto; las de esta sesión las crea y las
+       consume el motor. */
+    if(!sbCambios.cargados.size && gsTombstones.size){
+      let n = 0; gsTombstones.forEach(m => { n += m.size; });
+      gsTombstones.clear(); gsTombstonesGuardar();
+      console.log('[Base] Descartadas ' + n + ' marcas de borrado de la época de la hoja: en modo base no se usan.');
+    }
     await sbCambiosArrancar();
     /* Releer un dominio ya leído (la recarga tras un fallo de guardado) va
        entero a la base: es justo cuando no conviene fiarse de ninguna copia. */
@@ -18231,7 +18244,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     if(silencioso) console.log('[Cambios] '+domain+' al día en '+(Date.now()-t0)+' ms.');
     else{
       console.log('[Sync] Carga completada. '+resumen+' | total filas GS: '+totalRows+' | '+(Date.now()-t0)+'ms');
-      if(!auto) toast('Datos cargados desde Google Sheets ('+resumen+')','success');
+      if(!auto) toast('Datos cargados desde '+destinoDatos()+' ('+resumen+')','success');
       gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
     }
     goto(currentPage, { refresco:true, pantallaLimpia: silencioso });
@@ -18285,7 +18298,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-26.2';
+const APP_VERSION = '2026-11-26.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -18957,6 +18970,7 @@ function gsRenderControls(){
 // Genera ids con sufijo "_inv" para el dominio de inventario, así ambos
 // bloques de controles pueden coexistir en el DOM sin colisionar.
 function gsControlsHTML(domain='planilla'){
+  if(leyendoDeLaBase()) return sbControlsHTML(domain);
   const suf = domain==='inventario' ? '_inv' : '';
   const titulo = domain==='inventario' ? '☁️ Sincronización de Inventario con Google Sheets' : '☁️ Sincronización con Google Sheets';
   const detalle = domain==='inventario'
@@ -18984,8 +18998,48 @@ function gsControlsHTML(domain='planilla'){
     </div>`;
 }
 
+/* Modo base: de dónde salen los datos, recargar, y Google solo como extra
+   (Analítica, Compras, formulario de marcaciones). Sin «Guardar en Google
+   Sheets» ni «Cargar desde Google Sheets»: las hojas de planilla e inventario
+   quedaron como respaldo de solo lectura el 25/11/2026. */
+function sbControlsHTML(domain='planilla'){
+  const suf = domain==='inventario' ? '_inv' : '';
+  const g = gsIsSignedIn();
+  const lastTxt = gsState.lastSync ? gsState.lastSync.toLocaleString('es-PE') : '—';
+  return `
+    <div class="card">
+      <h2>🗄️ Datos en la base (Supabase)</h2>
+      <p class="hint" style="margin-top:0">Planilla e inventario se leen y se guardan en la base. Cada guardado llega al momento,
+        y lo que guarden otros equipos aparece solo. Las hojas de Google de planilla e inventario quedaron como
+        respaldo de solo lectura (hasta el 25/11/2026).</p>
+      <div class="actions">
+        <button class="btn btn-primary" id="sbBtnRecargar${suf}">⟳ Recargar desde la base</button>
+        ${g ? `<button class="btn btn-ghost" id="sbBtnGoogleFuera${suf}">Desconectar Google</button>`
+            : `<button class="btn btn-ghost" id="sbBtnGoogle${suf}">Conectar Google</button>`}
+      </div>
+      <div class="summary" style="margin-top:14px">
+        <div class="item"><div class="l">Sesión</div><div class="v" style="font-size:13px"><b>${sbSesion.email||'—'}</b></div></div>
+        <div class="item"><div class="l">Última lectura completa</div><div class="v" style="font-size:13px">${lastTxt}</div></div>
+        <div class="item"><div class="l">Google</div><div class="v" style="font-size:13px">${g
+          ? 'Conectado ('+(gsState.email||'cuenta de Google')+')'
+          : 'Sin conectar. Solo hace falta para Analítica, Compras y el formulario de marcaciones.'}</div></div>
+      </div>
+      <span id="gsSyncStatus${suf}" data-type="info" style="display:none"></span>
+    </div>`;
+}
+
 function gsBindControls(domain='planilla'){
   const suf = domain==='inventario' ? '_inv' : '';
+  if(leyendoDeLaBase()){
+    const bind = (id, fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; };
+    bind('sbBtnRecargar'+suf, async ()=>{
+      const dominios = sbDominiosCargados();
+      for(const d of dominios) await gsLoadFromSheets(d);
+    });
+    bind('sbBtnGoogle'+suf, ()=>{ googleConectarManual(); });
+    bind('sbBtnGoogleFuera'+suf, ()=>{ gsSignOut(); });
+    return;
+  }
   const bind = (id, fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; };
   bind('gsBtnSignIn'+suf, authSignIn);   // iniciar sesión = mismo flujo de acceso autorizado
   bind('gsBtnSignOut'+suf, authLogout);  // cerrar sesión bloquea de nuevo la app
@@ -19112,15 +19166,22 @@ function googleConectarManual(){
   googleConectar().catch(()=>{});
 }
 // ¿La cuenta conectada puede ver/usar el módulo "page"?
+/* Módulos que en modo base no tienen sentido: su único fin era sincronizar
+   con Google Sheets, que ya no es donde viven los datos. */
+const MODULOS_SOLO_HOJA = ['syncInventario'];
+// Dónde se guardan los datos, para los avisos: depende del modo.
+function destinoDatos(){ return leyendoDeLaBase() ? 'la base' : 'Google Sheets'; }
 function moduloPermitido(page){
   const role = currentRole();
+  if(leyendoDeLaBase() && MODULOS_SOLO_HOJA.includes(page)) return false;
   return !!role && role.modules.includes(page);
 }
 // Primer módulo del rol actual (página a la que se redirige tras iniciar
 // sesión, o si se intenta ir a un módulo no permitido).
 function paginaPorDefecto(){
   const role = currentRole();
-  return (role && role.modules.length) ? role.modules[0] : 'empleados';
+  const permitidos = role ? role.modules.filter(moduloPermitido) : [];
+  return permitidos.length ? permitidos[0] : 'empleados';
 }
 // Oculta del menú lateral los módulos que no pertenecen al rol de la cuenta
 // conectada. Si todavía no hay sesión (currentRole()===null), no oculta nada:
@@ -19244,7 +19305,8 @@ function renderNavAccordion(activePage, suppressAutoOpen){
   let html = '';
   groups.forEach(g=>{
     // Filtra módulos que el rol permite ver (sin rol: muestra todos del grupo)
-    const modulos = g.modules.filter(m=> !role || role.modules.includes(m));
+    const modulos = g.modules.filter(m=> (!role || role.modules.includes(m))
+                                        && !(leyendoDeLaBase() && MODULOS_SOLO_HOJA.includes(m)));
     if(!modulos.length) return;
     const hayActivo = modulos.includes(activePage);
     if(hayActivo && !suppressAutoOpen) navGroupState[g.id] = true; // auto-abrir el grupo con la página activa
