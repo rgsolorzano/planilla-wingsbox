@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.9';
+export const VERSION = '2026-11-25.11';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -576,14 +576,35 @@ export function consultarConSupabase(sb){
       return copiaDeFilas(c.filas);
     }
     const filas = await consultarTodo(tabla, opciones);
-    const conId = columnasRaiz(select).includes('id');
-    copias.set(clave, {
-      tabla, select, igual, orden: compara(order),
-      filas, porId: conId ? new Map(filas.map(f => [f.id, f])) : null,
-      depende: anidadas(select), traer: new Set(), quitar: new Set(), invalida: false,
-    });
+    copias.set(clave, nuevaCopia({ tabla, select, order, igual, filas }));
     return copiaDeFilas(filas);
   }
+  function nuevaCopia({ tabla, select, order, igual, filas, traer = [], quitar = [], invalida = false }){
+    const conId = columnasRaiz(select).includes('id');
+    return {
+      tabla, select, order, igual, orden: compara(order),
+      filas, porId: conId ? new Map(filas.map(f => [f.id, f])) : null,
+      depende: anidadas(select), traer: new Set(traer), quitar: new Set(quitar), invalida,
+    };
+  }
+
+  /* Para guardar las copias en el navegador (etapa 2) y recuperarlas al
+     abrir. Viajan las filas tal como vinieron de la base, más lo que haya
+     anotado y todavía sin traer: así nada avisado se pierde por el camino. */
+  consultar.exportarCopias = function exportarCopias(){
+    return [...copias.values()].filter(c => !c.invalida).map(c => ({
+      tabla: c.tabla, select: c.select, order: c.order, igual: c.igual, filas: c.filas,
+      traer: [...c.traer], quitar: [...c.quitar],
+    }));
+  };
+  consultar.importarCopias = function importarCopias(lista){
+    copias.clear();
+    for (const x of lista || []) {
+      if (!x || !x.tabla || !Array.isArray(x.filas)) continue;
+      copias.set(firma(x.tabla, x), nuevaCopia(x));
+    }
+    return copias.size;
+  };
 
   /* cambios: [{ tabla, clave, accion: 'I'|'U'|'D' }], tal como los da
      core.cambios_desde. Solo anota; las filas se traen en la próxima lectura. */

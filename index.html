@@ -8673,6 +8673,10 @@ function propPadronBind(){
   const btn = document.getElementById('psPadron');
   if(!btn) return;
   btn.onclick = async ()=>{
+    if(leyendoDeLaBase()){
+      toast('En modo base no hace falta publicar el padrón: la cuenta del local lee los meseros directamente de la base.','info');
+      return;
+    }
     const padron = meseroPadronExport();
     if(!padron.length){ toast('No hay meseros visibles que publicar','error'); return; }
     if(!confirm('Se publicarán '+padron.length+' mesero(s) (solo id y nombre) en la hoja "Meseros" del spreadsheet de Inventario.\n\nNo se copia ninguna otra información de empleado. ¿Continuar?')) return;
@@ -8922,12 +8926,15 @@ async function tarjetaValGuardar(){
   try{
     save(K.tarjetaVal, S.tarjetaVal);
     console.log('[TarjetaVal] Guardando', S.tarjetaVal.length, 'registros de validación de tarjeta');
-    const ok = await gsSaveSheet('planilla','ValidacionTarjeta', gsSerializeSheet('planilla','ValidacionTarjeta'));
-    if(ok){
+    /* Por _syncSheetConfirmado: en modo base va a la base por el motor; en
+       modo hoja, a la hoja como siempre. Antes iba directo a la hoja y en
+       modo base no se guardaba en ningún sitio. */
+    const r = await _syncSheetConfirmado('planilla','ValidacionTarjeta','Validación de tarjeta');
+    if(r.ok){
       tarjetaValPendiente = false;
       toast('Validación de tarjeta guardada correctamente','success');
     }else{
-      toast('Los datos se guardaron localmente pero ocurrió un error al sincronizar con Google Sheets','error');
+      toast('No se guardó la validación de tarjeta: '+(r.motivo||'error desconocido'),'error');
     }
     actualizarIndicadorTarjetaVal();
   }catch(e){
@@ -12831,9 +12838,9 @@ async function insumosActualizarResaltados(){
       if(ins) ins.alertaMinimo = cb.checked;
     });
     save(K.insumos, S.insumos);
-    const ok = await gsSaveSheet('inventario','Insumos',gsSerializeSheet('inventario','Insumos'));
-    if(ok) toast('Cambios actualizados y sincronizados correctamente','success');
-    else toast('Los cambios se guardaron localmente, pero ocurrió un error al sincronizar con Google Sheets','error');
+    const r = await _syncSheetConfirmado('inventario','Insumos','Insumos');
+    if(r.ok) toast('Cambios actualizados y guardados correctamente','success');
+    else toast('No se guardaron los cambios de insumos: '+(r.motivo||'error desconocido'),'error');
   }finally{
     if(btn){ btn.disabled=false; btn.textContent=btn.dataset.txt||'💾 Actualizar'; }
     RENDERERS.insumos();
@@ -15384,9 +15391,12 @@ async function cajaGuardar(){
     S.efectivoCaja.push({ id:uid(), fecha, turno, responsable, apQtys, apBolsa, clQtys, clBolsa });
   }
   save(K.efectivoCaja, S.efectivoCaja);
-  toast(`Registro de caja guardado (${turno} · ${fmtFecha(fecha)})`,'success');
-  const ok2 = await gsSaveSheet('inventario','EfectivoCaja',gsSerializeSheet('inventario','EfectivoCaja'));
-  if(!ok2) toast('Guardado localmente, pero la sincronización con Google Sheets falló','error');
+  /* El aviso de «guardado» va DESPUÉS de confirmarlo. Antes se anunciaba
+     primero y se escribía directo a la hoja: en modo base salía «guardado»
+     y no llegaba a la base. */
+  const r = await _syncSheetConfirmado('inventario','EfectivoCaja','Caja');
+  if(r.ok) toast(`Registro de caja guardado (${turno} · ${fmtFecha(fecha)})`,'success');
+  else toast('No se guardó el registro de caja: '+(r.motivo||'error desconocido'),'error');
   RENDERERS.efectivoCaja();
 }
 
@@ -15476,12 +15486,15 @@ window.cajaConsEditar = function(id){
 };
 window.cajaConsDel = async function(id){
   if(!confirm('¿Eliminar este registro de caja? Esta acción no se puede deshacer.')) return;
+  const quitado = S.efectivoCaja.find(x=>x.id===id);
   S.efectivoCaja = S.efectivoCaja.filter(x=>x.id!==id);
   save(K.efectivoCaja, S.efectivoCaja);
-  toast('Registro eliminado','warn');
+  // La marca de borrado es lo que el motor necesita para borrarlo en la base.
+  if(quitado && leyendoDeLaBase()) gsMarcarEliminado('EfectivoCaja', quitado);
   RENDERERS.consolidadoCaja();
-  const ok = await gsSaveSheet('inventario','EfectivoCaja',gsSerializeSheet('inventario','EfectivoCaja'));
-  if(!ok) toast('Eliminado localmente, pero la sincronización falló','error');
+  const r = await _syncSheetConfirmado('inventario','EfectivoCaja','Caja');
+  if(r.ok) toast('Registro eliminado','warn');
+  else toast('No se eliminó el registro de caja: '+(r.motivo||'error desconocido'),'error');
 };
 
 /* ================================================================
@@ -16804,7 +16817,8 @@ const modulo = nombre => './' + nombre + '.mjs?v=' + APP_VERSION;
    ═══════════════════════════════════════════════════════════════════════ */
 var _sbConsultar = null;
 const sbCambios = { cursor:null, vistos:new Set(), activo:true, corriendo:false, otraVez:false,
-                    pendiente:false, arranque:null, escriturasAlEmpezar:0, cargados:new Set() };
+                    pendiente:false, arranque:null, escriturasAlEmpezar:0, cargados:new Set(),
+                    instancia:null };
 let _sbEscriturasEnVuelo = 0, _sbEscriturasHechas = 0;
 const SB_CAMBIOS_SOLAPE = 200, SB_CAMBIOS_CADA_MS = 30000;
 const SB_TABLAS_DOMINIO = {
@@ -16844,9 +16858,13 @@ function sbCambiosArrancar(){
   sbCambios.arranque = (async () => {
     try{
       const sb = await sbCliente();
+      /* Etapa 2: si este navegador guardó su copia, se recupera y solo se
+         pide lo que cambió desde entonces. Si algo no cuadra, se lee todo. */
+      if(await sbCopiaRecuperar(sb)) return;
       const { data, error } = await sb.schema('core').rpc('cambios_desde', { p_desde: null });
       if(error || !data || typeof data.hasta !== 'number') throw new Error(error ? error.message : 'respuesta inesperada');
       sbCambios.cursor = data.hasta;
+      sbCambios.instancia = data.instancia || null;
       console.log('[Cambios] Atento a lo que guarden otros desde el cambio nº ' + data.hasta + '.');
     }catch(e){
       sbCambios.activo = false;
@@ -16872,7 +16890,17 @@ async function sbBuscarCambios(motivo){
     if(!data || data.estado) return;
     const nuevos = (data.cambios || []).filter(c => !sbCambios.vistos.has(c.seq));
     const dominios = new Set();
-    if(data.incompleto){
+    /* Otra base (reconstruida desde un respaldo) o numeración que retrocede:
+       nada de lo que hay en la copia se puede mezclar con ella. */
+    const otraBase = (data.instancia && sbCambios.instancia && data.instancia !== sbCambios.instancia)
+                     || Number(data.hasta) < sbCambios.cursor;
+    if(otraBase){
+      console.warn('[Cambios] La base no es la misma que cuando se leyó: se relee todo.');
+      sbCambios.instancia = data.instancia || null;
+      sbCambios.cursor = Number(data.hasta) || 0;
+      sbCambios.vistos.clear();
+    }
+    if(data.incompleto || otraBase){
       // Lo pedido ya se podó (pestaña abierta días sin mirar): se relee todo.
       if(_sbConsultar) _sbConsultar.olvidar();
       sbDominiosCargados().forEach(d => dominios.add(d));
@@ -16897,6 +16925,7 @@ async function sbBuscarCambios(motivo){
       sbCambios.cursor = Math.max(sbCambios.cursor, Number(data.hasta) || 0);
       for(const n of sbCambios.vistos) if(n <= sbCambios.cursor - 2 * SB_CAMBIOS_SOLAPE) sbCambios.vistos.delete(n);
       sbCambios.pendiente = false;
+      if(dominios.size) sbCopiaGuardarPronto();
       if(dominios.size) console.log('[Cambios] Al día (' + motivo + '): ' + nuevos.length
         + ' cambio(s) de otros en ' + [...dominios].join(' y ') + '.');
     }else{
@@ -16909,6 +16938,99 @@ async function sbBuscarCambios(motivo){
     sbCambios.corriendo = false;
     if(sbCambios.otraVez){ sbCambios.otraVez = false; setTimeout(() => sbBuscarCambios('seguir'), 50); }
   }
+}
+
+/* ── ETAPA 2 · La copia guardada en el navegador ────────────────────────
+   Al cerrar no se pierde lo leído: se guarda en IndexedDB (las filas tal
+   como vinieron de la base, el número del último cambio visto y la huella
+   de la base). Al abrir, se recupera y solo se pide lo que cambió desde ese
+   número; recargar deja de costar la lectura entera.
+
+   Se descarta y se lee todo si:
+     · es de otra cuenta (cada cuenta guarda la suya, y al cerrar sesión se
+       borran todas: en un equipo compartido no queda nada de nadie);
+     · la base no es la misma (huella distinta: se reconstruyó);
+     · pasó tanto tiempo que el registro ya se podó (más de 3 días);
+     · hay más de 2000 cambios pendientes: leer todo es más rápido.
+
+   Todo fallo aquí es silencioso y cae en leer todo, como antes: la copia
+   es un atajo, nunca la fuente. */
+const SB_COPIA = { base:'wingsbox', almacen:'copias', formato:1 };
+let _sbCopiaTimer = null;
+function sbIdb(){
+  return new Promise((ok, mal) => {
+    let r;
+    try{ r = indexedDB.open(SB_COPIA.base, 1); }catch(e){ mal(e); return; }
+    const t = setTimeout(() => mal(new Error('IndexedDB no responde')), 3000);
+    r.onupgradeneeded = () => { try{ r.result.createObjectStore(SB_COPIA.almacen); }catch(e){} };
+    r.onsuccess = () => { clearTimeout(t); ok(r.result); };
+    r.onerror = () => { clearTimeout(t); mal(r.error); };
+    r.onblocked = () => { clearTimeout(t); mal(new Error('IndexedDB bloqueada')); };
+  });
+}
+async function sbIdbHacer(modo, fn){
+  const db = await sbIdb();
+  try{
+    return await new Promise((ok, mal) => {
+      const tx = db.transaction(SB_COPIA.almacen, modo);
+      const req = fn(tx.objectStore(SB_COPIA.almacen));
+      tx.oncomplete = () => ok(req && req.result);
+      tx.onerror = () => mal(tx.error);
+      tx.onabort = () => mal(tx.error || new Error('transacción abortada'));
+    });
+  }finally{ db.close(); }
+}
+async function sbCopiaRecuperar(sb){
+  if(!_sbConsultar || !sbSesion.email) return false;
+  const t0 = Date.now();
+  let c;
+  try{ c = await sbIdbHacer('readonly', st => st.get(sbSesion.email)); }
+  catch(e){ console.warn('[Copia] No se pudo leer la copia del navegador:', e && e.message || e); return false; }
+  if(!c || c.formato !== SB_COPIA.formato || c.email !== sbSesion.email || !Array.isArray(c.copias) || !c.copias.length)
+    return false;
+  const { data, error } = await sb.schema('core').rpc('cambios_desde', { p_desde: Math.max(0, c.cursor - SB_CAMBIOS_SOLAPE) });
+  if(error || !data || data.estado){ return false; }
+  let porque = '';
+  if(data.incompleto) porque = 'pasó demasiado tiempo';
+  else if(data.mas) porque = 'hay demasiados cambios';
+  else if(!data.instancia || data.instancia !== c.instancia) porque = 'la base no es la misma';
+  else if(Number(data.hasta) < c.cursor) porque = 'la numeración retrocedió';
+  if(porque){
+    console.log('[Copia] Se descarta la copia del navegador (' + porque + '): se lee todo.');
+    return false;
+  }
+  const vistos = new Set(c.vistos || []);
+  const nuevos = (data.cambios || []).filter(x => !vistos.has(x.seq));
+  _sbConsultar.importarCopias(c.copias);
+  _sbConsultar.anotarCambios(nuevos);
+  for(const x of nuevos) vistos.add(x.seq);
+  sbCambios.vistos = vistos;
+  sbCambios.cursor = Number(data.hasta);
+  sbCambios.instancia = data.instancia;
+  console.log('[Copia] Recuperada la copia del ' + new Date(c.guardado).toLocaleString('es-PE')
+    + ': ' + nuevos.length + ' cambio(s) desde entonces · ' + (Date.now() - t0) + ' ms.');
+  return true;
+}
+function sbCopiaGuardarPronto(){
+  clearTimeout(_sbCopiaTimer);
+  _sbCopiaTimer = setTimeout(sbCopiaGuardar, 2000);
+}
+async function sbCopiaGuardar(){
+  if(!_sbConsultar || !sbSesion.email || sbCambios.cursor === null || !leyendoDeLaBase()) return;
+  const t0 = Date.now();
+  try{
+    const copias = _sbConsultar.exportarCopias();
+    await sbIdbHacer('readwrite', st => st.put({
+      formato: SB_COPIA.formato, email: sbSesion.email, instancia: sbCambios.instancia,
+      cursor: sbCambios.cursor, vistos: [...sbCambios.vistos], copias, guardado: Date.now(),
+    }, sbSesion.email));
+    console.log('[Copia] Guardada en el navegador (' + copias.length + ' consultas · ' + (Date.now() - t0) + ' ms).');
+  }catch(e){ console.warn('[Copia] No se pudo guardar en el navegador:', e && e.message || e); }
+}
+async function sbCopiaBorrarTodas(){
+  clearTimeout(_sbCopiaTimer);
+  try{ await sbIdbHacer('readwrite', st => st.clear()); }
+  catch(e){ console.warn('[Copia] No se pudo borrar la copia del navegador:', e && e.message || e); }
 }
 
 /* ── ¿Hay algo escrito sin guardar en pantalla? ──────────────────────────
@@ -16964,7 +17086,11 @@ function sbEnvolverRenderers(){
 }
 function sbCambiosEscuchar(){
   setInterval(() => sbBuscarCambios('cada 30 s'), SB_CAMBIOS_CADA_MS);
-  document.addEventListener('visibilitychange', () => { if(!document.hidden) sbBuscarCambios('volver a la pestaña'); });
+  document.addEventListener('visibilitychange', () => {
+    if(!document.hidden) sbBuscarCambios('volver a la pestaña');
+    // Al ocultarse (cambiar de app, cerrar) se guarda ya lo pendiente: puede no haber otra ocasión.
+    else if(_sbCopiaTimer){ clearTimeout(_sbCopiaTimer); _sbCopiaTimer = null; sbCopiaGuardar(); }
+  });
   window.addEventListener('focus', () => sbBuscarCambios('volver a la ventana'));
   if(_sbCanal) _sbCanal.onmessage = ev => {
     if(ev && ev.data && ev.data.tipo === 'guardado') setTimeout(() => sbBuscarCambios('otra pestaña guardó'), 300);
@@ -17044,6 +17170,7 @@ async function sbRespuestaDeHojas(domain, hojasPedidas, opciones = {}){
     _sbMotor.fotografiar('planilla', hojas, lector.meta());
   }
   sbCambios.cargados.add(domain);
+  if(!silencioso) sbCopiaGuardarPronto();
 
   if(!silencioso) console.log('[Fuente] Leyendo de PostgreSQL ('+domain+').');
   return {
@@ -17600,6 +17727,40 @@ function cargaFin(domain, error){
   cargaPintaTapa(error || undefined);
 }
 
+/* ── RESCATE de lo que se guardó solo en el navegador ───────────────────
+   Hasta la versión 2026-11-25.11, el arqueo de caja y la validación de
+   tarjeta se escribían directo a la hoja: en modo base salía «guardado» y el
+   dato se quedaba solo en el navegador donde se escribió. Recargar lo habría
+   borrado, porque la carga reemplaza el estado con lo que dice la base.
+
+   Antes de reemplazarlo se compara: lo que este navegador tiene y la base no
+   (o tiene distinto), con fecha desde que se usa la base, se conserva y se
+   escribe a la base. Una vez escrito, la base y el navegador coinciden y
+   esto ya no encuentra nada. */
+const SB_RESCATE_DESDE = { EfectivoCaja:'2026-11-25', ValidacionTarjeta:'2026-11-20' };
+function sbRescatar(hoja, local, deLaBase, clave, valor, desde){
+  const enBase = new Map(deLaBase.map(r => [clave(r), r]));
+  const rescatados = [];
+  for(const r of local){
+    if(!r || !r.fecha || normFechaGS(r.fecha) < desde) continue;
+    const b = enBase.get(clave(r));
+    if(b && valor(b) === valor(r)) continue;
+    if(b) deLaBase.splice(deLaBase.indexOf(b), 1, r); else deLaBase.push(r);
+    rescatados.push(clave(r));
+  }
+  if(rescatados.length)
+    console.warn('[Rescate] '+hoja+': '+rescatados.length+' registro(s) que solo estaban en este navegador: '+rescatados.join(', '));
+  return rescatados.length ? [hoja] : [];
+}
+async function sbEscribirRescates(domain, hojas){
+  for(const hoja of hojas){
+    const etiqueta = hoja === 'EfectivoCaja' ? 'Caja' : 'Validación de tarjeta';
+    const r = await _syncSheetConfirmado(domain, hoja, etiqueta);
+    if(r.ok) toast('Se recuperaron datos de '+etiqueta.toLowerCase()+' que se habían quedado en este equipo y ya están en la base.','success');
+    else toast('Hay datos de '+etiqueta.toLowerCase()+' que solo están en este equipo y no se pudieron subir: '+(r.motivo||'')+'. No recargues; avisa.','error');
+  }
+}
+
 async function gsLoadFromSheets(domain='planilla', opts={}){
   const auto = !!opts.auto; // true = sincronización automática al iniciar sesión (sin diálogo de confirmación)
   /* silencioso: puesta al día con lo que guardaron otros (sbBuscarCambios).
@@ -17615,6 +17776,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
     if(!confirm(confirmMsg)) return;
   }
   if(!silencioso) cargaInicio(domain);
+  const rescates = [];    // pestañas con datos que nunca llegaron a la base (ver sbRescatar)
   try{
     const t0 = Date.now();
     if(!silencioso) gsUpdateSyncStatus(auto? 'Sincronizando datos al iniciar sesión…' : 'Cargando últimos datos…','info');
@@ -17828,6 +17990,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         cantidad:Number(r.cantidad)||0, tipoMovimiento:bebMovTipoNorm(r.tipoMovimiento||r.tipo)
       })).filter(r=>r.bebidaId && /^\d{4}-\d{2}-\d{2}$/.test(r.fecha));
       save(K.bebidasMovs, S.bebidasMovs);
+      const cajaLocal = (base && !silencioso) ? (S.efectivoCaja||[]).slice() : null;
       S.efectivoCaja = (byName['EfectivoCaja']||[]).map(r=>({
         id:String(r.id||uid()), fecha:normFechaGS(r.fecha||''), turno:String(r.turno||'Mañana'), responsable:String(r.responsable||''),
         apBolsa:Number(r.apBolsa)||0,
@@ -17835,6 +17998,10 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         clBolsa:Number(r.clBolsa)||0,
         clQtys:DENOMINACIONES.map((_,i)=>Number(r['cl'+i])||0)
       }));
+      if(cajaLocal) rescates.push(...sbRescatar('EfectivoCaja', cajaLocal, S.efectivoCaja,
+        r => r.fecha+'|'+r.turno,
+        r => [r.responsable, r.apBolsa, r.clBolsa, (r.apQtys||[]).join(','), (r.clQtys||[]).join(',')].join('|'),
+        SB_RESCATE_DESDE.EfectivoCaja));
       // ── Salón: catálogo y registros diarios ────────────────────────────────
       // El catálogo de la hoja SalonProductos es la FUENTE DE VERDAD cuando
       // tiene filas: así todos los dispositivos/cuentas comparten los mismos
@@ -17975,7 +18142,10 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
          sería destructivo para la cuenta combinada, porque ambas ramas
          corren en paralelo al iniciar sesión y esta, al no encontrar la
          hoja, sobreescribiría S.prop con un array vacío. */
+      const tarjetaLocal = (base && !silencioso) ? (S.tarjetaVal||[]).slice() : null;
       S.tarjetaVal = (byName['ValidacionTarjeta']||[]).filter(r=>r.fecha).map(r=>({ fecha:String(r.fecha), niubiz:(r.niubiz===''||r.niubiz==null)?'':numProp(r.niubiz), caja:(r.caja===''||r.caja==null)?'':numProp(r.caja) }));
+      if(tarjetaLocal) rescates.push(...sbRescatar('ValidacionTarjeta', tarjetaLocal, S.tarjetaVal,
+        r => String(r.fecha), r => String(r.niubiz)+'|'+String(r.caja), SB_RESCATE_DESDE.ValidacionTarjeta));
       loadConsiderarHEFromRows(byName['ConsiderarHoraExtra']||[]);
       loadExoTardFromRows(byName['ExoneracionTardanza']||[]);
 
@@ -18001,6 +18171,7 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
       gsUpdateSyncStatus('Datos cargados: '+resumen+'.','success');
     }
     goto(currentPage, { refresco:true, pantallaLimpia: silencioso });
+    if(rescates.length) setTimeout(() => sbEscribirRescates(domain, rescates), 0);
   }catch(err){
     if(err && err.codigo === 'POSPUESTO'){
       console.log('[Cambios] '+domain+': hay algo sin guardar o una escritura en marcha; se actualiza después.');
@@ -18050,7 +18221,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.9';
+const APP_VERSION = '2026-11-25.11';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -18796,6 +18967,7 @@ function currentRole(){
    sesión que se pudiera esquivar por no tener red no sería un tope. */
 function sbCerrarSesionLocal(){
   sbSesion.email = null;
+  sbCopiaBorrarTodas();        // en un equipo compartido no queda la copia de nadie
   return sbCliente()
     .then(sb => sb.auth.signOut({ scope:'local' }))
     .catch(e => console.warn('[Sesión] signOut de Supabase falló:', e && e.message || e))

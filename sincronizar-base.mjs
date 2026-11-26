@@ -36,7 +36,7 @@
    de calcular la clave de la app. Así se prueba en Node contra la base real.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-export const VERSION = '2026-11-25.9';
+export const VERSION = '2026-11-25.11';
 
 /* ── Normalización: la MISMA que usa el comparador ───────────────────────── */
 const canonico = x => Array.isArray(x) ? x.map(canonico)
@@ -294,6 +294,9 @@ export const HOJAS = {
       return { p_fecha: fecha(o.fecha), p_turno: o.turno, p_responsable: o.responsable || null,
                p_apertura: lado('ap'), p_cierre: lado('cl'), p_version: m?.version ?? null };
     } }],
+    // Eliminar desde el Consolidado de Caja (52_borrar_arqueo.sql).
+    borrar: (ant, m) => ({ fn: 'borrar_fila_planilla',
+      params: { p_tabla: 'efectivo_caja', p_id: m.id, p_version: m.version } }),
   },
 
   /* Copia derivada que la app arma para la cuenta de inventario. En la base
