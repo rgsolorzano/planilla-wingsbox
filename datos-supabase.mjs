@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-25.11';
+export const VERSION = '2026-11-26.2';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -803,4 +803,92 @@ export function consultarConSupabase(sb){
   };
 
   return consultar;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RESPALDO COMPLETO
+   ---------------------------------------------------------------------------
+   Copia de cada tabla TAL CUAL está en la base: todas las filas (también lo
+   retirado y lo desactivado), con sus ids y versiones. A diferencia de la
+   exportación con forma de hoja, con esto la base se reconstruye exacta
+   (nucleo/restaurar-respaldo.py genera el SQL).
+
+   · En el orden en que se restauran: primero lo que otros referencian.
+   · Cada tabla se lee por páginas ordenadas por su clave primaria, y al final
+     se cuenta en la base: si no coincide, se relee una vez y, si sigue sin
+     coincidir, el respaldo FALLA. Un respaldo al que le faltan filas sin
+     decirlo es peor que ninguno.
+   · Las de administración y las de analítica (externo) son de referencia: si
+     no se pueden leer se anota y se sigue; las de datos son obligatorias.
+   ═══════════════════════════════════════════════════════════════════════════ */
+export const TABLAS_RESPALDO = [
+  // Administración: referencia (el esquema las vuelve a crear; los roles se reasignan por correo).
+  { esquema: 'core', tabla: 'roles',        clave: ['id'], referencia: true },
+  { esquema: 'core', tabla: 'permisos',     clave: ['id'], referencia: true },
+  { esquema: 'core', tabla: 'rol_permiso',  clave: ['rol_id', 'permiso_id'], referencia: true },
+  { esquema: 'core', tabla: 'usuarios',     clave: ['id'], referencia: true },
+  { esquema: 'core', tabla: 'usuario_rol',  clave: ['usuario_id', 'rol_id'], referencia: true },
+  // Planilla
+  { esquema: 'core', tabla: 'empleados',              clave: ['id'] },
+  { esquema: 'core', tabla: 'condiciones_laborales',  clave: ['id'] },
+  { esquema: 'core', tabla: 'horarios',               clave: ['id'] },
+  { esquema: 'core', tabla: 'marcaciones',            clave: ['id'] },
+  { esquema: 'core', tabla: 'descuentos',             clave: ['id'] },
+  { esquema: 'core', tabla: 'pagos_extra',            clave: ['id'] },
+  { esquema: 'core', tabla: 'dias_libres',            clave: ['id'] },
+  { esquema: 'core', tabla: 'feriados',               clave: ['fecha'] },
+  { esquema: 'core', tabla: 'considerar_hora_extra',  clave: ['id'] },
+  { esquema: 'core', tabla: 'exoneraciones_tardanza', clave: ['id'] },
+  { esquema: 'core', tabla: 'quincenas_cierre',       clave: ['id'] },
+  { esquema: 'core', tabla: 'propinas',               clave: ['id'] },
+  { esquema: 'core', tabla: 'validacion_tarjeta',     clave: ['fecha'] },
+  { esquema: 'core', tabla: 'efectivo_caja',          clave: ['id'] },
+  // Inventario
+  { esquema: 'core', tabla: 'insumos',      clave: ['id'] },
+  { esquema: 'core', tabla: 'stock_diario', clave: ['id'] },
+  { esquema: 'core', tabla: 'produccion',   clave: ['id'] },
+  { esquema: 'core', tabla: 'articulos',    clave: ['id'] },
+  { esquema: 'core', tabla: 'conteos',      clave: ['id'] },
+  { esquema: 'core', tabla: 'movimientos',  clave: ['id'] },
+  // Analítica: referencia (se puede volver a importar desde sus hojas).
+  { esquema: 'externo', tabla: 'caja_dia',        clave: ['fecha', 'fuente'], referencia: true },
+  { esquema: 'externo', tabla: 'ventas_orden',    clave: ['numero_orden'],    referencia: true },
+  { esquema: 'externo', tabla: 'ventas_producto', clave: ['id'],              referencia: true },
+];
+
+export async function crearRespaldo(sb, { alAvanzar = () => {}, tablas = TABLAS_RESPALDO } = {}){
+  const respaldo = { formato: 'wingsbox-respaldo', version: 1, generado: new Date().toISOString(),
+                     tablas: {}, cuentas: {}, avisos: [] };
+  const PAGINA = 1000;
+  async function leer(t){
+    const filas = [];
+    for (let desde = 0; ; ) {
+      let q = sb.schema(t.esquema).from(t.tabla).select('*');
+      for (const c of t.clave) q = q.order(c, { ascending: true });
+      const r = await q.range(desde, desde + PAGINA - 1);
+      if (r.error) throw new Error(r.error.message);
+      if (!r.data.length) break;
+      filas.push(...r.data);
+      desde += r.data.length;     // si la base corta antes de PAGINA, se sigue desde donde cortó
+    }
+    const c = await sb.schema(t.esquema).from(t.tabla).select('*', { count: 'exact', head: true });
+    if (c.error) throw new Error(c.error.message);
+    return { filas, cuenta: c.count };
+  }
+  for (const [i, t] of tablas.entries()) {
+    const nombre = `${t.esquema}.${t.tabla}`;
+    alAvanzar({ tabla: nombre, n: i + 1, de: tablas.length });
+    try {
+      let { filas, cuenta } = await leer(t);
+      if (cuenta !== filas.length) ({ filas, cuenta } = await leer(t));   // alguien escribió mientras: otra vez
+      if (cuenta !== filas.length)
+        throw new Error(`se leyeron ${filas.length} filas y la base dice ${cuenta}`);
+      respaldo.tablas[nombre] = filas;
+      respaldo.cuentas[nombre] = filas.length;
+    } catch (e) {
+      if (!t.referencia) throw new Error(`Respaldo incompleto: ${nombre}: ${e.message}`);
+      respaldo.avisos.push(`${nombre}: no se pudo leer (${e.message})`);
+    }
+  }
+  return respaldo;
 }

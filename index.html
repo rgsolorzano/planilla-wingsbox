@@ -689,6 +689,7 @@
     <div class="foot">
       <div id="gsSideStatus" style="font-size:11px;color:var(--muted);padding:2px 0">⚪ Google: sin sesión</div>
       <button class="btn btn-ghost btn-sm" id="authLogoutBtn">🔒 Cerrar sesión</button>
+      <button class="btn btn-ghost btn-sm" id="btnRespaldo" style="display:none" title="Copia completa de la base en un archivo">💾 Descargar respaldo</button>
       <button class="btn btn-ghost btn-sm" id="btnSeed">Recargar datos de ejemplo</button>
       <button class="btn btn-red btn-sm" id="btnWipe">Borrar todos los datos</button>
     </div>
@@ -11749,12 +11750,67 @@ function aplicarTextosFooterPorRol(){
   const role = currentRole();
   const seedBtn = document.getElementById('btnSeed'), wipeBtn = document.getElementById('btnWipe');
   if(!seedBtn || !wipeBtn) return;
+  /* En modo base: el respaldo, solo para la cuenta que administra todo. Y
+     fuera los botones de la era de la hoja: «Recargar catálogos de ejemplo»
+     metería artículos de ejemplo en la base al siguiente guardado, y «Borrar
+     datos» solo vaciaba el navegador, que se vuelve a llenar al recargar. */
+  const base = leyendoDeLaBase();
+  const resp = document.getElementById('btnRespaldo');
+  if(resp){
+    resp.style.display = (base && role && role.domain === 'planilla+inventario') ? '' : 'none';
+    resp.onclick = descargarRespaldo;
+    respaldoRotulo();
+  }
+  seedBtn.style.display = base ? 'none' : '';
+  wipeBtn.style.display = base ? 'none' : '';
   if(role && (role.domain==='inventario' || role.domain==='planilla+inventario')){
     seedBtn.textContent = 'Recargar catálogos de ejemplo';
     wipeBtn.textContent = 'Borrar datos de inventario';
   }else{
     seedBtn.textContent = 'Recargar datos de ejemplo';
     wipeBtn.textContent = 'Borrar todos los datos';
+  }
+}
+
+/* ── Respaldo completo (ver crearRespaldo en datos-supabase.mjs) ──────── */
+function respaldoRotulo(){
+  const b = document.getElementById('btnRespaldo');
+  if(!b || b.disabled) return;
+  let ult = 0; try{ ult = Number(localStorage.getItem('wb_ultimo_respaldo')) || 0; }catch(e){}
+  const dias = ult ? Math.floor((Date.now() - ult) / 86400000) : null;
+  b.textContent = '💾 Descargar respaldo';
+  b.title = ult ? ('Último respaldo desde este equipo: ' + new Date(ult).toLocaleString('es-PE')) : 'Aún no se ha descargado un respaldo desde este equipo';
+  // Un día sin respaldo ya se nota: se marca para que no pase desapercibido.
+  b.style.color = (dias === null || dias >= 1) ? 'var(--red, #c0392b)' : '';
+}
+async function descargarRespaldo(){
+  const b = document.getElementById('btnRespaldo');
+  if(!b || b.disabled) return;
+  b.disabled = true;
+  const t0 = Date.now();
+  try{
+    const sb = await sbCliente();
+    const { crearRespaldo } = await import(modulo('datos-supabase'));
+    const r = await crearRespaldo(sb, { alAvanzar: ({ n, de }) => { b.textContent = '💾 Respaldando ' + n + '/' + de + '…'; } });
+    const filas = Object.values(r.cuentas).reduce((a, n) => a + n, 0);
+    const ahora = new Date();
+    const hhmm = String(ahora.getHours()).padStart(2, '0') + String(ahora.getMinutes()).padStart(2, '0');
+    const url = URL.createObjectURL(new Blob([JSON.stringify(r)], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'wingsbox-respaldo-' + fechaHoy() + '-' + hhmm + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    try{ localStorage.setItem('wb_ultimo_respaldo', String(Date.now())); }catch(e){}
+    console.log('[Respaldo] ' + filas + ' filas de ' + Object.keys(r.cuentas).length + ' tablas en '
+      + Math.round((Date.now() - t0) / 1000) + ' s.', r.cuentas, r.avisos);
+    toast('Respaldo descargado: ' + filas.toLocaleString('es-PE') + ' filas de ' + Object.keys(r.cuentas).length + ' tablas.'
+      + (r.avisos.length ? ' Aviso: ' + r.avisos.join('; ') : ''), r.avisos.length ? 'warn' : 'success');
+  }catch(e){
+    console.error('[Respaldo]', e);
+    toast('No se pudo hacer el respaldo: ' + (e && e.message || e) + '. No se descargó nada.', 'error');
+  }finally{
+    b.disabled = false;
+    respaldoRotulo();
   }
 }
 
@@ -12276,7 +12332,7 @@ RENDERERS.produccion = function(){
   if(prodInvFiltro==='noche' && isAuthorized()){
     const RP = invPorcionesRango(prodFecha, prodFecha);
     const clave = RP.desde+'|'+RP.hasta;
-    if(!vpdEstado.cargando && vpdEstado.rango !== clave){
+    if(vpdPuedeAutocargar(clave) && vpdEstado.rango !== clave){
       vpdEstado.cargando = true;
       vpdCargarPorciones(RP.desde, RP.hasta).then(()=>{
         /* Repintar aquí borraría lo que el usuario esté escribiendo. Pasó:
@@ -12893,7 +12949,14 @@ function vpdNormalizar(s){
 const VPD_SET = new Set(VPD_PRODUCTOS.map(vpdNormalizar));
 // porciones[fecha]['NOMBRE NORMALIZADO'] = cantidad. Ausencia = sin ventas.
 let vpdPorciones = {};
-let vpdEstado = { cargando:false, rango:null, error:null, ultima:null, filas:0 };
+let vpdEstado = { cargando:false, rango:null, error:null, ultima:null, filas:0, fallido:null };
+/* fallido: el rango cuya última carga FALLÓ. Las pantallas que cargan solas
+   (Producción, Consolidado, Alerta de Insumos) repintan al terminar, haya ido
+   bien o mal; si al repintar volvieran a intentarlo, un fallo inmediato (por
+   ejemplo «Ahora no» en el aviso de Google) se convertía en un bucle sin fin
+   que congelaba la página. Ese rango no se reintenta solo: se reintenta con
+   el botón de actualizar, al cambiar de rango, o al conectar Google. */
+function vpdPuedeAutocargar(clave){ return !vpdEstado.cargando && vpdEstado.fallido !== clave && isAuthorized(); }
 
 // Recuenta las porciones del rango. Devuelve true si la carga fue exitosa.
 async function vpdCargarPorciones(desde, hasta, opts={}){
@@ -12951,7 +13014,7 @@ async function vpdCargarPorciones(desde, hasta, opts={}){
     return true;
   }catch(e){
     console.error('[Porciones] Error:', e);
-    vpdEstado = { cargando:false, rango:null, error:e.message, ultima:vpdEstado.ultima, filas:0 };
+    vpdEstado = { cargando:false, rango:null, error:e.message, ultima:vpdEstado.ultima, filas:0, fallido:clave };
     return false;
   }
 }
@@ -13572,7 +13635,7 @@ RENDERERS.inventarioConsolidado = function(){
   // Carga automática al abrir el módulo o al cambiar el rango: si las
   // porciones en memoria no corresponden al rango visible, se recargan.
   const RPauto = invPorcionesRango(desde, hasta);
-  if(!vpdEstado.cargando && vpdEstado.rango !== (RPauto.desde+'|'+RPauto.hasta) && isAuthorized()){
+  if(vpdEstado.rango !== (RPauto.desde+'|'+RPauto.hasta) && vpdPuedeAutocargar(RPauto.desde+'|'+RPauto.hasta)){
     vpdEstado.cargando = true;
     vpdCargarPorciones(RPauto.desde, RPauto.hasta).then(()=>{
       if(currentPage==='inventarioConsolidado') RENDERERS.inventarioConsolidado();
@@ -14209,8 +14272,9 @@ RENDERERS.alertaInsumos = function(){
      lugar de añadir una sincronización propia; si el rango ya cargado las
      cubre, no se vuelve a pedir nada. Al terminar se repinta para que las
      alertas se recalculen con los datos recién llegados. */
-  if(!alertaPorcionesDisponibles() && !vpdEstado.cargando && isAuthorized()){
-    const R = alertaPorcionesRango3d();
+  const R3 = alertaPorcionesRango3d();
+  if(!alertaPorcionesDisponibles() && vpdPuedeAutocargar(R3.desde+'|'+R3.hasta)){
+    const R = R3;
     vpdEstado.cargando = true;
     vpdCargarPorciones(R.desde, R.hasta).then(()=>{
       if(currentPage==='alertaInsumos') RENDERERS.alertaInsumos();
@@ -18221,7 +18285,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-25.11';
+const APP_VERSION = '2026-11-26.2';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
@@ -18998,7 +19062,10 @@ function errGoogleDesconectado(){
 }
 function googleConectar(){
   if(tokenGoogleVigente()) return Promise.resolve();
-  if(_googleRehusado) return Promise.reject(errGoogleDesconectado());
+  /* Rechazo con un respiro: si alguna pantalla reintentara al fallar, el
+     rechazo inmediato encadenaría intentos sin dejar respirar a la página
+     (eso la congelaba). Con la espera, un descuido así no la bloquea. */
+  if(_googleRehusado) return new Promise((_, mal) => setTimeout(() => mal(errGoogleDesconectado()), 250));
   if(_googleConexion) return _googleConexion;
   _googleConexion = gsWaitForLib().then(() => new Promise((resolve, reject) => {
     const d = document.createElement('div');
@@ -19028,6 +19095,11 @@ function googleConectar(){
             toast('Google se conectó con '+g+', distinta de la sesión ('+app+'). Si la sección no carga, conecta la misma cuenta.','warn');
           gsUpdateSyncStatus('Google conectado ('+(gsState.email||'cuenta de Google')+').','success');
           resolve();
+          // Lo que falló por no tener Google se puede volver a cargar.
+          if(typeof vpdEstado !== 'undefined' && vpdEstado.fallido){
+            vpdEstado.fallido = null;
+            setTimeout(() => goto(currentPage, { refresco:true }), 0);
+          }
         })
         .catch(e => { msg.textContent = 'Google no conectó ('+(e && e.message || e)+'). Puedes reintentar.'; });
     };
