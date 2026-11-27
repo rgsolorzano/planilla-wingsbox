@@ -21,7 +21,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-26.4';
+export const VERSION = '2026-11-26.5';
 
 /* ── Conversiones, equivalentes a las del exportador en Python ───────────── */
 
@@ -850,10 +850,17 @@ export const TABLAS_RESPALDO = [
   { esquema: 'core', tabla: 'articulos',    clave: ['id'] },
   { esquema: 'core', tabla: 'conteos',      clave: ['id'] },
   { esquema: 'core', tabla: 'movimientos',  clave: ['id'] },
-  // Analítica: referencia (se puede volver a importar desde sus hojas).
+  // Analítica: lo propio (la lista de platos, sus meses congelados y los contactos de remarketing).
+  { esquema: 'core', tabla: 'platos',          clave: ['id'] },
+  { esquema: 'core', tabla: 'platos_mes_fijo', clave: ['plato_id', 'mes'] },
+  { esquema: 'core', tabla: 'remarketing',     clave: ['id'] },
+  // Referencia (se puede volver a importar desde su hoja).
   { esquema: 'externo', tabla: 'caja_dia',        clave: ['fecha', 'fuente'], referencia: true },
-  { esquema: 'externo', tabla: 'ventas_orden',    clave: ['numero_orden'],    referencia: true },
-  { esquema: 'externo', tabla: 'ventas_producto', clave: ['id'],              referencia: true },
+  /* Las ventas de IDBI (externo.ventas_orden y ventas_producto) NO van en el
+     respaldo diario: son ~40 000 filas y crecen cada día (el archivo pasaría
+     de pocos MB a más de 60). Se pueden volver a traer de IDBI, y mientras el
+     spreadsheet de Analítica siga vivo, también de él (cargar-analitica.js).
+     Antes de retirar el spreadsheet se les dará un respaldo propio. */
 ];
 
 export async function crearRespaldo(sb, { alAvanzar = () => {}, tablas = TABLAS_RESPALDO } = {}){
