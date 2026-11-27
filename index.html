@@ -3730,6 +3730,10 @@ async function analiticaFetchRaw(rango){
 // creación, escritura), se lanza el error para que quede registrado — nunca
 // se reintenta contra el spreadsheet RAW.
 async function analiticaWriteProcessedSheet(nombreHoja, matrix, rangoLimpieza){
+  /* Modo base: nada se escribe ya en el spreadsheet de Analítica. FACTS,
+     VENTAS_FACTS y COMPRAS_FACTS eran copias que nadie lee, y REMARKETING
+     se guarda en la base (core.remarketing). */
+  if(leyendoDeLaBase()){ console.log('[Analítica] Modo base: no se escribe '+nombreHoja+' en el spreadsheet.'); return; }
   const SS = ANALITICA_PROC_SS_ID;
   if(SS === ANALITICA_RAW_SS_ID)
     throw new Error('Configuración inválida: el spreadsheet de ANALÍTICA no puede ser el de datos crudos.');
@@ -4330,9 +4334,47 @@ function vdNormCanal(raw){
   return VD_CANALES.find(c=>plano(c)===p) || null;
 }
 
+/* Modo base: VENTAS_DETALLE sale de core.v_ventas_orden (con «canal de
+   venta 2» ya calculado, igual que la columna AR). Mismo registro compacto
+   por venta. Se lee solo al entrar a Evolución de Ventas o a Estadísticas, y
+   de nuevo si lo leído tiene más de 5 minutos. */
+let vdBase = { cargando:false, ultima:0, fallido:false, error:null };
+async function vdCargarDesdeBase(){
+  const t0 = Date.now();
+  const filas = await sbLeerTodo('v_ventas_orden', 'numero_orden,fecha_venta,hora_venta,total,medio_venta,canal_venta_2', ['numero_orden']);
+  const out = []; let invalidas = 0;
+  for(const x of filas){
+    if(!x.fecha_venta){ invalidas++; continue; }          // orden aún abierta: sin fecha de venta
+    const canalRaw = String(x.canal_venta_2 ?? '');
+    out.push({ f:String(x.fecha_venta).slice(0,10), c:vdNormCanal(canalRaw),
+      m:String(x.medio_venta ?? '').trim() || '(Sin medio)', v: analNumOrNull(x.total) ?? 0,
+      h: vdHoraDe(x.hora_venta), cr: canalRaw.trim() });
+  }
+  vdFacts = out;
+  vdMeta = { lastSync:new Date().toISOString(), ventas:out.length, descartadas:invalidas,
+    medios:[...new Set(out.map(x=>x.m))].length, duracion:((Date.now()-t0)/1000).toFixed(1),
+    sinHora: out.filter(x=>x.h===null).length, version: VD_FACTS_VERSION, fuente:'base' };
+  try{ localStorage.setItem(K_VD_DATA, JSON.stringify(vdFacts)); localStorage.setItem(K_VD_META, JSON.stringify(vdMeta)); }
+  catch(e){ console.warn('[Canal] No se pudo cachear el detalle de ventas:', e); }
+  console.log('[Canal] De la base: '+out.length+' ventas ('+invalidas+' órdenes abiertas sin fecha de venta).');
+}
+function vdAutoBase(pagina, forzar){
+  if(!leyendoDeLaBase() || !isAuthorized() || vdBase.cargando) return;
+  if(!forzar && (vdBase.fallido || (vdBase.ultima && Date.now() - vdBase.ultima < ANAL_VIGENCIA_MS))) return;
+  vdBase.cargando = true; vdBase.error = null;
+  vdCargarDesdeBase()
+    .then(()=>{ vdBase.ultima = Date.now(); vdBase.fallido = false; })
+    .catch(e=>{ console.error('[Canal] Error al leer de la base:', e); vdBase.error = e.message; vdBase.fallido = true; })
+    .finally(()=>{ vdBase.cargando = false; if(currentPage===pagina && RENDERERS[pagina]) RENDERERS[pagina](); });
+}
+
 // Descarga y normaliza VENTAS_DETALLE (una sola consulta por sincronización).
 async function vdSync(){
   if(!isAuthorized()){ toast('Inicia sesión para sincronizar el detalle de ventas.','error'); return null; }
+  if(leyendoDeLaBase()){
+    try{ await vdCargarDesdeBase(); vdBase.ultima = Date.now(); vdBase.fallido = false; return vdMeta; }
+    catch(e){ vdBase.error = e.message; vdBase.fallido = true; toast('Error al leer el detalle de ventas: '+e.message,'error'); return null; }
+  }
   const t0=Date.now();
   try{
     const r = await gsApiFetch(
@@ -4537,14 +4579,20 @@ function vdChartSVG(puntos, canales){
 
 // HTML de la tarjeta del gráfico (se inserta en el renderer de Evolución de Ventas).
 function vdCardHTML(){
-  const metaStr = vdMeta
+  const enBase = leyendoDeLaBase();
+  const horaVd = vdBase.ultima ? new Date(vdBase.ultima).toLocaleTimeString('es-PE', { hour:'2-digit', minute:'2-digit' }) : '';
+  const metaStr = enBase
+    ? (vdBase.error ? `<span style="color:var(--red)">Error al leer de la base: ${vdBase.error}</span>`
+       : (vdMeta && vdBase.ultima) ? `${vdMeta.ventas.toLocaleString('es-PE')} ventas · ${vdMeta.medios} medios · leídas al ${horaVd}, se actualizan solas`
+       : '⏳ Leyendo las ventas…')
+    : vdMeta
     ? `${vdMeta.ventas.toLocaleString('es-PE')} ventas · ${vdMeta.medios} medios · sync ${fmtFecha(vdMeta.lastSync.slice(0,10))}`
     : 'Sin sincronizar todavía.';
   const medios=vdMediosDisponibles();
   return `
     <div class="card">
       <h2>🛒 Ventas por Canal de Venta</h2>
-      <p class="hint" style="margin-top:0">Fuente: ${VD_SHEET} (Spreadsheet de Analítica) · cada fila = una venta · ${metaStr}. <b>Medio de Venta</b> filtra solo las series de canal; <b>Total Ventas</b> siempre muestra el total general del período. Filtros independientes de los demás gráficos.</p>
+      <p class="hint" style="margin-top:0">Fuente: ${enBase ? 'las ventas de IDBI (base)' : VD_SHEET+' (Spreadsheet de Analítica)'} · cada fila = una venta · ${metaStr}. <b>Medio de Venta</b> filtra solo las series de canal; <b>Total Ventas</b> siempre muestra el total general del período. Filtros independientes de los demás gráficos.</p>
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="vdDesde" value="${vdFilter.desde}"></div>
         <div class="field"><label>Hasta</label><input type="date" id="vdHasta" value="${vdFilter.hasta}"></div>
@@ -4566,10 +4614,11 @@ function vdCardHTML(){
         <div style="display:flex;gap:4px;align-self:flex-end">
           <button class="btn btn-ghost btn-sm" id="vdQ2">Últimos 2 meses</button>
           <button class="btn btn-ghost btn-sm" id="vdQ12">Últimos 12 meses</button>
-          <button class="btn btn-primary btn-sm" id="vdSyncBtn">🔄 Actualizar detalle</button>
+          ${!enBase ? `<button class="btn btn-primary btn-sm" id="vdSyncBtn">🔄 Actualizar detalle</button>`
+            : vdBase.fallido ? `<button class="btn btn-primary btn-sm" id="vdSyncBtn">🔄 Reintentar</button>` : ''}
         </div>
       </div>
-      ${(()=>{ if(!vdFacts.length) return `<div class="empty" style="padding:32px;text-align:center">Sin datos de ${VD_SHEET}. Presiona <b>🔄 Actualizar detalle</b>.</div>`;
+      ${(()=>{ if(!vdFacts.length) return `<div class="empty" style="padding:32px;text-align:center">${enBase ? (vdBase.cargando ? '⏳ Leyendo las ventas…' : 'Sin ventas en la base.') : `Sin datos de ${VD_SHEET}. Presiona <b>🔄 Actualizar detalle</b>.`}</div>`;
         const {puntos,canales}=vdBuildSerie();
         if(!puntos.length) return `<div class="empty">Sin ventas en el rango y filtros seleccionados.</div>`;
         return vdChartSVG(puntos,canales); })()}
@@ -4744,7 +4793,7 @@ RENDERERS.evolucionVentas = function(){
   el.innerHTML=`
     <div class="page-head"><div><h1>📉 Evolución de Ventas</h1>
       <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p>${cajaEstructuraHTML()}</div>
-      <button class="btn btn-primary" id="evSync">🔄 Actualizar ventas</button></div>
+      <button class="btn btn-primary" id="evSync" title="CAJA sigue en Google Sheets: este botón la vuelve a leer">🔄 ${leyendoDeLaBase() ? 'Actualizar CAJA' : 'Actualizar ventas'}</button></div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap">
         <div class="field"><label>Desde</label><input type="date" id="evDesde" value="${evFilter.desde}"></div>
@@ -4849,7 +4898,8 @@ RENDERERS.evolucionVentas = function(){
   ['evbDesde','evbHasta','evbAgrup','evbTipo'].forEach(id=>{const e=document.getElementById(id); if(e) e.onchange=applyB;});
   // Gráfico de canales: enlaces y carga inicial única (sin re-consultas al filtrar)
   vdBindCard();
-  if(!vdFacts.length && !vdAutoSyncIntentado && isAuthorized()){
+  if(leyendoDeLaBase()) vdAutoBase('evolucionVentas');
+  else if(!vdFacts.length && !vdAutoSyncIntentado && isAuthorized()){
     vdAutoSyncIntentado=true;
     vdSync().then(()=>{ if(currentPage==='evolucionVentas') RENDERERS.evolucionVentas(); });
   }
@@ -5144,9 +5194,9 @@ function vhSeccionHTML(){
   const opt = (v,l,sel)=>`<option value="${v}" ${String(sel)===String(v)?'selected':''}>${l}</option>`;
   const horasOpts = sel => Array.from({length:24},(_,h)=>opt(h, String(h).padStart(2,'0')+':00', sel)).join('');
   const meta = vdMeta
-    ? `${vdMeta.ventas.toLocaleString('es-PE')} pedidos en ${VD_SHEET}`
+    ? `${vdMeta.ventas.toLocaleString('es-PE')} pedidos ${leyendoDeLaBase() ? 'de la base' + (vdBase.ultima ? ', se actualizan solos' : '') : 'en '+VD_SHEET}`
       + (vdMeta.sinHora ? ` · ${vdMeta.sinHora} sin hora válida (excluidos)` : '')
-    : 'Sin sincronizar todavía.';
+    : (leyendoDeLaBase() ? '⏳ Leyendo las ventas…' : 'Sin sincronizar todavía.');
 
   const filtros = `
     <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
@@ -5211,7 +5261,7 @@ function vhSeccionHTML(){
       </p>
       ${filtros}
       ${ag.filas===0
-        ? `<div class="empty" style="padding:24px">Sin pedidos para los filtros seleccionados${vdFacts.length?'':' (no hay datos sincronizados: pulsa «Actualizar ventas»)'}.</div>`
+        ? `<div class="empty" style="padding:24px">Sin pedidos para los filtros seleccionados${vdFacts.length?'':(leyendoDeLaBase()?' (leyendo las ventas…)':' (no hay datos sincronizados: pulsa «Actualizar ventas»)')}.</div>`
         : ''}
       <div class="table-wrap"><table class="vh-table">
         <thead><tr>
@@ -5243,7 +5293,8 @@ RENDERERS.estadisticasDiaSemana = function(){
      sincroniza una sola vez por sesión y también cuando la caché viene de una
      versión anterior, que no guardaba la hora ni el canal en crudo. */
   const vdDesactualizado = vdFacts.length && (!vdMeta || vdMeta.version!==VD_FACTS_VERSION);
-  if((!vdFacts.length || vdDesactualizado) && !vdAutoSyncIntentado && isAuthorized()){
+  if(leyendoDeLaBase()) vdAutoBase('estadisticasDiaSemana');
+  else if((!vdFacts.length || vdDesactualizado) && !vdAutoSyncIntentado && isAuthorized()){
     vdAutoSyncIntentado=true;
     vdSync().then(()=>{ if(currentPage==='estadisticasDiaSemana') RENDERERS.estadisticasDiaSemana(); });
   }
@@ -5291,7 +5342,7 @@ RENDERERS.estadisticasDiaSemana = function(){
   el.innerHTML=`
     <div class="page-head"><div><h1>🗓️ Estadísticas por Día de la Semana</h1>
       <p>Fuente: pestaña CAJA (solo registros WB). ${metaStr}</p></div>
-      <button class="btn btn-primary" id="edsSync">🔄 Actualizar ventas</button></div>
+      <button class="btn btn-primary" id="edsSync" title="CAJA sigue en Google Sheets: este botón la vuelve a leer">🔄 ${leyendoDeLaBase() ? 'Actualizar CAJA' : 'Actualizar ventas'}</button></div>
     <div class="card">
       <div class="toolbar">
         <div class="field"><label>Desde</label><input type="date" id="edsDesde" value="${edsFilter.desde}"></div>
@@ -5305,8 +5356,9 @@ RENDERERS.estadisticasDiaSemana = function(){
   document.getElementById('edsSync').onclick=async function(){
     this.disabled=true; this.textContent='Sincronizando…';
     // Las dos fuentes del módulo: CAJA (cuadros 1-3) y VENTAS_DETALLE (hora/día).
+    // En modo base el detalle se lee solo; el botón refresca CAJA.
     await ventasSync();
-    await vdSync();
+    if(!leyendoDeLaBase()) await vdSync();
     RENDERERS.estadisticasDiaSemana();
   };
   const apply=()=>{
@@ -10032,6 +10084,81 @@ function vcTrasladarFormula(formula, filaBase, filaDestino){
 }
 /* Procesa un archivo Excel y anexa sus filas nuevas. Devuelve el resumen.
    Toda la validación ocurre ANTES de cualquier escritura. */
+/* ── Carga manual en MODO BASE ────────────────────────────────────────────
+   El archivo de IDBI va a la base con core.cargar_ventas, las MISMAS reglas
+   que el Apps Script: cada orden se reconoce por su número; nueva → se
+   añade; ya cerrada → no se toca; abierta → se reemplaza por la del archivo.
+   Por eso volver a cargar el mismo archivo no duplica nada. No retira
+   anuladas (eso lo hace la sincronización automática, que ve el turno
+   completo). Las fechas y horas se guardan como el histórico: 'dd/mm/aaaa'
+   y 'hh:mm:ss' (el Excel las trae como número de serie). */
+const VC_REQUERIDAS = {
+  ventas:    ['NUMERO ORDEN', 'FECHA DE APERTURA', 'CERRADA', 'TOTAL'],
+  ventasDet: ['NUMERO ORDEN', 'FECHA CREACIÓN', 'PRODUCTO', 'CANTIDAD'],
+};
+const VC_COLS_FORMULA_HOJA = new Set(['CANAL DE VENTA 2', 'DIA']);   // las calcula la base
+function vcValorParaBase(v, h){
+  if(v === null || v === undefined) return undefined;
+  if(typeof v === 'string' && v.trim() === '') return undefined;
+  const dos = n => String(n).padStart(2, '0');
+  if(/FECHA/.test(h) && typeof v === 'number' && isFinite(v)){
+    const d = new Date(Math.round((Math.floor(v) - 25569) * 86400000));
+    return dos(d.getUTCDate()) + '/' + dos(d.getUTCMonth() + 1) + '/' + d.getUTCFullYear();
+  }
+  if(/HORA/.test(h) && typeof v === 'number' && isFinite(v)){
+    const seg = Math.round((v - Math.floor(v)) * 86400) % 86400;
+    return dos(Math.floor(seg / 3600)) + ':' + dos(Math.floor(seg / 60) % 60) + ':' + dos(seg % 60);
+  }
+  if(/HORA/.test(h) && typeof v === 'string' && /^\d{1,2}:\d{2}$/.test(v.trim())) return v.trim() + ':00';
+  return v;
+}
+async function vcProcesarArchivoBase(filas, cfg, cfgKey){
+  const req = VC_REQUERIDAS[cfgKey];
+  let idxHdr = -1, enc = null;
+  for(const n of cfg.filasEncabezado){
+    const e = (filas[n-1] || []).map(vcNorm);
+    if(req.every(r => e.includes(r))){ idxHdr = n-1; enc = e; break; }
+  }
+  if(idxHdr < 0) throw new Error('No se reconocieron los encabezados en las filas '+cfg.filasEncabezado.join(' ni ')+
+    ' (se buscan '+req.join(', ')+'). ¿Es el reporte de «'+cfg.etiqueta+'» de IDBI? No se modificó nada.');
+  const cuerpo = filas.slice(idxHdr + 1).filter(f=>f.some(c=>String(c??'').trim()!==''));
+  if(!cuerpo.length) throw new Error('El archivo no tiene registros después de los encabezados (fila '+(idxHdr+1)+').');
+  const objetos = cuerpo.map(f=>{
+    const o = {};
+    enc.forEach((h, i)=>{
+      if(!h || VC_COLS_FORMULA_HOJA.has(h) || o[h] !== undefined) return;
+      let v = vcValorParaBase(f[i], h);
+      if(v === undefined) return;
+      if(cfg.colTelefono !== undefined && h === 'TELEFONO') v = vcLimpiarTelefono(v);
+      o[h] = v;
+    });
+    return o;
+  }).filter(o => String(o['NUMERO ORDEN'] ?? '').trim() !== '');
+  if(!objetos.length) throw new Error('Ninguna fila trae NUMERO ORDEN. No se modificó nada.');
+  // Lotes de órdenes completas (todas las líneas de una orden en el mismo envío).
+  const grupos = new Map();
+  objetos.forEach(o=>{ const k = String(o['NUMERO ORDEN']).trim(); if(!grupos.has(k)) grupos.set(k, []); grupos.get(k).push(o); });
+  const lotes = []; let lote = [], tam = 0;
+  for(const g of grupos.values()){
+    const t = JSON.stringify(g).length;
+    if(lote.length && tam + t > 450000){ lotes.push(lote); lote = []; tam = 0; }
+    lote.push(...g); tam += t;
+  }
+  if(lote.length) lotes.push(lote);
+  const sb = await sbCliente();
+  const suma = { nuevas:0, reemplazadas:0, intactas:0, filas_escritas:0 };
+  for(const l of lotes){
+    const { data, error } = await sb.schema('core').rpc('cargar_ventas',
+      { p_reporte: cfgKey === 'ventas' ? 'ventas' : 'detalle', p_filas: l, p_detectar_anuladas: false });
+    if(error) throw new Error('La base rechazó la carga: '+error.message+
+      (lotes.length > 1 ? ' (los lotes anteriores sí se guardaron; volver a cargar el archivo completa lo que falte sin duplicar)' : ''));
+    for(const k in suma) suma[k] += data[k] || 0;
+  }
+  console.log('[Ventas] '+cfg.etiqueta+' → base:', suma);
+  return { base:true, encontrados: cuerpo.length, ordenes: grupos.size, agregados: suma.filas_escritas,
+           nuevas: suma.nuevas, actualizadas: suma.reemplazadas, yaCargadas: suma.intactas, hoja: cfg.hoja };
+}
+
 async function vcProcesarArchivo(file, cfgKey, opciones={}){
   const cfg = VENTAS_CARGA[cfgKey];
   if(!file) throw new Error('Selecciona un archivo .xlsx primero.');
@@ -10048,6 +10175,7 @@ async function vcProcesarArchivo(file, cfgKey, opciones={}){
     filas = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:''});
   }catch(e){ throw new Error('No se pudo leer el archivo: parece dañado o no es un Excel válido.'); }
   if(!filas.length) throw new Error('El archivo está vacío.');
+  if(leyendoDeLaBase()) return vcProcesarArchivoBase(filas, cfg, cfgKey);
 
   /* 2) Leer el DESTINO primero: sus encabezados son la referencia con la que
         se reconoce cuál de las filas candidatas del archivo es la de
@@ -10228,7 +10356,12 @@ RENDERERS.admin = function(){
 
     <div class="card">
       <h2>Actualización de datos de ventas</h2>
-      <p class="hint" style="margin-top:0">
+      ${leyendoDeLaBase() ? `<p class="hint" style="margin-top:0">
+        Carga en la <b>base</b> los reportes de IDBI. Normalmente no hace falta: la sincronización automática los trae cada 10 minutos.
+        Cada orden se reconoce por su <b>número</b>: las nuevas se añaden, las que seguían abiertas se actualizan y las ya cerradas no se tocan,
+        así que <b>volver a cargar un archivo no duplica nada</b>. Admite el reporte de un solo día y el de varios días.
+      </p>` : ''}
+      <p class="hint" style="margin-top:0;${leyendoDeLaBase() ? 'display:none' : ''}">
         Agrega registros al Spreadsheet de analítica desde archivos Excel. Cada archivo tiene su propia fila de encabezados y todo lo anterior se ignora.
         <b>La operación solo añade</b>: nunca borra, reemplaza ni reordena la información existente, y los registros que ya estén cargados se omiten automáticamente.
         Cada archivo se procesa por separado.
@@ -10236,14 +10369,14 @@ RENDERERS.admin = function(){
       <div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
           <h3 style="margin:0 0 4px;font-size:14px">Ventas</h3>
-          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_DETALLE</code>. Admite el reporte de <b>un solo día</b> (encabezados en la fila 6) y el de <b>varios días</b> (fila 7): la fila correcta se detecta sola comparando las columnas con las del destino. Las columnas AR y AS reciben sus fórmulas automáticamente.</p>
+          ${leyendoDeLaBase() ? '' : `<p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_DETALLE</code>. Admite el reporte de <b>un solo día</b> (encabezados en la fila 6) y el de <b>varios días</b> (fila 7): la fila correcta se detecta sola comparando las columnas con las del destino. Las columnas AR y AS reciben sus fórmulas automáticamente.</p>`}
           <input type="file" id="vcFileVentas" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
           <button class="btn btn-primary btn-sm" id="vcBtnVentas">⬆ Cargar ventas</button>
           <div id="vcMsgVentas" style="margin-top:10px;font-size:12.5px"></div>
         </div>
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
           <h3 style="margin:0 0 4px;font-size:14px">Ventas Detalladas</h3>
-          <p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Admite el reporte de <b>un solo día</b> (encabezados en la fila 7) y el de <b>varios días</b> (fila 6): la fila correcta se detecta sola comparando las columnas con las del destino. Cada fila es una venta independiente: las filas con datos idénticos se cargan todas. Si el archivo ya se cargó antes, se avisa antes de repetirlo.</p>
+          ${leyendoDeLaBase() ? '' : `<p class="hint" style="margin:0 0 10px;font-size:12px">Destino: <code>VENTAS_PRODUCTO_DETALLE</code>. Admite el reporte de <b>un solo día</b> (encabezados en la fila 7) y el de <b>varios días</b> (fila 6): la fila correcta se detecta sola comparando las columnas con las del destino. Cada fila es una venta independiente: las filas con datos idénticos se cargan todas. Si el archivo ya se cargó antes, se avisa antes de repetirlo.</p>`}
           <input type="file" id="vcFileVentasDet" accept=".xlsx,.xls" style="width:100%;margin-bottom:10px">
           <button class="btn btn-primary btn-sm" id="vcBtnVentasDet">⬆ Cargar ventas detalladas</button>
           <div id="vcMsgVentasDet" style="margin-top:10px;font-size:12.5px"></div>
@@ -10284,6 +10417,14 @@ RENDERERS.admin = function(){
       try{
         const res = await vcProcesarArchivo(file, cfgKey, {forzarReimport: !!btn.dataset.forzar});
         delete btn.dataset.forzar;
+        if(res.base){
+          const txt = `<b>Archivo cargado en la base.</b><br>`+
+            `Filas del archivo: <b>${res.encontrados}</b> · órdenes: <b>${res.ordenes}</b><br>`+
+            `Órdenes nuevas: <b>${res.nuevas}</b> · actualizadas (estaban abiertas): <b>${res.actualizadas}</b> · ya cargadas y cerradas (no se tocan): <b>${res.yaCargadas}</b>`;
+          pinta(txt, (res.nuevas || res.actualizadas) ? OK : INFO);
+          toast(cfg.etiqueta+': '+res.nuevas+' orden(es) nueva(s), '+res.actualizadas+' actualizada(s).', (res.nuevas || res.actualizadas) ? 'success' : 'info');
+          return;
+        }
         /* El renglón de omitidos solo aparece cuando la hoja realmente
            deduplica por contenido. En Ventas Detalladas cada fila es una venta
            independiente, así que no se etiqueta nada como "duplicado". */
@@ -12435,17 +12576,15 @@ RENDERERS.produccion = function(){
   // aparecen tanto en Stock día como en Stock noche, conservando su posición.
   // Registrar stock: solo insumos cuyo TIPO DE REGISTRO incluya stock,
   // filtrados además por la clasificación de inventario elegida.
-  // Registro de "Stock cierre": para las 22 salsas se ocultan las que NO
-  // tuvieron movimiento (ventas ni producción) en la fecha, y a las visibles se
-  // les muestra el peso esperado. Solo se oculta cuando las ventas del día ya se
-  // cargaron; mientras no, se muestran todas (no se trata "sin datos" como "sin
-  // ventas"). El resto de insumos no cambia.
-  const esNocheCierre = (prodInvFiltro === 'noche');
+  /* Salsas (desde 2026-11-27): se muestran SIEMPRE todas, tengan o no
+     movimiento, y su cierre se escribe a mano todos los días (ya no se copia
+     el del día anterior). Junto al cierre se muestra el PESO ESPERADO en las
+     vistas «Stock cierre» y «Ambos». */
+  const muestraEsperado = (prodInvFiltro === 'noche' || prodInvFiltro === 'ambos');
   const ventasListas = porcionesListasPara(prodFecha);
   const insumosVista = insumosOrdenados()
     .filter(i=>insumoRegistraStock(i))
-    .filter(i=>insumoEnInventario(i, prodInvFiltro))
-    .filter(i=> !(esNocheCierre && ventasListas && esSalsaCierre(i) && !salsaTuvoMovimiento(i, prodFecha)));
+    .filter(i=>insumoEnInventario(i, prodInvFiltro));
   const filas = insumosVista.length ? insumosVista.map(ins=>{
     const reg = getProduccion(ins.id, prodFecha);
     return `<tr>
@@ -12460,8 +12599,8 @@ RENDERERS.produccion = function(){
           class="prodInput" data-insumo="${ins.id}" data-campo="${campo}"
           value="${val===null?'':val}" placeholder="${editable?'':'—'}"
           ${editable?'':'disabled title="No editable: la clasificación Inventario de este insumo no incluye este campo" style="background:#f3f4f6;color:#9ca3af;cursor:not-allowed"'}>${extra}</td>`;
-        // Peso esperado: solo junto al cierre, en la vista "Stock cierre" y para salsas.
-        const extraCie = (esNocheCierre && esSalsaCierre(ins)) ? pesoEsperadoHTML(ins, prodFecha) : '';
+        // Peso esperado: junto al cierre de las salsas, en «Stock cierre» y «Ambos».
+        const extraCie = (muestraEsperado && editaCie && esSalsaCierre(ins)) ? pesoEsperadoHTML(ins, prodFecha) : '';
         return celda('stockInicial', vIni, editaIni) + celda('stockCierre', vCie, editaCie, extraCie);
       })()}
     </tr>`;
@@ -12472,9 +12611,9 @@ RENDERERS.produccion = function(){
     <div class="card">
       <h2>Registrar stock</h2>
       <p class="hint" style="margin-top:0">Stock inicial y stock de cierre del día. Los campos editables dependen de la clasificación <b>Inventario</b> de cada insumo; los no editables se muestran atenuados.</p>
-      ${esNocheCierre ? `<p class="hint" style="margin-top:0;border-left:3px solid #5b21b6;padding-left:8px">
-        <b>Stock de cierre de salsas:</b> solo se piden las salsas con <b>movimiento</b> hoy (ventas o producción). Las salsas sin movimiento no aparecen: al <b>Guardar</b>, su cierre se <b>conserva automáticamente</b> del día anterior. Junto a cada salsa se muestra el <b>peso esperado</b> (cierre anterior + producción − consumo estimado por ventas), como referencia.
-        ${ventasListas ? '' : '<br><span style="color:#b45309">⏳ Cargando las ventas del día… se oculta/estima al terminar.</span>'}</p>` : ''}
+      ${muestraEsperado ? `<p class="hint" style="margin-top:0;border-left:3px solid #5b21b6;padding-left:8px">
+        <b>Stock de cierre de salsas:</b> registra el cierre de <b>todas</b> las salsas, hayan tenido movimiento o no. Junto a cada una se muestra el <b>peso esperado</b>, como referencia: cierre del día anterior + producción de hoy − consumo estimado por las ventas de hoy (porciones × prom. rendimiento de 1 mes). Sin ventas hoy, es el cierre anterior más la producción. Si el día anterior no tiene cierre, se parte del último cierre registrado y se suman la producción y se restan las ventas de los días intermedios.
+        ${ventasListas ? '' : '<br><span style="color:#b45309">⏳ Cargando las ventas del día… el esperado aparece al terminar.</span>'}</p>` : ''}
       <div class="toolbar">
         <div class="field"><label>Fecha</label><input type="date" id="prodFecha" value="${prodFecha}"></div>
         <div class="field"><label>Inventario</label>
@@ -12501,7 +12640,7 @@ RENDERERS.produccion = function(){
   // ventana de 1 mes (para el prom. rendimiento). Se usa el MISMO cargador del
   // Consolidado (vpdCargarPorciones) y el mismo rango (invPorcionesRango), y se
   // re-renderiza al terminar para ocultar/estimar con datos ya cargados.
-  if(prodInvFiltro==='noche' && isAuthorized()){
+  if((prodInvFiltro==='noche' || prodInvFiltro==='ambos') && isAuthorized()){
     const RP = invPorcionesRango(prodFecha, prodFecha);
     const clave = RP.desde+'|'+RP.hasta;
     if(vpdPuedeAutocargar(clave) && vpdEstado.rango !== clave){
@@ -12706,9 +12845,8 @@ function guardarRegistroProduccion(){
 
 async function guardarProduccion(){
   /* Foto del día ANTES de tocar nada. El diff se calcula al final contra
-     esta foto, no al vuelo, porque además de lo que el usuario escribe hay
-     cierres que se conservan solos (conservarSalsasSinMovimiento). Si solo
-     mirásemos los inputs, esos cambios no llegarían a la base. */
+     esta foto, no al vuelo: así solo viaja a la base lo que cambió de
+     verdad, campo por campo. */
   const antes = new Map(S.produccion.filter(r => r.fecha === prodFecha)
     .map(r => [r.insumoId, { ini: r.stockInicial ?? null, cie: r.stockCierre ?? null }]));
   const inputs = document.querySelectorAll('.prodInput');
@@ -12755,13 +12893,9 @@ async function guardarProduccion(){
     if(!cieVacio) r.stockCierre  = Number(vals.stockCierre);
     guardados++;
   });
-  // Conservación automática del cierre de salsas sin movimiento. Solo en el
-  // registro de "Stock cierre" y solo si las ventas del día ya se cargaron (para
-  // no conservar por error una salsa que sí vendió). No pide entrada manual ni
-  // duplica registros.
-  let conservados = 0;
-  const ventasListas = porcionesListasPara(prodFecha);
-  if(prodInvFiltro === 'noche' && ventasListas) conservados = conservarSalsasSinMovimiento(prodFecha);
+  /* Hasta 2026-11-27 el cierre de las salsas sin movimiento se copiaba solo
+     del día anterior al guardar. Ya no: todas las salsas se registran a mano
+     y una salsa con el cierre vacío queda sin cierre ese día. */
 
   if(aVaciar.length){
     const nombres = aVaciar.map(v => { const i = S.insumos.find(x => x.id === v.insumoId); return i ? i.nombre : v.insumoId; });
@@ -12781,11 +12915,8 @@ async function guardarProduccion(){
     }
   }
 
-  if(!guardados && !conservados && !aVaciar.length){
-    if(prodInvFiltro === 'noche' && !ventasListas)
-      toast('Aún se están cargando las ventas del día. Espera unos segundos y vuelve a Guardar para conservar el cierre de las salsas sin movimiento.','warn');
-    else
-      toast('Ingresa al menos un valor de stock inicial o de cierre','error');
+  if(!guardados && !aVaciar.length){
+    toast('Ingresa al menos un valor de stock inicial o de cierre','error');
     return;
   }
   save(K.produccion, S.produccion);
@@ -12815,7 +12946,7 @@ async function guardarProduccion(){
                                    incidencias: [...rb.incidencias, ...rg.incidencias] };
       const { msg, tipo } = sbExplicarConteos(r, 'Stock de producción');
       if(!r.ok) await sbRecargarTrasFallo();
-      toast(msg + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : ''), tipo);
+      toast(msg, tipo);
     }catch(e){
       console.error('[Stock] producción:', e);
       toast('No se pudo guardar en la base: ' + (e && e.message ? e.message : e), 'error');
@@ -12823,8 +12954,7 @@ async function guardarProduccion(){
     prodRepintadoPendiente = false;
     RENDERERS.produccion();
   }else{
-    toast(`Stock guardado (${guardados} insumo(s))`
-          + (conservados ? ` · ${conservados} salsa(s) sin movimiento: cierre conservado del día anterior` : '') + '.','success');
+    toast(`Stock guardado (${guardados} insumo(s)).`,'success');
     RENDERERS.produccion();
     syncProduccion();
   }
@@ -13277,75 +13407,61 @@ function porcionesListasPara(fecha){
   return p[0] <= fecha && fecha <= p[1];
 }
 
-/* ¿La salsa tuvo movimiento en la fecha? Movimiento = porciones consumidas
-   (ventas) > 0  O  una producción registrada ese día. Reutiliza porcionesTabla
-   y produccionDe (las mismas fuentes del tablero), sin recalcular nada. */
-function salsaTuvoMovimiento(ins, fecha){
-  if(porcionesTabla(ins.nombre, fecha) > 0) return true;
-  return produccionDe(ins.id, fecha) !== null;
-}
-
 /* Peso esperado de cierre de una salsa en una fecha. Distingue el valor
    calculable de los casos sin datos suficientes (nunca inventa un 0):
-     { estado:'ok', valor }        calculable
-     { estado:'sin-anterior' }     no hay stock de cierre del día anterior
-     { estado:'sin-rendimiento' }  hubo ventas pero el prom. rendimiento (1 mes) está vacío
-   Fórmula: cierre del día anterior + producción del día − consumo estimado,
-   con consumo estimado = porciones consumidas hoy × prom. rendimiento (1 mes).
-   Producción ausente aporta 0; porciones ausentes dan consumo 0. */
+     { estado:'ok', valor, desde }  calculable; `desde` = fecha del cierre de partida
+     { estado:'sin-anterior' }      no hay ningún cierre en la ventana de ventas cargada
+     { estado:'sin-rendimiento' }   hubo ventas pero el prom. rendimiento (1 mes) está vacío
+   Fórmula: último cierre registrado ANTES de la fecha (normalmente el de
+   ayer) + producción de cada día desde entonces hasta hoy inclusive −
+   consumo estimado de esos mismos días (porciones × prom. rendimiento 1 mes).
+   Sin ventas ni producción, el esperado es el cierre anterior tal cual; sin
+   ventas, el cierre anterior más la producción. El retroceso es para el caso
+   extremo de un día sin cierre; no pasa del inicio de las ventas cargadas
+   (≈ 1 mes), porque sin ventas no se puede restar el consumo de esos días. */
 function pesoEsperadoCierre(ins, fecha){
-  const prev = stockCierreDe(ins.id, fechaMasDias(fecha, -1));
-  if(prev === null) return { estado:'sin-anterior' };
-  const prod = produccionDe(ins.id, fecha);
-  const prodN = (prod === null) ? 0 : prod;
-  const porc = porcionesTabla(ins.nombre, fecha);
+  const limite = vpdEstado.rango ? vpdEstado.rango.split('|')[0] : fechaMasDias(fecha, -31);
+  const dias = [fecha];                                    // días cuyo movimiento se suma
+  let d = fechaMasDias(fecha, -1), base = null;
+  while(d >= limite){
+    const c = stockCierreDe(ins.id, d);
+    if(c !== null){ base = c; break; }
+    dias.push(d);
+    d = fechaMasDias(d, -1);
+  }
+  if(base === null) return { estado:'sin-anterior' };
+  let prodN = 0, porc = 0;
+  dias.forEach(f=>{
+    const p = produccionDe(ins.id, f);
+    if(p !== null) prodN += p;
+    porc += porcionesTabla(ins.nombre, f);
+  });
   let consumo = 0;
   if(porc > 0){
     const pr = promRendimiento1Mes(ins).prom;
     if(pr === null || !Number.isFinite(pr)) return { estado:'sin-rendimiento' };
     consumo = porc * pr;
   }
-  return { estado:'ok', valor: prev + prodN - consumo };
+  return { estado:'ok', valor: base + prodN - consumo, desde: d };
 }
 
 // Indicador visual del peso esperado, para mostrar junto al input de cierre.
 function pesoEsperadoHTML(ins, fecha){
   const nd = 'margin-top:4px;font-size:11px;line-height:1.25;font-weight:500;font-style:italic;color:#9ca3af;white-space:normal';
   if(!porcionesListasPara(fecha))
-    return `<div style="${nd}" title="Aún se están cargando las ventas del día desde Google Sheets.">Esperado: cargando ventas…</div>`;
+    return `<div style="${nd}" title="Aún se están cargando las ventas del día.">Esperado: cargando ventas…</div>`;
   const r = pesoEsperadoCierre(ins, fecha);
   if(r.estado === 'sin-anterior')
-    return `<div style="${nd}" title="No hay stock de cierre registrado el día anterior; no se puede estimar.">Esperado: — (falta cierre anterior)</div>`;
+    return `<div style="${nd}" title="No hay ningún stock de cierre registrado en el último mes; no se puede estimar.">Esperado: — (sin cierre anterior)</div>`;
   if(r.estado === 'sin-rendimiento')
     return `<div style="${nd}" title="Hubo ventas, pero el prom. rendimiento (1 mes) está vacío; no se puede estimar el consumo.">Esperado: — (sin rendimiento suficiente)</div>`;
   const neg = r.valor < 0;
   const col = neg ? '#b91c1c' : '#5b21b6';
   const val = Number(r.valor).toLocaleString('es-PE', { maximumFractionDigits:1 });
+  const ayer = fechaMasDias(fecha, -1);
+  const desdeOtro = r.desde !== ayer;
   return `<div style="margin-top:4px;font-size:11px;line-height:1.25;font-weight:600;color:${col};white-space:normal"
-    title="Peso esperado = cierre del día anterior + producción del día − (porciones consumidas × prom. rendimiento 1 mes).">Esperado: ${val} ${ins.unidad||''}</div>`;
-}
-
-/* CONSERVACIÓN AUTOMÁTICA del cierre de salsas sin movimiento en la fecha. Fija
-   el stock de cierre del día = stock de cierre del día anterior, SOLO si:
-     · el día anterior tiene un stock de cierre registrado, y
-     · la fecha aún no tiene stock de cierre (no se pisa nada existente).
-   Upsert por (insumo, fecha) sobre S.produccion: nunca duplica. No toca stock
-   inicial ni producción. Devuelve la cantidad de salsas conservadas. El llamador
-   debe asegurar que las ventas del día estén cargadas (porcionesListasPara). */
-function conservarSalsasSinMovimiento(fecha){
-  let n = 0;
-  insumosOrdenados().filter(esSalsaCierre).forEach(ins=>{
-    if(!insumoEnInventario(ins, 'noche')) return;      // sin concepto de cierre
-    if(salsaTuvoMovimiento(ins, fecha)) return;        // tuvo movimiento: se pide a mano
-    if(stockCierreDe(ins.id, fecha) !== null) return;  // ya tiene cierre: no se pisa
-    const prev = stockCierreDe(ins.id, fechaMasDias(fecha, -1));
-    if(prev === null) return;                          // sin anterior: no se inventa
-    let r = getStockReg(ins.id, fecha);
-    if(!r){ r = {id:uid(), insumoId:ins.id, fecha}; S.produccion.push(r); }
-    r.stockCierre = prev;
-    n++;
-  });
-  return n;
+    title="Peso esperado = cierre ${desdeOtro ? 'del '+fmtFecha(r.desde)+' (último registrado)' : 'del día anterior'} + producción − (porciones consumidas × prom. rendimiento 1 mes)${desdeOtro ? ', sumando los días desde entonces' : ''}.">Esperado: ${val} ${ins.unidad||''}${desdeOtro ? `<br><span style="font-weight:500;color:#b45309">desde el cierre del ${fmtFecha(r.desde)}</span>` : ''}</div>`;
 }
 
 /* ── CONSUMO DIARIO: definición ÚNICA de la aplicación ────────────────────
@@ -18494,7 +18610,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-27.3';
+const APP_VERSION = '2026-11-27.5';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
