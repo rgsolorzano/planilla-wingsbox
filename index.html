@@ -6371,6 +6371,22 @@ async function cotCargarVentas(desde, hasta, opts={}){
   if(!opts.forzar && cotEstado.rango===clave && !cotEstado.error) return true;
   cotEstado.cargando = true; cotEstado.error = null;
   try{
+    if(leyendoDeLaBase()){
+      const setBeb = new Set(COTEJO_BEBIDAS.map(b=>vpdNormalizar(b.venta)));
+      const acc = {}; let filasOk = 0, unidades = 0, noListado = 0;
+      for(const x of await ventasProductoDiaBase(desde, hasta)){
+        const prod = vpdNormalizar(x.p);
+        if(!setBeb.has(prod)){ noListado += x.l; continue; }   // coincidencia EXACTA
+        const cant = Number(x.c) || 0;
+        (acc[x.f] = acc[x.f] || {});
+        acc[x.f][prod] = (acc[x.f][prod] || 0) + cant;         // SUMA de la cantidad
+        filasOk += x.l; unidades += cant;
+      }
+      cotVentas = acc;
+      cotEstado = { cargando:false, rango:clave, error:null, ultima:new Date(), filas:filasOk, unidades };
+      console.log('[Cotejos] '+filasOk+' fila(s) de venta → '+unidades+' unidad(es) entre '+desde+' y '+hasta+' (de la base; no listadas: '+noListado+').');
+      return true;
+    }
     const r = await gsApiFetch(
       'https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
       '/values/'+encodeURIComponent(VPD_RANGO)+'?valueRenderOption=UNFORMATTED_VALUE');
@@ -12960,6 +12976,18 @@ let vpdEstado = { cargando:false, rango:null, error:null, ultima:null, filas:0, 
    el botón de actualizar, al cambiar de rango, o al conectar Google. */
 function vpdPuedeAutocargar(clave){ return !vpdEstado.cargando && vpdEstado.fallido !== clave && isAuthorized(); }
 
+/* Ventas por día y producto DESDE LA BASE (analítica, etapa 2). Ya sumadas
+   en el servidor: una entrada por fecha y nombre de producto tal como viene
+   de IDBI, con l = líneas y c = cantidad. Sustituye leer la pestaña
+   VENTAS_PRODUCTO_DETALLE entera y no necesita conectar Google. Ver
+   db/56_porciones_desde_la_base.sql. */
+async function ventasProductoDiaBase(desde, hasta){
+  const sb = await sbCliente();
+  const { data, error } = await sb.schema('core').rpc('ventas_por_producto_dia', { p_desde: desde, p_hasta: hasta });
+  if(error) throw new Error('No se pudieron leer las ventas de la base: ' + error.message);
+  return Array.isArray(data) ? data : [];
+}
+
 // Recuenta las porciones del rango. Devuelve true si la carga fue exitosa.
 async function vpdCargarPorciones(desde, hasta, opts={}){
   if(!isAuthorized()) return false;
@@ -12967,6 +12995,20 @@ async function vpdCargarPorciones(desde, hasta, opts={}){
   if(!opts.forzar && vpdEstado.rango===clave && !vpdEstado.error) return true; // ya cargado
   vpdEstado.cargando = true; vpdEstado.error = null;
   try{
+    if(leyendoDeLaBase()){
+      const acc = {}; let contadas = 0, noListados = 0;
+      for(const x of await ventasProductoDiaBase(desde, hasta)){
+        const prod = vpdNormalizar(x.p);                      // coincidencia EXACTA, igual que con la hoja
+        if(!VPD_SET.has(prod)){ noListados += x.l; continue; }
+        (acc[x.f] = acc[x.f] || {});
+        acc[x.f][prod] = (acc[x.f][prod] || 0) + x.l;         // 1 línea = 1 porción
+        contadas += x.l;
+      }
+      vpdPorciones = acc;
+      vpdEstado = { cargando:false, rango:clave, error:null, ultima:new Date(), filas:contadas };
+      console.log('[Porciones] '+contadas+' porción(es) entre '+desde+' y '+hasta+' (de la base; no listadas: '+noListados+').');
+      return true;
+    }
     const r = await gsApiFetch(
       'https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
       '/values/'+encodeURIComponent(VPD_RANGO)+'?valueRenderOption=UNFORMATTED_VALUE');
@@ -18298,7 +18340,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-26.5';
+const APP_VERSION = '2026-11-27.1';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
