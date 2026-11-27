@@ -3065,6 +3065,71 @@ async function syncAnaliticaFromRAW(){
   }
 }
 
+/* ── Modo base: RAW sale de la vista core.v_platos_mes ────────────────────
+   Mismos hechos que syncAnaliticaFromRAW ({grupo, plato, activo, precio,
+   margen, año, mes, cantidad}), pero de la base: no hace falta Google ni
+   botón. Se lee solo al entrar al Consolidado o a Ganancia por grupo, y de
+   nuevo si lo leído tiene más de ANAL_VIGENCIA_MS. Los meses llegan hasta el
+   último con ventas (la hoja traía columnas vacías hasta diciembre). Los
+   filtros que el usuario eligió NO se reinician al releer. */
+const ANAL_VIGENCIA_MS = 5 * 60 * 1000;
+let analBase = { cargando:false, ultima:0, error:null, fallido:false };
+
+// Lee una vista entera de la base, por páginas (Supabase entrega hasta 1000 filas por vez).
+async function sbLeerTodo(vista, columnas, orden){
+  const sb = await sbCliente();
+  const filas = [];
+  for(let desde = 0; ; ){
+    let q = sb.schema('core').from(vista).select(columnas);
+    for(const c of orden) q = q.order(c, { ascending:true });
+    const { data, error } = await q.range(desde, desde + 999);
+    if(error) throw new Error('No se pudo leer '+vista+': '+error.message);
+    if(!data || !data.length) break;
+    filas.push(...data); desde += data.length;
+  }
+  return filas;
+}
+
+async function analCargarDesdeBase(){
+  const t0 = Date.now();
+  const filas = await sbLeerTodo('v_platos_mes', 'orden,grupo,activo,plato,precio,margen,mes,cantidad', ['orden', 'mes']);
+  const facts = [], productos = new Set(), meses = new Set();
+  for(const r of filas){
+    const [a, m] = String(r.mes).split('-').map(Number);
+    const rawMargen = analNumOrNull(r.margen);
+    facts.push({ grupo:String(r.grupo||'').trim(), plato:String(r.plato||'').trim(), activo: r.activo !== false,
+                 precio: analNumOrNull(r.precio),
+                 margen: rawMargen===null ? null : (rawMargen>0 && rawMargen<1 ? rawMargen*100 : rawMargen),
+                 año:a, mes:m, cantidad: (r.cantidad===null || r.cantidad===undefined) ? null : +r.cantidad });
+    productos.add(r.plato); meses.add(r.mes);
+  }
+  analiticaData = facts;
+  analiticaMeta = { lastSync:new Date().toISOString(), productos:productos.size, meses:meses.size,
+                    registros:facts.filter(f=>f.cantidad!==null).length,
+                    duracion:((Date.now()-t0)/1000).toFixed(1), fuente:'base' };
+  analSaveToStorage();
+  console.log('[Analítica] De la base: '+productos.size+' platos · '+meses.size+' meses · '+analiticaMeta.duracion+' s.');
+}
+// Lanza la lectura si toca; al terminar repinta `pagina` si sigue abierta.
+function analAutoBase(pagina, forzar){
+  if(!leyendoDeLaBase() || !isAuthorized() || analBase.cargando) return;
+  if(!forzar && (analBase.fallido || (analBase.ultima && Date.now() - analBase.ultima < ANAL_VIGENCIA_MS))) return;
+  analBase.cargando = true; analBase.error = null;
+  analCargarDesdeBase()
+    .then(()=>{ analBase.ultima = Date.now(); analBase.fallido = false; })
+    .catch(e=>{ console.error('[Analítica] Error al leer de la base:', e); analBase.error = e.message; analBase.fallido = true; })
+    .finally(()=>{ analBase.cargando = false; if(currentPage===pagina && RENDERERS[pagina]) RENDERERS[pagina](); });
+}
+// Texto de estado para la cabecera, en modo base.
+function analMetaBase(){
+  const m = analiticaMeta;
+  if(analBase.error) return `<span style="color:var(--red)">Error al leer de la base: ${analBase.error}</span>`;
+  if(analBase.cargando && !analBase.ultima) return '⏳ Leyendo los datos de la base…';
+  const hora = analBase.ultima ? new Date(analBase.ultima).toLocaleTimeString('es-PE', { hour:'2-digit', minute:'2-digit' }) : '';
+  return (m ? `${m.productos} productos · ${m.meses} meses · ${m.registros} registros` : '') +
+         (hora ? ` · leídos al ${hora}, se actualizan solos` : '');
+}
+
 function analNumOrNull(v){
   if(v===undefined||v===null||v==='') return null;
   const n=Number(String(v).replace(',','.').replace('%',''));
@@ -3217,9 +3282,11 @@ window.analToggleSort=function(col){
 RENDERERS.consolidadoVentas = function(){
   const el=document.getElementById('page-consolidadoVentas');
   if(!el) return;
+  const enBase = leyendoDeLaBase();
+  analAutoBase('consolidadoVentas');
 
   const meta=analiticaMeta;
-  const metaStr=meta
+  const metaStr= enBase ? analMetaBase() : meta
     ? `Última sincronización: ${fmtFecha(meta.lastSync.slice(0,10))} · ${meta.productos} productos · ${meta.meses} meses · ${meta.registros} registros`
     : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
 
@@ -3377,13 +3444,14 @@ RENDERERS.consolidadoVentas = function(){
           <span style="font-size:13px;font-weight:500;color:var(--c-text)">Filtra solo activos</span>
         </label>
         <button class="btn btn-ghost btn-sm" id="anFClear">🗑 Limpiar</button>
-        <button class="btn btn-primary btn-sm" id="anSyncAnalytics" style="align-self:flex-end"
-          title="Lee la hoja RAW del Spreadsheet ESTADISTICAS RAW y actualiza los datos que alimentan este reporte">📊 Actualizar datos analíticos</button>
+        ${!enBase ? `<button class="btn btn-primary btn-sm" id="anSyncAnalytics" style="align-self:flex-end"
+          title="Lee la hoja RAW del Spreadsheet ESTADISTICAS RAW y actualiza los datos que alimentan este reporte">📊 Actualizar datos analíticos</button>`
+          : analBase.fallido ? `<button class="btn btn-primary btn-sm" id="anReintentar" style="align-self:flex-end">🔄 Reintentar</button>` : ''}
       </div>
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       ${!analiticaData.length
-        ?`<div class="empty" style="padding:40px;text-align:center">Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b> para sincronizar.</div>`
+        ?`<div class="empty" style="padding:40px;text-align:center">${enBase ? (analBase.cargando ? '⏳ Leyendo los datos de la base…' : 'Sin datos analíticos en la base.') : 'Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b> para sincronizar.'}</div>`
         :!rows.length
           ?`<div class="empty" style="padding:30px">Ningún plato coincide con los filtros seleccionados.</div>`
           :`<div class="anal-outer">
@@ -3433,6 +3501,8 @@ RENDERERS.consolidadoVentas = function(){
      Administración general (syncAnaliticaFromRAW). Solo cambió de ubicación;
      no hay una segunda implementación. Al terminar se repinta el módulo para
      reflejar los datos y la fecha de sincronización. */
+  const btnRe = document.getElementById('anReintentar');
+  if(btnRe) btnRe.onclick = ()=>{ analAutoBase('consolidadoVentas', true); RENDERERS.consolidadoVentas(); };
   const btnSync = document.getElementById('anSyncAnalytics');
   if(btnSync) btnSync.onclick = async ()=>{
     const txt = btnSync.textContent;
@@ -3460,9 +3530,11 @@ window.gananciaToggleSort = function(col){
 RENDERERS.gananciaGrupo = function(){
   const el=document.getElementById('page-gananciaGrupo');
   if(!el) return;
+  const enBase = leyendoDeLaBase();
+  analAutoBase('gananciaGrupo');
 
   const meta=analiticaMeta;
-  const metaStr=meta
+  const metaStr= enBase ? analMetaBase() : meta
     ? `Última sincronización: ${fmtFecha(meta.lastSync.slice(0,10))} · ${meta.productos} productos · ${meta.meses} meses`
     : '⚠ Sin datos. Ve a <b>Administración → Actualizar datos analíticos</b>.';
 
@@ -3577,7 +3649,7 @@ RENDERERS.gananciaGrupo = function(){
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       ${!analiticaData.length
-        ?`<div class="empty" style="padding:40px;text-align:center">Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b>.</div>`
+        ?`<div class="empty" style="padding:40px;text-align:center">${enBase ? (analBase.cargando ? '⏳ Leyendo los datos de la base…' : 'Sin datos analíticos en la base.') : 'Sin datos analíticos. Ve a <b>Administración → Actualizar datos analíticos</b>.'}</div>`
         :!rows.length
           ?`<div class="empty" style="padding:30px">Sin registros para el período seleccionado.</div>`
           :`<div class="anal-outer">
@@ -5311,6 +5383,7 @@ let rmError = null;
 let rmAutoIntentado = false;
 let rmPendientes = {};   // telefono -> true|false (cambios sin guardar)
 let rmGuardando = false;
+let rmBase = { ultima:0, fallido:false };   // modo base: cuándo se leyó y si falló
 
 function rmLoadFromStorage(){
   try{
@@ -5381,6 +5454,22 @@ async function rmSyncClientes(){
   rmCargando = true; rmError = null;
   const t0 = Date.now();
   try{
+    if(leyendoDeLaBase()){
+      /* La vista core.v_clientes es la pestaña CLIENTES: mismas columnas,
+         mismo orden. Se arma la misma matriz y se agrega igual. */
+      const filasBase = await sbLeerTodo('v_clientes', 'numero_orden,cliente,telefono,total,fecha_venta,canal_venta_2', ['numero_orden']);
+      const matriz = [['NUMERO ORDEN','CLIENTE','TELEFONO','TOTAL','FECHA DE VENTA','CANAL DE VENTA 2'],
+        ...filasBase.map(x=>[x.numero_orden, x.cliente ?? '', x.telefono ?? '', x.total ?? '', x.fecha_venta ?? '', x.canal_venta_2 ?? ''])];
+      const agB = rmAgregarFilas(matriz);
+      rmClientes = agB.clientes;
+      rmClientesMeta = { lastSync:new Date().toISOString(), filas:agB.leidas, clientes:rmClientes.length,
+                         sinTelefono:agB.sinTelefono, sinFecha:agB.sinFecha,
+                         duracion:((Date.now()-t0)/1000).toFixed(1), fuente:'base' };
+      rmSaveClientes();
+      console.log('[Remarketing] De la base: '+agB.leidas+' órdenes → '+rmClientes.length+' clientes.');
+      rmCargando = false;
+      return true;
+    }
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
       '/values/'+encodeURIComponent(RM_SHEET_CLIENTES+'!A1:F200000')+'?valueRenderOption=UNFORMATTED_VALUE');
     if(r.status===403) throw new Error('Sin permiso para leer la pestaña '+RM_SHEET_CLIENTES+'.');
@@ -5410,6 +5499,18 @@ async function rmSyncClientes(){
 async function rmSyncContactos(){
   if(!isAuthorized()) return false;
   try{
+    if(leyendoDeLaBase()){
+      const out = [];
+      for(const x of await sbLeerTodo('remarketing', 'id,telefono,fecha', ['id'])){
+        const tel = rmNormalizarTelefono(x.telefono), fecha = normFechaGS(x.fecha);
+        if(!tel || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) continue;
+        out.push({ id:String(x.id), telefono:tel, fecha });
+      }
+      rmContactos = out;
+      rmSaveContactos();
+      console.log('[Remarketing] '+out.length+' contacto(s) de remarketing cargados de la base.');
+      return true;
+    }
     const r = await gsApiFetch('https://sheets.googleapis.com/v4/spreadsheets/'+ANALITICA_PROC_SS_ID+
       '/values/'+encodeURIComponent(RM_SHEET_CONTACTOS+'!A1:D100000')+'?valueRenderOption=UNFORMATTED_VALUE');
     if(r.status===400 || r.status===404){
@@ -5619,7 +5720,18 @@ window.rmGuardar = async function(){
   rmGuardando = true; RENDERERS.remarketing();
   const { altas, bajas } = rmAplicarPendientes();
   try{
-    await analiticaWriteProcessedSheet(RM_SHEET_CONTACTOS, rmMatrizContactos(), 'A1:D100000');
+    if(leyendoDeLaBase()){
+      // Solo lo que cambió: los contactos nuevos y los ids retirados. Todo o nada (ver 57_guardar_remarketing.sql).
+      const antes = new Set(respaldo.map(c=>c.id)), ahora = new Set(rmContactos.map(c=>c.id));
+      const p_altas = rmContactos.filter(c=>!antes.has(c.id));
+      const p_bajas = respaldo.filter(c=>!ahora.has(c.id)).map(c=>c.id);
+      const sb = await sbCliente();
+      const { error } = await sb.schema('core').rpc('guardar_remarketing', { p_altas, p_bajas });
+      if(error) throw new Error(error.message);
+      rmBase.ultima = 0;                 // la próxima vez que se pinte, se relee lo guardado
+    }else{
+      await analiticaWriteProcessedSheet(RM_SHEET_CONTACTOS, rmMatrizContactos(), 'A1:D100000');
+    }
     rmSaveContactos();
     rmPendientes = {};
     rmGuardando = false;
@@ -5640,7 +5752,21 @@ RENDERERS.remarketing = function(){
   /* Carga automática una sola vez por sesión: clientes + historial. No se
      vuelve a leer el spreadsheet al cambiar un dropdown; los agregados ya
      están en memoria y la segmentación se recalcula sobre ellos. */
-  if(!rmAutoIntentado && !rmCargando && isAuthorized() && !rmClientes.length){
+  const enBase = leyendoDeLaBase();
+  if(enBase){
+    /* Modo base: se lee solo al entrar y de nuevo si lo leído tiene más de
+       5 minutos. No mientras se guarda. Si falla, no se reintenta solo
+       (botón «Reintentar»). Los cambios sin guardar se conservan. */
+    if(!rmCargando && !rmGuardando && isAuthorized() && !rmBase.fallido &&
+       (!rmBase.ultima || Date.now() - rmBase.ultima > ANAL_VIGENCIA_MS)){
+      rmCargando = true;
+      Promise.all([rmSyncClientes(), rmSyncContactos()]).then(([a, b])=>{
+        rmCargando = false;
+        if(a && b){ rmBase.ultima = Date.now(); rmBase.fallido = false; } else rmBase.fallido = true;
+        if(currentPage==='remarketing') RENDERERS.remarketing();
+      });
+    }
+  } else if(!rmAutoIntentado && !rmCargando && isAuthorized() && !rmClientes.length){
     rmAutoIntentado = true;
     rmCargando = true;
     Promise.all([rmSyncClientes(), rmSyncContactos()]).then(()=>{
@@ -5651,7 +5777,10 @@ RENDERERS.remarketing = function(){
 
   const hoy = fechaEnLima();
   const pend = Object.keys(rmPendientes).length;
-  const meta = rmClientesMeta
+  const horaRm = rmBase.ultima ? new Date(rmBase.ultima).toLocaleTimeString('es-PE', { hour:'2-digit', minute:'2-digit' }) : '';
+  const meta = (enBase && rmClientesMeta && rmClientesMeta.fuente==='base')
+    ? `${rmClientesMeta.filas} órdenes con teléfono · ${rmClientesMeta.clientes} clientes` + (horaRm ? ` · leídos al ${horaRm}, se actualizan solos` : '')
+    : rmClientesMeta
     ? `Última sincronización: ${fmtFecha(rmClientesMeta.lastSync.slice(0,10))} · ${rmClientesMeta.filas} filas de ${RM_SHEET_CLIENTES} · ${rmClientesMeta.clientes} clientes`
       + (rmClientesMeta.sinTelefono? ` · ${rmClientesMeta.sinTelefono} fila(s) sin teléfono utilizable (excluidas)`:'')
     : 'Sin sincronizar todavía.';
@@ -5740,10 +5869,10 @@ RENDERERS.remarketing = function(){
   el.innerHTML = `
     <div class="page-head">
       <div><h1>📣 Remarketing</h1>
-        <p>Segmentación de clientes a partir de la pestaña <b>${RM_SHEET_CLIENTES}</b> (solo lectura), agrupados por teléfono.
+        <p>Segmentación de clientes a partir de ${enBase ? 'las <b>ventas de IDBI</b>' : `la pestaña <b>${RM_SHEET_CLIENTES}</b>`} (solo lectura), agrupados por teléfono.
            ${meta}</p></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-ghost" id="rmSync" ${rmCargando?'disabled':''}>${rmCargando?'⏳ Actualizando…':'🔄 Actualizar clientes'}</button>
+        ${(!enBase || rmBase.fallido) ? `<button class="btn btn-ghost" id="rmSync" ${rmCargando?'disabled':''}>${rmCargando?'⏳ Actualizando…':(enBase?'🔄 Reintentar':'🔄 Actualizar clientes')}</button>` : ''}
         <button class="btn btn-primary" id="rmSave" ${(!pend||rmGuardando)?'disabled':''}>${rmGuardando?'⏳ Guardando…':'💾 Guardar cambios'+(pend?' ('+pend+')':'')}</button>
       </div>
     </div>
@@ -5765,6 +5894,7 @@ RENDERERS.remarketing = function(){
     const ok1 = await rmSyncClientes();
     const ok2 = await rmSyncContactos();
     rmCargando = false;
+    if(ok1 && ok2){ rmBase.ultima = Date.now(); rmBase.fallido = false; }
     RENDERERS.remarketing();
     toast((ok1&&ok2) ? 'Clientes actualizados · '+rmClientes.length+' clientes'
                      : 'No se pudieron actualizar los datos. '+(rmError||''), (ok1&&ok2)?'success':'error');
@@ -6478,13 +6608,29 @@ function cotCalcular(beb, periodo){
 }
 
 let cotAutoCargaIntentada = false;
+/* Modo base: las ventas se leen solas. Al entrar al módulo, al cambiar el
+   rango, y si la última lectura tiene más de COT_VIGENCIA_MS (el Apps Script
+   carga ventas cada 10 minutos). Un rango cuya lectura FALLÓ no se reintenta
+   solo —el repintado tras el fallo lo volvería a pedir sin fin—: aparece el
+   botón «Reintentar». */
+const COT_VIGENCIA_MS = 5 * 60 * 1000;
+let cotFallido = null;
 RENDERERS.cotejos = function(){
   const el=document.getElementById('page-cotejos');
   if(!el) return;
   const { desde, hasta, agrup } = cotFilter;
   const R = anRangoNormalizado(desde, hasta, agrup);
   // Las ventas se piden sobre el rango de CÁLCULO, no sobre el visual.
-  if(isAuthorized() && !cotEstado.cargando && cotEstado.rango!==(R.desde+'|'+R.hasta)){
+  const enBase = leyendoDeLaBase(), claveR = R.desde+'|'+R.hasta;
+  if(enBase){
+    const vieja = !cotEstado.ultima || (Date.now() - cotEstado.ultima.getTime() > COT_VIGENCIA_MS);
+    if(isAuthorized() && !cotEstado.cargando && cotFallido!==claveR && (cotEstado.rango!==claveR || vieja)){
+      cotCargarVentas(R.desde, R.hasta, {forzar:true}).then(ok=>{
+        cotFallido = ok ? null : claveR;
+        if(currentPage==='cotejos') RENDERERS.cotejos();
+      });
+    }
+  } else if(isAuthorized() && !cotEstado.cargando && cotEstado.rango!==claveR){
     if(!cotAutoCargaIntentada || cotFilter._recargar){
       cotAutoCargaIntentada = true; cotFilter._recargar = false;
       cotCargarVentas(R.desde, R.hasta).then(()=>{ if(currentPage==='cotejos') RENDERERS.cotejos(); });
@@ -6511,16 +6657,22 @@ RENDERERS.cotejos = function(){
     return `<tr><td class="mx-fix">${b.venta}${aviso}</td>${celdas}</tr>`;
   }).join('');
 
+  const horaLectura = cotEstado.ultima ? cotEstado.ultima.toLocaleTimeString('es-PE', { hour:'2-digit', minute:'2-digit' }) : '';
   const metaStr = cotEstado.error ? `<br><span style="color:var(--red)">Error al leer ventas: ${cotEstado.error}</span>`
-    : (cotEstado.ultima ? `<br>Ventas leídas: <b>${cotEstado.unidades.toLocaleString('es-PE')}</b> unidad(es) en ${cotEstado.filas.toLocaleString('es-PE')} fila(s)` : '');
+    : (enBase && cotEstado.cargando) ? `<br><span class="hint">Leyendo las ventas…</span>`
+    : (cotEstado.ultima ? `<br>Ventas leídas: <b>${cotEstado.unidades.toLocaleString('es-PE')}</b> unidad(es) en ${cotEstado.filas.toLocaleString('es-PE')} fila(s)`
+                          + (enBase ? ` · al ${horaLectura}, se actualizan solas` : '') : '');
+  const botonVentas = !enBase ? `<button class="btn btn-primary" id="cotSync">🔄 Actualizar ventas</button>`
+    : (cotEstado.error ? `<button class="btn btn-primary" id="cotSync">🔄 Reintentar</button>` : '');
+  const fuenteVentas = enBase ? 'las ventas de IDBI' : `<code>${VPD_SHEET}</code> (Z·AJ·AQ)`;
   const rangoCalc = (R.desde!==desde || R.hasta!==hasta)
     ? `<span class="hint" style="margin-left:8px">Rango de cálculo: <b>${fmtFecha(R.desde)} → ${fmtFecha(R.hasta)}</b></span>` : '';
 
   el.innerHTML=`
     <div class="page-head"><div><h1>🔎 Cotejos</h1>
       <p>Ventas reales frente al consumo deducido del inventario físico y sus movimientos.
-      Fuentes: <code>${VPD_SHEET}</code> (Z·AJ·AQ), Stock Diario Bebidas y Registrar movimiento.${metaStr}</p></div>
-      <button class="btn btn-primary" id="cotSync">🔄 Actualizar ventas</button></div>
+      Fuentes: ${fuenteVentas}, Stock Diario Bebidas y Registrar movimiento.${metaStr}</p></div>
+      ${botonVentas}</div>
     <div class="card">
       <div class="toolbar" style="flex-wrap:wrap;gap:10px 16px;align-items:flex-end">
         <div class="field"><label>Desde</label><input type="date" id="cotDesde" value="${desde}"></div>
@@ -6554,9 +6706,11 @@ RENDERERS.cotejos = function(){
   document.getElementById('cotHasta').onchange=aplicar;
   document.getElementById('cotAgrup').onchange=aplicar;
   document.getElementById('cotClear').onclick=()=>{ cotFilter=cotRangoPorDefecto(); RENDERERS.cotejos(); };
-  document.getElementById('cotSync').onclick=async function(){
-    this.disabled=true; this.textContent='Actualizando…';
+  const btnCot = document.getElementById('cotSync');
+  if(btnCot) btnCot.onclick=async function(){
+    this.disabled=true; this.textContent='Actualizando…'; cotFallido = null;
     const ok=await cotCargarVentas(R.desde, R.hasta, {forzar:true});
+    cotFallido = ok ? null : claveR;
     if(ok) toast(`Ventas actualizadas: ${cotEstado.unidades.toLocaleString('es-PE')} unidad(es) en ${cotEstado.filas.toLocaleString('es-PE')} fila(s).`,'success');
     else toast('No se pudieron actualizar las ventas: '+(cotEstado.error||'error desconocido'),'error');
     RENDERERS.cotejos();
@@ -18340,7 +18494,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-27.1';
+const APP_VERSION = '2026-11-27.3';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
