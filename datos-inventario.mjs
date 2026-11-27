@@ -28,7 +28,7 @@
 /* La versión de ESTE archivo. El arranque la coteja con la del index y avisa
    si no coinciden: una subida a medias deja un .mjs viejo en caché sirviendo
    código que ya se arregló, y eso costó una tarde de dar vueltas. */
-export const VERSION = '2026-11-27.5';
+export const VERSION = '2026-11-27.6';
 
 const t = x => (x === null || x === undefined) ? '' : x;
 const n0 = x => (x === null || x === undefined || x === '') ? 0 : Number(x);
@@ -69,6 +69,7 @@ export function crearLectorInventario(consultar){
      llevan su propio mapa de versiones desde antes. */
   let ultimaMeta = {};
   const versionStock   = new Map();   // stock_diario, por insumo y fecha
+  const versionProd    = new Map();   // produccion, por insumo y fecha
 
   async function leerInventario(){
     /* Las nueve consultas se lanzan A LA VEZ y se esperan más abajo, cada
@@ -117,7 +118,7 @@ export function crearLectorInventario(consultar){
       order: 'id',
     });
     const _p_produccion = consultar('produccion', {
-      select: 'id, id_externo, insumo_id, fecha, cantidad',
+      select: 'id, id_externo, insumo_id, fecha, cantidad, version',
       // Orden único: sin él, paginar de mil en mil se salta filas.
       order: 'id',
     });
@@ -354,9 +355,13 @@ export function crearLectorInventario(consultar){
 
     const produccion = (await _p_produccion).sort(porClaves(r => r.fecha, r => r.id_externo));
     hojas.ProduccionInsumos = [['id','insumoId','fecha','cantidad']];
-    for(const p of produccion)
-      hojas.ProduccionInsumos.push([t(p.id_externo), insPorId.get(p.insumo_id)?.id_externo ?? '',
-                                    p.fecha, n0(p.cantidad)]);
+    for(const p of produccion){
+      const ext = insPorId.get(p.insumo_id)?.id_externo ?? '';
+      /* Lo registrado desde la app en modo base no tiene id_externo: se usa el
+         uuid, para que el id sea el mismo en cada lectura. */
+      hojas.ProduccionInsumos.push([t(p.id_externo) || p.id, ext, p.fecha, n0(p.cantidad)]);
+      if(ext && p.version !== undefined && p.version !== null) versionProd.set(ext + '|' + p.fecha, p.version);
+    }
 
     /* ── Arqueo de efectivo: el jsonb vuelve a ser 24 columnas ──────────── */
     const caja = (await _p_efectivo_caja).sort(porClaves(r => r.fecha, r => r.id_externo));
@@ -431,6 +436,10 @@ export function crearLectorInventario(consultar){
     versionDe: (idExterno, fecha, unidad) =>
       versionConteo.get(claveConteo(idExterno, fecha, unidad)) ?? null,
     versionStockDe: (idExterno, fecha) => versionStock.get(idExterno + '|' + fecha) ?? null,
+    versionProdDe: (idExterno, fecha) => versionProd.get(idExterno + '|' + fecha) ?? null,
+    anotarVersionProd: (idExterno, fecha, version) =>
+      version === null ? versionProd.delete(idExterno + '|' + fecha)
+                       : versionProd.set(idExterno + '|' + fecha, version),
     anotarVersionStock: (idExterno, fecha, version) =>
       version === null ? versionStock.delete(idExterno + '|' + fecha)
                        : versionStock.set(idExterno + '|' + fecha, version),

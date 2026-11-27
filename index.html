@@ -12757,7 +12757,7 @@ function prodRegListadoHTML(){
    insumo, cantidad y fecha. No toca ningún otro registro del día.
    Se marca como eliminado (tombstone) para que la fusión con el remoto
    durante la sincronización no lo resucite. */
-window.prodRegEliminar = function(id){
+window.prodRegEliminar = async function(id){
   const r = S.prodInsumos.find(x=>x.id===id);
   if(!r) return;
   const ins = S.insumos.find(i=>i.id===r.insumoId);
@@ -12768,7 +12768,10 @@ window.prodRegEliminar = function(id){
     'Cantidad: '+r.cantidad+unidad+'\n'+
     'Fecha: '+fmtFecha(r.fecha)+'\n\n'+
     'Esta acción no se puede deshacer y solo afecta a este registro.')) return;
-  if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('ProduccionInsumos', r);
+  if(leyendoDeLaBase()){
+    const rb = await sbBorrarProduccion(r.insumoId, r.fecha);
+    if(!rb.ok){ toast('No se pudo eliminar en la base: '+rb.motivo+'. Sigue registrada.','error'); return; }
+  }else if(typeof gsMarcarEliminado==='function') gsMarcarEliminado('ProduccionInsumos', r);
   S.prodInsumos = S.prodInsumos.filter(x=>x.id!==id);
   save(K.prodInsumos, S.prodInsumos);
   syncProdInsumos();
@@ -12800,7 +12803,7 @@ window.prodRegQuitar = function(idx){
 // Guarda todas las filas en una sola acción. Ante un duplicado
 // (mismo insumo y fecha) NUNCA sobrescribe en silencio: pide confirmación
 // explícita por cada caso; si el usuario cancela, conserva el valor existente.
-function guardarRegistroProduccion(){
+async function guardarRegistroProduccion(){
   const fecha = prodRegFecha;
   if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ toast('Selecciona una fecha válida','error'); return; }
   const candidatas = prodRegFilas
@@ -12820,6 +12823,8 @@ function guardarRegistroProduccion(){
     vistos.add(c.insumoId);
   }
   let nuevos=0, reemplazados=0, conservados=0;
+  const fotoAntes = S.prodInsumos.map(r=>({...r}));       // para deshacer si la base no lo acepta
+  const aGuardar = [];
   candidatas.forEach(c=>{
     const ins = S.insumos.find(i=>i.id===c.insumoId);
     const nombre = ins?ins.nombre:'—';
@@ -12831,7 +12836,30 @@ function guardarRegistroProduccion(){
       reemplazados++;
     } else nuevos++;
     prodRegistroUpsert(c.insumoId, fecha, Number(c.valor));
+    aGuardar.push({ insumoId:c.insumoId, fecha, cantidad:Number(c.valor) });
   });
+  if(leyendoDeLaBase() && aGuardar.length){
+    /* Se confirma con la base ANTES de dar nada por guardado. Si falla,
+       todo vuelve a como estaba y el formulario conserva lo escrito. */
+    const btn = document.getElementById('prodRegSave');
+    if(btn){ btn.disabled = true; btn.textContent = '⏳ Guardando…'; }
+    let r;
+    try{ r = await sbGuardarProduccion(aGuardar); }
+    catch(e){ r = { ok:false, motivo:(e && e.message) ? e.message : String(e) }; }
+    if(!r.ok){
+      // Lo que sí llegó a la base se queda; lo que no, se deshace en pantalla.
+      const fallidos = new Set((r.incidencias||[]).map(i=>i.celda.insumoId+'|'+i.celda.fecha));
+      const todosFallan = !!r.motivo;
+      S.prodInsumos = S.prodInsumos.filter(x=>!(x.fecha===fecha && (todosFallan || fallidos.has(x.insumoId+'|'+fecha))))
+        .concat(fotoAntes.filter(x=>x.fecha===fecha && (todosFallan || fallidos.has(x.insumoId+'|'+fecha))));
+      save(K.prodInsumos, S.prodInsumos);
+      toast('No se pudo guardar la producción en la base: '+sbExplicarProduccion(r)+'. Lo no guardado sigue en el formulario.','error');
+      prodRegFilas = prodRegFilas.filter(f=>todosFallan || fallidos.has(f.insumoId+'|'+fecha));
+      if(!prodRegFilas.length) prodRegFilas = [{insumoId:'', cantidad:''}];
+      RENDERERS.produccion();
+      return;
+    }
+  }
   save(K.prodInsumos, S.prodInsumos);
   syncProdInsumos();
   prodRegFilas = [{insumoId:'', cantidad:''}];
@@ -17070,7 +17098,11 @@ function syncPropinasConfirmado(){ return _syncSheetConfirmado('inventario','Pro
 // ── INVENTARIO ──
 function syncInsumos()     { _syncSheet('inventario','Insumos',    'Insumos',    S.insumos.length); }
 function syncProduccion()  { _syncSheet('inventario','Produccion', 'Stock de insumos', S.produccion.length); }
-function syncProdInsumos() { _syncSheet('inventario','ProduccionInsumos','Producción', S.prodInsumos.length); }
+/* En modo base la producción NO pasa por aquí: guardarRegistroProduccion y
+   prodRegEliminar escriben cada registro en la base y esperan su respuesta.
+   Hasta la 2026-11-27.6 esto la mandaba a la hoja también en modo base, y la
+   producción se quedaba solo en el equipo donde se registró. */
+function syncProdInsumos() { if(leyendoDeLaBase()) return; _syncSheet('inventario','ProduccionInsumos','Producción', S.prodInsumos.length); }
 function syncLicores()     { _syncSheet('inventario','Licores',    'Licores',    S.licores.length); }
 function syncInvLicores()  { _syncSheet('inventario','InvLicores', 'Inv.Licores',S.invLicores.length); }
 function syncBebidasCat()  { _syncSheet('inventario','BebidasCat', 'Bebidas',    S.bebidasCat.length); }
@@ -17820,6 +17852,53 @@ async function sbGuardarStock(celdas){
   return res;
 }
 
+/* Producción de insumos (Registrar producción). regs: [{insumoId, fecha, cantidad}]
+   con el id de la app; se traducen al uuid de la base. Devuelve como
+   sbGuardarStock: { ok, creados, actualizados, repetidos, incidencias }. */
+async function sbGuardarProduccion(regs){
+  if(!_sbLectorInv) return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  const escritor = await sbEscritor();
+  const accion = (typeof uid === 'function' ? uid() : String(Date.now()));
+  const res = { ok:true, creados:0, actualizados:0, repetidos:0, incidencias:[] };
+  for(const c of regs){
+    const insumoId = _sbLectorInv.uuidDe(c.insumoId);
+    if(!insumoId){ res.incidencias.push({ celda:c, estado:'desconocido', motivo:'ese insumo no existe en la base' }); res.ok = false; continue; }
+    const r = await escritor.guardarProduccion({ clave: accion + ':prod:' + c.insumoId + ':' + c.fecha,
+      insumoId, fecha: c.fecha, cantidad: c.cantidad, version: _sbLectorInv.versionProdDe(c.insumoId, c.fecha) });
+    if(r.estado === 'creado' || r.estado === 'actualizado'){
+      _sbLectorInv.anotarVersionProd(c.insumoId, c.fecha, r.version);
+      res[r.estado === 'creado' ? 'creados' : 'actualizados']++;
+    }else if(r.estado === 'repetido') res.repetidos++;
+    else{
+      console.warn('[Producción] no se guardó', { registro:c, respuesta:r });
+      res.incidencias.push({ celda:c, estado:r.estado, motivo:r.motivo || r.mensaje || 'sin detalle' });
+      res.ok = false;
+    }
+  }
+  return res;
+}
+async function sbBorrarProduccion(insumoIdApp, fecha){
+  if(!_sbLectorInv) return { ok:false, motivo:'Todavía no se leyó el inventario de la base. Recarga la página.' };
+  const insumoId = _sbLectorInv.uuidDe(insumoIdApp);
+  if(!insumoId) return { ok:false, motivo:'ese insumo no existe en la base' };
+  const escritor = await sbEscritor();
+  const r = await escritor.borrarProduccion({ clave:(typeof uid==='function'?uid():String(Date.now()))+':borrarprod',
+    insumoId, fecha, version: _sbLectorInv.versionProdDe(insumoIdApp, fecha) });
+  if(r.estado === 'borrado' || r.estado === 'ausente' || r.estado === 'repetido'){
+    _sbLectorInv.anotarVersionProd(insumoIdApp, fecha, null);
+    return { ok:true };
+  }
+  return { ok:false, motivo: r.motivo || r.mensaje || r.estado };
+}
+// Texto legible de las incidencias de sbGuardarProduccion.
+function sbExplicarProduccion(r){
+  if(r.motivo) return r.motivo;
+  return r.incidencias.map(i=>{
+    const ins = S.insumos.find(x=>x.id===i.celda.insumoId);
+    return (ins ? ins.nombre : i.celda.insumoId) + ': ' + i.motivo;
+  }).join(' · ');
+}
+
 /* Movimientos de artículo: el inventario físico diario de licores y las
    entradas y salidas de bebidas y cocina.
 
@@ -18126,16 +18205,26 @@ function cargaFin(domain, error){
    (o tiene distinto), con fecha desde que se usa la base, se conserva y se
    escribe a la base. Una vez escrito, la base y el navegador coinciden y
    esto ya no encuentra nada. */
-const SB_RESCATE_DESDE = { EfectivoCaja:'2026-11-25', ValidacionTarjeta:'2026-11-20' };
+/* ProduccionInsumos: lo mismo pasó con «Registrar producción» hasta la
+   2026-11-27.6. */
+const SB_RESCATE_DESDE = { EfectivoCaja:'2026-11-25', ValidacionTarjeta:'2026-11-20', ProduccionInsumos:'2026-11-25' };
+const sbRescatados = {};   // hoja → registros rescatados (para escribirlos uno a uno)
+/* hasta (opcional): última fecha que puede haber quedado solo en un navegador.
+   Pasado el arreglo, todo se escribe directo en la base; seguir rescatando
+   fechas posteriores podría resucitar algo que otro equipo borró. */
+const SB_RESCATE_HASTA = { ProduccionInsumos:'2026-11-27' };
 function sbRescatar(hoja, local, deLaBase, clave, valor, desde){
+  const hasta = SB_RESCATE_HASTA[hoja] || '9999-12-31';
   const enBase = new Map(deLaBase.map(r => [clave(r), r]));
   const rescatados = [];
+  sbRescatados[hoja] = [];
   for(const r of local){
-    if(!r || !r.fecha || normFechaGS(r.fecha) < desde) continue;
+    if(!r || !r.fecha || normFechaGS(r.fecha) < desde || normFechaGS(r.fecha) > hasta) continue;
     const b = enBase.get(clave(r));
     if(b && valor(b) === valor(r)) continue;
     if(b) deLaBase.splice(deLaBase.indexOf(b), 1, r); else deLaBase.push(r);
     rescatados.push(clave(r));
+    sbRescatados[hoja].push(r);
   }
   if(rescatados.length)
     console.warn('[Rescate] '+hoja+': '+rescatados.length+' registro(s) que solo estaban en este navegador: '+rescatados.join(', '));
@@ -18143,6 +18232,13 @@ function sbRescatar(hoja, local, deLaBase, clave, valor, desde){
 }
 async function sbEscribirRescates(domain, hojas){
   for(const hoja of hojas){
+    if(hoja === 'ProduccionInsumos'){
+      const regs = (sbRescatados.ProduccionInsumos || []).map(x=>({ insumoId:x.insumoId, fecha:normFechaGS(x.fecha), cantidad:Number(x.cantidad) }));
+      const r = await sbGuardarProduccion(regs);
+      if(r.ok) toast('Se recuperaron '+regs.length+' registro(s) de producción que se habían quedado en este equipo y ya están en la base.','success');
+      else toast('Hay producción que solo está en este equipo y no se pudo subir: '+sbExplicarProduccion(r)+'. No borres los datos del navegador; avisa.','error');
+      continue;
+    }
     const etiqueta = hoja === 'EfectivoCaja' ? 'Caja' : 'Validación de tarjeta';
     const r = await _syncSheetConfirmado(domain, hoja, etiqueta);
     if(r.ok) toast('Se recuperaron datos de '+etiqueta.toLowerCase()+' que se habían quedado en este equipo y ya están en la base.','success');
@@ -18334,10 +18430,13 @@ async function gsLoadFromSheets(domain='planilla', opts={}){
         stockInicial:numOrNull(r.stockInicial), stockCierre:numOrNull(r.stockCierre),
         // Sello de migración: evita recrear producciones ya migradas (y borradas).
         migradoV2: !!(r.migradoV2 && String(r.migradoV2).toLowerCase()!=='false' && r.migradoV2!=='0') })), 'Produccion');
+      const prodLocal = (base && !silencioso) ? (S.prodInsumos||[]).slice() : null;
       if(puedeAplicar('ProduccionInsumos', S.prodInsumos))
       S.prodInsumos = (byName['ProduccionInsumos']||[]).map(r=>({
         id:String(r.id||uid()), insumoId:String(r.insumoId), fecha:normFechaGS(r.fecha),
         cantidad:numOrNull(r.cantidad) })).filter(r=>r.insumoId && r.cantidad!==null);
+      if(prodLocal) rescates.push(...sbRescatar('ProduccionInsumos', prodLocal, S.prodInsumos,
+        r => r.insumoId+'|'+normFechaGS(r.fecha), r => String(numOrNull(r.cantidad)), SB_RESCATE_DESDE.ProduccionInsumos));
       // Migra cualquier producción histórica que aún viva solo en el campo
       // legado (idempotente: nunca duplica lo ya migrado).
       migrarProduccionV2();
@@ -18610,7 +18709,7 @@ const SES_KEYS = { borrador:'ses_borrador', version:'ses_appVersion', recarga:'s
 // despliegue: conviene incrementarla en cada publicación, pero la detección ya
 // no depende de ello (ver «Versión de la aplicación» más abajo: la firma del
 // documento servido cambia sola aunque esta constante se quede atrás).
-const APP_VERSION = '2026-11-27.5';
+const APP_VERSION = '2026-11-27.6';
 let sesionExpiradaAvisada = false;
 
 // ── Borradores de formulario ──────────────────────────────────────────────
